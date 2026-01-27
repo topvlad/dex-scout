@@ -1,385 +1,316 @@
+# app.py
 import re
 import time
-import math
-import base64
-from io import BytesIO
-from datetime import datetime, timezone
+from typing import Dict, Any, List, Tuple
 
 import requests
 import streamlit as st
 
-
 DEX_BASE = "https://api.dexscreener.com"
 
-# --------- Helpers ---------
-def safe_get(d, path, default=None):
+# ---- UI defaults / presets ----
+CHAIN_DEX_PRESETS = {
+    "bsc": ["pancakeswap", "thena", "biswap", "apeswap"],
+    "ethereum": ["uniswap", "sushiswap", "pancakeswap"],
+    "base": ["uniswap", "aerodrome"],
+    "polygon": ["quickswap", "uniswap", "sushiswap"],
+    "arbitrum": ["uniswap", "sushiswap"],
+    "optimism": ["uniswap", "velodrome"],
+    "solana": ["raydium", "orca", "meteora"],
+}
+
+# “ієрогліфи/сміття”: лишаємо латиницю/цифри/частину символів
+NAME_OK_RE = re.compile(r"^[A-Za-z0-9\-\._\s]{2,30}$")
+
+
+def safe_get(d: Dict[str, Any], *path, default=None):
     cur = d
     for p in path:
-        if isinstance(cur, dict) and p in cur:
-            cur = cur[p]
-        else:
+        if not isinstance(cur, dict) or p not in cur:
             return default
+        cur = cur[p]
     return cur
 
 
-def is_ascii_like(s: str) -> bool:
-    """Rejects most non-latin / hieroglyphic names. Allows common tickers."""
-    if not s:
-        return False
-    # allow: letters, digits, space, _ - . / + #
-    return re.fullmatch(r"[A-Za-z0-9 _\-\.\+/#]{2,}", s) is not None
-
-
-def now_ts():
-    return int(time.time())
-
-
-def age_hours(pair_created_at_ms: int) -> float:
-    if not pair_created_at_ms:
-        return 99999.0
-    return (now_ts() * 1000 - int(pair_created_at_ms)) / 1000 / 3600
-
-
-def make_beep_wav_base64(freq=880, duration=0.18, sr=22050):
-    """Generate a short beep WAV (base64) without extra deps."""
-    import wave
-    import struct
-
-    n = int(sr * duration)
-    buf = BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        for i in range(n):
-            # simple sine
-            val = int(16000 * math.sin(2 * math.pi * freq * (i / sr)))
-            wf.writeframes(struct.pack("<h", val))
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-BEEP_B64 = make_beep_wav_base64()
-
-
-def chain_swap_link(chain_id: str, token_addr: str):
-    chain_id = (chain_id or "").lower()
-    if chain_id in ["bsc", "bnb", "bnbchain", "bep20"]:
-        # PancakeSwap BSC
-        return f"https://pancakeswap.finance/swap?outputCurrency={token_addr}"
-    if chain_id == "solana":
-        # Jupiter
-        return f"https://jup.ag/swap/SOL-{token_addr}"
-    # fallback to dexscreener token page (not perfect but better than nothing)
-    return f"https://dexscreener.com/{chain_id}/{token_addr}"
-
-
-def dexscreener_pair_link(chain_id: str, pair_addr: str):
-    return f"https://dexscreener.com/{chain_id}/{pair_addr}"
-
-
-# --------- API ---------
-@st.cache_data(ttl=25)
-def ds_search(query: str):
+@st.cache_data(ttl=25, show_spinner=False)
+def fetch_latest_pairs_for_query(q: str) -> List[Dict[str, Any]]:
+    # /latest/dex/search?q=...
     url = f"{DEX_BASE}/latest/dex/search"
-    r = requests.get(url, params={"q": query}, timeout=20)
+    r = requests.get(url, params={"q": q.strip()}, timeout=20)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    return data.get("pairs", []) or []
 
 
-def extract_timeframe_metrics(pair: dict):
-    """
-    Dexscreener fields:
-    - txns: { m5: {buys,sells}, h1: {...}, h24: {...} } (timeframes vary)
-    - volume: { m5: x, h1: x, h24: x } (varies)
-    - priceChange: { m5: %, h1: %, h24:% } (varies)
-    """
-    txns = pair.get("txns", {}) or {}
-    volume = pair.get("volume", {}) or {}
-    pchg = pair.get("priceChange", {}) or {}
+def score_pair(p: Dict[str, Any]) -> float:
+    liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
+    vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
+    vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
 
-    # prefer m5 & h1 if present
-    buys_m5 = safe_get(txns, ["m5", "buys"], 0) or 0
-    sells_m5 = safe_get(txns, ["m5", "sells"], 0) or 0
-    vol_m5 = volume.get("m5", 0) or 0
-    d_m5 = pchg.get("m5", 0) or 0
+    pc5 = float(safe_get(p, "priceChange", "m5", default=0) or 0)
+    pc1h = float(safe_get(p, "priceChange", "h1", default=0) or 0)
 
-    d_h1 = pchg.get("h1", 0) or 0
-    vol_h24 = volume.get("h24", 0) or 0
-    liq_usd = safe_get(pair, ["liquidity", "usd"], 0) or 0
+    buys5 = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
+    sells5 = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
 
-    return {
-        "buys_m5": int(buys_m5),
-        "sells_m5": int(sells_m5),
-        "vol_m5": float(vol_m5),
-        "d_m5": float(d_m5),
-        "d_h1": float(d_h1),
-        "vol_h24": float(vol_h24),
-        "liq_usd": float(liq_usd),
-    }
+    # Нормальний “екшен”: є і покупки і продажі, є ліквідність і обʼєм
+    trades5 = buys5 + sells5
+
+    # Простий скор: ліквідність + короткий обʼєм + активність, з легким бонусом за імпульс
+    s = 0.0
+    s += min(liq / 1000.0, 400.0)              # кап до 400
+    s += min(vol24 / 10000.0, 300.0)           # кап до 300
+    s += min(vol5 / 2000.0, 200.0)             # кап до 200
+    s += min(trades5 * 2.0, 120.0)             # кап до 120
+    s += max(min(pc1h, 80.0), -80.0) * 0.3     # +/- імпульс
+    s += max(min(pc5, 30.0), -30.0) * 0.2
+    return round(s, 2)
 
 
-def tag_and_decide(pair: dict, m: dict):
-    """
-    Simple actionable rules (not MA-based).
-    """
+def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Повертає (рішення, теги)"""
+    liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
+    vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
+    vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
+
+    pc5 = float(safe_get(p, "priceChange", "m5", default=0) or 0)
+    pc1h = float(safe_get(p, "priceChange", "h1", default=0) or 0)
+
+    buys5 = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
+    sells5 = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
+    trades5 = buys5 + sells5
+
     tags = []
 
-    created = pair.get("pairCreatedAt")
-    age_h = age_hours(created)
-    if age_h < 6:
-        tags.append("EARLY<6H")
-    elif age_h < 24:
-        tags.append("EARLY<24H")
-
-    if m["liq_usd"] >= 150_000:
-        tags.append("LIQ_STRONG")
-    elif m["liq_usd"] >= 50_000:
-        tags.append("LIQ_OK")
+    if liq >= 250_000:
+        tags.append("Liquid ✅")
+    elif liq >= 80_000:
+        tags.append("Liq ok")
     else:
-        tags.append("LIQ_LOW")
+        tags.append("Low liq ⚠️")
 
-    if m["vol_m5"] >= 20_000:
-        tags.append("VOL_SPIKE")
-    elif m["vol_m5"] >= 5_000:
-        tags.append("VOL_OK")
+    if trades5 >= 60:
+        tags.append("Hot flow 🔥")
+    elif trades5 >= 25:
+        tags.append("Active")
     else:
-        tags.append("VOL_LOW")
+        tags.append("Thin")
 
-    total_tx = m["buys_m5"] + m["sells_m5"]
-    if total_tx >= 80:
-        tags.append("TXNS_HOT")
-    elif total_tx >= 25:
-        tags.append("TXNS_OK")
-    else:
-        tags.append("TXNS_THIN")
+    if abs(pc1h) >= 30:
+        tags.append("Volatile")
+    if pc1h >= 80 or pc5 >= 15:
+        tags.append("Pumpish")
+    if pc1h <= -40:
+        tags.append("Dump risk")
 
-    if m["sells_m5"] == 0 and m["buys_m5"] > 0:
-        tags.append("NO_SELLS(FAKE?)")
-    elif m["buys_m5"] == 0 and m["sells_m5"] > 0:
-        tags.append("NO_BUYS")
-
-    # pressure
-    if m["buys_m5"] >= max(1, int(m["sells_m5"] * 1.6)):
-        tags.append("BUY_PRESSURE")
-    elif m["sells_m5"] >= max(1, int(m["buys_m5"] * 1.6)):
-        tags.append("SELL_PRESSURE")
-
-    # decision
-    # Enter if: liquidity ok, vol ok, txns ok, has sells, no extreme red flags
-    red_flags = ("NO_SELLS(FAKE?)" in tags) or ("VOL_LOW" in tags) or ("TXNS_THIN" in tags) or ("LIQ_LOW" in tags)
-    good = ("VOL_OK" in tags or "VOL_SPIKE" in tags) and ("TXNS_OK" in tags or "TXNS_HOT" in tags) and ("LIQ_OK" in tags or "LIQ_STRONG" in tags) and (m["sells_m5"] >= 3)
-
-    if good and not red_flags:
-        decision = "ENTER"
-    elif red_flags:
-        decision = "AVOID"
-    else:
-        decision = "WAIT"
-
-    return tags, decision
+    # Рішення (дуже грубо, але екшенабл)
+    decision = "NO ENTRY"
+    if liq >= 80_000 and vol24 >= 80_000 and trades5 >= 25 and sells5 >= 5:
+        # якщо імпульс позитивний і є короткий обʼєм
+        if pc1h > 5 and vol5 > 5_000:
+            decision = "BUY (scalp)"
+        elif pc1h > -5:
+            decision = "WATCH / WAIT"
+        else:
+            decision = "NO ENTRY"
+    return decision, tags
 
 
-def score_pair(pair: dict, m: dict):
-    # heuristic score used for ranking
-    base = 0.0
-    base += min(m["liq_usd"] / 10_000, 40)         # up to 40
-    base += min(m["vol_m5"] / 1_000, 40)           # up to 40
-    base += min((m["buys_m5"] + m["sells_m5"]), 60) / 2  # up to 30
-    base += min(max(m["d_h1"], 0), 120) / 6        # up to 20
-    # penalty for no sells
-    if m["sells_m5"] == 0:
-        base *= 0.45
-    return round(base, 2)
+def is_name_suspicious(p: Dict[str, Any]) -> bool:
+    base_sym = (safe_get(p, "baseToken", "symbol", default="") or "").strip()
+    # якщо пуста назва або купа “дивних” символів — підозріло
+    if not base_sym:
+        return True
+    if not NAME_OK_RE.match(base_sym):
+        return True
+    return False
 
 
-# --------- UI ---------
-st.set_page_config(page_title="DEX Scout", layout="wide")
+def main():
+    st.set_page_config(page_title="DEX Scout — actionable candidates", layout="wide")
+    st.title("DEX Scout — actionable candidates (DEXScreener API)")
 
-st.title("DEX Scout — actionable candidates (DEXScreener API)")
+    with st.sidebar:
+        chain = st.selectbox(
+            "Chain",
+            options=sorted(list(CHAIN_DEX_PRESETS.keys())),
+            index=sorted(list(CHAIN_DEX_PRESETS.keys())).index("bsc") if "bsc" in CHAIN_DEX_PRESETS else 0
+        )
 
-with st.sidebar:
-    st.subheader("Filters")
+        st.caption("DEX filter")
+        any_dex = st.checkbox("Any DEX (do not filter by DEX)", value=True)
 
-    chain = st.selectbox("Chain", ["bsc", "solana"], index=0)
+        dex_options = CHAIN_DEX_PRESETS.get(chain, [])
+        selected_dexes = []
+        if not any_dex:
+            selected_dexes = st.multiselect(
+                "Allowed DEXes",
+                options=dex_options,
+                default=dex_options[:2] if len(dex_options) >= 2 else dex_options
+            )
 
-    top_n = st.slider("Top N", min_value=5, max_value=30, value=12, step=1)
+        top_n = st.slider("Top N", 5, 50, 15, step=5)
 
-    min_liq = st.number_input("Min Liquidity ($)", min_value=0, value=50000, step=5000)
-    min_vol24 = st.number_input("Min 24h Volume ($)", min_value=0, value=100000, step=10000)
+        min_liq = st.number_input("Min Liquidity ($)", min_value=0, value=10000, step=5000)
+        min_vol24 = st.number_input("Min 24h Volume ($)", min_value=0, value=50000, step=25000)
 
-    # stricter activity filters
-    st.markdown("---")
-    st.caption("Activity (to avoid fake/owner-only prints)")
-    min_m5_vol = st.number_input("Min vol m5 ($)", min_value=0, value=3000, step=500)
-    min_m5_tx = st.number_input("Min txns m5 (buys+sells)", min_value=0, value=20, step=5)
-    min_m5_sells = st.number_input("Min sells m5", min_value=0, value=3, step=1)
+        st.divider()
+        st.caption("“Real trading” filters")
+        min_trades_m5 = st.slider("Min trades in last 5m (buys+sells)", 0, 200, 20, step=5)
+        min_sells_m5 = st.slider("Min sells in last 5m", 0, 80, 5, step=1)
+        max_buy_sell_imbalance = st.slider("Max buy/sell imbalance (buys vs sells)", 1, 20, 8, step=1)
 
-    ascii_only = st.checkbox("Filter out non-latin names/symbols", value=True)
+        st.divider()
+        block_suspicious_names = st.checkbox("Filter out suspicious token names (hieroglyphs / garbage)", value=True)
 
-    st.markdown("---")
-    seeds = st.text_area(
-        "Queries (comma-separated)",
-        value="WBNB, USDT, BNB, PancakeSwap, meme, AI, dog, cat, pepe",
-        height=90
-    )
+        st.divider()
+        st.caption("Queries (comma-separated)")
+        seeds = st.text_area(
+            "Search seeds",
+            value="WBNB, USDT, CAKE, BNB, PancakeSwap, meme",
+            height=110
+        )
 
-    refresh = st.button("Refresh now")
-    sound_alert = st.checkbox("Sound alert on HOT ENTER", value=False)
+        refresh = st.button("Refresh now")
 
-# refresh trick
-if refresh:
-    st.cache_data.clear()
+    if refresh:
+        st.cache_data.clear()
 
-seed_list = [s.strip() for s in seeds.split(",") if s.strip()]
-if not seed_list:
-    st.warning("Add at least 1 query seed.")
-    st.stop()
+    queries = [q.strip() for q in seeds.split(",") if q.strip()]
+    if not queries:
+        st.info("Add at least 1 seed query in the sidebar.")
+        return
 
-# fetch
-pairs_all = []
-errors = 0
+    # Fetch pairs for each query and merge
+    all_pairs = []
+    for q in queries:
+        try:
+            all_pairs.extend(fetch_latest_pairs_for_query(q))
+            time.sleep(0.12)  # tiny spacing, friendly
+        except Exception as e:
+            st.warning(f"Query failed: {q} — {e}")
 
-for q in seed_list[:20]:
-    try:
-        data = ds_search(q)
-        pairs = data.get("pairs", []) or []
-        pairs_all.extend(pairs)
-    except Exception:
-        errors += 1
+    # Deduplicate by pairAddress
+    uniq = {}
+    for p in all_pairs:
+        pa = p.get("pairAddress") or p.get("url")
+        if not pa:
+            continue
+        uniq[pa] = p
+    pairs = list(uniq.values())
 
-# dedupe by pairAddress
-seen = set()
-dedup = []
-for p in pairs_all:
-    pa = p.get("pairAddress")
-    if not pa:
-        continue
-    key = (p.get("chainId"), pa)
-    if key in seen:
-        continue
-    seen.add(key)
-    dedup.append(p)
+    # Filters
+    filtered = []
+    for p in pairs:
+        if (p.get("chainId") or "").lower() != chain.lower():
+            continue
 
-# filter chain + minimums
-filtered = []
-for p in dedup:
-    if (p.get("chainId") or "").lower() != chain:
-        continue
+        if not any_dex and selected_dexes:
+            if (p.get("dexId") or "").lower() not in set([d.lower() for d in selected_dexes]):
+                continue
 
-    base_token = p.get("baseToken", {}) or {}
-    quote_token = p.get("quoteToken", {}) or {}
+        liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
+        vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
+        buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
+        sells = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
+        trades = buys + sells
 
-    name = (base_token.get("name") or "")[:80]
-    sym = (base_token.get("symbol") or "")[:32]
+        # core thresholds
+        if liq < float(min_liq):
+            continue
+        if vol24 < float(min_vol24):
+            continue
 
-    if ascii_only and (not is_ascii_like(sym) or not is_ascii_like(name)):
-        continue
+        # “real trading” thresholds
+        if trades < int(min_trades_m5):
+            continue
+        if sells < int(min_sells_m5):
+            continue
 
-    m = extract_timeframe_metrics(p)
+        # anti-one-sided flow (часто “накрутка” лише покупками)
+        if sells > 0:
+            imbalance = max(buys, sells) / max(1, min(buys, sells))
+            if imbalance > max_buy_sell_imbalance:
+                continue
+        else:
+            continue
 
-    if m["liq_usd"] < float(min_liq):
-        continue
-    if m["vol_h24"] < float(min_vol24):
-        continue
-    if m["vol_m5"] < float(min_m5_vol):
-        continue
-    if (m["buys_m5"] + m["sells_m5"]) < int(min_m5_tx):
-        continue
-    if m["sells_m5"] < int(min_m5_sells):
-        continue
+        if block_suspicious_names and is_name_suspicious(p):
+            continue
 
-    tags, decision = tag_and_decide(p, m)
-    score = score_pair(p, m)
+        filtered.append(p)
 
-    filtered.append({
-        "pair": p,
-        "m": m,
-        "tags": tags,
-        "decision": decision,
-        "score": score
-    })
+    # Score + sort
+    ranked = []
+    for p in filtered:
+        s = score_pair(p)
+        decision, tags = build_trade_hint(p)
+        ranked.append((s, decision, tags, p))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    ranked = ranked[:top_n]
 
-filtered.sort(key=lambda x: x["score"], reverse=True)
-filtered = filtered[:top_n]
+    st.metric("Passed filters", len(ranked))
 
-# header
-colA, colB = st.columns([1, 1])
-with colA:
-    st.metric("Passed filters", value=len(filtered))
-with colB:
-    if errors:
-        st.warning(f"Some queries failed: {errors}")
+    if not ranked:
+        st.info("No pairs passed filters. Try lowering thresholds, changing seeds, or enabling Any DEX.")
+        return
 
-st.markdown("---")
+    # Render
+    for s, decision, tags, p in ranked:
+        base = safe_get(p, "baseToken", "symbol", default="???") or "???"
+        quote = safe_get(p, "quoteToken", "symbol", default="???") or "???"
+        dex = p.get("dexId", "?")
+        url = p.get("url", "")
 
-if not filtered:
-    st.info("No pairs passed filters. Try lowering thresholds or changing seeds.")
-    st.stop()
+        price = safe_get(p, "priceUsd", default=None)
+        liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
+        vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
+        vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
+        pc5 = float(safe_get(p, "priceChange", "m5", default=0) or 0)
+        pc1h = float(safe_get(p, "priceChange", "h1", default=0) or 0)
+        buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
+        sells = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
 
-# HOT alert
-hot_enters = [x for x in filtered if x["decision"] == "ENTER" and ("TXNS_HOT" in x["tags"] or "VOL_SPIKE" in x["tags"])]
-if hot_enters:
-    st.toast(f"HOT ENTER candidates: {len(hot_enters)}", icon="🔥")
-    if sound_alert:
-        st.audio(base64.b64decode(BEEP_B64), format="audio/wav")
+        base_addr = safe_get(p, "baseToken", "address", default="") or ""
+        pair_addr = p.get("pairAddress", "") or ""
 
-# render list
-for item in filtered:
-    p = item["pair"]
-    m = item["m"]
-    tags = item["tags"]
-    decision = item["decision"]
-    score = item["score"]
+        st.markdown("---")
+        cols = st.columns([3, 2, 2, 2])
 
-    base_token = p.get("baseToken", {}) or {}
-    quote_token = p.get("quoteToken", {}) or {}
+        with cols[0]:
+            st.markdown(f"### [{base}/{quote}]({url})")
+            st.caption(f"{chain} • {dex}")
+            st.code(base_addr if base_addr else "no baseToken.address", language="text")
+            st.caption("↑ Token contract (baseToken.address)")
+            if pair_addr:
+                st.caption("Pair / pool address")
+                st.code(pair_addr, language="text")
 
-    chain_id = (p.get("chainId") or "").lower()
-    dex_id = p.get("dexId") or "dex"
-    pair_addr = p.get("pairAddress") or ""
+        with cols[1]:
+            st.write(f"**Price:** ${price}" if price else "**Price:** n/a")
+            st.write(f"**Liq:** ${liq:,.0f}")
+            st.write(f"**Vol24:** ${vol24:,.0f}")
+            st.write(f"**Vol m5:** ${vol5:,.0f}")
 
-    token_addr = base_token.get("address") or ""  # THIS is what PancakeSwap needs
-    token_sym = base_token.get("symbol") or "TOKEN"
-    quote_sym = quote_token.get("symbol") or "QUOTE"
+        with cols[2]:
+            st.write(f"**Δ m5:** {pc5:+.2f}%")
+            st.write(f"**Δ h1:** {pc1h:+.2f}%")
+            st.write(f"**Buys/Sells (m5):** {buys}/{sells}")
+            st.write(f"**Score:** {s}")
 
-    price = p.get("priceUsd") or "?"
-    url_pair = p.get("url") or dexscreener_pair_link(chain_id, pair_addr)
+        with cols[3]:
+            st.write(f"**Action:** `{decision}`")
+            st.write("**Tags:** " + ", ".join(tags))
 
-    swap_url = chain_swap_link(chain_id, token_addr)
+            # Quick links
+            if base_addr:
+                # PancakeSwap link (works only if PCS supports token listing; not always)
+                pcs_link = f"https://pancakeswap.finance/swap?outputCurrency={base_addr}"
+                st.markdown(f"- PancakeSwap swap link: {pcs_link}")
 
-    created_at = p.get("pairCreatedAt") or None
-    age_h = age_hours(created_at)
+            if url:
+                st.markdown(f"- DexScreener: {url}")
 
-    left, right = st.columns([2.2, 1.3])
 
-    with left:
-        st.subheader(f"{token_sym}/{quote_sym}")
-        st.caption(f"{chain_id} • {dex_id}")
-
-        # IMPORTANT: show both addresses clearly
-        st.code(f"TOKEN (buy/import): {token_addr}", language="text")
-        st.code(f"PAIR/LP (Dexscreener): {pair_addr}", language="text")
-
-        btn1, btn2, btn3 = st.columns([1, 1, 1])
-        with btn1:
-            st.link_button("Open Dexscreener", url_pair)
-        with btn2:
-            st.link_button("Open Swap", swap_url)
-        with btn3:
-            st.link_button("Copy token addr (manual)", f"https://dexscreener.com/{chain_id}/{pair_addr}")
-
-        st.write("Tags:", ", ".join(tags))
-        st.write("Decision:", decision)
-
-    with right:
-        st.write(f"**Price:** ${price}")
-        st.write(f"**Liq:** ${m['liq_usd']:,.0f}")
-        st.write(f"**Vol24:** ${m['vol_h24']:,.0f}")
-        st.write(f"**Vol m5:** ${m['vol_m5']:,.0f}")
-        st.write(f"**Δ m5:** {m['d_m5']:+.2f}%")
-        st.write(f"**Δ h1:** {m['d_h1']:+.2f}%")
-        st.write(f"**Buys/Sells m5:** {m['buys_m5']}/{m['sells_m5']}")
-        st.write(f"**Age:** {age_h:.1f}h")
-        st.write(f"**Score:** {score}")
-
-    st.markdown("---")
+if __name__ == "__main__":
+    main()
