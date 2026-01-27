@@ -1,4 +1,11 @@
-# app.py
+# app.py — DEX Scout v0.3.0
+# Changes:
+# - Mobile-friendly navigation (sidebar page switch вместо tabs)
+# - Action colors: GREEN only for ENTRY, YELLOW for WATCH, RED for NO ENTRY
+# - Tags: no emoji, more informative
+# - Links: buttons only
+# - Presets: simple named presets that set thresholds/seeds
+
 import os
 import re
 import csv
@@ -8,6 +15,8 @@ from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 import streamlit as st
+
+VERSION = "0.3.0"
 
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
@@ -26,6 +35,9 @@ CHAIN_DEX_PRESETS = {
 NAME_OK_RE = re.compile(r"^[A-Za-z0-9\-\._\s]{2,30}$")
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def safe_get(d: Dict[str, Any], *path, default=None):
     cur = d
     for p in path:
@@ -39,6 +51,23 @@ def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def fmt_usd(x: float) -> str:
+    try:
+        return f"${x:,.0f}"
+    except Exception:
+        return "n/a"
+
+
+def fmt_pct(x: float) -> str:
+    try:
+        return f"{x:+.2f}%"
+    except Exception:
+        return "n/a"
+
+
+# -----------------------------
+# API
+# -----------------------------
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_latest_pairs_for_query(q: str) -> List[Dict[str, Any]]:
     url = f"{DEX_BASE}/latest/dex/search"
@@ -50,7 +79,6 @@ def fetch_latest_pairs_for_query(q: str) -> List[Dict[str, Any]]:
 
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_token_pairs(chain: str, token_address: str) -> List[Dict[str, Any]]:
-    # returns list of pools for a token address
     url = f"{DEX_BASE}/token-pairs/v1/{chain}/{token_address}"
     r = requests.get(url, timeout=20)
     r.raise_for_status()
@@ -64,22 +92,24 @@ def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, An
         return None
     if not pools:
         return None
-    # choose best by liquidity usd, then by vol24
+
     def key(p):
         liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
         vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
         return (liq, vol24)
+
     pools.sort(key=key, reverse=True)
     return pools[0]
 
 
+# -----------------------------
+# Filtering / Scoring
+# -----------------------------
 def is_name_suspicious(p: Dict[str, Any]) -> bool:
     base_sym = (safe_get(p, "baseToken", "symbol", default="") or "").strip()
     if not base_sym:
         return True
-    if not NAME_OK_RE.match(base_sym):
-        return True
-    return False
+    return not bool(NAME_OK_RE.match(base_sym))
 
 
 def score_pair(p: Dict[str, Any]) -> float:
@@ -102,7 +132,35 @@ def score_pair(p: Dict[str, Any]) -> float:
     return round(s, 2)
 
 
+def action_badge(action: str) -> str:
+    # GREEN only for ENTRY/BUY
+    a = (action or "").upper()
+    if "ENTRY" in a or a.startswith("BUY"):
+        color = "#1f9d55"      # green
+        bg = "rgba(31,157,85,0.15)"
+    elif "WATCH" in a or "WAIT" in a:
+        color = "#d69e2e"      # yellow
+        bg = "rgba(214,158,46,0.15)"
+    else:
+        color = "#e53e3e"      # red
+        bg = "rgba(229,62,62,0.12)"
+    return f"""
+    <span style="
+      display:inline-block;
+      padding:6px 12px;
+      border-radius:999px;
+      border:1px solid {color};
+      background:{bg};
+      color:{color};
+      font-weight:800;
+      font-size:12px;
+      letter-spacing:0.4px;
+    ">{action}</span>
+    """
+
+
 def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
+    # More informative tags (no emoji)
     liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
     vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
     vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
@@ -112,69 +170,43 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
     sells5 = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
     trades5 = buys5 + sells5
 
-    tags = []
-
+    # liquidity band
     if liq >= 250_000:
-        tags.append("Liquid ✅")
+        liq_tag = "Liquidity: High"
     elif liq >= 80_000:
-        tags.append("Liq ok")
+        liq_tag = "Liquidity: Medium"
     else:
-        tags.append("Low liq ⚠️")
+        liq_tag = "Liquidity: Low"
 
-    if trades5 >= 60:
-        tags.append("Hot flow 🔥")
-    elif trades5 >= 25:
-        tags.append("Active")
+    # flow band
+    if trades5 >= 60 and sells5 >= 10:
+        flow_tag = "Flow: Hot"
+    elif trades5 >= 25 and sells5 >= 6:
+        flow_tag = "Flow: Active"
     else:
-        tags.append("Thin")
+        flow_tag = "Flow: Thin"
 
-    if abs(pc1h) >= 30:
-        tags.append("Volatile")
-    if pc1h >= 80 or pc5 >= 15:
-        tags.append("Pumpish")
-    if pc1h <= -40:
-        tags.append("Dump risk")
+    # trend
+    trend_tag = f"Trend(1h): {fmt_pct(pc1h)}"
+    micro_tag = f"Micro(5m): {fmt_pct(pc5)}"
+    vol_tag = f"Vol(5m): {fmt_usd(vol5)}"
 
-    # decision (actionable but conservative)
+    tags = [liq_tag, flow_tag, trend_tag, micro_tag, vol_tag]
+
+    # decision (simple)
     decision = "NO ENTRY"
-    if liq >= 80_000 and vol24 >= 80_000 and trades5 >= 25 and sells5 >= 5:
+    if liq >= 80_000 and vol24 >= 80_000 and trades5 >= 25 and sells5 >= 6:
         if pc1h > 5 and vol5 > 5_000 and pc5 >= -2:
             decision = "ENTRY (scalp)"
-        elif pc1h > -5:
-            decision = "WATCH / WAIT"
         else:
-            decision = "NO ENTRY"
+            decision = "WATCH / WAIT"
 
     return decision, tags
 
 
-def action_badge(action: str) -> str:
-    # color via HTML
-    a = (action or "").upper()
-    if "ENTRY" in a or a.startswith("BUY"):
-        color = "#1f9d55"  # green
-        bg = "rgba(31,157,85,0.15)"
-    elif "WATCH" in a or "WAIT" in a:
-        color = "#d69e2e"  # yellow
-        bg = "rgba(214,158,46,0.15)"
-    else:
-        color = "#e53e3e"  # red
-        bg = "rgba(229,62,62,0.12)"
-    return f"""
-    <span style="
-      display:inline-block;
-      padding:4px 10px;
-      border-radius:999px;
-      border:1px solid {color};
-      background:{bg};
-      color:{color};
-      font-weight:700;
-      font-size:12px;
-      letter-spacing:0.4px;
-    ">{action}</span>
-    """
-
-
+# -----------------------------
+# Storage (portfolio)
+# -----------------------------
 def ensure_storage():
     os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(TRADES_CSV):
@@ -252,10 +284,9 @@ def log_swap_intent(p: Dict[str, Any], score: float, action: str, tags: List[str
     url = p.get("url", "") or ""
     price = safe_get(p, "priceUsd", default="") or ""
 
-    # avoid duplicates: if same base_addr active exists, don't spam
+    # avoid duplicates
     for r in rows:
         if r.get("active") == "1" and r.get("base_token_address", "").lower() == base_addr.lower():
-            # update note and last seen price if you want — keep simple:
             return "ALREADY_EXISTS"
 
     rows.append(
@@ -286,7 +317,6 @@ def portfolio_reco(entry: float, current: float, pc1h: float, pc5: float) -> str
         return "HOLD / WAIT"
     change = (current - entry) / entry * 100.0
 
-    # very simple rules
     if change >= 35 and pc5 < 0 and pc1h < 0:
         return "SELL (take profit)"
     if change >= 20 and pc5 < -2:
@@ -298,73 +328,113 @@ def portfolio_reco(entry: float, current: float, pc1h: float, pc5: float) -> str
     return "HOLD / WAIT"
 
 
+# -----------------------------
+# Presets
+# -----------------------------
+PRESETS = {
+    "Scalp Hot (strict)": {
+        "top_n": 12,
+        "min_liq": 80000,
+        "min_vol24": 250000,
+        "min_trades_m5": 35,
+        "min_sells_m5": 10,
+        "max_imbalance": 6,
+        "block_suspicious_names": True,
+        "seeds": "WBNB, USDT, meme, ai, launch, trending, pump",
+    },
+    "Balanced (default)": {
+        "top_n": 15,
+        "min_liq": 25000,
+        "min_vol24": 150000,
+        "min_trades_m5": 25,
+        "min_sells_m5": 6,
+        "max_imbalance": 8,
+        "block_suspicious_names": True,
+        "seeds": "WBNB, USDT, BNB, meme, ai, gaming, cat, dog",
+    },
+    "Wide Net (explore)": {
+        "top_n": 25,
+        "min_liq": 15000,
+        "min_vol24": 60000,
+        "min_trades_m5": 15,
+        "min_sells_m5": 4,
+        "max_imbalance": 10,
+        "block_suspicious_names": False,
+        "seeds": "WBNB, USDT, new, launch, trend, community",
+    },
+}
+
+
 def main():
     st.set_page_config(page_title="DEX Scout", layout="wide")
 
-    tabs = st.tabs(["Scout", "Portfolio"])
+    # Sidebar navigation (mobile-friendly)
+    with st.sidebar:
+        st.markdown(f"### DEX Scout")
+        st.caption(f"Version: v{VERSION}")
 
-    # -------------------- SCOUT TAB --------------------
-    with tabs[0]:
-        st.title("DEX Scout — actionable candidates (DEXScreener API)")
-        st.caption("Кнопки + логіка “Swap натиснув → запис у Portfolio”")
+        page = st.radio("Page", ["Scout", "Portfolio"], index=0)
 
-        with st.sidebar:
-            chain = st.selectbox(
-                "Chain",
-                options=sorted(list(CHAIN_DEX_PRESETS.keys())),
-                index=sorted(list(CHAIN_DEX_PRESETS.keys())).index("bsc") if "bsc" in CHAIN_DEX_PRESETS else 0,
+        preset_name = st.selectbox("Preset", list(PRESETS.keys()), index=1)
+        preset = PRESETS[preset_name]
+
+        st.divider()
+
+        chain = st.selectbox(
+            "Chain",
+            options=sorted(list(CHAIN_DEX_PRESETS.keys())),
+            index=sorted(list(CHAIN_DEX_PRESETS.keys())).index("bsc") if "bsc" in CHAIN_DEX_PRESETS else 0,
+        )
+
+        st.caption("DEX filter")
+        any_dex = st.checkbox("Any DEX (no filter)", value=True)
+
+        dex_options = CHAIN_DEX_PRESETS.get(chain, [])
+        selected_dexes = []
+        if not any_dex:
+            selected_dexes = st.multiselect(
+                "Allowed DEXes",
+                options=dex_options,
+                default=dex_options[:3] if len(dex_options) >= 3 else dex_options,
             )
 
-            st.caption("DEX filter")
-            any_dex = st.checkbox("Any DEX (do not filter by DEX)", value=True)
+        # Preset-driven defaults (you said numbers later; still leave them visible)
+        top_n = st.slider("Top N", 5, 50, int(preset["top_n"]), step=1)
+        min_liq = st.number_input("Min Liquidity ($)", min_value=0, value=int(preset["min_liq"]), step=5000)
+        min_vol24 = st.number_input("Min 24h Volume ($)", min_value=0, value=int(preset["min_vol24"]), step=25000)
 
-            dex_options = CHAIN_DEX_PRESETS.get(chain, [])
-            selected_dexes = []
-            if not any_dex:
-                selected_dexes = st.multiselect(
-                    "Allowed DEXes",
-                    options=dex_options,
-                    default=dex_options[:3] if len(dex_options) >= 3 else dex_options,
-                )
+        st.divider()
+        st.caption("Real trading filters")
+        min_trades_m5 = st.slider("Min trades (5m)", 0, 200, int(preset["min_trades_m5"]), step=1)
+        min_sells_m5 = st.slider("Min sells (5m)", 0, 80, int(preset["min_sells_m5"]), step=1)
+        max_buy_sell_imbalance = st.slider("Max buy/sell imbalance", 1, 20, int(preset["max_imbalance"]), step=1)
 
-            top_n = st.slider("Top N", 5, 50, 15, step=5)
+        st.divider()
+        block_suspicious_names = st.checkbox("Filter suspicious names", value=bool(preset["block_suspicious_names"]))
 
-            min_liq = st.number_input("Min Liquidity ($)", min_value=0, value=25000, step=5000)
-            min_vol24 = st.number_input("Min 24h Volume ($)", min_value=0, value=150000, step=25000)
+        st.divider()
+        st.caption("Queries (comma-separated)")
+        seeds = st.text_area("Search seeds", value=str(preset["seeds"]), height=110)
 
-            st.divider()
-            st.caption("“Real trading” filters")
-            min_trades_m5 = st.slider("Min trades in last 5m (buys+sells)", 0, 200, 25, step=5)
-            min_sells_m5 = st.slider("Min sells in last 5m", 0, 80, 6, step=1)
-            max_buy_sell_imbalance = st.slider("Max buy/sell imbalance (buys vs sells)", 1, 20, 8, step=1)
-
-            st.divider()
-            block_suspicious_names = st.checkbox("Filter out suspicious token names", value=True)
-
-            st.divider()
-            st.caption("Queries (comma-separated)")
-            seeds = st.text_area(
-                "Search seeds",
-                value="WBNB, USDT, BNB, meme, ai, gaming, cat, dog",
-                height=110,
-            )
-
-            refresh = st.button("Refresh now")
-
+        refresh = st.button("Refresh now")
         if refresh:
             st.cache_data.clear()
+
+    # -------------------- SCOUT PAGE --------------------
+    if page == "Scout":
+        st.title("DEX Scout — actionable candidates (DEXScreener API)")
+        st.caption("Кнопки, теги без емодзі, кольори тільки по дії, лог в портфель. Mobile-friendly.")
 
         queries = [q.strip() for q in seeds.split(",") if q.strip()]
         if not queries:
             st.info("Add at least 1 seed query in the sidebar.")
             return
 
-        # Fetch pairs
-        all_pairs = []
+        all_pairs: List[Dict[str, Any]] = []
         for q in queries:
             try:
                 all_pairs.extend(fetch_latest_pairs_for_query(q))
-                time.sleep(0.12)
+                time.sleep(0.10)
             except Exception as e:
                 st.warning(f"Query failed: {q} — {e}")
 
@@ -399,7 +469,6 @@ def main():
                 continue
             if vol24 < float(min_vol24):
                 continue
-
             if trades < int(min_trades_m5):
                 continue
             if sells < int(min_sells_m5):
@@ -417,7 +486,6 @@ def main():
 
             filtered.append(p)
 
-        # Rank
         ranked = []
         for p in filtered:
             s = score_pair(p)
@@ -450,7 +518,6 @@ def main():
 
             base_addr = safe_get(p, "baseToken", "address", default="") or ""
             pair_addr = p.get("pairAddress", "") or ""
-
             swap_url = f"https://pancakeswap.finance/swap?outputCurrency={base_addr}" if base_addr else ""
 
             st.markdown("---")
@@ -460,7 +527,8 @@ def main():
                 st.markdown(f"### {base}/{quote}")
                 st.caption(f"{p.get('chainId','')} • {dex}")
                 if url:
-                    st.link_button("Open DexScreener", url)
+                    st.link_button("Open DexScreener", url, use_container_width=True)
+
                 if base_addr:
                     st.caption("Token contract (baseToken.address)")
                     st.code(base_addr, language="text")
@@ -470,37 +538,40 @@ def main():
 
             with mid:
                 st.write(f"**Price:** ${price}" if price else "**Price:** n/a")
-                st.write(f"**Liq:** ${liq:,.0f}")
-                st.write(f"**Vol24:** ${vol24:,.0f}")
-                st.write(f"**Vol m5:** ${vol5:,.0f}")
-                st.write(f"**Δ m5:** {pc5:+.2f}%")
-                st.write(f"**Δ h1:** {pc1h:+.2f}%")
+                st.write(f"**Liq:** {fmt_usd(liq)}")
+                st.write(f"**Vol24:** {fmt_usd(vol24)}")
+                st.write(f"**Vol m5:** {fmt_usd(vol5)}")
+                st.write(f"**Δ m5:** {fmt_pct(pc5)}")
+                st.write(f"**Δ h1:** {fmt_pct(pc1h)}")
                 st.write(f"**Buys/Sells (m5):** {buys}/{sells}")
                 st.write(f"**Score:** {s}")
 
             with right:
+                st.write("**Action:**")
                 st.markdown(action_badge(decision), unsafe_allow_html=True)
-                st.write("**Tags:** " + ", ".join(tags))
 
-                # Swap logging button
+                st.write("**Tags:**")
+                for t in tags:
+                    st.caption(f"- {t}")
+
                 if base_addr and swap_url:
                     key_log = f"log_{base_addr}"
-                    if st.button("Swap (log)", key=key_log, use_container_width=True):
+                    if st.button("Log → Portfolio (I swapped)", key=key_log, use_container_width=True):
                         res = log_swap_intent(p, s, decision, tags, swap_url)
                         if res == "OK":
                             st.success("Logged to Portfolio (entry snapshot saved).")
                         else:
                             st.info("Already in Portfolio (active).")
 
-                    # real open swap (separate click, but reliable)
-                    st.link_button("Open Swap", swap_url, use_container_width=True)
+                    # Always button (no naked links)
+                    st.link_button("Open Swap (PancakeSwap)", swap_url, use_container_width=True)
                 else:
-                    st.caption("Swap link unavailable (missing base token address).")
+                    st.caption("Swap unavailable (missing base token address).")
 
-    # -------------------- PORTFOLIO TAB --------------------
-    with tabs[1]:
+    # -------------------- PORTFOLIO PAGE --------------------
+    else:
         st.title("Portfolio / Watchlist")
-        st.caption("Тут зʼявляються позиції після натискання **Swap (log)** у Scout.")
+        st.caption("Entries appear here after clicking **Log → Portfolio (I swapped)** in Scout.")
 
         rows = load_portfolio()
         active_rows = [r for r in rows if r.get("active") == "1"]
@@ -512,18 +583,15 @@ def main():
         with topbar[1]:
             st.metric("Closed", len(closed_rows))
         with topbar[2]:
-            if st.button("Export CSV"):
-                # Offer download
-                with open(TRADES_CSV, "rb") as f:
-                    st.download_button("Download portfolio.csv", f, file_name="portfolio.csv")
+            with open(TRADES_CSV, "rb") as f:
+                st.download_button("Download portfolio.csv", f, file_name="portfolio.csv")
 
         st.markdown("---")
 
         if not active_rows:
-            st.info("Portfolio пустий. Йди в Scout → натисни **Swap (log)** на потрібному токені.")
+            st.info("Portfolio пустий. Йди в Scout → натисни **Log → Portfolio (I swapped)**.")
             return
 
-        # Update current prices
         st.subheader("Active positions")
         for idx, r in enumerate(active_rows):
             base_addr = (r.get("base_token_address") or "").strip()
@@ -531,6 +599,7 @@ def main():
             base_sym = r.get("base_symbol") or "???"
             quote_sym = r.get("quote_symbol") or "???"
             entry_price_str = r.get("entry_price_usd") or "0"
+
             try:
                 entry_price = float(entry_price_str)
             except Exception:
@@ -541,6 +610,7 @@ def main():
             pc1h = 0.0
             pc5 = 0.0
             liq = 0.0
+
             if best:
                 try:
                     cur_price = float(best.get("priceUsd") or 0)
@@ -552,57 +622,55 @@ def main():
 
             reco = portfolio_reco(entry_price, cur_price, pc1h, pc5)
 
-            # PnL
             pnl = 0.0
             if entry_price > 0 and cur_price > 0:
                 pnl = (cur_price - entry_price) / entry_price * 100.0
 
             c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+
             with c1:
                 st.markdown(f"### {base_sym}/{quote_sym}")
                 st.caption(f"Chain: {chain} • DEX: {r.get('dex','')}")
                 st.code(base_addr, language="text")
                 if r.get("dexscreener_url"):
-                    st.link_button("DexScreener", r["dexscreener_url"])
+                    st.link_button("DexScreener", r["dexscreener_url"], use_container_width=True)
                 if r.get("swap_url"):
-                    st.link_button("Swap", r["swap_url"])
+                    st.link_button("Swap", r["swap_url"], use_container_width=True)
 
             with c2:
                 st.write(f"**Entry:** ${entry_price_str}")
                 st.write(f"**Now:** ${cur_price:.8f}" if cur_price else "**Now:** n/a")
                 st.write(f"**PnL:** {pnl:+.2f}%" if entry_price and cur_price else "**PnL:** n/a")
-                st.write(f"**Liq:** ${liq:,.0f}" if liq else "**Liq:** n/a")
+                st.write(f"**Liq:** {fmt_usd(liq)}" if liq else "**Liq:** n/a")
 
             with c3:
-                st.write(f"**Δ m5:** {pc5:+.2f}%")
-                st.write(f"**Δ h1:** {pc1h:+.2f}%")
+                st.write(f"**Δ m5:** {fmt_pct(pc5)}")
+                st.write(f"**Δ h1:** {fmt_pct(pc1h)}")
                 st.write(f"**Reco:** `{reco}`")
 
                 note_key = f"note_{idx}_{base_addr}"
                 note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
 
             with c4:
-                # delete/close controls
                 close_key = f"close_{idx}_{base_addr}"
                 delete_key = f"delete_{idx}_{base_addr}"
 
-                close = st.checkbox("Close (remove from active)", value=False, key=close_key)
+                close = st.checkbox("Close (archive)", value=False, key=close_key)
                 delete = st.checkbox("Delete row", value=False, key=delete_key)
 
                 if st.button("Apply", key=f"apply_{idx}_{base_addr}", use_container_width=True):
-                    # apply changes into full rows list
                     all_rows = load_portfolio()
-                    # find matching active row by base_token_address + active
                     for rr in all_rows:
                         if rr.get("active") == "1" and (rr.get("base_token_address") or "").lower() == base_addr.lower():
                             rr["note"] = note_val
                             if close:
                                 rr["active"] = "0"
                             break
-
                     if delete:
-                        all_rows = [x for x in all_rows if not ((x.get("active") == "1") and ((x.get("base_token_address") or "").lower() == base_addr.lower()))]
-
+                        all_rows = [
+                            x for x in all_rows
+                            if not (x.get("active") == "1" and (x.get("base_token_address") or "").lower() == base_addr.lower())
+                        ]
                     save_portfolio(all_rows)
                     st.success("Saved.")
                     st.rerun()
@@ -611,8 +679,11 @@ def main():
 
         if closed_rows:
             with st.expander("Closed / Archived"):
-                for r in closed_rows[-20:]:
-                    st.write(f"{r.get('ts_utc','')} — {r.get('base_symbol','')}/{r.get('quote_symbol','')} — entry ${r.get('entry_price_usd','')} — {r.get('action','')}")
+                for r in closed_rows[-30:]:
+                    st.write(
+                        f"{r.get('ts_utc','')} — {r.get('base_symbol','')}/{r.get('quote_symbol','')} "
+                        f"— entry ${r.get('entry_price_usd','')} — {r.get('action','')}"
+                    )
 
 
 if __name__ == "__main__":
