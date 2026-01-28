@@ -1,10 +1,10 @@
-# app.py — DEX Scout v0.3.1
-# Changes from v0.3.0:
-# - Filter Debug: pipeline counters + top reject reasons
-# - Auto-Relax: if 0 results, progressively relax thresholds automatically
-# - Softer name filter (unicode + $, _)
-# - Seeds presets expanded (sol, eth, usdc, pepe, trump, ai agent, pump, launch)
-# - Basic retry/backoff for DexScreener requests to reduce rate-limit pain
+# app.py — DEX Scout v0.3.2
+# Changes from v0.3.1:
+# - Fix layout regression: restore "right" column rendering for actions/buttons
+# - Top tokens mode: de-duplicate ranked results by base token (keep best-scoring pool per token)
+# - Portfolio "Apply" now matches by pair_address when available (more accurate for multi-pool tokens)
+# - Minor safety: sanitize keys and handle missing pair/base addresses more consistently
+#
 # Notes:
 # - Swap URL still PancakeSwap-only (BSC); chain->swap map later.
 
@@ -19,7 +19,7 @@ from collections import Counter
 import requests
 import streamlit as st
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
@@ -38,6 +38,7 @@ CHAIN_DEX_PRESETS = {
 # Softer, more realistic ticker validation:
 # allow unicode letters/digits + common ticker chars ($ _ - .) + spaces
 NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
+
 
 # -----------------------------
 # Helpers
@@ -74,6 +75,13 @@ def clamp_int(x: int, lo: int = 0, hi: int = 10**9) -> int:
         return int(max(lo, min(hi, int(x))))
     except Exception:
         return lo
+
+
+def safe_key(s: str) -> str:
+    """Make a string safe for Streamlit widget keys."""
+    if not s:
+        return "na"
+    return re.sub(r"[^A-Za-z0-9_\-\.]+", "_", s)[:120]
 
 
 # -----------------------------
@@ -154,7 +162,6 @@ def is_name_suspicious(p: Dict[str, Any]) -> bool:
     base_sym = (safe_get(p, "baseToken", "symbol", default="") or "").strip()
     if not base_sym:
         return True
-    # common garbage patterns often seen on DEX: too many spaces or very long
     if len(base_sym) > 40:
         return True
     return not bool(NAME_OK_RE.match(base_sym))
@@ -265,13 +272,11 @@ def filter_pairs_with_debug(
 
     out = []
     for p in pairs:
-        # chain
         if (p.get("chainId") or "").lower() != chain.lower():
             reasons["chain_mismatch"] += 1
             continue
         stats["after_chain"] += 1
 
-        # dex
         if not any_dex and allowed_dexes:
             if (p.get("dexId") or "").lower() not in allowed_dexes:
                 reasons["dex_not_allowed"] += 1
@@ -304,7 +309,6 @@ def filter_pairs_with_debug(
             continue
         stats["after_sells"] += 1
 
-        # imbalance
         if sells > 0 and buys > 0:
             imbalance = max(buys, sells) / max(1, min(buys, sells))
             if imbalance > max_buy_sell_imbalance:
@@ -323,6 +327,23 @@ def filter_pairs_with_debug(
         out.append(p)
 
     return out, stats, reasons
+
+
+def dedupe_ranked_by_token(ranked: List[Tuple[float, str, List[str], Dict[str, Any]]]) -> List[Tuple[float, str, List[str], Dict[str, Any]]]:
+    """
+    Keep only best-scoring entry per base token address.
+    This converts "Top pairs" into "Top tokens".
+    """
+    best_by_token: Dict[str, Tuple[float, str, List[str], Dict[str, Any]]] = {}
+    for s, decision, tags, p in ranked:
+        base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip().lower()
+        if not base_addr:
+            # if no base address, keep as-is but with synthetic key
+            base_addr = f"__noaddr__{safe_key(p.get('url', '') or p.get('pairAddress', '') or str(id(p)))}"
+        cur = best_by_token.get(base_addr)
+        if cur is None or s > cur[0]:
+            best_by_token[base_addr] = (s, decision, tags, p)
+    return list(best_by_token.values())
 
 
 # -----------------------------
@@ -405,9 +426,12 @@ def log_swap_intent(p: Dict[str, Any], score: float, action: str, tags: List[str
     url = p.get("url", "") or ""
     price = safe_get(p, "priceUsd", default="") or ""
 
-    # avoid duplicates
     for r in rows:
-        if r.get("active") == "1" and r.get("base_token_address", "").lower() == base_addr.lower():
+        if r.get("active") != "1":
+            continue
+        if pair_addr and (r.get("pair_address", "").lower() == pair_addr.lower()):
+            return "ALREADY_EXISTS"
+        if not pair_addr and (r.get("base_token_address", "").lower() == base_addr.lower()):
             return "ALREADY_EXISTS"
 
     rows.append(
@@ -536,6 +560,9 @@ def main():
         st.caption("Queries (comma-separated)")
         seeds = st.text_area("Search seeds", value=str(preset["seeds"]), height=110)
 
+        st.divider()
+        top_tokens_mode = st.checkbox("Top tokens (dedupe by base token)", value=True)
+
         refresh = st.button("Refresh now")
         if refresh:
             st.cache_data.clear()
@@ -561,7 +588,7 @@ def main():
                 query_failures += 1
                 st.warning(f"Query failed: {q} — {e}")
 
-        # Deduplicate
+        # Deduplicate by pairAddress/url
         uniq = {}
         for p in all_pairs:
             pa = p.get("pairAddress") or p.get("url")
@@ -589,12 +616,18 @@ def main():
             block_suspicious_names=bool(block_suspicious_names),
         )
 
-        ranked = []
+        ranked: List[Tuple[float, str, List[str], Dict[str, Any]]] = []
         for p in filtered:
             s = score_pair(p)
             decision, tags = build_trade_hint(p)
             ranked.append((s, decision, tags, p))
+
         ranked.sort(key=lambda x: x[0], reverse=True)
+
+        if top_tokens_mode:
+            ranked = dedupe_ranked_by_token(ranked)
+            ranked.sort(key=lambda x: x[0], reverse=True)
+
         ranked = ranked[:top_n]
 
         st.metric("Passed filters", len(ranked))
@@ -640,12 +673,18 @@ def main():
                     block_suspicious_names=bool(block_suspicious_names),
                 )
 
-                ranked2 = []
+                ranked2: List[Tuple[float, str, List[str], Dict[str, Any]]] = []
                 for p in f2:
                     s = score_pair(p)
                     decision, tags = build_trade_hint(p)
                     ranked2.append((s, decision, tags, p))
+
                 ranked2.sort(key=lambda x: x[0], reverse=True)
+
+                if top_tokens_mode:
+                    ranked2 = dedupe_ranked_by_token(ranked2)
+                    ranked2.sort(key=lambda x: x[0], reverse=True)
+
                 ranked2 = ranked2[:top_n]
 
                 if ranked2:
@@ -678,12 +717,13 @@ def main():
             buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
             sells = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
 
-            base_addr = safe_get(p, "baseToken", "address", default="") or ""
-            pair_addr = p.get("pairAddress", "") or ""
+            base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
+            pair_addr = (p.get("pairAddress", "") or "").strip()
+            chain_id = (p.get("chainId") or "").lower()
 
             # Swap URL: BSC PancakeSwap only for now
             swap_url = ""
-            if base_addr and (p.get("chainId") or "").lower() == "bsc":
+            if base_addr and chain_id == "bsc":
                 swap_url = f"https://pancakeswap.finance/swap?outputCurrency={base_addr}"
 
             st.markdown("---")
@@ -722,7 +762,7 @@ def main():
 
                 if base_addr:
                     if swap_url:
-                        key_log = f"log_{base_addr}"
+                        key_log = f"log_{safe_key(chain_id)}_{safe_key(base_addr)}_{safe_key(pair_addr)}"
                         if st.button("Log → Portfolio (I swapped)", key=key_log, use_container_width=True):
                             res = log_swap_intent(p, s, decision, tags, swap_url)
                             if res == "OK":
@@ -730,9 +770,14 @@ def main():
                             else:
                                 st.info("Already in Portfolio (active).")
 
-                        st.link_button("Open Swap (PancakeSwap)", swap_url, use_container_width=True)
+                        st.link_button(
+                            "Open Swap (PancakeSwap)",
+                            swap_url,
+                            use_container_width=True,
+                            key=f"swap_{safe_key(chain_id)}_{safe_key(base_addr)}_{safe_key(pair_addr)}",
+                        )
                     else:
-                        st.caption("Swap button disabled for this chain (BSC-only in v0.3.1).")
+                        st.caption("Swap button disabled for this chain (BSC-only in v0.3.2).")
                 else:
                     st.caption("Swap unavailable (missing base token address).")
 
@@ -763,6 +808,7 @@ def main():
         st.subheader("Active positions")
         for idx, r in enumerate(active_rows):
             base_addr = (r.get("base_token_address") or "").strip()
+            pair_addr = (r.get("pair_address") or "").strip()
             chain = (r.get("chain") or "").strip().lower()
             base_sym = r.get("base_symbol") or "???"
             quote_sym = r.get("quote_symbol") or "???"
@@ -773,7 +819,10 @@ def main():
             except Exception:
                 entry_price = 0.0
 
+            # NOTE: For now we still pull "best pair for token" by base_addr for live price.
+            # In future we can store & query by pair_addr for higher fidelity.
             best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
+
             cur_price = 0.0
             pc1h = 0.0
             pc5 = 0.0
@@ -799,7 +848,11 @@ def main():
             with c1:
                 st.markdown(f"### {base_sym}/{quote_sym}")
                 st.caption(f"Chain: {chain} • DEX: {r.get('dex','')}")
-                st.code(base_addr, language="text")
+                if base_addr:
+                    st.code(base_addr, language="text")
+                if pair_addr:
+                    st.caption("Pair / pool")
+                    st.code(pair_addr, language="text")
                 if r.get("dexscreener_url"):
                     st.link_button("DexScreener", r["dexscreener_url"], use_container_width=True)
                 if r.get("swap_url"):
@@ -816,29 +869,42 @@ def main():
                 st.write(f"**Δ h1:** {fmt_pct(pc1h)}")
                 st.write(f"**Reco:** `{reco}`")
 
-                note_key = f"note_{idx}_{base_addr}"
+                note_key = f"note_{idx}_{safe_key(pair_addr or base_addr)}"
                 note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
 
             with c4:
-                close_key = f"close_{idx}_{base_addr}"
-                delete_key = f"delete_{idx}_{base_addr}"
+                close_key = f"close_{idx}_{safe_key(pair_addr or base_addr)}"
+                delete_key = f"delete_{idx}_{safe_key(pair_addr or base_addr)}"
 
                 close = st.checkbox("Close (archive)", value=False, key=close_key)
                 delete = st.checkbox("Delete row", value=False, key=delete_key)
 
-                if st.button("Apply", key=f"apply_{idx}_{base_addr}", use_container_width=True):
+                if st.button("Apply", key=f"apply_{idx}_{safe_key(pair_addr or base_addr)}", use_container_width=True):
                     all_rows = load_portfolio()
+                    target_pair = pair_addr.lower().strip()
+                    target_base = base_addr.lower().strip()
+
+                    def _is_target(rr: Dict[str, Any]) -> bool:
+                        if rr.get("active") != "1":
+                            return False
+                        rr_pair = (rr.get("pair_address") or "").lower().strip()
+                        rr_base = (rr.get("base_token_address") or "").lower().strip()
+                        if target_pair and rr_pair:
+                            return rr_pair == target_pair
+                        return rr_base == target_base
+
+                    # update note + close
                     for rr in all_rows:
-                        if rr.get("active") == "1" and (rr.get("base_token_address") or "").lower() == base_addr.lower():
+                        if _is_target(rr):
                             rr["note"] = note_val
                             if close:
                                 rr["active"] = "0"
                             break
+
+                    # delete if requested
                     if delete:
-                        all_rows = [
-                            x for x in all_rows
-                            if not (x.get("active") == "1" and (x.get("base_token_address") or "").lower() == base_addr.lower())
-                        ]
+                        all_rows = [x for x in all_rows if not _is_target(x)]
+
                     save_portfolio(all_rows)
                     st.success("Saved.")
                     st.rerun()
