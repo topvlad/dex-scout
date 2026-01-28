@@ -1,20 +1,12 @@
-# app.py — DEX Scout v0.3.6 (stable core: BSC + Solana)
-# Key fixes vs your last state:
-# 1) FIX: "NO ENTRY" badge is now RED (not green).
-# 2) FIX: Unique Streamlit keys (no duplicate / TypeError surprises).
-# 3) Core locked to BSC + Solana (simple, stable).
-# 4) Swap enabled on BOTH:
-#    - BSC: PancakeSwap
-#    - Solana: Jupiter (jup.ag)
-# 5) More output dynamics WITHOUT loosening safety too much:
-#    - Seed sampler (random K seeds per run)
-#    - Top tokens mode (dedupe by base token)
-#    - Pair age window (still early, but anti-rug-ish)
-#    - Majors/stables filter ON by default
-#    - Optional "Hide if Solana token looks UNVERIFIED" (heuristic) ON by default
+# app.py — DEX Scout v0.3.7 (stable core: BSC + Solana)
+# Fixes:
+# - Streamlit compatibility: st.link_button() may NOT support key= on some versions => wrapper added
+# - "NO ENTRY" badge is RED (hard-fixed)
+# - Swap enabled for BOTH: BSC (PancakeSwap) + Solana (Jupiter)
+# - Expanded seeds (bigger funnel) + seed sampler for dynamics without dropping safety
 #
-# NOTE (important): We do NOT have on-chain holder concentration / mint auth / freeze auth checks here.
-# DexScreener doesn’t provide them reliably. For Solana, ALWAYS glance at Jupiter warnings before swapping.
+# NOTE: This tool uses DexScreener data. It does NOT do full on-chain safety (holders, mint auth, freeze auth, etc).
+# For Solana, ALWAYS check Jupiter/JupShield warnings before swapping.
 
 import os
 import re
@@ -29,35 +21,73 @@ from collections import Counter
 import requests
 import streamlit as st
 
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 TRADES_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 
-# Stable core only
+# Stable core only (keep simple + reliable)
 CHAIN_DEX_PRESETS = {
     "bsc": ["pancakeswap", "thena", "biswap", "apeswap", "babyswap", "mdex", "woofi"],
     "solana": ["raydium", "orca", "meteora", "pumpfun", "pumpswap"],
 }
 
-# Softer ticker validation:
-# allow unicode letters/digits + common ticker chars ($ _ - .) + spaces
+# Ticker validation: unicode letters/digits + common ticker chars ($ _ - .) + spaces
 NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
 
-# Major/stable symbols we don't want as "early gems"
+# Majors/stables we don't want as "early gems"
 MAJORS_STABLES = {
-    # majors
     "BTC", "WBTC", "ETH", "WETH", "BNB", "WBNB", "SOL", "WSOL",
-    # stables
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDE", "USDS",
-    # common wrappers
-    "WBNB", "WETH", "WBTC", "WAVAX", "WMATIC",
+    "WAVAX", "WMATIC",
 }
 
 
 # -----------------------------
-# Helpers
+# Streamlit compatibility helpers
+# -----------------------------
+def link_button(label: str, url: str, use_container_width: bool = True, key: Optional[str] = None):
+    """
+    Compatibility wrapper:
+    - Some Streamlit versions DON'T accept key= for st.link_button -> TypeError
+    - Some older versions may not have st.link_button at all -> fallback to HTML
+    """
+    if not url:
+        return
+    if hasattr(st, "link_button"):
+        try:
+            if key is not None:
+                st.link_button(label, url, use_container_width=use_container_width, key=key)
+            else:
+                st.link_button(label, url, use_container_width=use_container_width)
+            return
+        except TypeError:
+            # key not supported on this Streamlit build
+            st.link_button(label, url, use_container_width=use_container_width)
+            return
+
+    # Fallback if link_button doesn't exist
+    st.markdown(
+        f"""
+        <a href="{url}" target="_blank" style="text-decoration:none;">
+          <div style="
+            display:inline-block;
+            padding:10px 14px;
+            border-radius:10px;
+            border:1px solid rgba(0,0,0,0.2);
+            font-weight:700;
+            width:100%;
+            text-align:center;
+          ">{label}</div>
+        </a>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# -----------------------------
+# Generic helpers
 # -----------------------------
 def safe_get(d: Dict[str, Any], *path, default=None):
     cur = d
@@ -94,18 +124,8 @@ def clamp_int(x: float, lo: int = 0, hi: int = 10**9) -> int:
 
 
 def hkey(*parts: str, n: int = 10) -> str:
-    """Short stable hash for Streamlit keys."""
     raw = "|".join([p or "" for p in parts])
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:n]
-
-
-def safe_key(s: str, limit: int = 80) -> str:
-    """Keep Streamlit key safe + bounded."""
-    if s is None:
-        s = ""
-    s = str(s)
-    s = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", s)
-    return s[:limit] if len(s) > limit else s
 
 
 # -----------------------------
@@ -196,29 +216,16 @@ def is_name_suspicious(p: Dict[str, Any]) -> bool:
 
 def is_major_or_stable(p: Dict[str, Any]) -> bool:
     base = (safe_get(p, "baseToken", "symbol", default="") or "").strip().upper()
-    quote = (safe_get(p, "quoteToken", "symbol", default="") or "").strip().upper()
-    if base in MAJORS_STABLES:
-        return True
-    # if quote is a major/stable we still allow (because most pairs quote in USDT/USDC),
-    # but we DON'T want "ETH/USDT", "SOL/USDC" etc (base filter already catches that).
-    return False
+    return base in MAJORS_STABLES
 
 
 def pair_age_minutes(p: Dict[str, Any]) -> Optional[float]:
-    """
-    DexScreener usually provides pairCreatedAt (ms).
-    If missing, return None (we then treat as unknown age).
-    """
     ts = p.get("pairCreatedAt")
     if ts is None:
         return None
     try:
         ts = float(ts)
-        # most likely ms
-        if ts > 10_000_000_000:
-            created = ts / 1000.0
-        else:
-            created = ts
+        created = ts / 1000.0 if ts > 10_000_000_000 else ts
         age_sec = max(0.0, time.time() - created)
         return age_sec / 60.0
     except Exception:
@@ -227,13 +234,7 @@ def pair_age_minutes(p: Dict[str, Any]) -> Optional[float]:
 
 def solana_unverified_heuristic(p: Dict[str, Any]) -> bool:
     """
-    We can't truly check "verified" on-chain here.
-    So we use a conservative heuristic to HIDE likely-degen tokens by default.
-    Mark as "unverified-like" if:
-      - very new (< 60 min) OR age unknown
-      - AND liquidity is low-ish
-      - AND 24h volume is extreme relative to liquidity OR 1h pump is extreme
-    You can toggle this OFF to see everything.
+    Not a true verification check. Conservative filter to hide very-new + low-liq + overpumped pools.
     """
     if (p.get("chainId") or "").lower() != "solana":
         return False
@@ -245,7 +246,6 @@ def solana_unverified_heuristic(p: Dict[str, Any]) -> bool:
     age = pair_age_minutes(p)
     very_new_or_unknown = (age is None) or (age < 60)
 
-    # "too hot" ratios/pumps — typical of farm/stealth launches
     vol_liq_ratio = (vol24 / max(1.0, liq)) if liq else 999.0
 
     if very_new_or_unknown and liq < 50_000:
@@ -303,7 +303,6 @@ def action_badge(action: str) -> str:
         color = "#e53e3e"
         bg = "rgba(229,62,62,0.12)"
     else:
-        # default to yellow-ish (neutral)
         color = "#d69e2e"
         bg = "rgba(214,158,46,0.10)"
 
@@ -354,7 +353,6 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
         f"Vol(5m): {fmt_usd(vol5)}",
     ]
 
-    # Conservative decisioning
     decision = "NO ENTRY"
     if liq >= 30_000 and vol24 >= 20_000 and trades5 >= 12 and sells5 >= 3:
         if pc1h > 6 and vol5 > 2_500 and pc5 >= -3:
@@ -392,30 +390,25 @@ def filter_pairs_with_debug(
     out = []
 
     for p in pairs:
-        # chain
         if (p.get("chainId") or "").lower() != chain.lower():
             reasons["chain_mismatch"] += 1
             continue
         stats["after_chain"] += 1
 
-        # dex filter
         if not any_dex and allowed_dexes:
             if (p.get("dexId") or "").lower() not in allowed_dexes:
                 reasons["dex_not_allowed"] += 1
                 continue
         stats["after_dex"] += 1
 
-        # majors/stables
         if block_majors and is_major_or_stable(p):
             reasons["major_or_stable"] += 1
             continue
         stats["after_major_filter"] += 1
 
-        # age window
         if enforce_age:
             age = pair_age_minutes(p)
             if age is None:
-                # treat unknown as "too old" to avoid random legacy pools
                 reasons["age_unknown"] += 1
                 continue
             if age < float(min_age_min):
@@ -426,13 +419,11 @@ def filter_pairs_with_debug(
                 continue
         stats["after_age"] += 1
 
-        # solana "unverified-like" hide (heuristic)
         if hide_solana_unverified and solana_unverified_heuristic(p):
             reasons["sol_unverified_like"] += 1
             continue
         stats["after_sol_check"] += 1
 
-        # numeric filters
         liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
         vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
         buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
@@ -459,7 +450,6 @@ def filter_pairs_with_debug(
             continue
         stats["after_sells"] += 1
 
-        # imbalance
         if sells > 0 and buys > 0:
             imbalance = max(buys, sells) / max(1, min(buys, sells))
             if imbalance > int(max_buy_sell_imbalance):
@@ -470,7 +460,6 @@ def filter_pairs_with_debug(
             continue
         stats["after_imbalance"] += 1
 
-        # name filter
         if block_suspicious_names and is_name_suspicious(p):
             reasons["suspicious_name"] += 1
             continue
@@ -485,10 +474,6 @@ def filter_pairs_with_debug(
 # Output dynamics
 # -----------------------------
 def dedupe_mode(pairs: List[Dict[str, Any]], by_base_token: bool) -> List[Dict[str, Any]]:
-    """
-    If by_base_token=True => keep best pool per base token.
-    Else => keep best per pairAddress/url.
-    """
     if not pairs:
         return []
 
@@ -510,13 +495,13 @@ def dedupe_mode(pairs: List[Dict[str, Any]], by_base_token: bool) -> List[Dict[s
         if cur is None:
             best[base_addr] = p
         else:
-            # choose by (liq, vol24)
             liq1 = float(safe_get(p, "liquidity", "usd", default=0) or 0)
             vol1 = float(safe_get(p, "volume", "h24", default=0) or 0)
             liq0 = float(safe_get(cur, "liquidity", "usd", default=0) or 0)
             vol0 = float(safe_get(cur, "volume", "h24", default=0) or 0)
             if (liq1, vol1) > (liq0, vol0):
                 best[base_addr] = p
+
     return list(best.values())
 
 
@@ -613,7 +598,6 @@ def log_swap_intent(p: Dict[str, Any], score: float, action: str, tags: List[str
     url = p.get("url", "") or ""
     price = safe_get(p, "priceUsd", default="") or ""
 
-    # avoid duplicates (pair-level preferred)
     for r in rows:
         if r.get("active") != "1":
             continue
@@ -662,7 +646,54 @@ def portfolio_reco(entry: float, current: float, pc1h: float, pc5: float) -> str
 
 
 # -----------------------------
-# Presets (more dynamic but still guarded)
+# Swap URL builders
+# -----------------------------
+def build_swap_url(chain: str, base_addr: str) -> str:
+    chain = (chain or "").lower().strip()
+    base_addr = (base_addr or "").strip()
+    if not base_addr:
+        return ""
+
+    if chain == "bsc":
+        return f"https://pancakeswap.finance/swap?outputCurrency={base_addr}"
+
+    if chain == "solana":
+        # Jupiter SOL -> token mint
+        return f"https://jup.ag/swap/SOL-{base_addr}"
+
+    return ""
+
+
+# -----------------------------
+# Seeds (BIG funnel)
+# -----------------------------
+DEFAULT_SEEDS = (
+    # Your first list
+    "WBNB, USDT, meme, ai, ai agent, launch, trending, pump, sol, eth, usdc, pepe, trump, "
+    # Your second list
+    "launch, new, trend, community, pump, inu, pepe, ai, ai agent, bot, points, claim, v2, v3, "
+    # Extra popular / emerging discovery tags
+    "fairlaunch, stealth, presale, airdrop, whitelist, wl, public sale, token sale, "
+    "tge, listing, listed, migration, upgrade, v4, v5, relaunch, rebrand, "
+    "cto, community takeover, takeover, revival, "
+    "meta, gamefi, gaming, rpg, mmorpg, esports, "
+    "defi, dex, perp, perps, leverage, "
+    "rwa, depin, ai, agentic, ai agents, llm, inference, gpu, "
+    "meme coin, memecoin, dog, cat, pepe, frog, shiba, inu, "
+    "pumpfun, pumpswap, launchpad, "
+    "trend, trending, hot, hype, viral, "
+    "telegram, x, twitter, "
+    "points, quest, campaign, rewards, "
+    "bridge, crosschain, multichain, "
+    "eco, ecosystem, partner, partnership, "
+    "burn, buyback, revenue share, "
+    "staking, apr, farming, "
+    "cex listing, binance, gate, okx, bybit"
+)
+
+
+# -----------------------------
+# Presets
 # -----------------------------
 PRESETS = {
     "Ultra Early (safer)": {
@@ -678,26 +709,9 @@ PRESETS = {
         "min_age_min": 20,
         "max_age_min": 14400,  # 10 days
         "hide_solana_unverified": True,
-        "seed_k": 12,
-        "dedupe_by_base": True,
-        "seeds": "new, launch, fairlaunch, airdrop, points, claim, v2, v3, inu, pepe, ai, agent, bot, pump, stealth, community, trend",
-    },
-    "Early Momentum": {
-        "top_n": 20,
-        "min_liq": 4000,
-        "min_vol24": 12000,
-        "min_trades_m5": 10,
-        "min_sells_m5": 3,
-        "max_imbalance": 16,
-        "block_suspicious_names": True,
-        "block_majors": True,
-        "enforce_age": True,
-        "min_age_min": 30,
-        "max_age_min": 28800,  # 20 days
-        "hide_solana_unverified": True,
         "seed_k": 14,
         "dedupe_by_base": True,
-        "seeds": "launch, new, pump, fairlaunch, presale, stealth, inu, pepe, ai agent, agent, bot, points, claim, v2, v3, community, trend",
+        "seeds": DEFAULT_SEEDS,
     },
     "Balanced (default)": {
         "top_n": 15,
@@ -712,9 +726,9 @@ PRESETS = {
         "min_age_min": 60,
         "max_age_min": 43200,  # 30 days
         "hide_solana_unverified": True,
-        "seed_k": 10,
+        "seed_k": 12,
         "dedupe_by_base": True,
-        "seeds": "launch, new, trend, community, pump, inu, pepe, ai, ai agent, bot, points, claim, v2, v3",
+        "seeds": DEFAULT_SEEDS,
     },
     "Wide Net (explore)": {
         "top_n": 25,
@@ -729,38 +743,15 @@ PRESETS = {
         "min_age_min": 20,
         "max_age_min": 86400,  # 60 days
         "hide_solana_unverified": True,
-        "seed_k": 14,
+        "seed_k": 16,
         "dedupe_by_base": True,
-        "seeds": "new, launch, trend, community, pump, fairlaunch, presale, stealth, airdrop, claim, points, v2, v3, inu, pepe, ai, agent, bot",
+        "seeds": DEFAULT_SEEDS,
     },
 }
 
 
 # -----------------------------
-# Swap URL builders (core)
-# -----------------------------
-def build_swap_url(chain: str, base_addr: str) -> str:
-    chain = (chain or "").lower().strip()
-    base_addr = (base_addr or "").strip()
-
-    if not base_addr:
-        return ""
-
-    if chain == "bsc":
-        # outputCurrency = token contract
-        return f"https://pancakeswap.finance/swap?outputCurrency={base_addr}"
-
-    if chain == "solana":
-        # Jupiter: SOL -> token mint
-        # Common working format:
-        #   https://jup.ag/swap/SOL-<MINT>
-        return f"https://jup.ag/swap/SOL-{base_addr}"
-
-    return ""
-
-
-# -----------------------------
-# UI
+# App
 # -----------------------------
 def main():
     st.set_page_config(page_title="DEX Scout", layout="wide")
@@ -771,7 +762,7 @@ def main():
 
         page = st.radio("Page", ["Scout", "Portfolio"], index=0)
 
-        preset_name = st.selectbox("Preset", list(PRESETS.keys()), index=list(PRESETS.keys()).index("Balanced (default)"))
+        preset_name = st.selectbox("Preset", list(PRESETS.keys()), index=1)
         preset = PRESETS[preset_name]
 
         st.divider()
@@ -812,17 +803,16 @@ def main():
         hide_solana_unverified = st.checkbox(
             "Hide Solana 'unverified-like' (heuristic)",
             value=bool(preset["hide_solana_unverified"]),
-            help="Conservative: hides very-new/low-liq/overpumped Solana pairs. Turn OFF to see everything.",
         )
 
         st.divider()
         st.caption("Output dynamics")
         dedupe_by_base = st.checkbox("Top tokens mode (dedupe by base token)", value=bool(preset["dedupe_by_base"]))
-        seed_k = st.slider("Seed sampler K", 3, 20, int(preset["seed_k"]), step=1)
+        seed_k = st.slider("Seed sampler K", 3, 25, int(preset["seed_k"]), step=1)
 
         st.divider()
         st.caption("Queries (comma-separated)")
-        seeds_raw = st.text_area("Search seeds", value=str(preset["seeds"]), height=120)
+        seeds_raw = st.text_area("Search seeds", value=str(preset["seeds"]), height=160)
 
         colA, colB = st.columns([1, 1])
         with colA:
@@ -833,10 +823,10 @@ def main():
         if clear_cache:
             st.cache_data.clear()
 
-    # -------------------- SCOUT PAGE --------------------
+    # -------------------- SCOUT --------------------
     if page == "Scout":
         st.title("DEX Scout — early candidates (DEXScreener API)")
-        st.caption("Фокус: дрібні/ранні монети. Majors/stables відсікаються. Stable core: BSC + Solana.")
+        st.caption("Focus: early/small tokens. Majors/stables filtered. Core: BSC + Solana.")
 
         seeds = [x.strip() for x in seeds_raw.split(",") if x.strip()]
         if not seeds:
@@ -852,18 +842,17 @@ def main():
         for q in sampled:
             try:
                 all_pairs.extend(fetch_latest_pairs_for_query(q))
-                time.sleep(0.10)  # gentle pacing
+                time.sleep(0.10)
             except Exception as e:
                 query_failures += 1
                 st.warning(f"Query failed: {q} — {e}")
 
         if query_failures and not all_pairs:
-            st.error("All sampled queries failed. Try Refresh now, reduce seeds, or wait a bit.")
+            st.error("All sampled queries failed. Try Refresh, reduce seeds, or wait.")
             return
 
-        # Dedupe first (pair/url)
+        # Dedupe (pair/url) then optionally by base token
         pairs = dedupe_mode(all_pairs, by_base_token=False)
-        # Optional: dedupe by base token (for "Top tokens mode")
         pairs = dedupe_mode(pairs, by_base_token=dedupe_by_base)
 
         allowed = set([d.lower() for d in selected_dexes]) if selected_dexes else set()
@@ -901,15 +890,14 @@ def main():
             st.write("**Counts (pipeline):**")
             st.json(dict(fstats))
             st.write("**Top reject reasons:**")
-            top = freasons.most_common(12)
-            st.write({k: v for k, v in top} if top else "No rejects counted (unexpected).")
+            top = freasons.most_common(15)
+            st.write({k: v for k, v in top} if top else "No rejects counted.")
 
         if not ranked:
-            st.info("0 results. Try: lower Min Liquidity/Vol24 a bit, widen age window, or hit Refresh to resample seeds.")
+            st.info("0 results. Try lowering Min Liquidity/Vol24, widening age window, or hit Refresh to resample seeds.")
             return
 
-        # Render cards
-        for idx, (s, decision, tags, p) in enumerate(ranked, start=1):
+        for i, (s, decision, tags, p) in enumerate(ranked, start=1):
             base = safe_get(p, "baseToken", "symbol", default="???") or "???"
             quote = safe_get(p, "quoteToken", "symbol", default="???") or "???"
             dex = p.get("dexId", "?")
@@ -929,6 +917,7 @@ def main():
             pair_addr = (p.get("pairAddress") or "").strip()
 
             swap_url = build_swap_url(chain_id, base_addr)
+            kb = hkey(url or "", pair_addr or "", base_addr or "", str(i))
 
             st.markdown("---")
             left, mid, right = st.columns([3, 2, 2])
@@ -936,8 +925,9 @@ def main():
             with left:
                 st.markdown(f"## {base}/{quote}")
                 st.caption(f"{chain_id} • {dex}")
+
                 if url:
-                    st.link_button("Open DexScreener", url, use_container_width=True, key=f"ds_{idx}_{hkey(url)}")
+                    link_button("Open DexScreener", url, use_container_width=True)
 
                 if base_addr:
                     st.caption("Token contract (baseToken.address)")
@@ -968,38 +958,22 @@ def main():
                 for t in tags:
                     st.write(f"• {t}")
 
-                # Unique key base: use URL+pair+idx
-                keybase = hkey(url or "", pair_addr or "", base_addr or "", str(idx))
-
-                # Log (works for both chains)
                 if base_addr:
-                    if st.button("Log → Portfolio (I swapped)", key=f"log_{keybase}", use_container_width=True):
+                    if st.button("Log → Portfolio (I swapped)", key=f"log_{kb}", use_container_width=True):
                         if not swap_url:
-                            st.info("Swap URL missing for this chain/token (should not happen for BSC/Solana).")
+                            st.info("Swap URL missing (unexpected for BSC/Solana).")
                         else:
                             res = log_swap_intent(p, s, decision, tags, swap_url)
-                            if res == "OK":
-                                st.success("Logged to Portfolio (entry snapshot saved).")
-                            else:
-                                st.info("Already in Portfolio (active).")
+                            st.success("Logged.") if res == "OK" else st.info("Already active in portfolio.")
 
-                # Swap button
                 if swap_url:
                     swap_label = "Open Swap (PancakeSwap)" if chain_id == "bsc" else "Open Swap (Jupiter)"
-                    st.link_button(
-                        swap_label,
-                        swap_url,
-                        use_container_width=True,
-                        key=f"swap_{keybase}",
-                    )
-                else:
-                    st.caption("Swap disabled (unexpected).")
+                    link_button(swap_label, swap_url, use_container_width=True)
 
-                # Solana safety note
                 if chain_id == "solana":
-                    st.caption("Solana: перед свопом глянь Jupiter warnings (JupShield).")
+                    st.caption("Solana: check Jupiter/JupShield warnings before swapping.")
 
-    # -------------------- PORTFOLIO PAGE --------------------
+    # -------------------- PORTFOLIO --------------------
     else:
         st.title("Portfolio / Watchlist")
         st.caption("Entries appear here after clicking **Log → Portfolio (I swapped)** in Scout.")
@@ -1020,7 +994,7 @@ def main():
         st.markdown("---")
 
         if not active_rows:
-            st.info("Portfolio пустий. Йди в Scout → натисни **Log → Portfolio (I swapped)**.")
+            st.info("Portfolio is empty. Go to Scout → click **Log → Portfolio (I swapped)**.")
             return
 
         st.subheader("Active positions")
@@ -1064,9 +1038,9 @@ def main():
                 st.caption(f"Chain: {chain} • DEX: {r.get('dex','')}")
                 st.code(base_addr, language="text")
                 if r.get("dexscreener_url"):
-                    st.link_button("DexScreener", r["dexscreener_url"], use_container_width=True, key=f"p_ds_{idx}_{hkey(r['dexscreener_url'])}")
+                    link_button("DexScreener", r["dexscreener_url"], use_container_width=True)
                 if r.get("swap_url"):
-                    st.link_button("Swap", r["swap_url"], use_container_width=True, key=f"p_sw_{idx}_{hkey(r['swap_url'])}")
+                    link_button("Swap", r["swap_url"], use_container_width=True)
 
             with c2:
                 st.write(f"**Entry:** ${entry_price_str}")
@@ -1091,8 +1065,6 @@ def main():
 
                 if st.button("Apply", key=f"apply_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                     all_rows = load_portfolio()
-
-                    # Update note/close by base token address (active only)
                     for rr in all_rows:
                         if rr.get("active") == "1" and (rr.get("base_token_address") or "").lower() == base_addr.lower():
                             rr["note"] = note_val
