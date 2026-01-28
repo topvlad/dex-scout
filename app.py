@@ -1,22 +1,28 @@
-# app.py — DEX Scout v0.3.6
-# Core goals (stable): BSC + Solana only
-# Fixes:
-# 1) Swap routing:
-#    - BSC -> PancakeSwap
-#    - Solana -> Jupiter (USDC -> token mint)
-# 2) Action color fix:
-#    - NO ENTRY is RED (no substring bug with "ENTRY")
-# Stability fixes:
-# - Avoid StreamlitDuplicateElementKey by using unique keys for buttons
-# - Avoid st.link_button(key=...) TypeError by not passing "key" to link_button at all
-# - Use HTML-styled links (safe, deterministic) for external links
+# app.py — DEX Scout v0.3.6 (stable core: BSC + Solana)
+# Key fixes vs your last state:
+# 1) FIX: "NO ENTRY" badge is now RED (not green).
+# 2) FIX: Unique Streamlit keys (no duplicate / TypeError surprises).
+# 3) Core locked to BSC + Solana (simple, stable).
+# 4) Swap enabled on BOTH:
+#    - BSC: PancakeSwap
+#    - Solana: Jupiter (jup.ag)
+# 5) More output dynamics WITHOUT loosening safety too much:
+#    - Seed sampler (random K seeds per run)
+#    - Top tokens mode (dedupe by base token)
+#    - Pair age window (still early, but anti-rug-ish)
+#    - Majors/stables filter ON by default
+#    - Optional "Hide if Solana token looks UNVERIFIED" (heuristic) ON by default
+#
+# NOTE (important): We do NOT have on-chain holder concentration / mint auth / freeze auth checks here.
+# DexScreener doesn’t provide them reliably. For Solana, ALWAYS glance at Jupiter warnings before swapping.
 
 import os
 import re
 import csv
 import time
 import random
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 from collections import Counter
 
@@ -29,24 +35,26 @@ DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 TRADES_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 
-# Stable core: only these two for now (as requested)
+# Stable core only
 CHAIN_DEX_PRESETS = {
     "bsc": ["pancakeswap", "thena", "biswap", "apeswap", "babyswap", "mdex", "woofi"],
-    "solana": ["raydium", "orca", "meteora", "pumpswap"],
+    "solana": ["raydium", "orca", "meteora", "pumpfun", "pumpswap"],
 }
 
+# Softer ticker validation:
 # allow unicode letters/digits + common ticker chars ($ _ - .) + spaces
 NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
 
-# Majors / stables to exclude (base token symbol)
-MAJORS = {
+# Major/stable symbols we don't want as "early gems"
+MAJORS_STABLES = {
+    # majors
     "BTC", "WBTC", "ETH", "WETH", "BNB", "WBNB", "SOL", "WSOL",
-    "MATIC", "AVAX", "OP", "ARB", "LINK", "DOT", "ATOM", "TON",
+    # stables
+    "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDE", "USDS",
+    # common wrappers
+    "WBNB", "WETH", "WBTC", "WAVAX", "WMATIC",
 }
-STABLES = {
-    "USDT", "USDC", "DAI", "BUSD", "TUSD", "FDUSD", "USDD", "FRAX", "USDP",
-    "LUSD", "SUSD", "EURC",
-}
+
 
 # -----------------------------
 # Helpers
@@ -61,24 +69,12 @@ def safe_get(d: Dict[str, Any], *path, default=None):
 
 
 def now_utc_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def fmt_usd(x: float) -> str:
     try:
         return f"${x:,.0f}"
-    except Exception:
-        return "n/a"
-
-
-def fmt_price(x: Any) -> str:
-    try:
-        v = float(x)
-        if v >= 1:
-            return f"${v:,.4f}"
-        if v >= 0.01:
-            return f"${v:,.6f}"
-        return f"${v:.10f}"
     except Exception:
         return "n/a"
 
@@ -97,55 +93,32 @@ def clamp_int(x: float, lo: int = 0, hi: int = 10**9) -> int:
         return lo
 
 
-def safe_key(x: str, max_len: int = 60) -> str:
-    # for Streamlit widget keys
-    s = str(x or "")
-    s = re.sub(r"[^a-zA-Z0-9_\-]+", "_", s)
-    return s[:max_len] if len(s) > max_len else s
+def hkey(*parts: str, n: int = 10) -> str:
+    """Short stable hash for Streamlit keys."""
+    raw = "|".join([p or "" for p in parts])
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:n]
 
 
-def html_link_button(label: str, url: str) -> str:
-    # Stable alternative to st.link_button (no key issues)
-    if not url:
-        return ""
-    return f"""
-    <a href="{url}" target="_blank" style="
-      display:inline-block;
-      width:100%;
-      text-align:center;
-      padding:10px 12px;
-      border:1px solid rgba(0,0,0,0.15);
-      border-radius:10px;
-      text-decoration:none;
-      font-weight:600;
-      color:inherit;
-      background:rgba(0,0,0,0.02);
-      margin:4px 0;
-    ">{label}</a>
-    """
-
-
-def parse_seeds(seeds_raw: str) -> List[str]:
-    items = [x.strip() for x in (seeds_raw or "").split(",")]
-    items = [x for x in items if x]
-    # dedupe preserving order
-    seen = set()
-    out = []
-    for x in items:
-        k = x.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(x)
-    return out
+def safe_key(s: str, limit: int = 80) -> str:
+    """Keep Streamlit key safe + bounded."""
+    if s is None:
+        s = ""
+    s = str(s)
+    s = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", s)
+    return s[:limit] if len(s) > limit else s
 
 
 # -----------------------------
 # HTTP with retry/backoff
 # -----------------------------
 def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, max_retries: int = 3) -> Any:
+    """
+    Basic retry/backoff wrapper for DexScreener calls.
+    Retries on 429 / 5xx / common network errors with exponential backoff.
+    """
     last_err = None
-    backoff = 0.6
+    backoff = 0.7
+
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(
@@ -171,6 +144,7 @@ def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, m
         except Exception as e:
             last_err = e
             break
+
     raise RuntimeError(f"Request failed after {max_retries} tries: {last_err}")
 
 
@@ -209,43 +183,83 @@ def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, An
 
 
 # -----------------------------
-# Swap routing (core)
-# -----------------------------
-def build_swap_url(chain: str, base_addr: str) -> str:
-    if not base_addr:
-        return ""
-    chain = (chain or "").lower()
-
-    if chain == "bsc":
-        return f"https://pancakeswap.finance/swap?outputCurrency={base_addr}"
-
-    if chain == "solana":
-        # Jupiter: USDC -> token mint
-        # (works well as a default; you can change to SOL later if you prefer)
-        return f"https://jup.ag/swap/USDC-{base_addr}"
-
-    return ""
-
-
-# -----------------------------
-# Filtering / Scoring
+# Safety / heuristics
 # -----------------------------
 def is_name_suspicious(p: Dict[str, Any]) -> bool:
-    base_sym = (safe_get(p, "baseToken", "symbol", default="") or "").strip()
-    if not base_sym:
+    sym = (safe_get(p, "baseToken", "symbol", default="") or "").strip()
+    if not sym:
         return True
-    if len(base_sym) > 40:
+    if len(sym) > 40:
         return True
-    return not bool(NAME_OK_RE.match(base_sym))
+    return not bool(NAME_OK_RE.match(sym))
 
 
-def is_major_or_stable_base(p: Dict[str, Any]) -> bool:
-    base_sym = (safe_get(p, "baseToken", "symbol", default="") or "").strip().upper()
-    if not base_sym:
+def is_major_or_stable(p: Dict[str, Any]) -> bool:
+    base = (safe_get(p, "baseToken", "symbol", default="") or "").strip().upper()
+    quote = (safe_get(p, "quoteToken", "symbol", default="") or "").strip().upper()
+    if base in MAJORS_STABLES:
         return True
-    return (base_sym in MAJORS) or (base_sym in STABLES)
+    # if quote is a major/stable we still allow (because most pairs quote in USDT/USDC),
+    # but we DON'T want "ETH/USDT", "SOL/USDC" etc (base filter already catches that).
+    return False
 
 
+def pair_age_minutes(p: Dict[str, Any]) -> Optional[float]:
+    """
+    DexScreener usually provides pairCreatedAt (ms).
+    If missing, return None (we then treat as unknown age).
+    """
+    ts = p.get("pairCreatedAt")
+    if ts is None:
+        return None
+    try:
+        ts = float(ts)
+        # most likely ms
+        if ts > 10_000_000_000:
+            created = ts / 1000.0
+        else:
+            created = ts
+        age_sec = max(0.0, time.time() - created)
+        return age_sec / 60.0
+    except Exception:
+        return None
+
+
+def solana_unverified_heuristic(p: Dict[str, Any]) -> bool:
+    """
+    We can't truly check "verified" on-chain here.
+    So we use a conservative heuristic to HIDE likely-degen tokens by default.
+    Mark as "unverified-like" if:
+      - very new (< 60 min) OR age unknown
+      - AND liquidity is low-ish
+      - AND 24h volume is extreme relative to liquidity OR 1h pump is extreme
+    You can toggle this OFF to see everything.
+    """
+    if (p.get("chainId") or "").lower() != "solana":
+        return False
+
+    liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
+    vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
+    pc1h = float(safe_get(p, "priceChange", "h1", default=0) or 0)
+
+    age = pair_age_minutes(p)
+    very_new_or_unknown = (age is None) or (age < 60)
+
+    # "too hot" ratios/pumps — typical of farm/stealth launches
+    vol_liq_ratio = (vol24 / max(1.0, liq)) if liq else 999.0
+
+    if very_new_or_unknown and liq < 50_000:
+        return True
+    if very_new_or_unknown and vol_liq_ratio > 25:
+        return True
+    if very_new_or_unknown and pc1h > 120:
+        return True
+    return False
+
+
+# -----------------------------
+# Scoring / decision
+# -----------------------------
 def score_pair(p: Dict[str, Any]) -> float:
     liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
     vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
@@ -257,28 +271,41 @@ def score_pair(p: Dict[str, Any]) -> float:
     trades5 = buys5 + sells5
 
     s = 0.0
-    s += min(liq / 1000.0, 420.0)
-    s += min(vol24 / 10000.0, 320.0)
+    s += min(liq / 1000.0, 380.0)
+    s += min(vol24 / 10000.0, 280.0)
     s += min(vol5 / 2000.0, 220.0)
     s += min(trades5 * 2.0, 140.0)
-    s += max(min(pc1h, 80.0), -80.0) * 0.25
-    s += max(min(pc5, 30.0), -30.0) * 0.20
+    s += max(min(pc1h, 90.0), -90.0) * 0.25
+    s += max(min(pc5, 40.0), -40.0) * 0.15
     return round(s, 2)
 
 
 def action_badge(action: str) -> str:
-    # FIXED: NO ENTRY must be red (no substring checks)
-    a = (action or "").upper().strip()
+    """
+    Color rules:
+      - ENTRY / BUY => green
+      - WATCH / WAIT => yellow
+      - NO ENTRY / CUT / RISK => red
+    """
+    a = (action or "").strip().upper()
 
-    if a.startswith("ENTRY") or a.startswith("BUY"):
-        color = "#1f9d55"      # green
-        bg = "rgba(31,157,85,0.14)"
-    elif a.startswith("WATCH") or a.startswith("WAIT"):
-        color = "#d69e2e"      # yellow
-        bg = "rgba(214,158,46,0.14)"
+    is_green = ("ENTRY" in a) or a.startswith("BUY")
+    is_yellow = ("WATCH" in a) or ("WAIT" in a)
+    is_red = ("NO ENTRY" in a) or ("CUT" in a) or ("RISK" in a) or ("AVOID" in a)
+
+    if is_green:
+        color = "#1f9d55"
+        bg = "rgba(31,157,85,0.15)"
+    elif is_yellow:
+        color = "#d69e2e"
+        bg = "rgba(214,158,46,0.15)"
+    elif is_red:
+        color = "#e53e3e"
+        bg = "rgba(229,62,62,0.12)"
     else:
-        color = "#e53e3e"      # red
-        bg = "rgba(229,62,62,0.10)"
+        # default to yellow-ish (neutral)
+        color = "#d69e2e"
+        bg = "rgba(214,158,46,0.10)"
 
     return f"""
     <span style="
@@ -288,9 +315,9 @@ def action_badge(action: str) -> str:
       border:1px solid {color};
       background:{bg};
       color:{color};
-      font-weight:800;
+      font-weight:900;
       font-size:12px;
-      letter-spacing:0.2px;
+      letter-spacing:0.35px;
     ">{action}</span>
     """
 
@@ -307,7 +334,7 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
 
     if liq >= 250_000:
         liq_tag = "Liquidity: High"
-    elif liq >= 80_000:
+    elif liq >= 60_000:
         liq_tag = "Liquidity: Medium"
     else:
         liq_tag = "Liquidity: Low"
@@ -319,18 +346,18 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
     else:
         flow_tag = "Flow: Thin"
 
-    trend_tag = f"Trend(1h): {fmt_pct(pc1h)}"
-    micro_tag = f"Micro(5m): {fmt_pct(pc5)}"
-    vol_tag = f"Vol(5m): {fmt_usd(vol5)}"
+    tags = [
+        liq_tag,
+        flow_tag,
+        f"Trend(1h): {fmt_pct(pc1h)}",
+        f"Micro(5m): {fmt_pct(pc5)}",
+        f"Vol(5m): {fmt_usd(vol5)}",
+    ]
 
-    tags = [liq_tag, flow_tag, trend_tag, micro_tag, vol_tag]
-
+    # Conservative decisioning
     decision = "NO ENTRY"
-
-    # Conservative scalp entry idea: still "early-ish", not pure degen.
-    # (You can tighten later in presets; this is used after filtering already.)
-    if liq >= 20_000 and vol24 >= 20_000 and trades5 >= 10 and sells5 >= 2:
-        if pc1h > 5 and vol5 > 5_000 and pc5 >= -2:
+    if liq >= 30_000 and vol24 >= 20_000 and trades5 >= 12 and sells5 >= 3:
+        if pc1h > 6 and vol5 > 2_500 and pc5 >= -3:
             decision = "ENTRY (scalp)"
         else:
             decision = "WATCH / WAIT"
@@ -338,6 +365,9 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
     return decision, tags
 
 
+# -----------------------------
+# Filtering / Debug
+# -----------------------------
 def filter_pairs_with_debug(
     pairs: List[Dict[str, Any]],
     chain: str,
@@ -348,15 +378,19 @@ def filter_pairs_with_debug(
     min_trades_m5: int,
     min_sells_m5: int,
     max_buy_sell_imbalance: int,
-    filter_majors_stables: bool,
     block_suspicious_names: bool,
+    block_majors: bool,
+    min_age_min: int,
+    max_age_min: int,
+    enforce_age: bool,
+    hide_solana_unverified: bool,
 ):
     stats = Counter()
     reasons = Counter()
 
     stats["total_in"] = len(pairs)
-
     out = []
+
     for p in pairs:
         # chain
         if (p.get("chainId") or "").lower() != chain.lower():
@@ -364,19 +398,41 @@ def filter_pairs_with_debug(
             continue
         stats["after_chain"] += 1
 
-        # dex
+        # dex filter
         if not any_dex and allowed_dexes:
             if (p.get("dexId") or "").lower() not in allowed_dexes:
                 reasons["dex_not_allowed"] += 1
                 continue
         stats["after_dex"] += 1
 
-        # majors / stables filter (base token)
-        if filter_majors_stables and is_major_or_stable_base(p):
+        # majors/stables
+        if block_majors and is_major_or_stable(p):
             reasons["major_or_stable"] += 1
             continue
         stats["after_major_filter"] += 1
 
+        # age window
+        if enforce_age:
+            age = pair_age_minutes(p)
+            if age is None:
+                # treat unknown as "too old" to avoid random legacy pools
+                reasons["age_unknown"] += 1
+                continue
+            if age < float(min_age_min):
+                reasons["age_too_new"] += 1
+                continue
+            if age > float(max_age_min):
+                reasons["age_too_old"] += 1
+                continue
+        stats["after_age"] += 1
+
+        # solana "unverified-like" hide (heuristic)
+        if hide_solana_unverified and solana_unverified_heuristic(p):
+            reasons["sol_unverified_like"] += 1
+            continue
+        stats["after_sol_check"] += 1
+
+        # numeric filters
         liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
         vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
         buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
@@ -406,7 +462,7 @@ def filter_pairs_with_debug(
         # imbalance
         if sells > 0 and buys > 0:
             imbalance = max(buys, sells) / max(1, min(buys, sells))
-            if imbalance > max_buy_sell_imbalance:
+            if imbalance > int(max_buy_sell_imbalance):
                 reasons["imbalance>max"] += 1
                 continue
         else:
@@ -414,6 +470,7 @@ def filter_pairs_with_debug(
             continue
         stats["after_imbalance"] += 1
 
+        # name filter
         if block_suspicious_names and is_name_suspicious(p):
             reasons["suspicious_name"] += 1
             continue
@@ -422,6 +479,58 @@ def filter_pairs_with_debug(
         out.append(p)
 
     return out, stats, reasons
+
+
+# -----------------------------
+# Output dynamics
+# -----------------------------
+def dedupe_mode(pairs: List[Dict[str, Any]], by_base_token: bool) -> List[Dict[str, Any]]:
+    """
+    If by_base_token=True => keep best pool per base token.
+    Else => keep best per pairAddress/url.
+    """
+    if not pairs:
+        return []
+
+    if not by_base_token:
+        uniq = {}
+        for p in pairs:
+            k = p.get("pairAddress") or p.get("url")
+            if not k:
+                continue
+            uniq[k] = p
+        return list(uniq.values())
+
+    best = {}
+    for p in pairs:
+        base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
+        if not base_addr:
+            continue
+        cur = best.get(base_addr)
+        if cur is None:
+            best[base_addr] = p
+        else:
+            # choose by (liq, vol24)
+            liq1 = float(safe_get(p, "liquidity", "usd", default=0) or 0)
+            vol1 = float(safe_get(p, "volume", "h24", default=0) or 0)
+            liq0 = float(safe_get(cur, "liquidity", "usd", default=0) or 0)
+            vol0 = float(safe_get(cur, "volume", "h24", default=0) or 0)
+            if (liq1, vol1) > (liq0, vol0):
+                best[base_addr] = p
+    return list(best.values())
+
+
+def sample_seeds(seeds: List[str], k: int, refresh: bool) -> List[str]:
+    seeds = [s.strip() for s in seeds if s.strip()]
+    if not seeds:
+        return []
+
+    k = max(1, min(int(k), len(seeds)))
+
+    if "seed_sample" not in st.session_state or refresh:
+        st.session_state["seed_sample"] = random.sample(seeds, k)
+
+    return st.session_state["seed_sample"]
 
 
 # -----------------------------
@@ -504,11 +613,13 @@ def log_swap_intent(p: Dict[str, Any], score: float, action: str, tags: List[str
     url = p.get("url", "") or ""
     price = safe_get(p, "priceUsd", default="") or ""
 
-    # avoid duplicates by pair
+    # avoid duplicates (pair-level preferred)
     for r in rows:
         if r.get("active") != "1":
             continue
         if pair_addr and (r.get("pair_address", "").lower() == pair_addr.lower()):
+            return "ALREADY_EXISTS"
+        if not pair_addr and base_addr and (r.get("base_token_address", "").lower() == base_addr.lower()):
             return "ALREADY_EXISTS"
 
     rows.append(
@@ -551,60 +662,106 @@ def portfolio_reco(entry: float, current: float, pc1h: float, pc5: float) -> str
 
 
 # -----------------------------
-# Presets (more dynamic but still safe-ish)
+# Presets (more dynamic but still guarded)
 # -----------------------------
 PRESETS = {
     "Ultra Early (safer)": {
         "top_n": 20,
         "min_liq": 2000,
         "min_vol24": 5000,
-        "min_trades_m5": 4,
-        "min_sells_m5": 1,
-        "max_imbalance": 20,
-        "filter_majors_stables": True,
+        "min_trades_m5": 6,
+        "min_sells_m5": 2,
+        "max_imbalance": 18,
         "block_suspicious_names": True,
+        "block_majors": True,
+        "enforce_age": True,
+        "min_age_min": 20,
+        "max_age_min": 14400,  # 10 days
+        "hide_solana_unverified": True,
         "seed_k": 12,
-        "seeds": "new, launch, fairlaunch, stealth, airdrop, points, claim, v2, v3, inu, pepe, ai, agent, bot",
+        "dedupe_by_base": True,
+        "seeds": "new, launch, fairlaunch, airdrop, points, claim, v2, v3, inu, pepe, ai, agent, bot, pump, stealth, community, trend",
+    },
+    "Early Momentum": {
+        "top_n": 20,
+        "min_liq": 4000,
+        "min_vol24": 12000,
+        "min_trades_m5": 10,
+        "min_sells_m5": 3,
+        "max_imbalance": 16,
+        "block_suspicious_names": True,
+        "block_majors": True,
+        "enforce_age": True,
+        "min_age_min": 30,
+        "max_age_min": 28800,  # 20 days
+        "hide_solana_unverified": True,
+        "seed_k": 14,
+        "dedupe_by_base": True,
+        "seeds": "launch, new, pump, fairlaunch, presale, stealth, inu, pepe, ai agent, agent, bot, points, claim, v2, v3, community, trend",
     },
     "Balanced (default)": {
         "top_n": 15,
         "min_liq": 15000,
         "min_vol24": 60000,
-        "min_trades_m5": 10,
-        "min_sells_m5": 2,
-        "max_imbalance": 12,
-        "filter_majors_stables": True,
+        "min_trades_m5": 18,
+        "min_sells_m5": 5,
+        "max_imbalance": 10,
         "block_suspicious_names": True,
+        "block_majors": True,
+        "enforce_age": True,
+        "min_age_min": 60,
+        "max_age_min": 43200,  # 30 days
+        "hide_solana_unverified": True,
         "seed_k": 10,
-        "seeds": "meme, ai, ai agent, launch, pump, new, community, bot, inu, pepe",
-    },
-    "Scalp Hot (strict)": {
-        "top_n": 12,
-        "min_liq": 30000,
-        "min_vol24": 120000,
-        "min_trades_m5": 25,
-        "min_sells_m5": 6,
-        "max_imbalance": 8,
-        "filter_majors_stables": True,
-        "block_suspicious_names": True,
-        "seed_k": 8,
-        "seeds": "launch, pump, trending, ai, bot, meme, new, community, inu, pepe",
+        "dedupe_by_base": True,
+        "seeds": "launch, new, trend, community, pump, inu, pepe, ai, ai agent, bot, points, claim, v2, v3",
     },
     "Wide Net (explore)": {
         "top_n": 25,
-        "min_liq": 3000,
-        "min_vol24": 10000,
-        "min_trades_m5": 4,
-        "min_sells_m5": 1,
-        "max_imbalance": 20,
-        "filter_majors_stables": True,
+        "min_liq": 8000,
+        "min_vol24": 25000,
+        "min_trades_m5": 10,
+        "min_sells_m5": 3,
+        "max_imbalance": 14,
         "block_suspicious_names": False,
+        "block_majors": True,
+        "enforce_age": True,
+        "min_age_min": 20,
+        "max_age_min": 86400,  # 60 days
+        "hide_solana_unverified": True,
         "seed_k": 14,
+        "dedupe_by_base": True,
         "seeds": "new, launch, trend, community, pump, fairlaunch, presale, stealth, airdrop, claim, points, v2, v3, inu, pepe, ai, agent, bot",
     },
 }
 
 
+# -----------------------------
+# Swap URL builders (core)
+# -----------------------------
+def build_swap_url(chain: str, base_addr: str) -> str:
+    chain = (chain or "").lower().strip()
+    base_addr = (base_addr or "").strip()
+
+    if not base_addr:
+        return ""
+
+    if chain == "bsc":
+        # outputCurrency = token contract
+        return f"https://pancakeswap.finance/swap?outputCurrency={base_addr}"
+
+    if chain == "solana":
+        # Jupiter: SOL -> token mint
+        # Common working format:
+        #   https://jup.ag/swap/SOL-<MINT>
+        return f"https://jup.ag/swap/SOL-{base_addr}"
+
+    return ""
+
+
+# -----------------------------
+# UI
+# -----------------------------
 def main():
     st.set_page_config(page_title="DEX Scout", layout="wide")
 
@@ -614,16 +771,12 @@ def main():
 
         page = st.radio("Page", ["Scout", "Portfolio"], index=0)
 
-        preset_name = st.selectbox("Preset", list(PRESETS.keys()), index=1)
+        preset_name = st.selectbox("Preset", list(PRESETS.keys()), index=list(PRESETS.keys()).index("Balanced (default)"))
         preset = PRESETS[preset_name]
 
         st.divider()
 
-        chain = st.selectbox(
-            "Chain",
-            options=list(CHAIN_DEX_PRESETS.keys()),
-            index=0,
-        )
+        chain = st.selectbox("Chain", options=["bsc", "solana"], index=0)
 
         st.caption("DEX filter")
         any_dex = st.checkbox("Any DEX (no filter)", value=True)
@@ -638,8 +791,8 @@ def main():
             )
 
         top_n = st.slider("Top N", 5, 50, int(preset["top_n"]), step=1)
-        min_liq = st.number_input("Min Liquidity ($)", min_value=0, value=int(preset["min_liq"]), step=1000)
-        min_vol24 = st.number_input("Min 24h Volume ($)", min_value=0, value=int(preset["min_vol24"]), step=5000)
+        min_liq = st.number_input("Min Liquidity ($)", min_value=0, value=int(preset["min_liq"]), step=500)
+        min_vol24 = st.number_input("Min 24h Volume ($)", min_value=0, value=int(preset["min_vol24"]), step=1000)
 
         st.divider()
         st.caption("Real trading filters")
@@ -649,40 +802,48 @@ def main():
 
         st.divider()
         st.caption("Safety guards")
-        filter_majors_stables = st.checkbox("Filter majors/stables (base)", value=bool(preset["filter_majors_stables"]))
+        block_majors = st.checkbox("Filter majors/stables (base)", value=bool(preset["block_majors"]))
         block_suspicious_names = st.checkbox("Filter suspicious tickers", value=bool(preset["block_suspicious_names"]))
+
+        enforce_age = st.checkbox("Pair age window (anti-rug + still early)", value=bool(preset["enforce_age"]))
+        min_age_min = st.number_input("Min age (minutes)", min_value=0, value=int(preset["min_age_min"]), step=10)
+        max_age_min = st.number_input("Max age (minutes)", min_value=30, value=int(preset["max_age_min"]), step=60)
+
+        hide_solana_unverified = st.checkbox(
+            "Hide Solana 'unverified-like' (heuristic)",
+            value=bool(preset["hide_solana_unverified"]),
+            help="Conservative: hides very-new/low-liq/overpumped Solana pairs. Turn OFF to see everything.",
+        )
 
         st.divider()
         st.caption("Output dynamics")
+        dedupe_by_base = st.checkbox("Top tokens mode (dedupe by base token)", value=bool(preset["dedupe_by_base"]))
         seed_k = st.slider("Seed sampler K", 3, 20, int(preset["seed_k"]), step=1)
 
         st.divider()
         st.caption("Queries (comma-separated)")
-        seeds_raw = st.text_area("Search seeds", value=str(preset["seeds"]), height=110)
+        seeds_raw = st.text_area("Search seeds", value=str(preset["seeds"]), height=120)
 
-        refresh = st.button("Refresh now")
-        if refresh:
+        colA, colB = st.columns([1, 1])
+        with colA:
+            refresh = st.button("Refresh now", use_container_width=True)
+        with colB:
+            clear_cache = st.button("Clear cache", use_container_width=True)
+
+        if clear_cache:
             st.cache_data.clear()
-            # also rotate seed sampling without needing extra input
-            st.session_state["seed_shuffle_nonce"] = random.randint(1, 10**9)
 
-    # -------------------- SCOUT --------------------
+    # -------------------- SCOUT PAGE --------------------
     if page == "Scout":
         st.title("DEX Scout — early candidates (DEXScreener API)")
         st.caption("Фокус: дрібні/ранні монети. Majors/stables відсікаються. Stable core: BSC + Solana.")
 
-        seeds = parse_seeds(seeds_raw)
+        seeds = [x.strip() for x in seeds_raw.split(",") if x.strip()]
         if not seeds:
-            st.info("Додай хоча б 1 seed у sidebar.")
+            st.info("Add at least 1 seed query in the sidebar.")
             return
 
-        # Seed sampling for dynamic output (still deterministic enough per refresh)
-        nonce = st.session_state.get("seed_shuffle_nonce", 0)
-        rnd = random.Random(str(nonce) + "|" + preset_name + "|" + chain)
-        sampled = seeds[:]
-        rnd.shuffle(sampled)
-        sampled = sampled[: min(seed_k, len(sampled))]
-
+        sampled = sample_seeds(seeds, seed_k, refresh)
         st.caption(f"Seeds sampled ({len(sampled)}/{len(seeds)}): " + ", ".join(sampled))
 
         all_pairs: List[Dict[str, Any]] = []
@@ -696,18 +857,14 @@ def main():
                 query_failures += 1
                 st.warning(f"Query failed: {q} — {e}")
 
-        # Deduplicate
-        uniq = {}
-        for p in all_pairs:
-            pa = p.get("pairAddress") or p.get("url")
-            if not pa:
-                continue
-            uniq[pa] = p
-        pairs = list(uniq.values())
-
-        if query_failures and not pairs:
-            st.error("Усі запити впали або повернули 0. Натисни Refresh або зменш seeds.")
+        if query_failures and not all_pairs:
+            st.error("All sampled queries failed. Try Refresh now, reduce seeds, or wait a bit.")
             return
+
+        # Dedupe first (pair/url)
+        pairs = dedupe_mode(all_pairs, by_base_token=False)
+        # Optional: dedupe by base token (for "Top tokens mode")
+        pairs = dedupe_mode(pairs, by_base_token=dedupe_by_base)
 
         allowed = set([d.lower() for d in selected_dexes]) if selected_dexes else set()
 
@@ -721,8 +878,12 @@ def main():
             min_trades_m5=int(min_trades_m5),
             min_sells_m5=int(min_sells_m5),
             max_buy_sell_imbalance=int(max_buy_sell_imbalance),
-            filter_majors_stables=bool(filter_majors_stables),
             block_suspicious_names=bool(block_suspicious_names),
+            block_majors=bool(block_majors),
+            min_age_min=int(min_age_min),
+            max_age_min=int(max_age_min),
+            enforce_age=bool(enforce_age),
+            hide_solana_unverified=bool(hide_solana_unverified),
         )
 
         ranked = []
@@ -735,27 +896,26 @@ def main():
 
         st.metric("Passed filters", len(ranked))
 
-        with st.expander("Why 0 results? (Filter Debug)", expanded=False):
+        with st.expander("Why 0 results? (Filter Debug)", expanded=(len(ranked) == 0)):
             st.write("**Fetched:**", len(all_pairs), " • **Deduped:**", len(pairs))
             st.write("**Counts (pipeline):**")
             st.json(dict(fstats))
             st.write("**Top reject reasons:**")
-            top = freasons.most_common(10)
+            top = freasons.most_common(12)
             st.write({k: v for k, v in top} if top else "No rejects counted (unexpected).")
 
         if not ranked:
-            st.info("0 results. Спробуй: трохи знизити Min Liquidity/Vol24 або натисни Refresh (пересемплити seeds).")
+            st.info("0 results. Try: lower Min Liquidity/Vol24 a bit, widen age window, or hit Refresh to resample seeds.")
             return
 
         # Render cards
-        for i, (s, decision, tags, p) in enumerate(ranked, start=1):
+        for idx, (s, decision, tags, p) in enumerate(ranked, start=1):
             base = safe_get(p, "baseToken", "symbol", default="???") or "???"
             quote = safe_get(p, "quoteToken", "symbol", default="???") or "???"
             dex = p.get("dexId", "?")
-            chain_id = (p.get("chainId", "") or "").lower()
             url = p.get("url", "")
-
             price = safe_get(p, "priceUsd", default=None)
+
             liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
             vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
             vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
@@ -764,8 +924,9 @@ def main():
             buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
             sells = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
 
-            base_addr = safe_get(p, "baseToken", "address", default="") or ""
-            pair_addr = p.get("pairAddress", "") or ""
+            chain_id = (p.get("chainId") or "").lower()
+            base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
+            pair_addr = (p.get("pairAddress") or "").strip()
 
             swap_url = build_swap_url(chain_id, base_addr)
 
@@ -773,11 +934,10 @@ def main():
             left, mid, right = st.columns([3, 2, 2])
 
             with left:
-                st.markdown(f"### {base}/{quote}")
+                st.markdown(f"## {base}/{quote}")
                 st.caption(f"{chain_id} • {dex}")
-
                 if url:
-                    st.markdown(html_link_button(f"Open DexScreener · {base}/{quote}", url), unsafe_allow_html=True)
+                    st.link_button("Open DexScreener", url, use_container_width=True, key=f"ds_{idx}_{hkey(url)}")
 
                 if base_addr:
                     st.caption("Token contract (baseToken.address)")
@@ -786,8 +946,12 @@ def main():
                     st.caption("Pair / pool address")
                     st.code(pair_addr, language="text")
 
+                age = pair_age_minutes(p)
+                if age is not None:
+                    st.caption(f"Pair age: ~{int(age)} min")
+
             with mid:
-                st.write(f"**Price:** {fmt_price(price)}" if price else "**Price:** n/a")
+                st.write(f"**Price:** ${float(price):.8f}" if price else "**Price:** n/a")
                 st.write(f"**Liq:** {fmt_usd(liq)}")
                 st.write(f"**Vol24:** {fmt_usd(vol24)}")
                 st.write(f"**Vol m5:** {fmt_usd(vol5)}")
@@ -797,30 +961,45 @@ def main():
                 st.write(f"**Score:** {s}")
 
             with right:
-                st.markdown("**Action:**")
+                st.write("**Action:**")
                 st.markdown(action_badge(decision), unsafe_allow_html=True)
 
-                st.markdown("**Tags:**")
+                st.write("**Tags:**")
                 for t in tags:
                     st.write(f"• {t}")
 
-                # unique keys (no duplicates)
-                uniq_id = f"{chain_id}_{safe_key(pair_addr or base_addr)}_{i}"
+                # Unique key base: use URL+pair+idx
+                keybase = hkey(url or "", pair_addr or "", base_addr or "", str(idx))
 
-                if swap_url:
-                    key_log = f"log_{uniq_id}"
-                    if st.button("Log → Portfolio (I swapped)", key=key_log, use_container_width=True):
-                        res = log_swap_intent(p, s, decision, tags, swap_url)
-                        if res == "OK":
-                            st.success("Logged to Portfolio (entry snapshot saved).")
+                # Log (works for both chains)
+                if base_addr:
+                    if st.button("Log → Portfolio (I swapped)", key=f"log_{keybase}", use_container_width=True):
+                        if not swap_url:
+                            st.info("Swap URL missing for this chain/token (should not happen for BSC/Solana).")
                         else:
-                            st.info("Already in Portfolio (active).")
+                            res = log_swap_intent(p, s, decision, tags, swap_url)
+                            if res == "OK":
+                                st.success("Logged to Portfolio (entry snapshot saved).")
+                            else:
+                                st.info("Already in Portfolio (active).")
 
-                    st.markdown(html_link_button(f"Open Swap · {base}/{quote}", swap_url), unsafe_allow_html=True)
+                # Swap button
+                if swap_url:
+                    swap_label = "Open Swap (PancakeSwap)" if chain_id == "bsc" else "Open Swap (Jupiter)"
+                    st.link_button(
+                        swap_label,
+                        swap_url,
+                        use_container_width=True,
+                        key=f"swap_{keybase}",
+                    )
                 else:
-                    st.caption("Swap unavailable (missing token address).")
+                    st.caption("Swap disabled (unexpected).")
 
-    # -------------------- PORTFOLIO --------------------
+                # Solana safety note
+                if chain_id == "solana":
+                    st.caption("Solana: перед свопом глянь Jupiter warnings (JupShield).")
+
+    # -------------------- PORTFOLIO PAGE --------------------
     else:
         st.title("Portfolio / Watchlist")
         st.caption("Entries appear here after clicking **Log → Portfolio (I swapped)** in Scout.")
@@ -836,7 +1015,7 @@ def main():
             st.metric("Closed", len(closed_rows))
         with topbar[2]:
             with open(TRADES_CSV, "rb") as f:
-                st.download_button("Download portfolio.csv", f, file_name="portfolio.csv")
+                st.download_button("Download portfolio.csv", f, file_name="portfolio.csv", use_container_width=True)
 
         st.markdown("---")
 
@@ -884,16 +1063,14 @@ def main():
                 st.markdown(f"### {base_sym}/{quote_sym}")
                 st.caption(f"Chain: {chain} • DEX: {r.get('dex','')}")
                 st.code(base_addr, language="text")
-
                 if r.get("dexscreener_url"):
-                    st.markdown(html_link_button("DexScreener", r["dexscreener_url"]), unsafe_allow_html=True)
-
+                    st.link_button("DexScreener", r["dexscreener_url"], use_container_width=True, key=f"p_ds_{idx}_{hkey(r['dexscreener_url'])}")
                 if r.get("swap_url"):
-                    st.markdown(html_link_button("Swap", r["swap_url"]), unsafe_allow_html=True)
+                    st.link_button("Swap", r["swap_url"], use_container_width=True, key=f"p_sw_{idx}_{hkey(r['swap_url'])}")
 
             with c2:
-                st.write(f"**Entry:** {fmt_price(entry_price_str)}")
-                st.write(f"**Now:** {fmt_price(cur_price)}" if cur_price else "**Now:** n/a")
+                st.write(f"**Entry:** ${entry_price_str}")
+                st.write(f"**Now:** ${cur_price:.8f}" if cur_price else "**Now:** n/a")
                 st.write(f"**PnL:** {pnl:+.2f}%" if entry_price and cur_price else "**PnL:** n/a")
                 st.write(f"**Liq:** {fmt_usd(liq)}" if liq else "**Liq:** n/a")
 
@@ -902,42 +1079,34 @@ def main():
                 st.write(f"**Δ h1:** {fmt_pct(pc1h)}")
                 st.write(f"**Reco:** `{reco}`")
 
-                note_key = f"note_{idx}_{safe_key(base_addr)}"
+                note_key = f"note_{idx}_{hkey(base_addr, chain)}"
                 note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
 
             with c4:
-                close_key = f"close_{idx}_{safe_key(base_addr)}"
-                delete_key = f"delete_{idx}_{safe_key(base_addr)}"
+                close_key = f"close_{idx}_{hkey(base_addr, chain)}"
+                delete_key = f"delete_{idx}_{hkey(base_addr, chain)}"
 
                 close = st.checkbox("Close (archive)", value=False, key=close_key)
                 delete = st.checkbox("Delete row", value=False, key=delete_key)
 
-                if st.button("Apply", key=f"apply_{idx}_{safe_key(base_addr)}", use_container_width=True):
+                if st.button("Apply", key=f"apply_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                     all_rows = load_portfolio()
 
-                    # Update by pair address if possible (safer)
-                    target_pair = (r.get("pair_address") or "").lower()
-                    target_base = (r.get("base_token_address") or "").lower()
-
-                    kept = []
+                    # Update note/close by base token address (active only)
                     for rr in all_rows:
-                        is_target = False
-                        if rr.get("active") == "1":
-                            if target_pair and (rr.get("pair_address") or "").lower() == target_pair:
-                                is_target = True
-                            elif (rr.get("base_token_address") or "").lower() == target_base:
-                                is_target = True
-
-                        if is_target:
-                            if delete:
-                                continue
+                        if rr.get("active") == "1" and (rr.get("base_token_address") or "").lower() == base_addr.lower():
                             rr["note"] = note_val
                             if close:
                                 rr["active"] = "0"
+                            break
 
-                        kept.append(rr)
+                    if delete:
+                        all_rows = [
+                            x for x in all_rows
+                            if not (x.get("active") == "1" and (x.get("base_token_address") or "").lower() == base_addr.lower())
+                        ]
 
-                    save_portfolio(kept)
+                    save_portfolio(all_rows)
                     st.success("Saved.")
                     st.rerun()
 
@@ -948,7 +1117,7 @@ def main():
                 for r in closed_rows[-50:]:
                     st.write(
                         f"{r.get('ts_utc','')} — {r.get('base_symbol','')}/{r.get('quote_symbol','')} "
-                        f"— entry {r.get('entry_price_usd','')} — {r.get('action','')}"
+                        f"— entry ${r.get('entry_price_usd','')} — {r.get('action','')}"
                     )
 
 
