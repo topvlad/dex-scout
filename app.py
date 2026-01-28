@@ -1,67 +1,52 @@
-# app.py — DEX Scout v0.3.5 (stable core: BSC + Solana)
-# Focus: early/small candidates. Majors/stables filtered out. Safety guards kept stable.
-# Core fixes/features:
-# 1) FIX: "NO ENTRY" badge is RED-ish (not green)
-# 2) Stable core: only BSC + Solana (no extra chains to keep mechanics simple & stable)
-# 3) Stronger Filter Debug: shows ALL pipeline stages + bottleneck reason
-# 4) Output dynamics (without extra rug risk):
-#    - Seed sampler (K) with resample on Refresh (session_state)
-#    - Auto-Relax only on market thresholds (liq/vol24/trades/sells/imbalance) — NOT on safety guards
-# 5) Safer Streamlit: no `key=` passed to st.link_button (prevents TypeError in some Streamlit versions)
-# 6) Top tokens mode: optional dedupe by base token (reduces duplicates); kept deterministic
+# app.py — DEX Scout v0.3.6
+# Core goals (stable): BSC + Solana only
+# Fixes:
+# 1) Swap routing:
+#    - BSC -> PancakeSwap
+#    - Solana -> Jupiter (USDC -> token mint)
+# 2) Action color fix:
+#    - NO ENTRY is RED (no substring bug with "ENTRY")
+# Stability fixes:
+# - Avoid StreamlitDuplicateElementKey by using unique keys for buttons
+# - Avoid st.link_button(key=...) TypeError by not passing "key" to link_button at all
+# - Use HTML-styled links (safe, deterministic) for external links
 
 import os
 import re
 import csv
 import time
 import random
-from datetime import datetime
-from typing import Dict, Any, List, Tuple, Optional, Set
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Tuple, Optional
 from collections import Counter
 
 import requests
 import streamlit as st
 
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 TRADES_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 
-# Stable core: only BSC + Solana
+# Stable core: only these two for now (as requested)
 CHAIN_DEX_PRESETS = {
     "bsc": ["pancakeswap", "thena", "biswap", "apeswap", "babyswap", "mdex", "woofi"],
-    "solana": ["raydium", "orca", "meteora"],
+    "solana": ["raydium", "orca", "meteora", "pumpswap"],
 }
 
-# Softer ticker validation (unicode + $, _, -, ., spaces)
+# allow unicode letters/digits + common ticker chars ($ _ - .) + spaces
 NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
 
-# Majors/stables (base token filter)
-MAJOR_OR_STABLE_SYMBOLS = {
-    # majors
+# Majors / stables to exclude (base token symbol)
+MAJORS = {
     "BTC", "WBTC", "ETH", "WETH", "BNB", "WBNB", "SOL", "WSOL",
-    # stables
-    "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FRAX", "LUSD",
-    # common wrappers
-    "WAVAX", "WMATIC",
+    "MATIC", "AVAX", "OP", "ARB", "LINK", "DOT", "ATOM", "TON",
 }
-
-PIPE_STAGES = [
-    "total_in",
-    "after_chain",
-    "after_dex",
-    "after_major_filter",
-    "after_age",
-    "after_liq",
-    "after_vol24",
-    "after_trades",
-    "after_sells",
-    "after_imbalance",
-    "after_name",
-    "passed",
-]
-
+STABLES = {
+    "USDT", "USDC", "DAI", "BUSD", "TUSD", "FDUSD", "USDD", "FRAX", "USDP",
+    "LUSD", "SUSD", "EURC",
+}
 
 # -----------------------------
 # Helpers
@@ -76,12 +61,24 @@ def safe_get(d: Dict[str, Any], *path, default=None):
 
 
 def now_utc_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def fmt_usd(x: float) -> str:
     try:
         return f"${x:,.0f}"
+    except Exception:
+        return "n/a"
+
+
+def fmt_price(x: Any) -> str:
+    try:
+        v = float(x)
+        if v >= 1:
+            return f"${v:,.4f}"
+        if v >= 0.01:
+            return f"${v:,.6f}"
+        return f"${v:.10f}"
     except Exception:
         return "n/a"
 
@@ -100,29 +97,63 @@ def clamp_int(x: float, lo: int = 0, hi: int = 10**9) -> int:
         return lo
 
 
-def safe_key(x: Any, max_len: int = 40) -> str:
+def safe_key(x: str, max_len: int = 60) -> str:
+    # for Streamlit widget keys
     s = str(x or "")
-    s = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", s)
-    if len(s) > max_len:
-        s = s[:max_len]
-    return s or "x"
+    s = re.sub(r"[^a-zA-Z0-9_\-]+", "_", s)
+    return s[:max_len] if len(s) > max_len else s
+
+
+def html_link_button(label: str, url: str) -> str:
+    # Stable alternative to st.link_button (no key issues)
+    if not url:
+        return ""
+    return f"""
+    <a href="{url}" target="_blank" style="
+      display:inline-block;
+      width:100%;
+      text-align:center;
+      padding:10px 12px;
+      border:1px solid rgba(0,0,0,0.15);
+      border-radius:10px;
+      text-decoration:none;
+      font-weight:600;
+      color:inherit;
+      background:rgba(0,0,0,0.02);
+      margin:4px 0;
+    ">{label}</a>
+    """
+
+
+def parse_seeds(seeds_raw: str) -> List[str]:
+    items = [x.strip() for x in (seeds_raw or "").split(",")]
+    items = [x for x in items if x]
+    # dedupe preserving order
+    seen = set()
+    out = []
+    for x in items:
+        k = x.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(x)
+    return out
 
 
 # -----------------------------
 # HTTP with retry/backoff
 # -----------------------------
 def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, max_retries: int = 3) -> Any:
-    """
-    Basic retry/backoff wrapper for DexScreener calls.
-    - Retries on 429 / 5xx / common network errors
-    - Exponential backoff (0.6s, 1.2s, 2.4s ...)
-    """
     last_err = None
     backoff = 0.6
-
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": f"dex-scout/{VERSION}"})
+            r = requests.get(
+                url,
+                params=params,
+                timeout=timeout,
+                headers={"User-Agent": f"dex-scout/{VERSION}"},
+            )
             if r.status_code == 429 or (500 <= r.status_code <= 599):
                 last_err = requests.HTTPError(f"HTTP {r.status_code} (attempt {attempt}/{max_retries})")
                 time.sleep(backoff)
@@ -140,7 +171,6 @@ def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, m
         except Exception as e:
             last_err = e
             break
-
     raise RuntimeError(f"Request failed after {max_retries} tries: {last_err}")
 
 
@@ -179,6 +209,25 @@ def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, An
 
 
 # -----------------------------
+# Swap routing (core)
+# -----------------------------
+def build_swap_url(chain: str, base_addr: str) -> str:
+    if not base_addr:
+        return ""
+    chain = (chain or "").lower()
+
+    if chain == "bsc":
+        return f"https://pancakeswap.finance/swap?outputCurrency={base_addr}"
+
+    if chain == "solana":
+        # Jupiter: USDC -> token mint
+        # (works well as a default; you can change to SOL later if you prefer)
+        return f"https://jup.ag/swap/USDC-{base_addr}"
+
+    return ""
+
+
+# -----------------------------
 # Filtering / Scoring
 # -----------------------------
 def is_name_suspicious(p: Dict[str, Any]) -> bool:
@@ -190,34 +239,11 @@ def is_name_suspicious(p: Dict[str, Any]) -> bool:
     return not bool(NAME_OK_RE.match(base_sym))
 
 
-def is_major_or_stable(p: Dict[str, Any]) -> bool:
+def is_major_or_stable_base(p: Dict[str, Any]) -> bool:
     base_sym = (safe_get(p, "baseToken", "symbol", default="") or "").strip().upper()
     if not base_sym:
-        return False
-    if base_sym in MAJOR_OR_STABLE_SYMBOLS:
         return True
-    # also filter obvious stable-ish patterns
-    if base_sym.endswith("USD") or base_sym in {"USD", "USDE", "USDB", "USDD"}:
-        return True
-    return False
-
-
-def parse_age_minutes(pair_created_at: Any) -> Optional[int]:
-    """
-    DexScreener often provides pairCreatedAt in ms epoch.
-    Return age minutes, or None if cannot parse.
-    """
-    if pair_created_at is None or pair_created_at == "":
-        return None
-    try:
-        created_ms = int(pair_created_at)
-        now_ms = int(time.time() * 1000)
-        age_min = int((now_ms - created_ms) / 60000)
-        if age_min < 0:
-            return None
-        return age_min
-    except Exception:
-        return None
+    return (base_sym in MAJORS) or (base_sym in STABLES)
 
 
 def score_pair(p: Dict[str, Any]) -> float:
@@ -231,46 +257,40 @@ def score_pair(p: Dict[str, Any]) -> float:
     trades5 = buys5 + sells5
 
     s = 0.0
-    s += min(liq / 1000.0, 400.0)
-    s += min(vol24 / 10000.0, 300.0)
-    s += min(vol5 / 2000.0, 200.0)
-    s += min(trades5 * 2.0, 120.0)
-    s += max(min(pc1h, 80.0), -80.0) * 0.3
-    s += max(min(pc5, 30.0), -30.0) * 0.2
+    s += min(liq / 1000.0, 420.0)
+    s += min(vol24 / 10000.0, 320.0)
+    s += min(vol5 / 2000.0, 220.0)
+    s += min(trades5 * 2.0, 140.0)
+    s += max(min(pc1h, 80.0), -80.0) * 0.25
+    s += max(min(pc5, 30.0), -30.0) * 0.20
     return round(s, 2)
 
 
 def action_badge(action: str) -> str:
-    """
-    FIX: "NO ENTRY" must not be green. It is RED-ish.
-    """
+    # FIXED: NO ENTRY must be red (no substring checks)
     a = (action or "").upper().strip()
 
-    if "ENTRY" in a or a.startswith("BUY"):
+    if a.startswith("ENTRY") or a.startswith("BUY"):
         color = "#1f9d55"      # green
         bg = "rgba(31,157,85,0.14)"
-        border = color
-    elif "WATCH" in a or "WAIT" in a:
+    elif a.startswith("WATCH") or a.startswith("WAIT"):
         color = "#d69e2e"      # yellow
         bg = "rgba(214,158,46,0.14)"
-        border = color
     else:
-        # NO ENTRY / RISK / etc
         color = "#e53e3e"      # red
         bg = "rgba(229,62,62,0.10)"
-        border = color
 
     return f"""
     <span style="
       display:inline-block;
       padding:6px 12px;
       border-radius:999px;
-      border:1px solid {border};
+      border:1px solid {color};
       background:{bg};
       color:{color};
       font-weight:800;
       font-size:12px;
-      letter-spacing:0.4px;
+      letter-spacing:0.2px;
     ">{action}</span>
     """
 
@@ -287,7 +307,7 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
 
     if liq >= 250_000:
         liq_tag = "Liquidity: High"
-    elif liq >= 60_000:
+    elif liq >= 80_000:
         liq_tag = "Liquidity: Medium"
     else:
         liq_tag = "Liquidity: Low"
@@ -302,43 +322,39 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
     trend_tag = f"Trend(1h): {fmt_pct(pc1h)}"
     micro_tag = f"Micro(5m): {fmt_pct(pc5)}"
     vol_tag = f"Vol(5m): {fmt_usd(vol5)}"
+
     tags = [liq_tag, flow_tag, trend_tag, micro_tag, vol_tag]
 
-    # conservative decision rules (don’t “force buys”)
     decision = "NO ENTRY"
-    if liq >= 25_000 and vol24 >= 10_000 and trades5 >= 8 and sells5 >= 2:
-        if pc1h > 3 and vol5 > 1_000 and pc5 >= -2:
-            decision = "WATCH / WAIT"
-            # scalp-entry only if flow supports it
-            if trades5 >= 25 and sells5 >= 6 and vol5 >= 5_000 and pc5 >= -1:
-                decision = "ENTRY (scalp)"
+
+    # Conservative scalp entry idea: still "early-ish", not pure degen.
+    # (You can tighten later in presets; this is used after filtering already.)
+    if liq >= 20_000 and vol24 >= 20_000 and trades5 >= 10 and sells5 >= 2:
+        if pc1h > 5 and vol5 > 5_000 and pc5 >= -2:
+            decision = "ENTRY (scalp)"
         else:
-            decision = "NO ENTRY"
+            decision = "WATCH / WAIT"
 
     return decision, tags
-
-
-def _init_stats(n: int) -> Counter:
-    return Counter({k: 0 for k in PIPE_STAGES}) | Counter({"total_in": n})
 
 
 def filter_pairs_with_debug(
     pairs: List[Dict[str, Any]],
     chain: str,
     any_dex: bool,
-    allowed_dexes: Set[str],
+    allowed_dexes: set,
     min_liq: float,
     min_vol24: float,
     min_trades_m5: int,
     min_sells_m5: int,
     max_buy_sell_imbalance: int,
+    filter_majors_stables: bool,
     block_suspicious_names: bool,
-    block_majors: bool,
-    min_age_min: int,
-    max_age_min: int,
-) -> Tuple[List[Dict[str, Any]], Counter, Counter, str]:
-    stats = _init_stats(len(pairs))
+):
+    stats = Counter()
     reasons = Counter()
+
+    stats["total_in"] = len(pairs)
 
     out = []
     for p in pairs:
@@ -355,25 +371,11 @@ def filter_pairs_with_debug(
                 continue
         stats["after_dex"] += 1
 
-        # majors/stables filter (base only)
-        if block_majors and is_major_or_stable(p):
+        # majors / stables filter (base token)
+        if filter_majors_stables and is_major_or_stable_base(p):
             reasons["major_or_stable"] += 1
             continue
         stats["after_major_filter"] += 1
-
-        # age window (anti-rug + still early)
-        age_minutes = parse_age_minutes(safe_get(p, "pairCreatedAt", default=None))
-        if age_minutes is not None:
-            if age_minutes < int(min_age_min):
-                reasons["age_too_fresh"] += 1
-                continue
-            if age_minutes > int(max_age_min):
-                reasons["age_too_old"] += 1
-                continue
-        else:
-            # If API didn't provide creation time — do not kill output.
-            reasons["age_unknown"] += 1
-        stats["after_age"] += 1
 
         liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
         vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
@@ -401,9 +403,10 @@ def filter_pairs_with_debug(
             continue
         stats["after_sells"] += 1
 
-        if buys > 0 and sells > 0:
+        # imbalance
+        if sells > 0 and buys > 0:
             imbalance = max(buys, sells) / max(1, min(buys, sells))
-            if imbalance > int(max_buy_sell_imbalance):
+            if imbalance > max_buy_sell_imbalance:
                 reasons["imbalance>max"] += 1
                 continue
         else:
@@ -418,15 +421,7 @@ def filter_pairs_with_debug(
 
         out.append(p)
 
-    stats["passed"] = len(out)
-
-    # bottleneck reason (excluding chain mismatch noise)
-    bottleneck = "none"
-    ranked_reasons = [(k, v) for k, v in reasons.items() if k != "chain_mismatch"]
-    if ranked_reasons:
-        bottleneck = max(ranked_reasons, key=lambda x: x[1])[0]
-
-    return out, stats, reasons, bottleneck
+    return out, stats, reasons
 
 
 # -----------------------------
@@ -497,7 +492,7 @@ def save_portfolio(rows: List[Dict[str, Any]]):
             w.writerow(row)
 
 
-def log_swap_intent(p: Dict[str, Any], score: float, action: str, tags: List[str], swap_url: str) -> str:
+def log_swap_intent(p: Dict[str, Any], score: float, action: str, tags: List[str], swap_url: str):
     rows = load_portfolio()
 
     chain = (p.get("chainId") or "").lower()
@@ -509,13 +504,11 @@ def log_swap_intent(p: Dict[str, Any], score: float, action: str, tags: List[str
     url = p.get("url", "") or ""
     price = safe_get(p, "priceUsd", default="") or ""
 
-    # avoid duplicates (pair-level uniqueness preferred)
+    # avoid duplicates by pair
     for r in rows:
         if r.get("active") != "1":
             continue
         if pair_addr and (r.get("pair_address", "").lower() == pair_addr.lower()):
-            return "ALREADY_EXISTS"
-        if not pair_addr and base_addr and (r.get("base_token_address", "").lower() == base_addr.lower()):
             return "ALREADY_EXISTS"
 
     rows.append(
@@ -558,230 +551,60 @@ def portfolio_reco(entry: float, current: float, pc1h: float, pc5: float) -> str
 
 
 # -----------------------------
-# Presets (more dynamic, still safe)
+# Presets (more dynamic but still safe-ish)
 # -----------------------------
 PRESETS = {
-    "Scalp Hot (strict)": {
-        "top_n": 12,
-        "min_liq": 25000,
-        "min_vol24": 50000,
-        "min_trades_m5": 20,
-        "min_sells_m5": 6,
-        "max_imbalance": 6,
-        "block_majors": True,
+    "Ultra Early (safer)": {
+        "top_n": 20,
+        "min_liq": 2000,
+        "min_vol24": 5000,
+        "min_trades_m5": 4,
+        "min_sells_m5": 1,
+        "max_imbalance": 20,
+        "filter_majors_stables": True,
         "block_suspicious_names": True,
-        "min_age_min": 20,
-        "max_age_min": 14400,
         "seed_k": 12,
-        "seeds": "new, launch, fairlaunch, stealth, airdrop, v2, v3, inu, pepe, ai, agent, bot, pump, points, claim",
+        "seeds": "new, launch, fairlaunch, stealth, airdrop, points, claim, v2, v3, inu, pepe, ai, agent, bot",
     },
     "Balanced (default)": {
         "top_n": 15,
-        "min_liq": 8000,
-        "min_vol24": 20000,
-        "min_trades_m5": 8,
+        "min_liq": 15000,
+        "min_vol24": 60000,
+        "min_trades_m5": 10,
         "min_sells_m5": 2,
-        "max_imbalance": 10,
-        "block_majors": True,
+        "max_imbalance": 12,
+        "filter_majors_stables": True,
         "block_suspicious_names": True,
-        "min_age_min": 20,
-        "max_age_min": 14400,
-        "seed_k": 14,
-        "seeds": "WBNB, USDT, BNB, meme, ai, ai agent, gaming, cat, dog, launch, pump, sol, eth, usdc, pepe, trump, new, launch, trend, community, fairlaunch, stealth, airdrop, v2, v3, inu, pepe, ai, agent, bot, pump",
+        "seed_k": 10,
+        "seeds": "meme, ai, ai agent, launch, pump, new, community, bot, inu, pepe",
+    },
+    "Scalp Hot (strict)": {
+        "top_n": 12,
+        "min_liq": 30000,
+        "min_vol24": 120000,
+        "min_trades_m5": 25,
+        "min_sells_m5": 6,
+        "max_imbalance": 8,
+        "filter_majors_stables": True,
+        "block_suspicious_names": True,
+        "seed_k": 8,
+        "seeds": "launch, pump, trending, ai, bot, meme, new, community, inu, pepe",
     },
     "Wide Net (explore)": {
         "top_n": 25,
         "min_liq": 3000,
         "min_vol24": 10000,
-        "min_trades_m5": 3,
+        "min_trades_m5": 4,
         "min_sells_m5": 1,
-        "max_imbalance": 15,
-        "block_majors": True,
-        "block_suspicious_names": True,
-        "min_age_min": 20,
-        "max_age_min": 14400,
-        "seed_k": 16,
-        "seeds": "new, launch, trend, community, pump, fairlaunch, stealth, airdrop, claim, points, v2, v3, inu, pepe, ai, agent, bot",
-    },
-    "Ultra Early (safer)": {
-        "top_n": 20,
-        "min_liq": 2000,
-        "min_vol24": 5000,
-        "min_trades_m5": 0,
-        "min_sells_m5": 0,
         "max_imbalance": 20,
-        "block_majors": True,
-        "block_suspicious_names": True,
-        "min_age_min": 15,
-        "max_age_min": 4320,   # 3 days
-        "seed_k": 16,
-        "seeds": "new, fairlaunch, stealth, airdrop, claim, points, launch, v2, v3, inu, pepe, ai, agent, bot, pump",
+        "filter_majors_stables": True,
+        "block_suspicious_names": False,
+        "seed_k": 14,
+        "seeds": "new, launch, trend, community, pump, fairlaunch, presale, stealth, airdrop, claim, points, v2, v3, inu, pepe, ai, agent, bot",
     },
 }
 
 
-# -----------------------------
-# Seed sampling / session state
-# -----------------------------
-def sample_seeds(seeds: List[str], k: int) -> List[str]:
-    seeds = [s.strip() for s in seeds if s.strip()]
-    if not seeds:
-        return []
-    k = max(1, min(int(k), len(seeds)))
-    return random.sample(seeds, k)
-
-
-def get_sampled_seeds(all_seeds: List[str], k: int, force_resample: bool) -> List[str]:
-    """
-    Keeps sampled seeds stable until Refresh (or first load).
-    """
-    ss_key = "sampled_seeds"
-    base_key = "sampled_seeds_base"
-
-    base_sig = "|".join(sorted(set([s.strip().lower() for s in all_seeds if s.strip()])))
-    prev_sig = st.session_state.get(base_key)
-
-    if force_resample or (ss_key not in st.session_state) or (prev_sig != base_sig):
-        st.session_state[ss_key] = sample_seeds(all_seeds, k)
-        st.session_state[base_key] = base_sig
-
-    return st.session_state[ss_key]
-
-
-# -----------------------------
-# Rendering helpers
-# -----------------------------
-def render_tags(tags: List[str]):
-    for t in tags:
-        st.write(f"- {t}")
-
-
-def build_swap_url(chain: str, base_addr: str) -> str:
-    # BSC only for now (stable core)
-    if chain.lower() == "bsc" and base_addr:
-        return f"https://pancakeswap.finance/swap?outputCurrency={base_addr}"
-    return ""
-
-
-def dedupe_pairs(pairs: List[Dict[str, Any]], mode_top_tokens: bool) -> List[Dict[str, Any]]:
-    """
-    If mode_top_tokens: dedupe by base token address (per chain), keeps the "best" pair by liq+vol24.
-    Else: dedupe by pairAddress/url.
-    """
-    if not pairs:
-        return []
-
-    if not mode_top_tokens:
-        uniq = {}
-        for p in pairs:
-            pa = p.get("pairAddress") or p.get("url")
-            if not pa:
-                continue
-            uniq[str(pa)] = p
-        return list(uniq.values())
-
-    # top tokens mode: group by base token
-    buckets: Dict[str, Dict[str, Any]] = {}
-    for p in pairs:
-        chain = (p.get("chainId") or "").lower()
-        base_addr = (safe_get(p, "baseToken", "address", default="") or "").lower().strip()
-        base_sym = (safe_get(p, "baseToken", "symbol", default="") or "").lower().strip()
-
-        key = f"{chain}:{base_addr}" if base_addr else f"{chain}:sym:{base_sym}"
-        if key.strip() == ":":
-            continue
-
-        liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
-        vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
-        score = liq * 1.0 + vol24 * 0.2
-
-        if key not in buckets:
-            buckets[key] = {"p": p, "k": score}
-        else:
-            if score > buckets[key]["k"]:
-                buckets[key] = {"p": p, "k": score}
-
-    return [v["p"] for v in buckets.values()]
-
-
-# -----------------------------
-# Auto-Relax (market thresholds only)
-# -----------------------------
-def auto_relax_search(
-    pairs: List[Dict[str, Any]],
-    base_params: Dict[str, Any],
-    allowed_dexes: Set[str],
-    top_n: int,
-) -> Tuple[List[Tuple[float, str, List[str], Dict[str, Any]]], Optional[str]]:
-    """
-    Returns ranked list and a note describing the relaxation applied.
-    Safety guards are not relaxed.
-    """
-    # keep safety stable
-    chain = base_params["chain"]
-    any_dex = base_params["any_dex"]
-    block_majors = base_params["block_majors"]
-    block_suspicious_names = base_params["block_suspicious_names"]
-    min_age_min = base_params["min_age_min"]
-    max_age_min = base_params["max_age_min"]
-
-    # initial + relax levels (ONLY market thresholds)
-    relax_levels = [
-        {"label": None, "k": 1.0, "imb_add": 0},
-        {"label": "Auto-Relax L1", "k": 0.75, "imb_add": 3},
-        {"label": "Auto-Relax L2", "k": 0.55, "imb_add": 6},
-        {"label": "Auto-Relax L3", "k": 0.40, "imb_add": 10},
-    ]
-
-    for level in relax_levels:
-        k = level["k"]
-        r_min_liq = clamp_int(float(base_params["min_liq"]) * k, 0)
-        r_min_vol24 = clamp_int(float(base_params["min_vol24"]) * k, 0)
-        r_min_trades = clamp_int(int(base_params["min_trades_m5"]) * k, 0)
-        r_min_sells = clamp_int(int(base_params["min_sells_m5"]) * k, 0)
-        r_imb = clamp_int(int(base_params["max_imbalance"]) + level["imb_add"], 1, 50)
-
-        filtered, _, _, _ = filter_pairs_with_debug(
-            pairs=pairs,
-            chain=chain,
-            any_dex=any_dex,
-            allowed_dexes=allowed_dexes,
-            min_liq=r_min_liq,
-            min_vol24=r_min_vol24,
-            min_trades_m5=r_min_trades,
-            min_sells_m5=r_min_sells,
-            max_buy_sell_imbalance=r_imb,
-            block_suspicious_names=block_suspicious_names,
-            block_majors=block_majors,
-            min_age_min=min_age_min,
-            max_age_min=max_age_min,
-        )
-
-        ranked = []
-        for p in filtered:
-            s = score_pair(p)
-            decision, tags = build_trade_hint(p)
-            ranked.append((s, decision, tags, p))
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        ranked = ranked[:top_n]
-
-        if ranked:
-            if level["label"] is None:
-                return ranked, None
-            note = (
-                f"{level['label']} applied: "
-                f"min_liq={r_min_liq}, min_vol24={r_min_vol24}, "
-                f"min_trades_m5={r_min_trades}, min_sells_m5={r_min_sells}, "
-                f"max_imbalance={r_imb}"
-            )
-            return ranked, note
-
-    return [], None
-
-
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     st.set_page_config(page_title="DEX Scout", layout="wide")
 
@@ -796,8 +619,11 @@ def main():
 
         st.divider()
 
-        # core chains only
-        chain = st.selectbox("Chain", options=["bsc", "solana"], index=0)
+        chain = st.selectbox(
+            "Chain",
+            options=list(CHAIN_DEX_PRESETS.keys()),
+            index=0,
+        )
 
         st.caption("DEX filter")
         any_dex = st.checkbox("Any DEX (no filter)", value=True)
@@ -812,55 +638,52 @@ def main():
             )
 
         top_n = st.slider("Top N", 5, 50, int(preset["top_n"]), step=1)
-
-        min_liq = st.number_input("Min Liquidity ($)", min_value=0, value=int(preset["min_liq"]), step=500)
-        min_vol24 = st.number_input("Min 24h Volume ($)", min_value=0, value=int(preset["min_vol24"]), step=1000)
+        min_liq = st.number_input("Min Liquidity ($)", min_value=0, value=int(preset["min_liq"]), step=1000)
+        min_vol24 = st.number_input("Min 24h Volume ($)", min_value=0, value=int(preset["min_vol24"]), step=5000)
 
         st.divider()
         st.caption("Real trading filters")
         min_trades_m5 = st.slider("Min trades (5m)", 0, 200, int(preset["min_trades_m5"]), step=1)
         min_sells_m5 = st.slider("Min sells (5m)", 0, 80, int(preset["min_sells_m5"]), step=1)
-        max_imbalance = st.slider("Max buy/sell imbalance", 1, 30, int(preset["max_imbalance"]), step=1)
+        max_buy_sell_imbalance = st.slider("Max buy/sell imbalance", 1, 30, int(preset["max_imbalance"]), step=1)
 
         st.divider()
         st.caption("Safety guards")
-        block_majors = st.checkbox("Filter majors/stables (base)", value=bool(preset["block_majors"]))
+        filter_majors_stables = st.checkbox("Filter majors/stables (base)", value=bool(preset["filter_majors_stables"]))
         block_suspicious_names = st.checkbox("Filter suspicious tickers", value=bool(preset["block_suspicious_names"]))
-
-        st.caption("Pair age window (anti-rug + still early)")
-        min_age_min = st.number_input("Min age (minutes)", min_value=0, value=int(preset["min_age_min"]), step=5)
-        max_age_min = st.number_input("Max age (minutes)", min_value=0, value=int(preset["max_age_min"]), step=60)
 
         st.divider()
         st.caption("Output dynamics")
-        top_tokens_mode = st.checkbox("Top tokens mode (dedupe by base token)", value=True)
         seed_k = st.slider("Seed sampler K", 3, 20, int(preset["seed_k"]), step=1)
 
         st.divider()
         st.caption("Queries (comma-separated)")
-        seeds_text = st.text_area("Search seeds", value=str(preset["seeds"]), height=120)
+        seeds_raw = st.text_area("Search seeds", value=str(preset["seeds"]), height=110)
 
         refresh = st.button("Refresh now")
         if refresh:
             st.cache_data.clear()
-            # force resample by resetting session key
-            st.session_state.pop("sampled_seeds", None)
-            st.session_state.pop("sampled_seeds_base", None)
+            # also rotate seed sampling without needing extra input
+            st.session_state["seed_shuffle_nonce"] = random.randint(1, 10**9)
 
-    # -------------------- SCOUT PAGE --------------------
+    # -------------------- SCOUT --------------------
     if page == "Scout":
         st.title("DEX Scout — early candidates (DEXScreener API)")
         st.caption("Фокус: дрібні/ранні монети. Majors/stables відсікаються. Stable core: BSC + Solana.")
 
-        all_seeds = [s.strip() for s in seeds_text.split(",") if s.strip()]
-        if not all_seeds:
+        seeds = parse_seeds(seeds_raw)
+        if not seeds:
             st.info("Додай хоча б 1 seed у sidebar.")
             return
 
-        sampled = get_sampled_seeds(all_seeds, seed_k, force_resample=refresh)
-        st.caption(f"Seeds sampled ({len(sampled)}/{len(all_seeds)}): {', '.join(sampled)}")
+        # Seed sampling for dynamic output (still deterministic enough per refresh)
+        nonce = st.session_state.get("seed_shuffle_nonce", 0)
+        rnd = random.Random(str(nonce) + "|" + preset_name + "|" + chain)
+        sampled = seeds[:]
+        rnd.shuffle(sampled)
+        sampled = sampled[: min(seed_k, len(sampled))]
 
-        allowed = set([d.lower() for d in selected_dexes]) if selected_dexes else set()
+        st.caption(f"Seeds sampled ({len(sampled)}/{len(seeds)}): " + ", ".join(sampled))
 
         all_pairs: List[Dict[str, Any]] = []
         query_failures = 0
@@ -868,47 +691,38 @@ def main():
         for q in sampled:
             try:
                 all_pairs.extend(fetch_latest_pairs_for_query(q))
-                time.sleep(0.10)
+                time.sleep(0.10)  # gentle pacing
             except Exception as e:
                 query_failures += 1
                 st.warning(f"Query failed: {q} — {e}")
 
         # Deduplicate
-        pairs = dedupe_pairs(all_pairs, mode_top_tokens=bool(top_tokens_mode))
+        uniq = {}
+        for p in all_pairs:
+            pa = p.get("pairAddress") or p.get("url")
+            if not pa:
+                continue
+            uniq[pa] = p
+        pairs = list(uniq.values())
 
         if query_failures and not pairs:
-            st.error("All sampled queries failed or returned no data. Try Refresh, reduce seeds, or wait a bit.")
+            st.error("Усі запити впали або повернули 0. Натисни Refresh або зменш seeds.")
             return
 
-        base_params = {
-            "chain": chain,
-            "any_dex": any_dex,
-            "min_liq": float(min_liq),
-            "min_vol24": float(min_vol24),
-            "min_trades_m5": int(min_trades_m5),
-            "min_sells_m5": int(min_sells_m5),
-            "max_imbalance": int(max_imbalance),
-            "block_suspicious_names": bool(block_suspicious_names),
-            "block_majors": bool(block_majors),
-            "min_age_min": int(min_age_min),
-            "max_age_min": int(max_age_min),
-        }
+        allowed = set([d.lower() for d in selected_dexes]) if selected_dexes else set()
 
-        # First pass: also keep debug stats
-        filtered, fstats, freasons, bottleneck = filter_pairs_with_debug(
+        filtered, fstats, freasons = filter_pairs_with_debug(
             pairs=pairs,
             chain=chain,
             any_dex=any_dex,
             allowed_dexes=allowed,
-            min_liq=base_params["min_liq"],
-            min_vol24=base_params["min_vol24"],
-            min_trades_m5=base_params["min_trades_m5"],
-            min_sells_m5=base_params["min_sells_m5"],
-            max_buy_sell_imbalance=base_params["max_imbalance"],
-            block_suspicious_names=base_params["block_suspicious_names"],
-            block_majors=base_params["block_majors"],
-            min_age_min=base_params["min_age_min"],
-            max_age_min=base_params["max_age_min"],
+            min_liq=float(min_liq),
+            min_vol24=float(min_vol24),
+            min_trades_m5=int(min_trades_m5),
+            min_sells_m5=int(min_sells_m5),
+            max_buy_sell_imbalance=int(max_buy_sell_imbalance),
+            filter_majors_stables=bool(filter_majors_stables),
+            block_suspicious_names=bool(block_suspicious_names),
         )
 
         ranked = []
@@ -919,44 +733,29 @@ def main():
         ranked.sort(key=lambda x: x[0], reverse=True)
         ranked = ranked[:top_n]
 
-        # If nothing — try auto-relax (market thresholds only)
-        relax_note = None
-        if not ranked:
-            ranked, relax_note = auto_relax_search(
-                pairs=pairs,
-                base_params=base_params,
-                allowed_dexes=allowed,
-                top_n=int(top_n),
-            )
-
         st.metric("Passed filters", len(ranked))
 
         with st.expander("Why 0 results? (Filter Debug)", expanded=False):
             st.write("**Fetched:**", len(all_pairs), " • **Deduped:**", len(pairs))
             st.write("**Counts (pipeline):**")
-            # ensure all keys appear
-            st.json({k: int(fstats.get(k, 0)) for k in PIPE_STAGES})
+            st.json(dict(fstats))
             st.write("**Top reject reasons:**")
-            top = freasons.most_common(12)
-            st.write({k: int(v) for k, v in top} if top else "No rejects counted (unexpected).")
-            st.write("**Bottleneck:**", bottleneck)
-
-        if relax_note:
-            st.info(relax_note)
+            top = freasons.most_common(10)
+            st.write({k: v for k, v in top} if top else "No rejects counted (unexpected).")
 
         if not ranked:
-            st.warning("0 results. Hit Refresh (resample seeds) або трохи ослаб vol24 / trades / sells.")
+            st.info("0 results. Спробуй: трохи знизити Min Liquidity/Vol24 або натисни Refresh (пересемплити seeds).")
             return
 
         # Render cards
-        for idx, (s, decision, tags, p) in enumerate(ranked, start=1):
+        for i, (s, decision, tags, p) in enumerate(ranked, start=1):
             base = safe_get(p, "baseToken", "symbol", default="???") or "???"
             quote = safe_get(p, "quoteToken", "symbol", default="???") or "???"
             dex = p.get("dexId", "?")
+            chain_id = (p.get("chainId", "") or "").lower()
             url = p.get("url", "")
-            chain_id = (p.get("chainId") or "").lower()
-            price = safe_get(p, "priceUsd", default=None)
 
+            price = safe_get(p, "priceUsd", default=None)
             liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
             vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
             vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
@@ -978,8 +777,7 @@ def main():
                 st.caption(f"{chain_id} • {dex}")
 
                 if url:
-                    # IMPORTANT: do NOT pass key= to link_button (prevents TypeError on some versions)
-                    st.link_button("Open DexScreener", url, use_container_width=True)
+                    st.markdown(html_link_button(f"Open DexScreener · {base}/{quote}", url), unsafe_allow_html=True)
 
                 if base_addr:
                     st.caption("Token contract (baseToken.address)")
@@ -989,7 +787,7 @@ def main():
                     st.code(pair_addr, language="text")
 
             with mid:
-                st.write(f"**Price:** ${price}" if price else "**Price:** n/a")
+                st.write(f"**Price:** {fmt_price(price)}" if price else "**Price:** n/a")
                 st.write(f"**Liq:** {fmt_usd(liq)}")
                 st.write(f"**Vol24:** {fmt_usd(vol24)}")
                 st.write(f"**Vol m5:** {fmt_usd(vol5)}")
@@ -999,27 +797,30 @@ def main():
                 st.write(f"**Score:** {s}")
 
             with right:
-                st.write("**Action:**")
+                st.markdown("**Action:**")
                 st.markdown(action_badge(decision), unsafe_allow_html=True)
-                st.write("**Tags:**")
-                render_tags(tags)
 
-                # Log button must have unique key
-                k_log = f"log_{safe_key(chain_id)}_{safe_key(base_addr)}_{safe_key(pair_addr)}_{idx}"
-                if st.button("Log → Portfolio (I swapped)", key=k_log, use_container_width=True):
-                    # we log swap_url even if empty (e.g. solana), but it’s fine; it’s a "log intent"
-                    res = log_swap_intent(p, s, decision, tags, swap_url)
-                    if res == "OK":
-                        st.success("Logged to Portfolio (entry snapshot saved).")
-                    else:
-                        st.info("Already in Portfolio (active).")
+                st.markdown("**Tags:**")
+                for t in tags:
+                    st.write(f"• {t}")
+
+                # unique keys (no duplicates)
+                uniq_id = f"{chain_id}_{safe_key(pair_addr or base_addr)}_{i}"
 
                 if swap_url:
-                    st.link_button("Open Swap (PancakeSwap)", swap_url, use_container_width=True)
-                else:
-                    st.caption("Swap disabled for this chain (BSC-only).")
+                    key_log = f"log_{uniq_id}"
+                    if st.button("Log → Portfolio (I swapped)", key=key_log, use_container_width=True):
+                        res = log_swap_intent(p, s, decision, tags, swap_url)
+                        if res == "OK":
+                            st.success("Logged to Portfolio (entry snapshot saved).")
+                        else:
+                            st.info("Already in Portfolio (active).")
 
-    # -------------------- PORTFOLIO PAGE --------------------
+                    st.markdown(html_link_button(f"Open Swap · {base}/{quote}", swap_url), unsafe_allow_html=True)
+                else:
+                    st.caption("Swap unavailable (missing token address).")
+
+    # -------------------- PORTFOLIO --------------------
     else:
         st.title("Portfolio / Watchlist")
         st.caption("Entries appear here after clicking **Log → Portfolio (I swapped)** in Scout.")
@@ -1082,16 +883,17 @@ def main():
             with c1:
                 st.markdown(f"### {base_sym}/{quote_sym}")
                 st.caption(f"Chain: {chain} • DEX: {r.get('dex','')}")
-                if base_addr:
-                    st.code(base_addr, language="text")
+                st.code(base_addr, language="text")
+
                 if r.get("dexscreener_url"):
-                    st.link_button("DexScreener", r["dexscreener_url"], use_container_width=True)
+                    st.markdown(html_link_button("DexScreener", r["dexscreener_url"]), unsafe_allow_html=True)
+
                 if r.get("swap_url"):
-                    st.link_button("Swap", r["swap_url"], use_container_width=True)
+                    st.markdown(html_link_button("Swap", r["swap_url"]), unsafe_allow_html=True)
 
             with c2:
-                st.write(f"**Entry:** ${entry_price_str}")
-                st.write(f"**Now:** ${cur_price:.8f}" if cur_price else "**Now:** n/a")
+                st.write(f"**Entry:** {fmt_price(entry_price_str)}")
+                st.write(f"**Now:** {fmt_price(cur_price)}" if cur_price else "**Now:** n/a")
                 st.write(f"**PnL:** {pnl:+.2f}%" if entry_price and cur_price else "**PnL:** n/a")
                 st.write(f"**Liq:** {fmt_usd(liq)}" if liq else "**Liq:** n/a")
 
@@ -1112,19 +914,30 @@ def main():
 
                 if st.button("Apply", key=f"apply_{idx}_{safe_key(base_addr)}", use_container_width=True):
                     all_rows = load_portfolio()
-                    # update by base token address (simple & stable)
+
+                    # Update by pair address if possible (safer)
+                    target_pair = (r.get("pair_address") or "").lower()
+                    target_base = (r.get("base_token_address") or "").lower()
+
+                    kept = []
                     for rr in all_rows:
-                        if rr.get("active") == "1" and (rr.get("base_token_address") or "").lower() == base_addr.lower():
+                        is_target = False
+                        if rr.get("active") == "1":
+                            if target_pair and (rr.get("pair_address") or "").lower() == target_pair:
+                                is_target = True
+                            elif (rr.get("base_token_address") or "").lower() == target_base:
+                                is_target = True
+
+                        if is_target:
+                            if delete:
+                                continue
                             rr["note"] = note_val
                             if close:
                                 rr["active"] = "0"
-                            break
-                    if delete:
-                        all_rows = [
-                            x for x in all_rows
-                            if not (x.get("active") == "1" and (x.get("base_token_address") or "").lower() == base_addr.lower())
-                        ]
-                    save_portfolio(all_rows)
+
+                        kept.append(rr)
+
+                    save_portfolio(kept)
                     st.success("Saved.")
                     st.rerun()
 
@@ -1132,10 +945,10 @@ def main():
 
         if closed_rows:
             with st.expander("Closed / Archived"):
-                for r in closed_rows[-30:]:
+                for r in closed_rows[-50:]:
                     st.write(
                         f"{r.get('ts_utc','')} — {r.get('base_symbol','')}/{r.get('quote_symbol','')} "
-                        f"— entry ${r.get('entry_price_usd','')} — {r.get('action','')}"
+                        f"— entry {r.get('entry_price_usd','')} — {r.get('action','')}"
                     )
 
 
