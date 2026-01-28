@@ -1,12 +1,14 @@
-# app.py — DEX Scout v0.3.2
-# Changes from v0.3.1:
-# - Fix layout regression: restore "right" column rendering for actions/buttons
-# - Top tokens mode: de-duplicate ranked results by base token (keep best-scoring pool per token)
-# - Portfolio "Apply" now matches by pair_address when available (more accurate for multi-pool tokens)
-# - Minor safety: sanitize keys and handle missing pair/base addresses more consistently
+# app.py — DEX Scout v0.3.3 (CORE)
+# Core goals:
+# - Only BSC + Solana (stable core)
+# - Exclude majors/stables by default (no ETH/BTC/USDT/USDC etc in results)
+# - Fix Streamlit TypeError: st.link_button does NOT accept key in some versions
+# - Keep Filter Debug + Auto-Relax + Retry/Backoff
 #
 # Notes:
-# - Swap URL still PancakeSwap-only (BSC); chain->swap map later.
+# - Swap URL remains PancakeSwap-only for BSC.
+# - Solana: "swap" button disabled for now (future: Jupiter/Raydium deep link map).
+# - This is the "crystallized core": only add features later, don't change core behavior.
 
 import os
 import re
@@ -19,25 +21,73 @@ from collections import Counter
 import requests
 import streamlit as st
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 TRADES_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 
+# CORE: only chains we support now
 CHAIN_DEX_PRESETS = {
     "bsc": ["pancakeswap", "thena", "biswap", "apeswap", "babyswap", "mdex", "woofi"],
-    "ethereum": ["uniswap", "sushiswap"],
-    "base": ["aerodrome", "uniswap"],
-    "polygon": ["quickswap", "uniswap", "sushiswap"],
-    "arbitrum": ["uniswap", "sushiswap", "camelot"],
-    "optimism": ["uniswap", "velodrome"],
     "solana": ["raydium", "orca", "meteora"],
 }
 
-# Softer, more realistic ticker validation:
 # allow unicode letters/digits + common ticker chars ($ _ - .) + spaces
 NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
+
+
+# -----------------------------
+# Majors / stables exclusion (CORE)
+# -----------------------------
+# Symbol-level blocklist: anything here will NOT be shown as base token candidate.
+BLOCK_BASE_SYMBOLS = {
+    # majors
+    "BTC", "WBTC", "TBTC", "BTCB", "BBTC",
+    "ETH", "WETH", "STETH", "WSTETH",
+    "BNB", "WBNB",
+    "SOL", "WSOL",
+
+    # stables
+    "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FDUSD",
+    "USDE", "SUSDE", "FRAX", "LUSD", "USDD",
+    "EURC", "EURS",
+}
+
+# Address-level blocklist (helps when symbols are tricky or wrapped)
+# BSC known common addresses (lowercased)
+BLOCK_BASE_ADDR = {
+    "bsc": {
+        # WBNB
+        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+        # ETH (Binance-Peg Ethereum)
+        "0x2170ed0880ac9a755fd29b2688956bd959f933f8",
+        # BTCB (Binance-Peg BTCB)
+        "0x7130d2a12b9bcfaae4f2634d864a1ee1ce3ead9c",
+        # USDT (BSC)
+        "0x55d398326f99059ff775485246999027b3197955",
+        # USDC (BSC)
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+        # DAI (BSC)
+        "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3",
+        # FDUSD (BSC) (common; if not present, harmless)
+        "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409",
+    },
+    "solana": {
+        # We mostly rely on symbol filtering on Solana; addresses vary.
+        # (Leave empty for now)
+    },
+}
+
+
+def is_blocked_major_or_stable(chain: str, base_symbol: str, base_addr: str) -> bool:
+    sym = (base_symbol or "").strip().upper()
+    if sym in BLOCK_BASE_SYMBOLS:
+        return True
+    addr = (base_addr or "").strip().lower()
+    if addr and addr in BLOCK_BASE_ADDR.get((chain or "").lower(), set()):
+        return True
+    return False
 
 
 # -----------------------------
@@ -78,7 +128,6 @@ def clamp_int(x: int, lo: int = 0, hi: int = 10**9) -> int:
 
 
 def safe_key(s: str) -> str:
-    """Make a string safe for Streamlit widget keys."""
     if not s:
         return "na"
     return re.sub(r"[^A-Za-z0-9_\-\.]+", "_", s)[:120]
@@ -114,7 +163,6 @@ def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, m
             else:
                 break
         except Exception as e:
-            # Unknown error: do not spin too long
             last_err = e
             break
 
@@ -190,13 +238,13 @@ def score_pair(p: Dict[str, Any]) -> float:
 def action_badge(action: str) -> str:
     a = (action or "").upper()
     if "ENTRY" in a or a.startswith("BUY"):
-        color = "#1f9d55"      # green
+        color = "#1f9d55"
         bg = "rgba(31,157,85,0.15)"
     elif "WATCH" in a or "WAIT" in a:
-        color = "#d69e2e"      # yellow
+        color = "#d69e2e"
         bg = "rgba(214,158,46,0.15)"
     else:
-        color = "#e53e3e"      # red
+        color = "#e53e3e"
         bg = "rgba(229,62,62,0.12)"
     return f"""
     <span style="
@@ -264,6 +312,7 @@ def filter_pairs_with_debug(
     min_sells_m5: int,
     max_buy_sell_imbalance: int,
     block_suspicious_names: bool,
+    exclude_majors_stables: bool,
 ):
     stats = Counter()
     reasons = Counter()
@@ -272,7 +321,8 @@ def filter_pairs_with_debug(
 
     out = []
     for p in pairs:
-        if (p.get("chainId") or "").lower() != chain.lower():
+        chain_id = (p.get("chainId") or "").lower()
+        if chain_id != chain.lower():
             reasons["chain_mismatch"] += 1
             continue
         stats["after_chain"] += 1
@@ -282,6 +332,14 @@ def filter_pairs_with_debug(
                 reasons["dex_not_allowed"] += 1
                 continue
         stats["after_dex"] += 1
+
+        base_sym = safe_get(p, "baseToken", "symbol", default="") or ""
+        base_addr = safe_get(p, "baseToken", "address", default="") or ""
+
+        if exclude_majors_stables and is_blocked_major_or_stable(chain_id, base_sym, base_addr):
+            reasons["major_or_stable"] += 1
+            continue
+        stats["after_major_filter"] += 1
 
         liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
         vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
@@ -330,15 +388,10 @@ def filter_pairs_with_debug(
 
 
 def dedupe_ranked_by_token(ranked: List[Tuple[float, str, List[str], Dict[str, Any]]]) -> List[Tuple[float, str, List[str], Dict[str, Any]]]:
-    """
-    Keep only best-scoring entry per base token address.
-    This converts "Top pairs" into "Top tokens".
-    """
     best_by_token: Dict[str, Tuple[float, str, List[str], Dict[str, Any]]] = {}
     for s, decision, tags, p in ranked:
         base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip().lower()
         if not base_addr:
-            # if no base address, keep as-is but with synthetic key
             base_addr = f"__noaddr__{safe_key(p.get('url', '') or p.get('pairAddress', '') or str(id(p)))}"
         cur = best_by_token.get(base_addr)
         if cur is None or s > cur[0]:
@@ -474,7 +527,7 @@ def portfolio_reco(entry: float, current: float, pc1h: float, pc5: float) -> str
 
 
 # -----------------------------
-# Presets
+# Presets (keep your seeds; majors filtered out anyway)
 # -----------------------------
 PRESETS = {
     "Scalp Hot (strict)": {
@@ -513,7 +566,6 @@ PRESETS = {
 def main():
     st.set_page_config(page_title="DEX Scout", layout="wide")
 
-    # Sidebar navigation (mobile-friendly)
     with st.sidebar:
         st.markdown("### DEX Scout")
         st.caption(f"Version: v{VERSION}")
@@ -525,11 +577,7 @@ def main():
 
         st.divider()
 
-        chain = st.selectbox(
-            "Chain",
-            options=sorted(list(CHAIN_DEX_PRESETS.keys())),
-            index=sorted(list(CHAIN_DEX_PRESETS.keys())).index("bsc") if "bsc" in CHAIN_DEX_PRESETS else 0,
-        )
+        chain = st.selectbox("Chain", options=["bsc", "solana"], index=0)
 
         st.caption("DEX filter")
         any_dex = st.checkbox("Any DEX (no filter)", value=True)
@@ -557,6 +605,9 @@ def main():
         block_suspicious_names = st.checkbox("Filter suspicious names", value=bool(preset["block_suspicious_names"]))
 
         st.divider()
+        exclude_majors_stables = st.checkbox("Exclude majors + stables (recommended)", value=True)
+
+        st.divider()
         st.caption("Queries (comma-separated)")
         seeds = st.text_area("Search seeds", value=str(preset["seeds"]), height=110)
 
@@ -569,8 +620,8 @@ def main():
 
     # -------------------- SCOUT PAGE --------------------
     if page == "Scout":
-        st.title("DEX Scout — actionable candidates (DEXScreener API)")
-        st.caption("Кнопки, теги без емодзі, кольори тільки по дії, лог в портфель. Mobile-friendly.")
+        st.title("DEX Scout — early candidates (DEXScreener API)")
+        st.caption("Фокус: дрібні/ранні монети. Majors/stables відсікаються. Stable core: BSC + Solana.")
 
         queries = [q.strip() for q in seeds.split(",") if q.strip()]
         if not queries:
@@ -583,12 +634,11 @@ def main():
         for q in queries:
             try:
                 all_pairs.extend(fetch_latest_pairs_for_query(q))
-                time.sleep(0.12)  # gentle pacing to reduce rate-limits
+                time.sleep(0.12)
             except Exception as e:
                 query_failures += 1
                 st.warning(f"Query failed: {q} — {e}")
 
-        # Deduplicate by pairAddress/url
         uniq = {}
         for p in all_pairs:
             pa = p.get("pairAddress") or p.get("url")
@@ -614,6 +664,7 @@ def main():
             min_sells_m5=int(min_sells_m5),
             max_buy_sell_imbalance=int(max_buy_sell_imbalance),
             block_suspicious_names=bool(block_suspicious_names),
+            exclude_majors_stables=bool(exclude_majors_stables),
         )
 
         ranked: List[Tuple[float, str, List[str], Dict[str, Any]]] = []
@@ -637,7 +688,7 @@ def main():
             st.write("**Counts (pipeline):**")
             st.json(dict(fstats))
             st.write("**Top reject reasons:**")
-            top = freasons.most_common(10)
+            top = freasons.most_common(12)
             if top:
                 st.write({k: v for k, v in top})
             else:
@@ -671,6 +722,7 @@ def main():
                     min_sells_m5=r_min_sells,
                     max_buy_sell_imbalance=r_imb,
                     block_suspicious_names=bool(block_suspicious_names),
+                    exclude_majors_stables=bool(exclude_majors_stables),
                 )
 
                 ranked2: List[Tuple[float, str, List[str], Dict[str, Any]]] = []
@@ -732,8 +784,10 @@ def main():
             with left:
                 st.markdown(f"### {base}/{quote}")
                 st.caption(f"{p.get('chainId','')} • {dex}")
+
                 if url:
-                    st.link_button("Open DexScreener", url, use_container_width=True)
+                    # FIX: no key= for link_button (TypeError in some Streamlit versions)
+                    st.link_button(f"Open DexScreener · {base}/{quote}", url, use_container_width=True)
 
                 if base_addr:
                     st.caption("Token contract (baseToken.address)")
@@ -770,14 +824,17 @@ def main():
                             else:
                                 st.info("Already in Portfolio (active).")
 
+                        # FIX: no key= for link_button
                         st.link_button(
-                            "Open Swap (PancakeSwap)",
+                            f"Open Swap (PancakeSwap) · {base}/{quote}",
                             swap_url,
                             use_container_width=True,
-                            key=f"swap_{safe_key(chain_id)}_{safe_key(base_addr)}_{safe_key(pair_addr)}",
                         )
                     else:
-                        st.caption("Swap button disabled for this chain (BSC-only in v0.3.2).")
+                        if chain_id == "solana":
+                            st.caption("Swap disabled for Solana in core (will add Jupiter/Raydium mapping later).")
+                        else:
+                            st.caption("Swap button disabled for this chain (core supports BSC swap only).")
                 else:
                     st.caption("Swap unavailable (missing base token address).")
 
@@ -819,8 +876,6 @@ def main():
             except Exception:
                 entry_price = 0.0
 
-            # NOTE: For now we still pull "best pair for token" by base_addr for live price.
-            # In future we can store & query by pair_addr for higher fidelity.
             best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
 
             cur_price = 0.0
@@ -853,10 +908,11 @@ def main():
                 if pair_addr:
                     st.caption("Pair / pool")
                     st.code(pair_addr, language="text")
+
                 if r.get("dexscreener_url"):
-                    st.link_button("DexScreener", r["dexscreener_url"], use_container_width=True)
+                    st.link_button(f"DexScreener · {base_sym}/{quote_sym}", r["dexscreener_url"], use_container_width=True)
                 if r.get("swap_url"):
-                    st.link_button("Swap", r["swap_url"], use_container_width=True)
+                    st.link_button(f"Swap · {base_sym}/{quote_sym}", r["swap_url"], use_container_width=True)
 
             with c2:
                 st.write(f"**Entry:** ${entry_price_str}")
@@ -893,7 +949,6 @@ def main():
                             return rr_pair == target_pair
                         return rr_base == target_base
 
-                    # update note + close
                     for rr in all_rows:
                         if _is_target(rr):
                             rr["note"] = note_val
@@ -901,7 +956,6 @@ def main():
                                 rr["active"] = "0"
                             break
 
-                    # delete if requested
                     if delete:
                         all_rows = [x for x in all_rows if not _is_target(x)]
 
