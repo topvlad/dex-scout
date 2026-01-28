@@ -1,10 +1,12 @@
-# app.py — DEX Scout v0.3.0
-# Changes:
-# - Mobile-friendly navigation (sidebar page switch вместо tabs)
-# - Action colors: GREEN only for ENTRY, YELLOW for WATCH, RED for NO ENTRY
-# - Tags: no emoji, more informative
-# - Links: buttons only
-# - Presets: simple named presets that set thresholds/seeds
+# app.py — DEX Scout v0.3.1
+# Changes from v0.3.0:
+# - Filter Debug: pipeline counters + top reject reasons
+# - Auto-Relax: if 0 results, progressively relax thresholds automatically
+# - Softer name filter (unicode + $, _)
+# - Seeds presets expanded (sol, eth, usdc, pepe, trump, ai agent, pump, launch)
+# - Basic retry/backoff for DexScreener requests to reduce rate-limit pain
+# Notes:
+# - Swap URL still PancakeSwap-only (BSC); chain->swap map later.
 
 import os
 import re
@@ -12,11 +14,12 @@ import csv
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
+from collections import Counter
 
 import requests
 import streamlit as st
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
@@ -32,8 +35,9 @@ CHAIN_DEX_PRESETS = {
     "solana": ["raydium", "orca", "meteora"],
 }
 
-NAME_OK_RE = re.compile(r"^[A-Za-z0-9\-\._\s]{2,30}$")
-
+# Softer, more realistic ticker validation:
+# allow unicode letters/digits + common ticker chars ($ _ - .) + spaces
+NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
 
 # -----------------------------
 # Helpers
@@ -65,24 +69,65 @@ def fmt_pct(x: float) -> str:
         return "n/a"
 
 
+def clamp_int(x: int, lo: int = 0, hi: int = 10**9) -> int:
+    try:
+        return int(max(lo, min(hi, int(x))))
+    except Exception:
+        return lo
+
+
+# -----------------------------
+# HTTP with retry/backoff
+# -----------------------------
+def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, max_retries: int = 3) -> Any:
+    """
+    Basic retry/backoff wrapper for DexScreener calls.
+    - Retries on 429 / 5xx / common network errors
+    - Exponential backoff (0.6s, 1.2s, 2.4s)
+    """
+    last_err = None
+    backoff = 0.6
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": f"dex-scout/{VERSION}"})
+            if r.status_code == 429 or (500 <= r.status_code <= 599):
+                last_err = requests.HTTPError(f"HTTP {r.status_code} (attempt {attempt}/{max_retries})")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            r.raise_for_status()
+            return r.json()
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+            last_err = e
+            if attempt < max_retries:
+                time.sleep(backoff)
+                backoff *= 2
+            else:
+                break
+        except Exception as e:
+            # Unknown error: do not spin too long
+            last_err = e
+            break
+
+    raise RuntimeError(f"Request failed after {max_retries} tries: {last_err}")
+
+
 # -----------------------------
 # API
 # -----------------------------
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_latest_pairs_for_query(q: str) -> List[Dict[str, Any]]:
     url = f"{DEX_BASE}/latest/dex/search"
-    r = requests.get(url, params={"q": q.strip()}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    data = _http_get_json(url, params={"q": q.strip()}, timeout=20, max_retries=3)
     return data.get("pairs", []) or []
 
 
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_token_pairs(chain: str, token_address: str) -> List[Dict[str, Any]]:
     url = f"{DEX_BASE}/token-pairs/v1/{chain}/{token_address}"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return r.json() or []
+    data = _http_get_json(url, params=None, timeout=20, max_retries=3)
+    return data or []
 
 
 def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, Any]]:
@@ -109,6 +154,9 @@ def is_name_suspicious(p: Dict[str, Any]) -> bool:
     base_sym = (safe_get(p, "baseToken", "symbol", default="") or "").strip()
     if not base_sym:
         return True
+    # common garbage patterns often seen on DEX: too many spaces or very long
+    if len(base_sym) > 40:
+        return True
     return not bool(NAME_OK_RE.match(base_sym))
 
 
@@ -133,7 +181,6 @@ def score_pair(p: Dict[str, Any]) -> float:
 
 
 def action_badge(action: str) -> str:
-    # GREEN only for ENTRY/BUY
     a = (action or "").upper()
     if "ENTRY" in a or a.startswith("BUY"):
         color = "#1f9d55"      # green
@@ -160,7 +207,6 @@ def action_badge(action: str) -> str:
 
 
 def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
-    # More informative tags (no emoji)
     liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
     vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
     vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
@@ -170,7 +216,6 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
     sells5 = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
     trades5 = buys5 + sells5
 
-    # liquidity band
     if liq >= 250_000:
         liq_tag = "Liquidity: High"
     elif liq >= 80_000:
@@ -178,7 +223,6 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
     else:
         liq_tag = "Liquidity: Low"
 
-    # flow band
     if trades5 >= 60 and sells5 >= 10:
         flow_tag = "Flow: Hot"
     elif trades5 >= 25 and sells5 >= 6:
@@ -186,14 +230,12 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
     else:
         flow_tag = "Flow: Thin"
 
-    # trend
     trend_tag = f"Trend(1h): {fmt_pct(pc1h)}"
     micro_tag = f"Micro(5m): {fmt_pct(pc5)}"
     vol_tag = f"Vol(5m): {fmt_usd(vol5)}"
 
     tags = [liq_tag, flow_tag, trend_tag, micro_tag, vol_tag]
 
-    # decision (simple)
     decision = "NO ENTRY"
     if liq >= 80_000 and vol24 >= 80_000 and trades5 >= 25 and sells5 >= 6:
         if pc1h > 5 and vol5 > 5_000 and pc5 >= -2:
@@ -202,6 +244,85 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
             decision = "WATCH / WAIT"
 
     return decision, tags
+
+
+def filter_pairs_with_debug(
+    pairs: List[Dict[str, Any]],
+    chain: str,
+    any_dex: bool,
+    allowed_dexes: set,
+    min_liq: float,
+    min_vol24: float,
+    min_trades_m5: int,
+    min_sells_m5: int,
+    max_buy_sell_imbalance: int,
+    block_suspicious_names: bool,
+):
+    stats = Counter()
+    reasons = Counter()
+
+    stats["total_in"] = len(pairs)
+
+    out = []
+    for p in pairs:
+        # chain
+        if (p.get("chainId") or "").lower() != chain.lower():
+            reasons["chain_mismatch"] += 1
+            continue
+        stats["after_chain"] += 1
+
+        # dex
+        if not any_dex and allowed_dexes:
+            if (p.get("dexId") or "").lower() not in allowed_dexes:
+                reasons["dex_not_allowed"] += 1
+                continue
+        stats["after_dex"] += 1
+
+        liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
+        vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
+        buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
+        sells = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
+        trades = buys + sells
+
+        if liq < float(min_liq):
+            reasons["liq<min"] += 1
+            continue
+        stats["after_liq"] += 1
+
+        if vol24 < float(min_vol24):
+            reasons["vol24<min"] += 1
+            continue
+        stats["after_vol24"] += 1
+
+        if trades < int(min_trades_m5):
+            reasons["trades<min"] += 1
+            continue
+        stats["after_trades"] += 1
+
+        if sells < int(min_sells_m5):
+            reasons["sells<min"] += 1
+            continue
+        stats["after_sells"] += 1
+
+        # imbalance
+        if sells > 0 and buys > 0:
+            imbalance = max(buys, sells) / max(1, min(buys, sells))
+            if imbalance > max_buy_sell_imbalance:
+                reasons["imbalance>max"] += 1
+                continue
+        else:
+            reasons["buys_or_sells_zero"] += 1
+            continue
+        stats["after_imbalance"] += 1
+
+        if block_suspicious_names and is_name_suspicious(p):
+            reasons["suspicious_name"] += 1
+            continue
+        stats["after_name"] += 1
+
+        out.append(p)
+
+    return out, stats, reasons
 
 
 # -----------------------------
@@ -340,7 +461,7 @@ PRESETS = {
         "min_sells_m5": 10,
         "max_imbalance": 6,
         "block_suspicious_names": True,
-        "seeds": "WBNB, USDT, meme, ai, launch, trending, pump",
+        "seeds": "WBNB, USDT, meme, ai, ai agent, launch, trending, pump, sol, eth, usdc, pepe, trump",
     },
     "Balanced (default)": {
         "top_n": 15,
@@ -350,7 +471,7 @@ PRESETS = {
         "min_sells_m5": 6,
         "max_imbalance": 8,
         "block_suspicious_names": True,
-        "seeds": "WBNB, USDT, BNB, meme, ai, gaming, cat, dog",
+        "seeds": "WBNB, USDT, BNB, meme, ai, ai agent, gaming, cat, dog, launch, pump, sol, eth, usdc, pepe, trump",
     },
     "Wide Net (explore)": {
         "top_n": 25,
@@ -360,7 +481,7 @@ PRESETS = {
         "min_sells_m5": 4,
         "max_imbalance": 10,
         "block_suspicious_names": False,
-        "seeds": "WBNB, USDT, new, launch, trend, community",
+        "seeds": "WBNB, USDT, new, launch, trend, community, pump, sol, eth, usdc, pepe, trump, ai agent",
     },
 }
 
@@ -370,7 +491,7 @@ def main():
 
     # Sidebar navigation (mobile-friendly)
     with st.sidebar:
-        st.markdown(f"### DEX Scout")
+        st.markdown("### DEX Scout")
         st.caption(f"Version: v{VERSION}")
 
         page = st.radio("Page", ["Scout", "Portfolio"], index=0)
@@ -398,7 +519,6 @@ def main():
                 default=dex_options[:3] if len(dex_options) >= 3 else dex_options,
             )
 
-        # Preset-driven defaults (you said numbers later; still leave them visible)
         top_n = st.slider("Top N", 5, 50, int(preset["top_n"]), step=1)
         min_liq = st.number_input("Min Liquidity ($)", min_value=0, value=int(preset["min_liq"]), step=5000)
         min_vol24 = st.number_input("Min 24h Volume ($)", min_value=0, value=int(preset["min_vol24"]), step=25000)
@@ -431,11 +551,14 @@ def main():
             return
 
         all_pairs: List[Dict[str, Any]] = []
+        query_failures = 0
+
         for q in queries:
             try:
                 all_pairs.extend(fetch_latest_pairs_for_query(q))
-                time.sleep(0.10)
+                time.sleep(0.12)  # gentle pacing to reduce rate-limits
             except Exception as e:
+                query_failures += 1
                 st.warning(f"Query failed: {q} — {e}")
 
         # Deduplicate
@@ -447,44 +570,24 @@ def main():
             uniq[pa] = p
         pairs = list(uniq.values())
 
-        # Filters
-        filtered = []
+        if query_failures and not pairs:
+            st.error("All queries failed or returned no data. Try Refresh, reduce seeds, or wait a bit.")
+            return
+
         allowed = set([d.lower() for d in selected_dexes]) if selected_dexes else set()
 
-        for p in pairs:
-            if (p.get("chainId") or "").lower() != chain.lower():
-                continue
-
-            if not any_dex and allowed:
-                if (p.get("dexId") or "").lower() not in allowed:
-                    continue
-
-            liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
-            vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
-            buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
-            sells = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
-            trades = buys + sells
-
-            if liq < float(min_liq):
-                continue
-            if vol24 < float(min_vol24):
-                continue
-            if trades < int(min_trades_m5):
-                continue
-            if sells < int(min_sells_m5):
-                continue
-
-            if sells > 0:
-                imbalance = max(buys, sells) / max(1, min(buys, sells))
-                if imbalance > max_buy_sell_imbalance:
-                    continue
-            else:
-                continue
-
-            if block_suspicious_names and is_name_suspicious(p):
-                continue
-
-            filtered.append(p)
+        filtered, fstats, freasons = filter_pairs_with_debug(
+            pairs=pairs,
+            chain=chain,
+            any_dex=any_dex,
+            allowed_dexes=allowed,
+            min_liq=float(min_liq),
+            min_vol24=float(min_vol24),
+            min_trades_m5=int(min_trades_m5),
+            min_sells_m5=int(min_sells_m5),
+            max_buy_sell_imbalance=int(max_buy_sell_imbalance),
+            block_suspicious_names=bool(block_suspicious_names),
+        )
 
         ranked = []
         for p in filtered:
@@ -496,9 +599,68 @@ def main():
 
         st.metric("Passed filters", len(ranked))
 
+        with st.expander("Why 0 results? (Filter Debug)", expanded=False):
+            st.write("**Fetched:**", len(all_pairs), " • **Deduped:**", len(pairs))
+            st.write("**Counts (pipeline):**")
+            st.json(dict(fstats))
+            st.write("**Top reject reasons:**")
+            top = freasons.most_common(10)
+            if top:
+                st.write({k: v for k, v in top})
+            else:
+                st.write("No rejects counted (unexpected).")
+
+        # Auto-relax if no results
         if not ranked:
-            st.info("No pairs passed filters. Lower thresholds / change seeds / enable Any DEX.")
-            return
+            st.info("No pairs passed filters. Trying Auto-Relax…")
+
+            relax_steps = [
+                {"k": 0.70, "imb_add": 2},
+                {"k": 0.55, "imb_add": 4},
+                {"k": 0.40, "imb_add": 6},
+            ]
+
+            for i, step in enumerate(relax_steps, start=1):
+                r_min_liq = clamp_int(float(min_liq) * step["k"], 0)
+                r_min_vol24 = clamp_int(float(min_vol24) * step["k"], 0)
+                r_min_trades = clamp_int(int(min_trades_m5) * step["k"], 0)
+                r_min_sells = clamp_int(int(min_sells_m5) * step["k"], 0)
+                r_imb = clamp_int(int(max_buy_sell_imbalance) + step["imb_add"], 1, 50)
+
+                f2, _, _ = filter_pairs_with_debug(
+                    pairs=pairs,
+                    chain=chain,
+                    any_dex=any_dex,
+                    allowed_dexes=allowed,
+                    min_liq=r_min_liq,
+                    min_vol24=r_min_vol24,
+                    min_trades_m5=r_min_trades,
+                    min_sells_m5=r_min_sells,
+                    max_buy_sell_imbalance=r_imb,
+                    block_suspicious_names=bool(block_suspicious_names),
+                )
+
+                ranked2 = []
+                for p in f2:
+                    s = score_pair(p)
+                    decision, tags = build_trade_hint(p)
+                    ranked2.append((s, decision, tags, p))
+                ranked2.sort(key=lambda x: x[0], reverse=True)
+                ranked2 = ranked2[:top_n]
+
+                if ranked2:
+                    st.success(
+                        f"Auto-Relax level {i} applied: "
+                        f"min_liq={r_min_liq}, min_vol24={r_min_vol24}, "
+                        f"min_trades_m5={r_min_trades}, min_sells_m5={r_min_sells}, "
+                        f"max_imbalance={r_imb}"
+                    )
+                    ranked = ranked2
+                    break
+
+            if not ranked:
+                st.info("Auto-Relax still found 0. Change seeds or disable some filters (especially sells/imbalance/name).")
+                return
 
         # Render cards
         for s, decision, tags, p in ranked:
@@ -518,7 +680,11 @@ def main():
 
             base_addr = safe_get(p, "baseToken", "address", default="") or ""
             pair_addr = p.get("pairAddress", "") or ""
-            swap_url = f"https://pancakeswap.finance/swap?outputCurrency={base_addr}" if base_addr else ""
+
+            # Swap URL: BSC PancakeSwap only for now
+            swap_url = ""
+            if base_addr and (p.get("chainId") or "").lower() == "bsc":
+                swap_url = f"https://pancakeswap.finance/swap?outputCurrency={base_addr}"
 
             st.markdown("---")
             left, mid, right = st.columns([3, 2, 2])
@@ -554,17 +720,19 @@ def main():
                 for t in tags:
                     st.caption(f"- {t}")
 
-                if base_addr and swap_url:
-                    key_log = f"log_{base_addr}"
-                    if st.button("Log → Portfolio (I swapped)", key=key_log, use_container_width=True):
-                        res = log_swap_intent(p, s, decision, tags, swap_url)
-                        if res == "OK":
-                            st.success("Logged to Portfolio (entry snapshot saved).")
-                        else:
-                            st.info("Already in Portfolio (active).")
+                if base_addr:
+                    if swap_url:
+                        key_log = f"log_{base_addr}"
+                        if st.button("Log → Portfolio (I swapped)", key=key_log, use_container_width=True):
+                            res = log_swap_intent(p, s, decision, tags, swap_url)
+                            if res == "OK":
+                                st.success("Logged to Portfolio (entry snapshot saved).")
+                            else:
+                                st.info("Already in Portfolio (active).")
 
-                    # Always button (no naked links)
-                    st.link_button("Open Swap (PancakeSwap)", swap_url, use_container_width=True)
+                        st.link_button("Open Swap (PancakeSwap)", swap_url, use_container_width=True)
+                    else:
+                        st.caption("Swap button disabled for this chain (BSC-only in v0.3.1).")
                 else:
                     st.caption("Swap unavailable (missing base token address).")
 
