@@ -818,7 +818,7 @@ def filter_pairs_with_debug(
 
         liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
         vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
-        txns_m5 = safe_get(p, "txns", "m5", default=None)
+                txns_m5 = safe_get(p, "txns", "m5", default=None)
         has_m5 = isinstance(txns_m5, dict)
         buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
         sells = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
