@@ -844,8 +844,9 @@ def filter_pairs_with_debug(
                 reasons["imbalance>max"] += 1
                 continue
         else:
+            # allow thin-flow pairs (DexScreener часто дає buys=0 або sells=0 на m5)
             reasons["buys_or_sells_zero"] += 1
-            continue
+            # НЕ continue — просто пропускаємо imbalance check
         stats["after_imbalance"] += 1
 
         if block_suspicious_names and is_name_suspicious(p):
