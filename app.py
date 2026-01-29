@@ -1,9 +1,9 @@
-# app.py — DEX Scout v0.3.9
-# Changes vs 0.3.8:
-# - Added "Monitoring" tab inside the SAME app (no separate monitoring app)
-# - Monitoring page renders monitoring.csv, refreshes live stats via best pool
-# - Explicit actions: Promote → Portfolio, Drop (archive)
-# - Removed automatic deactivate_from_monitoring() side-effect during Scout rendering
+# app.py — DEX Scout v0.3.10
+# Changes vs 0.3.9:
+# - Monitoring: compact UI (no "spaghetti" bullets)
+# - Added monitoring_history.csv snapshots on each Monitoring render (throttled)
+# - Shows deltas vs init + simple charts (score/price)
+# - Adds "Last updated" per token
 #
 # NOTE: Uses DexScreener data. Not full on-chain safety.
 # For Solana, ALWAYS check Jupiter/JupShield warnings before swapping.
@@ -17,16 +17,18 @@ import hashlib
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 from collections import Counter
+from contextlib import contextmanager
 
 import requests
 import streamlit as st
 
-VERSION = "0.3.9"
+VERSION = "0.3.10"
 
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 TRADES_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 MONITORING_CSV = os.path.join(DATA_DIR, "monitoring.csv")
+MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
 
 # -----------------------------
 # Storage init
@@ -80,6 +82,59 @@ def ensure_monitoring_storage():
             w.writeheader()
 
 
+def ensure_monitoring_history_storage():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(MON_HISTORY_CSV):
+        with open(MON_HISTORY_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "ts_utc",
+                    "chain",
+                    "base_symbol",
+                    "base_addr",
+                    "pair_addr",
+                    "dex",
+                    "quote_symbol",
+                    "price_usd",
+                    "liq_usd",
+                    "vol24_usd",
+                    "vol5_usd",
+                    "pc1h",
+                    "pc5",
+                    "score_live",
+                    "decision",
+                ],
+            )
+            w.writeheader()
+
+@contextmanager
+def file_lock(lock_path: str, timeout_sec: int = 8):
+    """
+    Ultra-light lock via lock-file creation.
+    Works on Streamlit Cloud/most Linux FS. Not perfect, but prevents most collisions.
+    """
+    start = time.time()
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            if (time.time() - start) >= timeout_sec:
+                # give up (avoid hanging the UI)
+                raise RuntimeError(f"Lock timeout: {lock_path}")
+            time.sleep(0.08)
+
+    try:
+        yield
+    finally:
+        try:
+            os.remove(lock_path)
+        except Exception:
+            pass
+
+
 def load_portfolio() -> List[Dict[str, Any]]:
     ensure_storage()
     rows = []
@@ -91,29 +146,32 @@ def load_portfolio() -> List[Dict[str, Any]]:
 
 def save_portfolio(rows: List[Dict[str, Any]]):
     ensure_storage()
-    with open(TRADES_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "ts_utc",
-                "chain",
-                "dex",
-                "base_symbol",
-                "quote_symbol",
-                "base_token_address",
-                "pair_address",
-                "dexscreener_url",
-                "swap_url",
-                "score",
-                "action",
-                "tags",
-                "entry_price_usd",
-                "note",
-                "active",
-            ],
-        )
-        w.writeheader()
-        w.writerows(rows)
+    lockp = TRADES_CSV + ".lock"
+    with file_lock(lockp):
+        with open(TRADES_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "ts_utc",
+                    "chain",
+                    "dex",
+                    "base_symbol",
+                    "quote_symbol",
+                    "base_token_address",
+                    "pair_address",
+                    "dexscreener_url",
+                    "swap_url",
+                    "score",
+                    "action",
+                    "tags",
+                    "entry_price_usd",
+                    "note",
+                    "active",
+                ],
+            )
+            w.writeheader()
+            w.writerows(rows)
+
 
 
 def load_monitoring() -> List[Dict[str, Any]]:
@@ -127,24 +185,161 @@ def load_monitoring() -> List[Dict[str, Any]]:
 
 def save_monitoring(rows: List[Dict[str, Any]]):
     ensure_monitoring_storage()
-    with open(MONITORING_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "ts_added",
-                "chain",
-                "base_symbol",
-                "base_addr",
-                "pair_addr",
-                "score_init",
-                "liq_init",
-                "vol24_init",
-                "vol5_init",
-                "active",
-            ],
-        )
-        w.writeheader()
-        w.writerows(rows)
+    lockp = MONITORING_CSV + ".lock"
+    with file_lock(lockp):
+        with open(MONITORING_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "ts_added",
+                    "chain",
+                    "base_symbol",
+                    "base_addr",
+                    "pair_addr",
+                    "score_init",
+                    "liq_init",
+                    "vol24_init",
+                    "vol5_init",
+                    "active",
+                ],
+            )
+            w.writeheader()
+            w.writerows(rows)
+
+
+
+def load_monitoring_history(limit_rows: int = 5000) -> List[Dict[str, Any]]:
+    ensure_monitoring_history_storage()
+    # read only last N lines; then parse with DictReader
+    try:
+        with open(MON_HISTORY_CSV, "r", encoding="utf-8", newline="") as f:
+            header = f.readline()
+        if not header:
+            return []
+        # reuse trim tail reader logic lightly
+        size = os.path.getsize(MON_HISTORY_CSV)
+        chunk_bytes = 1024 * 1024
+        data = ""
+        pos = size
+        while pos > 0 and data.count("\n") < (limit_rows + 50):
+            step = min(chunk_bytes, pos)
+            pos -= step
+            with open(MON_HISTORY_CSV, "rb") as bf:
+                bf.seek(pos)
+                chunk = bf.read(step)
+            data = chunk.decode("utf-8", errors="ignore") + data
+        lines = data.splitlines(True)
+        # drop partial first line if needed
+        if pos > 0 and lines:
+            lines = lines[1:]
+        # ensure header is present for DictReader
+        tail = "".join([header] + lines[-limit_rows:])
+        return list(csv.DictReader(tail.splitlines(True)))
+    except Exception:
+        # fallback to original full read
+        rows = []
+        with open(MON_HISTORY_CSV, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                rows.append(row)
+        if len(rows) > limit_rows:
+            rows = rows[-limit_rows:]
+        return rows
+
+
+def append_monitoring_history(row: Dict[str, Any]):
+    ensure_monitoring_history_storage()
+    lockp = MON_HISTORY_CSV + ".lock"
+    with file_lock(lockp):
+        with open(MON_HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "ts_utc",
+                    "chain",
+                    "base_symbol",
+                    "base_addr",
+                    "pair_addr",
+                    "dex",
+                    "quote_symbol",
+                    "price_usd",
+                    "liq_usd",
+                    "vol24_usd",
+                    "vol5_usd",
+                    "pc1h",
+                    "pc5",
+                    "score_live",
+                    "decision",
+                ],
+            )
+            w.writerow(row)
+
+    # Trim occasionally (about ~1% of snapshots)
+    if random.random() < 0.01:
+        trim_csv_tail(MON_HISTORY_CSV, keep_last=50_000)
+
+def trim_csv_tail(path: str, keep_last: int = 50_000, chunk_bytes: int = 1024 * 1024):
+    """
+    Keep only last N data rows (+ header). Avoids reading whole file into RAM.
+    Assumes append-only CSV with header at line 1.
+    """
+    try:
+        if not os.path.exists(path):
+            return
+
+        # read header (first line)
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            header = f.readline()
+            if not header:
+                return
+
+        # read tail by chunks from the end
+        size = os.path.getsize(path)
+        if size <= chunk_bytes:
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                lines = f.readlines()
+            if len(lines) <= keep_last + 1:
+                return
+            header_line = lines[0:1]
+            tail_lines = lines[-keep_last:]
+            lockp = path + ".lock"
+            with file_lock(lockp):
+                with open(path, "w", encoding="utf-8", newline="") as wf:
+                    wf.writelines(header_line + tail_lines)
+            return
+
+        data = ""
+        pos = size
+        # keep reading until we have enough newlines
+        while pos > 0 and data.count("\n") < (keep_last + 5):
+            step = min(chunk_bytes, pos)
+            pos -= step
+            with open(path, "rb") as bf:
+                bf.seek(pos)
+                chunk = bf.read(step)
+            data = chunk.decode("utf-8", errors="ignore") + data
+
+        lines = data.splitlines(True)
+        # drop possible partial first line (if we started mid-line)
+        if lines and not lines[0].startswith(header[:10]) and pos > 0:
+            lines = lines[1:]
+
+        # ensure we only keep data rows (skip header if it got included)
+        if lines and lines[0] == header:
+            lines = lines[1:]
+
+        if len(lines) <= keep_last:
+            return
+
+        tail_lines = lines[-keep_last:]
+
+        lockp = path + ".lock"
+        with file_lock(lockp):
+            with open(path, "w", encoding="utf-8", newline="") as wf:
+                wf.write(header)
+                wf.writelines(tail_lines)
+
+    except Exception:
+        return
 
 
 def deactivate_from_monitoring(base_addr: str) -> bool:
@@ -159,7 +354,6 @@ def deactivate_from_monitoring(base_addr: str) -> bool:
     if changed:
         save_monitoring(rows)
     return changed
-
 
 # -----------------------------
 # Presets
@@ -315,6 +509,12 @@ def fmt_pct(x: float) -> str:
     except Exception:
         return "n/a"
 
+def fmt_usd_delta(x: float) -> str:
+    try:
+        sign = "+" if x > 0 else ""
+        return f"{sign}${x:,.0f}"
+    except Exception:
+        return "n/a"
 
 def hkey(*parts: str, n: int = 10) -> str:
     raw = "|".join([p or "" for p in parts])
@@ -327,6 +527,9 @@ def parse_float(x, default=0.0) -> float:
     except Exception:
         return float(default)
 
+
+def clamp(n: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, n))
 
 # -----------------------------
 # HTTP with retry/backoff
@@ -396,8 +599,6 @@ def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, An
 
     pools.sort(key=key, reverse=True)
     return pools[0]
-
-
 # -----------------------------
 # Safety / heuristics
 # -----------------------------
@@ -538,6 +739,9 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
         f"Vol(5m): {fmt_usd(vol5)}",
     ]
 
+    # NOTE:
+    # - "NO ENTRY" tokens can still be shown in Scout list (they passed filters)
+    # - but we only allow Add to Monitoring for WATCH/WAIT by default.
     decision = "NO ENTRY"
     if liq >= 30_000 and vol24 >= 20_000 and trades5 >= 12 and sells5 >= 3:
         if pc1h > 6 and vol5 > 2_500 and pc5 >= -3:
@@ -724,7 +928,6 @@ def add_to_monitoring(p: Dict[str, Any], score: float):
         return "NO_ADDR"
 
     rows = load_monitoring()
-
     for r in rows:
         if r.get("active") == "1" and r.get("base_addr", "").lower() == base_addr:
             return "EXISTS"
@@ -746,7 +949,6 @@ def add_to_monitoring(p: Dict[str, Any], score: float):
 
     save_monitoring(rows)
     return "OK"
-
 
 def log_swap_intent(p: Dict[str, Any], score: float, action: str, tags: List[str], swap_url: str):
     rows = load_portfolio()
@@ -807,14 +1009,109 @@ def portfolio_reco(entry: float, current: float, pc1h: float, pc5: float) -> str
 
 
 # -----------------------------
+# Monitoring history (snapshots)
+# -----------------------------
+def should_snapshot(base_addr: str, min_interval_sec: int = 60) -> bool:
+    """
+    Throttle per token. Also adds tiny jitter to avoid synchronized multi-token writes.
+    """
+    base = (base_addr or "").lower().strip()
+    if not base:
+        return False
+    key = f"last_snap_{base}"
+    now = time.time()
+    last = float(st.session_state.get(key, 0.0))
+
+    # jitter 0..6s so multiple tokens don't trim/write at same moment
+    jitter = (int(hashlib.md5(base.encode("utf-8")).hexdigest(), 16) % 7)
+
+    if (now - last) >= float(min_interval_sec + jitter):
+        st.session_state[key] = now
+        return True
+    return False
+
+
+def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Optional[Dict[str, Any]]):
+    if not chain or not base_addr or not best:
+        return
+    if not should_snapshot(base_addr, min_interval_sec=60):
+        return
+
+    s_live = score_pair(best)
+    decision, _tags = build_trade_hint(best)
+
+    row = {
+        "ts_utc": now_utc_str(),
+        "chain": (chain or "").lower(),
+        "base_symbol": base_sym or "",
+        "base_addr": (base_addr or "").lower(),
+        "pair_addr": best.get("pairAddress", "") or "",
+        "dex": best.get("dexId", "") or "",
+        "quote_symbol": safe_get(best, "quoteToken", "symbol", default="") or "",
+        "price_usd": str(parse_float(best.get("priceUsd"), 0.0)),
+        "liq_usd": str(parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0)),
+        "vol24_usd": str(parse_float(safe_get(best, "volume", "h24", default=0), 0.0)),
+        "vol5_usd": str(parse_float(safe_get(best, "volume", "m5", default=0), 0.0)),
+        "pc1h": str(parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0)),
+        "pc5": str(parse_float(safe_get(best, "priceChange", "m5", default=0), 0.0)),
+        "score_live": str(s_live),
+        "decision": decision,
+    }
+    append_monitoring_history(row)
+
+
+def token_history_df(base_addr: str) -> "Optional[pd.DataFrame]":
+    """
+    Monitoring charts helper. Caches per token briefly to reduce repeated CSV reads.
+    """
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:
+        return None
+
+    base_addr_l = (base_addr or "").lower().strip()
+    if not base_addr_l:
+        return None
+
+    cache_key = f"hist_df_{base_addr_l}"
+    ts_key = f"hist_df_ts_{base_addr_l}"
+    now = time.time()
+    last = float(st.session_state.get(ts_key, 0.0))
+
+    # 10s UI cache (fast scroll / reruns)
+    if cache_key in st.session_state and (now - last) < 10:
+        return st.session_state.get(cache_key)
+
+    rows = load_monitoring_history(limit_rows=9000)
+    if not rows:
+        return None
+
+    filt = [r for r in rows if (r.get("base_addr", "").lower() == base_addr_l)]
+    if not filt:
+        return None
+
+    df = pd.DataFrame(filt)
+    for col in ["price_usd", "liq_usd", "vol24_usd", "vol5_usd", "pc1h", "pc5", "score_live"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.tail(300)
+    st.session_state[cache_key] = df
+    st.session_state[ts_key] = now
+    return df
+
+
+# -----------------------------
 # Pages
 # -----------------------------
-def page_scout(preset, chain, any_dex, selected_dexes, top_n, min_liq, min_vol24,
-               min_trades_m5, min_sells_m5, max_buy_sell_imbalance,
-               block_majors, block_suspicious_names,
-               enforce_age, min_age_min, max_age_min,
-               hide_solana_unverified,
-               dedupe_by_base, seed_k, seeds_raw, refresh):
+def page_scout(
+    preset, chain, any_dex, selected_dexes, top_n, min_liq, min_vol24,
+    min_trades_m5, min_sells_m5, max_buy_sell_imbalance,
+    block_majors, block_suspicious_names,
+    enforce_age, min_age_min, max_age_min,
+    hide_solana_unverified,
+    dedupe_by_base, seed_k, seeds_raw, refresh
+):
     st.title("DEX Scout — early candidates (DexScreener API)")
     st.caption("Focus: early/small tokens. Majors/stables filtered. Core: BSC + Solana.")
 
@@ -914,23 +1211,21 @@ def page_scout(preset, chain, any_dex, selected_dexes, top_n, min_liq, min_vol24
         with left:
             st.markdown(f"## {base}/{quote}")
             st.caption(f"{chain_id} • {dex}")
-
             if url:
                 link_button("Open DexScreener", url, use_container_width=True)
-
             if base_addr:
                 st.caption("Token contract (baseToken.address)")
                 st.code(base_addr, language="text")
             if pair_addr:
                 st.caption("Pair / pool address")
                 st.code(pair_addr, language="text")
-
             age = pair_age_minutes(p)
             if age is not None:
                 st.caption(f"Pair age: ~{int(age)} min")
 
         with mid:
-            st.write(f"**Price:** ${float(price):.8f}" if price else "**Price:** n/a")
+            price_f = parse_float(price, 0.0)
+            st.write(f"**Price:** ${price_f:.8f}" if price_f > 0 else "**Price:** n/a")
             st.write(f"**Liq:** {fmt_usd(liq)}")
             st.write(f"**Vol24:** {fmt_usd(vol24)}")
             st.write(f"**Vol m5:** {fmt_usd(vol5)}")
@@ -943,6 +1238,7 @@ def page_scout(preset, chain, any_dex, selected_dexes, top_n, min_liq, min_vol24
             st.write("**Action:**")
             st.markdown(action_badge(decision), unsafe_allow_html=True)
 
+            # Allow Add to Monitoring only for WATCH/WAIT by default
             if decision == "WATCH / WAIT":
                 if st.button("➕ Add to Monitoring", key=f"mon_{kb}", use_container_width=True):
                     res = add_to_monitoring(p, s)
@@ -975,14 +1271,16 @@ def page_scout(preset, chain, any_dex, selected_dexes, top_n, min_liq, min_vol24
 
 def page_monitoring():
     st.title("Monitoring")
-    st.caption("Tokens you added from Scout. This page refreshes best pool data and lets you promote or drop tokens.")
+    st.caption("Compact view + history snapshots + mini charts.")
 
     ensure_monitoring_storage()
+    ensure_monitoring_history_storage()
+
     rows = load_monitoring()
     active = [r for r in rows if r.get("active") == "1"]
     archived = [r for r in rows if r.get("active") != "1"]
 
-    topbar = st.columns([2, 2, 2])
+    topbar = st.columns([2, 2, 2, 2])
     with topbar[0]:
         st.metric("Active", len(active))
     with topbar[1]:
@@ -990,6 +1288,9 @@ def page_monitoring():
     with topbar[2]:
         with open(MONITORING_CSV, "rb") as f:
             st.download_button("Download monitoring.csv", f, file_name="monitoring.csv", use_container_width=True)
+    with topbar[3]:
+        with open(MON_HISTORY_CSV, "rb") as f:
+            st.download_button("Download history.csv", f, file_name="monitoring_history.csv", use_container_width=True)
 
     st.markdown("---")
 
@@ -997,8 +1298,8 @@ def page_monitoring():
         st.info("Monitoring is empty. Go to Scout and click **Add to Monitoring** on a WATCH / WAIT token.")
         return
 
-    # Optional manual refresh hint
-    st.caption("Tip: use sidebar **Clear cache** if DexScreener updates feel stale.")
+    # global refresh hint
+    st.caption("History snapshots are written at most ~1/min per token (throttled).")
 
     for idx, r in enumerate(active, start=1):
         chain = (r.get("chain") or "").strip().lower()
@@ -1038,58 +1339,81 @@ def page_monitoring():
             live["pc1h"] = parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0)
             live["pc5"] = parse_float(safe_get(best, "priceChange", "m5", default=0), 0.0)
 
-        st.markdown("---")
-        c1, c2, c3 = st.columns([3, 2, 2])
+            # write history snapshot (throttled)
+            snapshot_live_to_history(chain, base_sym, base_addr, best)
 
-        with c1:
-            st.markdown(f"## {base_sym}")
+        s_live = score_pair(best) if best else 0.0
+        decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
+
+        # deltas vs init
+        d_score = s_live - score_init
+        d_liq = live["liq"] - liq_init
+        d_v24 = live["vol24"] - vol24_init
+        d_v5 = live["vol5"] - vol5_init
+
+        # compact card layout
+        st.markdown("---")
+        head = st.columns([3, 2, 2, 2])
+
+        with head[0]:
+            st.subheader(f"{base_sym}")
             st.caption(f"Added: {ts_added} • Chain: {chain}")
             st.code(base_addr, language="text")
             if live["url"]:
-                link_button("Open DexScreener", live["url"], use_container_width=True, key=f"m_ds_{idx}_{hkey(base_addr)}")
-
+                link_button("DexScreener", live["url"], use_container_width=True, key=f"m_ds_{idx}_{hkey(base_addr)}")
             swap_url = build_swap_url(chain, base_addr)
             if swap_url:
-                swap_label = "Open Swap (PancakeSwap)" if chain == "bsc" else "Open Swap (Jupiter)"
+                swap_label = "Swap (PancakeSwap)" if chain == "bsc" else "Swap (Jupiter)"
                 link_button(swap_label, swap_url, use_container_width=True, key=f"m_sw_{idx}_{hkey(base_addr, chain)}")
-
             if chain == "solana":
                 st.caption("Solana: check Jupiter/JupShield warnings before swapping.")
 
-        with c2:
-            st.write("**Init snapshot:**")
-            st.write(f"- Score: {score_init}")
-            st.write(f"- Liq: {fmt_usd(liq_init)}")
-            st.write(f"- Vol24: {fmt_usd(vol24_init)}")
-            st.write(f"- Vol5: {fmt_usd(vol5_init)}")
+        with head[1]:
+            st.markdown("**Live**")
+            st.write(f"Price: ${live['price']:.8f}" if live["price"] else "Price: n/a")
+            st.write(f"Liq: {fmt_usd(live['liq'])}")
+            st.write(f"Vol24: {fmt_usd(live['vol24'])}")
+            st.write(f"Vol5: {fmt_usd(live['vol5'])}")
+            st.caption(f"Δ1h {fmt_pct(live['pc1h'])} • Δ5m {fmt_pct(live['pc5'])}")
 
-            st.write("**Live (best pool):**")
+        with head[2]:
+            st.markdown("**Vs init**")
+            st.write(f"Score: {s_live:.2f} ({d_score:+.2f})")
+            st.write(f"Liq: {fmt_usd(live['liq'])} ({fmt_usd_delta(d_liq)})")
+            st.write(f"Vol24: {fmt_usd(live['vol24'])} ({fmt_usd_delta(d_v24)})")
+            st.write(f"Vol5: {fmt_usd(live['vol5'])} ({fmt_usd_delta(d_v5)})")
+
+        with head[3]:
+            st.markdown("**Decision**")
+            st.markdown(action_badge(decision), unsafe_allow_html=True)
+            st.write(f"Score: {s_live:.2f}" if best else "Score: n/a")
+
+        # tags in expander (so they don't eat screen)
+        with st.expander("Tags / Details", expanded=False):
             if best:
-                st.write(f"- Pair: {live['dex']} • {base_sym}/{live['quote']}")
-                st.write(f"- Price: ${live['price']:.8f}" if live["price"] else "- Price: n/a")
-                st.write(f"- Liq: {fmt_usd(live['liq'])}")
-                st.write(f"- Vol24: {fmt_usd(live['vol24'])}")
-                st.write(f"- Vol5: {fmt_usd(live['vol5'])}")
-                st.write(f"- Δ 1h: {fmt_pct(live['pc1h'])}")
-                st.write(f"- Δ 5m: {fmt_pct(live['pc5'])}")
+                st.write(f"Pool: {live['dex']} • {base_sym}/{live['quote']}")
+            for t in tags:
+                st.write(f"• {t}")
+
+        # mini charts in expander
+        with st.expander("Mini charts (history)", expanded=False):
+            df = token_history_df(base_addr)
+            if df is None or df.empty:
+                st.info("No history yet. Re-open Monitoring after ~1 minute to collect snapshots.")
             else:
-                st.warning("No pools found via DexScreener token-pairs for this address.")
+                st.caption("Last 300 snapshots (max).")
+                if "score_live" in df.columns:
+                    st.line_chart(df["score_live"])
+                if "price_usd" in df.columns:
+                    st.line_chart(df["price_usd"])
 
-        with c3:
-            if best:
-                s_live = score_pair(best)
-                decision, tags = build_trade_hint(best)
-                st.write("**Decision (live):**")
-                st.markdown(action_badge(decision), unsafe_allow_html=True)
-                st.write(f"**Score:** {s_live}")
-                st.write("**Tags:**")
-                for t in tags:
-                    st.write(f"• {t}")
-
-                promote_key = f"prom_{idx}_{hkey(base_addr, chain)}"
-                drop_key = f"drop_{idx}_{hkey(base_addr, chain)}"
-
-                if st.button("Promote → Portfolio", key=promote_key, use_container_width=True):
+        # actions
+        actions = st.columns([2, 2, 6])
+        with actions[0]:
+            if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
+                if not best:
+                    st.error("No live pool found. Can't promote.")
+                else:
                     swap_url = build_swap_url(chain, base_addr)
                     if not swap_url:
                         st.error("Swap URL missing for this chain/address.")
@@ -1101,16 +1425,11 @@ def page_monitoring():
                             st.rerun()
                         else:
                             st.info("Already active in portfolio.")
-
-                if st.button("Drop (archive)", key=drop_key, use_container_width=True):
-                    deactivate_from_monitoring(base_addr)
-                    st.success("Archived.")
-                    st.rerun()
-            else:
-                if st.button("Drop (archive)", key=f"drop_{idx}_{hkey(base_addr)}", use_container_width=True):
-                    deactivate_from_monitoring(base_addr)
-                    st.success("Archived.")
-                    st.rerun()
+        with actions[1]:
+            if st.button("Drop (archive)", key=f"drop_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
+                deactivate_from_monitoring(base_addr)
+                st.success("Archived.")
+                st.rerun()
 
     if archived:
         with st.expander("Archived (last 50)"):
@@ -1208,7 +1527,11 @@ def page_portfolio():
             if st.button("Apply", key=f"apply_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                 all_rows = load_portfolio()
                 for rr in all_rows:
-                    if rr.get("active") == "1" and (rr.get("base_token_address") or "").lower() == base_addr.lower():
+                    if rr.get("active") != "1":
+                        continue
+                    if (rr.get("chain") or "").lower().strip() != chain.lower().strip():
+                        continue
+                    if (rr.get("base_token_address") or "").lower().strip() == base_addr.lower().strip():
                         rr["note"] = note_val
                         if close:
                             rr["active"] = "0"
@@ -1217,7 +1540,11 @@ def page_portfolio():
                 if delete:
                     all_rows = [
                         x for x in all_rows
-                        if not (x.get("active") == "1" and (x.get("base_token_address") or "").lower() == base_addr.lower())
+                        if not (
+                            (x.get("active") == "1")
+                            and ((x.get("chain") or "").lower().strip() == chain.lower().strip())
+                            and ((x.get("base_token_address") or "").lower().strip() == base_addr.lower().strip())
+                        )
                     ]
 
                 save_portfolio(all_rows)
