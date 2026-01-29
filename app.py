@@ -22,7 +22,7 @@ from contextlib import contextmanager
 import requests
 import streamlit as st
 
-VERSION = "0.3.11"
+VERSION = "0.3.12"
 
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
@@ -399,7 +399,6 @@ PRESETS = {
         "min_vol24": 5000,
         "min_trades_m5": 6,
         "min_sells_m5": 2,
-        "allow_missing_m5_txns": False,
         "max_imbalance": 18,
         "block_suspicious_names": True,
         "block_majors": True,
@@ -417,7 +416,6 @@ PRESETS = {
         "min_vol24": 60000,
         "min_trades_m5": 18,
         "min_sells_m5": 5,
-        "allow_missing_m5_txns": False,
         "max_imbalance": 10,
         "block_suspicious_names": True,
         "block_majors": True,
@@ -435,7 +433,6 @@ PRESETS = {
         "min_vol24": 25000,
         "min_trades_m5": 10,
         "min_sells_m5": 3,
-        "allow_missing_m5_txns": True,
         "max_imbalance": 14,
         "block_suspicious_names": False,
         "block_majors": True,
@@ -768,7 +765,6 @@ def filter_pairs_with_debug(
     min_trades_m5: int,
     min_sells_m5: int,
     max_buy_sell_imbalance: int,
-    allow_missing_m5_txns: bool,
     block_suspicious_names: bool,
     block_majors: bool,
     min_age_min: int,
@@ -818,11 +814,26 @@ def filter_pairs_with_debug(
 
         liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
         vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
+
+        # DexScreener sometimes omits txns.m5 on some pairs (esp. very new / less active).
+        # We try txns.m5 first; if missing, fall back to txns.h1 scaled to ~5m.
         txns_m5 = safe_get(p, "txns", "m5", default=None)
-        has_m5 = isinstance(txns_m5, dict)
-        buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
-        sells = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
-        trades = buys + sells
+        buys = sells = None
+        if isinstance(txns_m5, dict):
+            buys = int(txns_m5.get("buys", 0) or 0)
+            sells = int(txns_m5.get("sells", 0) or 0)
+        else:
+            txns_h1 = safe_get(p, "txns", "h1", default=None)
+            if isinstance(txns_h1, dict):
+                # scale down 1h → ~5m (1h / 12)
+                buys = float(txns_h1.get("buys", 0) or 0) / 12.0
+                sells = float(txns_h1.get("sells", 0) or 0) / 12.0
+                reasons["txns_used_h1_scaled"] += 1
+            else:
+                reasons["txns_missing"] += 1
+                buys = sells = None
+
+        trades = (buys + sells) if (buys is not None and sells is not None) else None
 
         if liq < float(min_liq):
             reasons["liq<min"] += 1
@@ -834,33 +845,31 @@ def filter_pairs_with_debug(
             continue
         stats["after_vol24"] += 1
 
-        # DexScreener sometimes omits m5 txns for otherwise valid pools.
-        # If allowed, do not reject those pools on trades/sells gates.
-        if (not has_m5) and allow_missing_m5_txns:
-            reasons["m5_txns_missing"] += 1
-            stats["after_trades"] += 1
-            stats["after_sells"] += 1
+        # Activity / flow filters
+        if trades is None:
+            # No reliable txns data → don't hard-fail in Wide Net mode, but record it.
+            reasons["txns_filters_skipped"] += 1
         else:
-            if trades < int(min_trades_m5):
+            if trades < float(min_trades_m5):
                 reasons["trades<min"] += 1
                 continue
             stats["after_trades"] += 1
 
-            if sells < int(min_sells_m5):
+            if sells < float(min_sells_m5):
                 reasons["sells<min"] += 1
                 continue
             stats["after_sells"] += 1
 
-        if sells > 0 and buys > 0:
-            imbalance = max(buys, sells) / max(1, min(buys, sells))
-            if imbalance > int(max_buy_sell_imbalance):
-                reasons["imbalance>max"] += 1
+            # Buy/sell imbalance (avoid one-sided wash / weird flow)
+            if sells > 0 and buys > 0:
+                imbalance = max(buys, sells) / max(1.0, min(buys, sells))
+                if imbalance > float(max_buy_sell_imbalance):
+                    reasons["imbalance>max"] += 1
+                    continue
+            else:
+                reasons["buys_or_sells_zero"] += 1
                 continue
-        else:
-            # allow thin-flow pairs (DexScreener часто дає buys=0 або sells=0 на m5)
-            reasons["buys_or_sells_zero"] += 1
-            # НЕ continue — просто пропускаємо imbalance check
-        stats["after_imbalance"] += 1
+            stats["after_imbalance"] += 1
 
         if block_suspicious_names and is_name_suspicious(p):
             reasons["suspicious_name"] += 1
@@ -1121,7 +1130,6 @@ def token_history_df(base_addr: str) -> "Optional[pd.DataFrame]":
 def page_scout(
     preset, chain, any_dex, selected_dexes, top_n, min_liq, min_vol24,
     min_trades_m5, min_sells_m5, max_buy_sell_imbalance,
-    allow_missing_m5_txns,
     block_majors, block_suspicious_names,
     enforce_age, min_age_min, max_age_min,
     hide_solana_unverified,
@@ -1168,7 +1176,6 @@ def page_scout(
         min_trades_m5=int(min_trades_m5),
         min_sells_m5=int(min_sells_m5),
         max_buy_sell_imbalance=int(max_buy_sell_imbalance),
-        allow_missing_m5_txns=bool(allow_missing_m5_txns),
         block_suspicious_names=bool(block_suspicious_names),
         block_majors=bool(block_majors),
         min_age_min=int(min_age_min),
@@ -1619,12 +1626,6 @@ def main():
         min_sells_m5 = st.slider("Min sells (5m)", 0, 80, int(preset["min_sells_m5"]), step=1)
         max_buy_sell_imbalance = st.slider("Max buy/sell imbalance", 1, 30, int(preset["max_imbalance"]), step=1)
 
-        allow_missing_m5_txns = st.checkbox(
-            "Allow pairs with missing m5 txns (DexScreener gaps)",
-            value=bool(preset.get("allow_missing_m5_txns", True)),
-            help="DexScreener often returns 0/missing txns for many pairs. When enabled, those pairs won't be rejected by the m5 trades/sells filters.",
-        )
-
         st.divider()
         st.caption("Safety guards")
         block_majors = st.checkbox("Filter majors/stables (base)", value=bool(preset["block_majors"]))
@@ -1668,7 +1669,6 @@ def main():
             min_trades_m5=min_trades_m5,
             min_sells_m5=min_sells_m5,
             max_buy_sell_imbalance=max_buy_sell_imbalance,
-            allow_missing_m5_txns=allow_missing_m5_txns,
             block_majors=block_majors,
             block_suspicious_names=block_suspicious_names,
             enforce_age=enforce_age,
