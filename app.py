@@ -21,11 +21,34 @@ from collections import Counter
 import requests
 import streamlit as st
 
-VERSION = "0.3.7"
+VERSION = "0.3.8"
 
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 TRADES_CSV = os.path.join(DATA_DIR, "portfolio.csv")
+
+MONITORING_CSV = os.path.join(DATA_DIR, "monitoring.csv")
+
+def ensure_monitoring_storage():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(MONITORING_CSV):
+        with open(MONITORING_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "ts_added",
+                    "chain",
+                    "base_symbol",
+                    "base_addr",
+                    "pair_addr",
+                    "score_init",
+                    "liq_init",
+                    "vol24_init",
+                    "vol5_init",
+                    "active",
+                ],
+            )
+            w.writeheader()
 
 # Stable core only (keep simple + reliable)
 CHAIN_DEX_PRESETS = {
@@ -42,6 +65,46 @@ MAJORS_STABLES = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDE", "USDS",
     "WAVAX", "WMATIC",
 }
+
+def add_to_monitoring(p: Dict[str, Any], score: float):
+    ensure_monitoring_storage()
+
+    base_addr = (safe_get(p, "baseToken", "address", default="") or "").lower()
+    if not base_addr:
+        return "NO_ADDR"
+
+    rows = []
+    with open(MONITORING_CSV, "r", newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            rows.append(r)
+
+    # prevent duplicates
+    for r in rows:
+        if r.get("active") == "1" and r.get("base_addr", "").lower() == base_addr:
+            return "EXISTS"
+
+    rows.append(
+        {
+            "ts_added": now_utc_str(),
+            "chain": (p.get("chainId") or "").lower(),
+            "base_symbol": safe_get(p, "baseToken", "symbol", default=""),
+            "base_addr": base_addr,
+            "pair_addr": p.get("pairAddress", ""),
+            "score_init": str(score),
+            "liq_init": str(safe_get(p, "liquidity", "usd", default=0)),
+            "vol24_init": str(safe_get(p, "volume", "h24", default=0)),
+            "vol5_init": str(safe_get(p, "volume", "m5", default=0)),
+            "active": "1",
+        }
+    )
+
+    with open(MONITORING_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+    return "OK"
 
 
 # -----------------------------
@@ -85,6 +148,22 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
         unsafe_allow_html=True,
     )
 
+def deactivate_from_monitoring(base_addr: str):
+    if not os.path.exists(MONITORING_CSV):
+        return
+    rows = []
+    changed = False
+    with open(MONITORING_CSV, "r", newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r.get("active") == "1" and r.get("base_addr","").lower() == base_addr.lower():
+                r["active"] = "0"
+                changed = True
+            rows.append(r)
+    if changed:
+        with open(MONITORING_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=rows[0].keys())
+            w.writeheader()
+            w.writerows(rows)
 
 # -----------------------------
 # Generic helpers
@@ -953,6 +1032,17 @@ def main():
             with right:
                 st.write("**Action:**")
                 st.markdown(action_badge(decision), unsafe_allow_html=True)
+
+                if decision == "NO ENTRY":
+                    deactivate_from_monitoring(base_addr)
+
+                if decision == "WATCH / WAIT":
+                    if st.button("➕ Add to Monitoring", key=f"mon_{kb}", use_container_width=True):
+                        res = add_to_monitoring(p, s)
+                        if res == "OK":
+                            st.success("Added to Monitoring")
+                        elif res == "EXISTS":
+                            st.info("Already in Monitoring")
 
                 st.write("**Tags:**")
                 for t in tags:
