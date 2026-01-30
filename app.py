@@ -23,7 +23,7 @@ import requests
 import streamlit as st
 import pandas as pd
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -94,6 +94,7 @@ def ensure_storage():
                     "chain",
                     "base_symbol",
                     "base_addr",
+                    "base_key",
                     "pair_addr",
                     "score_init",
                     "liq_init",
@@ -119,6 +120,7 @@ def ensure_storage():
                     "chain",
                     "base_symbol",
                     "base_addr",
+                    "base_key",
                     "pair_addr",
                     "dex",
                     "quote_symbol",
@@ -185,21 +187,22 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
     Streamlit's st.link_button signature has changed across versions.
     This wrapper avoids TypeError by:
     - trying without key
-    - falling back to HTML button if needed
+    - trying with key
+    - falling back to HTML link button
     """
     if not url:
         return
     if hasattr(st, "link_button"):
         try:
-            # safest: call without key first (prevents TypeError across versions)
-            link_button(label, url, use_container_width=use_container_width)
+            # safest: call without key first
+            st.link_button(label, url, use_container_width=use_container_width)
             return
         except TypeError:
             try:
                 if key is not None:
-                    link_button(label, url, use_container_width=use_container_width, key=key)
+                    st.link_button(label, url, use_container_width=use_container_width, key=key)
                 else:
-                    link_button(label, url, use_container_width=use_container_width)
+                    st.link_button(label, url, use_container_width=use_container_width)
                 return
             except Exception:
                 pass
@@ -208,50 +211,14 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
 
     st.markdown(
         f"""
-        <a href="{url}" target="_blank" style="text-decoration:none;">
-          <div style="
-            display:inline-block;
-            padding:10px 14px;
-            border-radius:10px;
-            border:1px solid rgba(0,0,0,0.22);
-            font-weight:800;
-            width:100%;
-            text-align:center;
-          ">{label}</div>
+        <a href=\"{url}\" target=\"_blank\" style=\"text-decoration:none;\">
+          <div style=\"display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid rgba(0,0,0,0.22);font-weight:800;width:100%;text-align:center;\">
+            {label}
+          </div>
         </a>
         """,
         unsafe_allow_html=True,
     )
-
-
-# =============================
-# Constants / presets
-# =============================
-CHAIN_DEX_PRESETS = {
-    "bsc": ["pancakeswap", "thena", "biswap", "apeswap", "babyswap", "mdex", "woofi"],
-    "solana": ["raydium", "orca", "meteora", "pumpfun", "pumpswap"],
-}
-
-NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
-
-MAJORS_STABLES = {
-    "BTC", "WBTC", "ETH", "WETH", "BNB", "WBNB", "SOL", "WSOL",
-    "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDE", "USDS",
-    "WAVAX", "WMATIC",
-}
-
-DEFAULT_SEEDS = (
-    "WBNB, USDT, meme, memecoin, ai, ai agent, agentic, launch, new, listing, trending, hot, hype, pump, "
-    "sol, eth, usdc, pepe, trump, inu, dog, cat, frog, shiba, "
-    "community, cto, community takeover, takeover, revival, "
-    "fairlaunch, stealth, presale, airdrop, claim, points, quest, rewards, wl, whitelist, "
-    "v2, v3, v4, relaunch, rebrand, migration, upgrade, "
-    "depin, rwa, gaming, gamefi, esports, "
-    "defi, dex, perp, perps, leverage, staking, apr, farming, "
-    "bridge, crosschain, multichain, ecosystem, partnership, "
-    "burn, buyback, revenue share, "
-    "pumpfun, pumpswap, launchpad"
-)
 
 PRESETS = {
     "Ultra Early (safer)": {
@@ -364,6 +331,23 @@ def fmt_usd_delta(x: float) -> str:
         return f"{sign}${x:,.0f}"
     except Exception:
         return "n/a"
+
+# =============================
+# Address normalization (Solana is case-sensitive)
+# =============================
+def norm_addr(chain: str, addr: str) -> str:
+    chain = (chain or "").lower().strip()
+    a = (addr or "").strip()
+    if not a:
+        return ""
+    if chain == "solana":
+        return a  # base58 is case-sensitive
+    return a.lower()
+
+def token_key(chain: str, addr: str) -> str:
+    chain = (chain or "").lower().strip()
+    na = norm_addr(chain, addr)
+    return f"{chain}:{na}" if chain and na else ""
 
 
 # =============================
@@ -720,7 +704,7 @@ def dedupe_mode(pairs: List[Dict[str, Any]], by_base_token: bool) -> List[Dict[s
 
     best = {}
     for p in pairs:
-        base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip().lower()
+        base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
         if not base_addr:
             continue
         cur = best.get(base_addr)
@@ -800,6 +784,7 @@ MON_FIELDS = [
     "chain",
     "base_symbol",
     "base_addr",
+    "base_key",
     "pair_addr",
     "score_init",
     "liq_init",
@@ -817,6 +802,7 @@ HIST_FIELDS = [
     "chain",
     "base_symbol",
     "base_addr",
+    "base_key",
     "pair_addr",
     "dex",
     "quote_symbol",
@@ -846,6 +832,8 @@ def load_monitoring() -> List[Dict[str, Any]]:
         for k in MON_FIELDS:
             if k not in r:
                 r[k] = ""
+        if not r.get("base_key"):
+            r["base_key"] = token_key(r.get("chain",""), r.get("base_addr",""))
     return rows
 
 
@@ -854,13 +842,14 @@ def save_monitoring(rows: List[Dict[str, Any]]):
 
 
 def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
-    base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip().lower()
+    base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
     if not base_addr:
         return "NO_ADDR"
 
     rows = load_monitoring()
+    base_key = token_key((p.get("chainId") or "").lower(), base_addr)
     for r in rows:
-        if r.get("active") == "1" and (r.get("base_addr", "").lower() == base_addr):
+        if r.get("active") == "1" and (r.get("base_key","") == base_key):
             return "EXISTS"
 
     rows.append(
@@ -869,6 +858,7 @@ def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
             "chain": (p.get("chainId") or "").lower(),
             "base_symbol": safe_get(p, "baseToken", "symbol", default="") or "",
             "base_addr": base_addr,
+            "base_key": base_key,
             "pair_addr": p.get("pairAddress", "") or "",
             "score_init": str(score),
             "liq_init": str(safe_get(p, "liquidity", "usd", default=0) or 0),
@@ -885,33 +875,37 @@ def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
     return "OK"
 
 
-def archive_monitoring(base_addr: str, reason: str, last_score: float = 0.0, last_decision: str = "") -> bool:
+def archive_monitoring(base_addr: str, reason: str, last_score: float = 0.0, last_decision: str = "", chain: str = "") -> bool:
     if not base_addr:
         return False
-    base = base_addr.lower().strip()
     rows = load_monitoring()
+    base_key = token_key(chain or (rows[0].get("chain") if rows else ""), base_addr)
+
     changed = False
     for r in rows:
-        if r.get("active") == "1" and (r.get("base_addr", "").lower().strip() == base):
+        if r.get("active") == "1" and (r.get("base_key","") == base_key or (not r.get("base_key") and r.get("base_addr","") == base_addr)):
             r["active"] = "0"
             r["ts_archived"] = now_utc_str()
             r["archived_reason"] = reason
-            r["last_score"] = f"{last_score:.2f}" if last_score else str(last_score)
+            r["last_score"] = f"{last_score:.2f}" if isinstance(last_score, (int, float)) else str(last_score)
             r["last_decision"] = last_decision or ""
             changed = True
+
     if changed:
         save_monitoring(rows)
     return changed
 
 
-def reactivate_monitoring(base_addr: str) -> bool:
+
+def reactivate_monitoring(base_addr: str, chain: str = "") -> bool:
     if not base_addr:
         return False
-    base = base_addr.lower().strip()
     rows = load_monitoring()
+    base_key = token_key(chain or (rows[0].get("chain") if rows else ""), base_addr)
+
     changed = False
     for r in rows:
-        if (r.get("active") != "1") and (r.get("base_addr", "").lower().strip() == base):
+        if (r.get("active") != "1") and (r.get("base_key","") == base_key or (not r.get("base_key") and r.get("base_addr","") == base_addr)):
             r["active"] = "1"
             r["ts_added"] = now_utc_str()
             r["ts_archived"] = ""
@@ -920,9 +914,11 @@ def reactivate_monitoring(base_addr: str) -> bool:
             r["last_decision"] = ""
             changed = True
             break
+
     if changed:
         save_monitoring(rows)
     return changed
+
 
 
 def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[str], swap_url: str) -> str:
@@ -976,16 +972,16 @@ def active_base_sets() -> Tuple[set, set]:
     """
     mon = load_monitoring()
     port = load_portfolio()
-    mon_set = {r.get("base_addr", "").lower().strip() for r in mon if r.get("active") == "1" and r.get("base_addr")}
-    port_set = {r.get("base_token_address", "").lower().strip() for r in port if r.get("active") == "1" and r.get("base_token_address")}
+    mon_set = {r.get('base_key','') or token_key(r.get('chain',''), r.get('base_addr','')) for r in mon if r.get('active')=='1' and (r.get('base_addr') or r.get('base_key'))}
+    port_set = {token_key(r.get('chain',''), r.get('base_token_address','')) for r in port if r.get('active')=='1' and r.get('base_token_address')}
     return mon_set, port_set
 
 
 # =============================
 # Monitoring history snapshots
 # =============================
-def should_snapshot(base_addr: str, min_interval_sec: int = 60) -> bool:
-    base = (base_addr or "").lower().strip()
+def should_snapshot(base_key: str, min_interval_sec: int = 60) -> bool:
+    base = (base_key or "").strip()
     if not base:
         return False
     key = f"last_snap_{base}"
@@ -1005,7 +1001,7 @@ def append_monitoring_history(row: Dict[str, Any]):
 def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Optional[Dict[str, Any]]):
     if not chain or not base_addr or not best:
         return
-    if not should_snapshot(base_addr, min_interval_sec=60):
+    if not should_snapshot(token_key(chain, base_addr), min_interval_sec=60):
         return
 
     s_live = score_pair(best)
@@ -1015,7 +1011,8 @@ def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Op
         "ts_utc": now_utc_str(),
         "chain": (chain or "").lower(),
         "base_symbol": base_sym or "",
-        "base_addr": (base_addr or "").lower(),
+        "base_addr": (base_addr or ""),
+        "base_key": token_key((chain or "").lower(), base_addr),
         "pair_addr": best.get("pairAddress", "") or "",
         "dex": best.get("dexId", "") or "",
         "quote_symbol": safe_get(best, "quoteToken", "symbol", default="") or "",
@@ -1062,12 +1059,12 @@ def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
         return rows[-limit_rows:]
 
 
-def token_history_rows(base_addr: str, limit: int = 300) -> List[Dict[str, Any]]:
-    base = (base_addr or "").lower().strip()
-    if not base:
+def token_history_rows(chain: str, base_addr: str, limit: int = 300) -> List[Dict[str, Any]]:
+    base_key = token_key(chain, base_addr)
+    if not base_key:
         return []
     rows = load_monitoring_history(limit_rows=8000)
-    filt = [r for r in rows if (r.get("base_addr", "").lower().strip() == base)]
+    filt = [r for r in rows if (r.get('base_key','') == base_key) or (not r.get('base_key') and token_key(chain, r.get('base_addr','')) == base_key)]
     return filt[-limit:]
 
 
@@ -1150,11 +1147,12 @@ def page_scout(cfg: Dict[str, Any]):
 
     ranked = []
     for p in filtered:
-        base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip().lower()
+        base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
         if not base_addr:
             continue
         # ядро: Scout не показує те, що вже active у Monitoring/Portfolio
-        if base_addr in mon_set or base_addr in port_set:
+        base_key = token_key(chain_id, base_addr)
+        if base_key in mon_set or base_key in port_set:
             continue
 
         s = score_pair(p)
@@ -1337,9 +1335,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
             if best:
                 if drop_no_entry and decision.strip().upper() == "NO ENTRY":
-                    archive_monitoring(base_addr, reason="auto: NO ENTRY", last_score=s_live, last_decision=decision)
+                    archive_monitoring(base_addr, reason="auto: NO ENTRY", last_score=s_live, last_decision=decision, chain=chain)
                 elif s_live > 0 and s_live < min_score:
-                    archive_monitoring(base_addr, reason=f"auto: score<{min_score:.0f}", last_score=s_live, last_decision=decision)
+                    archive_monitoring(base_addr, reason=f"auto: score<{min_score:.0f}", last_score=s_live, last_decision=decision, chain=chain)
 
         # deltas vs init
         d_score = s_live - score_init
@@ -1410,7 +1408,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"• {t}")
 
         # quick history (last N decisions) to help понять "чи переживе очікування"
-        hist = token_history_rows(base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
+        hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
         with st.expander("Stability check (last snapshots)", expanded=False):
             if not hist:
                 st.info("No snapshots yet.")
@@ -1473,14 +1471,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     else:
                         res = log_to_portfolio(best, s_live, decision, tags, swap_url)
                         if res == "OK":
-                            archive_monitoring(base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
+                            archive_monitoring(base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision, chain=chain)
                             st.success("Promoted to Portfolio + archived from Monitoring.")
                             st.rerun()
                         else:
                             st.info("Already active in portfolio.")
         with actions[1]:
             if st.button("Archive (manual)", key=f"drop_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
-                archive_monitoring(base_addr, reason="manual", last_score=s_live, last_decision=decision)
+                archive_monitoring(base_addr, reason="manual", last_score=s_live, last_decision=decision, chain=chain)
                 st.success("Archived.")
                 st.rerun()
         with actions[2]:
@@ -1532,7 +1530,7 @@ def page_archive():
                 link_button(swap_label, swap_url, use_container_width=True, key=f"a_sw_{idx}_{hkey(base_addr, chain)}")
 
             if st.button("Re-activate → Monitoring", key=f"rea_{idx}_{hkey(base_addr)}", use_container_width=True):
-                ok = reactivate_monitoring(base_addr)
+                ok = reactivate_monitoring(base_addr, chain=chain)
                 if ok:
                     st.success("Re-activated.")
                     st.rerun()
