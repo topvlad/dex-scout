@@ -22,8 +22,7 @@ from contextlib import contextmanager
 import requests
 import streamlit as st
 
-VERSION = "0.4.0"
-
+VERSION = "0.4.1"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -192,14 +191,14 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
     if hasattr(st, "link_button"):
         try:
             # safest: call without key first (prevents TypeError across versions)
-            st.link_button(label, url, use_container_width=use_container_width)
+            link_button(label, url, use_container_width=use_container_width)
             return
         except TypeError:
             try:
                 if key is not None:
-                    st.link_button(label, url, use_container_width=use_container_width, key=key)
+                    link_button(label, url, use_container_width=use_container_width, key=key)
                 else:
-                    st.link_button(label, url, use_container_width=use_container_width)
+                    link_button(label, url, use_container_width=use_container_width)
                 return
             except Exception:
                 pass
@@ -555,19 +554,19 @@ def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
 def action_badge(action: str) -> str:
     a = (action or "").strip().upper()
 
-    # explicit mapping (fix for "NO ENTRY is green")
-    if "NO ENTRY" in a or "AVOID" in a or "CUT" in a or "RISK" in a:
-        color = "#e53e3e"  # red
+    # IMPORTANT: "NO ENTRY" contains substring "ENTRY" – handle it first
+    if a.startswith("NO ENTRY") or a == "NO ENTRY":
+        color = "#e53e3e"      # red
         bg = "rgba(229,62,62,0.12)"
-    elif "WATCH" in a or "WAIT" in a:
-        color = "#d69e2e"  # yellow
-        bg = "rgba(214,158,46,0.15)"
-    elif "ENTRY" in a or a.startswith("BUY"):
-        color = "#1f9d55"  # green
+    elif a.startswith("ENTRY") or a.startswith("BUY"):
+        color = "#1f9d55"      # green
         bg = "rgba(31,157,85,0.15)"
+    elif "WATCH" in a or "WAIT" in a:
+        color = "#d69e2e"      # yellow
+        bg = "rgba(214,158,46,0.15)"
     else:
-        color = "#718096"  # gray
-        bg = "rgba(113,128,150,0.12)"
+        color = "#e53e3e"
+        bg = "rgba(229,62,62,0.12)"
 
     return f"""
     <span style="
@@ -577,16 +576,11 @@ def action_badge(action: str) -> str:
       border:1px solid {color};
       background:{bg};
       color:{color};
-      font-weight:900;
+      font-weight:800;
       font-size:12px;
-      letter-spacing:0.35px;
+      letter-spacing:0.4px;
     ">{action}</span>
     """
-
-
-# =============================
-# Filtering / Debug
-# =============================
 def filter_pairs_with_debug(
     pairs: List[Dict[str, Any]],
     chain: str,
@@ -742,15 +736,27 @@ def dedupe_mode(pairs: List[Dict[str, Any]], by_base_token: bool) -> List[Dict[s
 
 
 def sample_seeds(seeds: List[str], k: int, refresh: bool) -> List[str]:
-    seeds = [s.strip() for s in seeds if s.strip()]
-    if not seeds:
+    # Clean + de-noise: DexScreener search can 400 on weird/too-short queries (e.g. "x")
+    cleaned = []
+    for s in seeds:
+        s = (s or "").strip()
+        if not s:
+            continue
+        if len(s) < 2:
+            continue
+        if s.lower() in {"x"}:
+            continue
+        cleaned.append(s)
+
+    if not cleaned:
         return []
-    k = max(1, min(int(k), len(seeds)))
+
+    k = max(1, min(int(k), len(cleaned)))
+
     if "seed_sample" not in st.session_state or refresh:
-        st.session_state["seed_sample"] = random.sample(seeds, k)
+        st.session_state["seed_sample"] = random.sample(cleaned, k)
+
     return st.session_state["seed_sample"]
-
-
 # =============================
 # Swap URL builders (routing fix)
 # =============================
@@ -1401,23 +1407,55 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         # quick history (last N decisions) to help понять "чи переживе очікування"
         with st.expander("Stability check (last snapshots)", expanded=False):
-            hist = token_history_rows(base_addr, limit=120)
             if not hist:
-                st.info("No history yet. Re-open Monitoring after ~1 minute.")
+                st.info("No snapshots yet.")
             else:
-                # compute share of NO ENTRY in last 30 snapshots
-                last30 = hist[-30:]
-                no_entry = sum(1 for x in last30 if (x.get("decision", "").upper().strip() == "NO ENTRY"))
-                avg_score = 0.0
-                cnt = 0
-                for x in last30:
-                    s = parse_float(x.get("score_live"), 0.0)
-                    if s > 0:
-                        avg_score += s
-                        cnt += 1
-                avg_score = (avg_score / cnt) if cnt else 0.0
-                st.write(f"Last 30: NO ENTRY {no_entry}/30 • avg score ~{avg_score:.1f}")
+                dfh = pd.DataFrame(hist).copy()
+                # Normalize + order
+                if "ts_utc" in dfh.columns:
+                    dfh["ts_utc"] = pd.to_datetime(dfh["ts_utc"], errors="coerce")
+                    dfh = dfh.sort_values("ts_utc")
+                else:
+                    dfh["ts_utc"] = pd.NaT
 
+                # Quick stats
+                last_n = min(30, len(dfh))
+                tail = dfh.tail(last_n)
+                no_entry_cnt = int((tail.get("decision", "").astype(str).str.upper() == "NO ENTRY").sum())
+                no_entry_ratio = no_entry_cnt / max(1, last_n)
+
+                avg_score = float(pd.to_numeric(tail.get("score_live", pd.Series([0]*len(tail))), errors="coerce").fillna(0).mean())
+                std_score = float(pd.to_numeric(tail.get("score_live", pd.Series([0]*len(tail))), errors="coerce").fillna(0).std(ddof=0))
+                # A simple "survivability" heuristic: prefers stable score + low NO ENTRY share
+                survivability = max(0.0, 100.0 - (no_entry_ratio * 70.0) - min(std_score / 10.0, 30.0))
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Last N", str(last_n))
+                c2.metric("NO ENTRY (last N)", f"{no_entry_cnt}/{last_n}", f"{no_entry_ratio*100:.0f}%")
+                c3.metric("Avg score (last N)", f"{avg_score:.1f}")
+                c4.metric("Survivability", f"{survivability:.0f}/100")
+
+                # Sparklines (what you missed)
+                chart_df = tail[["ts_utc", "price_usd", "score_live"]].copy()
+                chart_df = chart_df.set_index("ts_utc")
+                chart_df["price_usd"] = pd.to_numeric(chart_df["price_usd"], errors="coerce")
+                chart_df["score_live"] = pd.to_numeric(chart_df["score_live"], errors="coerce")
+
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    st.caption("Price (sparkline)")
+                    st.line_chart(chart_df[["price_usd"]], height=120, use_container_width=True)
+                with cc2:
+                    st.caption("Score (sparkline)")
+                    st.line_chart(chart_df[["score_live"]], height=120, use_container_width=True)
+
+                # Why can score be high while decision is NO ENTRY?
+                dec_now = str(best.get("decision", "")).upper()
+                if dec_now == "NO ENTRY":
+                    st.warning(
+                        "Decision = NO ENTRY is rule-based (flow / imbalance / micro-volume guards). "
+                        "A high score can still happen if liquidity/24h volume are strong, but micro-activity is weak or imbalanced."
+                    )
         actions = st.columns([2, 2, 2, 6])
         with actions[0]:
             if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
