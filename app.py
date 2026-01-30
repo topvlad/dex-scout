@@ -23,7 +23,7 @@ import requests
 import streamlit as st
 import pandas as pd
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -1109,6 +1109,9 @@ def page_scout(cfg: Dict[str, Any]):
     all_pairs: List[Dict[str, Any]] = []
     query_failures = 0
     for q in sampled:
+        # DexScreener часто віддає 400 на занадто короткі запити типу 'x'
+        if len(q.strip()) < 2:
+            continue
         try:
             all_pairs.extend(fetch_latest_pairs_for_query(q))
             time.sleep(0.10)
@@ -1407,7 +1410,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"• {t}")
 
         # quick history (last N decisions) to help понять "чи переживе очікування"
-        hist = token_history_rows(base_addr, limit=int(cfg.get("stability_window_n", 30)))
+        hist = token_history_rows(base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
         with st.expander("Stability check (last snapshots)", expanded=False):
             if not hist:
                 st.info("No snapshots yet.")
