@@ -21,8 +21,9 @@ from contextlib import contextmanager
 
 import requests
 import streamlit as st
+import pandas as pd
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -1406,6 +1407,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"• {t}")
 
         # quick history (last N decisions) to help понять "чи переживе очікування"
+        hist = token_history_rows(base_addr, limit=int(cfg.get("stability_window_n", 30)))
         with st.expander("Stability check (last snapshots)", expanded=False):
             if not hist:
                 st.info("No snapshots yet.")
