@@ -23,7 +23,7 @@ import requests
 import streamlit as st
 import pandas as pd
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -219,6 +219,20 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
         """,
         unsafe_allow_html=True,
     )
+
+
+DEFAULT_SEEDS = (
+    "WBNB, USDT, meme, memecoin, ai, ai agent, agentic, launch, new, listing, trending, hot, hype, pump, "
+    "sol, eth, usdc, pepe, trump, inu, dog, cat, frog, shiba, "
+    "community, cto, community takeover, takeover, revival, "
+    "fairlaunch, stealth, presale, airdrop, claim, points, quest, rewards, wl, whitelist, "
+    "v2, v3, v4, relaunch, rebrand, migration, upgrade, "
+    "depin, rwa, gaming, gamefi, esports, "
+    "defi, dex, perp, perps, leverage, staking, apr, farming, "
+    "bridge, crosschain, multichain, ecosystem, partnership, "
+    "burn, buyback, revenue share, "
+    "pumpfun, pumpswap, launchpad"
+)
 
 PRESETS = {
     "Ultra Early (safer)": {
