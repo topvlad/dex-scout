@@ -1,12 +1,12 @@
-# app.py — DEX Scout v0.4.0 (stable core)
+# app.py — DEX Scout v0.4.6
 # ядро: Scout → Monitoring → Archive (+ Portfolio)
 # - Scout: показує тільки re-eligible токени (не в Monitoring active, не в Portfolio active), і НЕ показує "NO ENTRY"
-# - Monitoring: тільки WATCH/WAIT. Сортування: monitoring_score, momentum, time since added
+# - Monitoring: тільки WATCH/WAIT. Сортування: priority → momentum → time since added
 # - Archive: автоматична архівація (опційно) по мін. score та/або по "NO ENTRY"
 # - BSC + Solana, swap routing: PancakeSwap (BSC) + Jupiter (Solana)
-# - Streamlit link_button TypeError fix: єдиний wrapper link_button()
+# - Address handling: Solana mint addresses are case-sensitive – NEVER lower() them
 #
-# ⚠️ Safety note: Це НЕ ончейн-аудит. Для Solana — завжди дивись JupShield warnings перед swap.
+# ⚠️ Safety note: Це НЕ ончейн-аудит. Для Solana – завжди дивись JupShield warnings перед swap.
 
 import os
 import re
@@ -23,7 +23,7 @@ import requests
 import streamlit as st
 import pandas as pd
 
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -94,7 +94,6 @@ def ensure_storage():
                     "chain",
                     "base_symbol",
                     "base_addr",
-                    "base_key",
                     "pair_addr",
                     "score_init",
                     "liq_init",
@@ -120,7 +119,6 @@ def ensure_storage():
                     "chain",
                     "base_symbol",
                     "base_addr",
-                    "base_key",
                     "pair_addr",
                     "dex",
                     "quote_symbol",
@@ -184,17 +182,16 @@ def hkey(*parts: str, n: int = 10) -> str:
 
 def link_button(label: str, url: str, use_container_width: bool = True, key: Optional[str] = None):
     """
-    Streamlit's st.link_button signature has changed across versions.
+    Streamlit's st.link_button signature differs across versions.
     This wrapper avoids TypeError by:
     - trying without key
-    - trying with key
-    - falling back to HTML link button
+    - then with key
+    - falling back to HTML if needed
     """
     if not url:
         return
     if hasattr(st, "link_button"):
         try:
-            # safest: call without key first
             st.link_button(label, url, use_container_width=use_container_width)
             return
         except TypeError:
@@ -211,15 +208,37 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
 
     st.markdown(
         f"""
-        <a href=\"{url}\" target=\"_blank\" style=\"text-decoration:none;\">
-          <div style=\"display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid rgba(0,0,0,0.22);font-weight:800;width:100%;text-align:center;\">
-            {label}
-          </div>
+        <a href="{url}" target="_blank" style="text-decoration:none;">
+          <div style="
+            display:inline-block;
+            padding:10px 14px;
+            border-radius:10px;
+            border:1px solid rgba(0,0,0,0.22);
+            font-weight:800;
+            width:100%;
+            text-align:center;
+          ">{label}</div>
         </a>
         """,
         unsafe_allow_html=True,
     )
 
+
+# =============================
+# Constants / presets
+# =============================
+CHAIN_DEX_PRESETS = {
+    "bsc": ["pancakeswap", "thena", "biswap", "apeswap", "babyswap", "mdex", "woofi"],
+    "solana": ["raydium", "orca", "meteora", "pumpfun", "pumpswap"],
+}
+
+NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
+
+MAJORS_STABLES = {
+    "BTC", "WBTC", "ETH", "WETH", "BNB", "WBNB", "SOL", "WSOL",
+    "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDE", "USDS",
+    "WAVAX", "WMATIC",
+}
 
 DEFAULT_SEEDS = (
     "WBNB, USDT, meme, memecoin, ai, ai agent, agentic, launch, new, listing, trending, hot, hype, pump, "
@@ -307,6 +326,30 @@ PRESETS = {
 
 
 # =============================
+# Address helpers
+# =============================
+def addr_key(chain: str, addr: str) -> str:
+    c = (chain or "").lower().strip()
+    a = (addr or "").strip()
+    if not a:
+        return ""
+    if c == "solana":
+        return f"solana:{a}"  # case-sensitive
+    return f"{c}:{a.lower()}"
+
+
+def addr_store(chain: str, addr: str) -> str:
+    """What we store in CSV base_addr field."""
+    c = (chain or "").lower().strip()
+    a = (addr or "").strip()
+    if not a:
+        return ""
+    if c == "solana":
+        return a
+    return a.lower()
+
+
+# =============================
 # Helpers
 # =============================
 def safe_get(d: Dict[str, Any], *path, default=None):
@@ -345,23 +388,6 @@ def fmt_usd_delta(x: float) -> str:
         return f"{sign}${x:,.0f}"
     except Exception:
         return "n/a"
-
-# =============================
-# Address normalization (Solana is case-sensitive)
-# =============================
-def norm_addr(chain: str, addr: str) -> str:
-    chain = (chain or "").lower().strip()
-    a = (addr or "").strip()
-    if not a:
-        return ""
-    if chain == "solana":
-        return a  # base58 is case-sensitive
-    return a.lower()
-
-def token_key(chain: str, addr: str) -> str:
-    chain = (chain or "").lower().strip()
-    na = norm_addr(chain, addr)
-    return f"{chain}:{na}" if chain and na else ""
 
 
 # =============================
@@ -487,7 +513,9 @@ def solana_unverified_heuristic(p: Dict[str, Any]) -> bool:
 # =============================
 # Scoring / decision / colors
 # =============================
-def score_pair(p: Dict[str, Any]) -> float:
+def score_pair(p: Optional[Dict[str, Any]]) -> float:
+    if not p:
+        return 0.0
     liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
     vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
     vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
@@ -507,7 +535,10 @@ def score_pair(p: Dict[str, Any]) -> float:
     return round(s, 2)
 
 
-def build_trade_hint(p: Dict[str, Any]) -> Tuple[str, List[str]]:
+def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
+    if not p:
+        return "NO DATA", []
+
     liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
     vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
     vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
@@ -580,6 +611,8 @@ def action_badge(action: str) -> str:
       letter-spacing:0.4px;
     ">{action}</span>
     """
+
+
 def filter_pairs_with_debug(
     pairs: List[Dict[str, Any]],
     chain: str,
@@ -718,24 +751,25 @@ def dedupe_mode(pairs: List[Dict[str, Any]], by_base_token: bool) -> List[Dict[s
 
     best = {}
     for p in pairs:
+        chain = (p.get("chainId") or "").lower().strip()
         base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
-        if not base_addr:
+        k = addr_key(chain, base_addr)
+        if not k:
             continue
-        cur = best.get(base_addr)
+        cur = best.get(k)
         if cur is None:
-            best[base_addr] = p
+            best[k] = p
         else:
             liq1 = float(safe_get(p, "liquidity", "usd", default=0) or 0)
             vol1 = float(safe_get(p, "volume", "h24", default=0) or 0)
             liq0 = float(safe_get(cur, "liquidity", "usd", default=0) or 0)
             vol0 = float(safe_get(cur, "volume", "h24", default=0) or 0)
             if (liq1, vol1) > (liq0, vol0):
-                best[base_addr] = p
+                best[k] = p
     return list(best.values())
 
 
 def sample_seeds(seeds: List[str], k: int, refresh: bool) -> List[str]:
-    # Clean + de-noise: DexScreener search can 400 on weird/too-short queries (e.g. "x")
     cleaned = []
     for s in seeds:
         s = (s or "").strip()
@@ -756,6 +790,8 @@ def sample_seeds(seeds: List[str], k: int, refresh: bool) -> List[str]:
         st.session_state["seed_sample"] = random.sample(cleaned, k)
 
     return st.session_state["seed_sample"]
+
+
 # =============================
 # Swap URL builders (routing fix)
 # =============================
@@ -767,7 +803,6 @@ def build_swap_url(chain: str, base_addr: str) -> str:
     if chain == "bsc":
         return f"https://pancakeswap.finance/swap?outputCurrency={base_addr}"
     if chain == "solana":
-        # Jupiter accepts mint address; route is SOL -> token
         return f"https://jup.ag/swap/SOL-{base_addr}"
     return ""
 
@@ -798,7 +833,6 @@ MON_FIELDS = [
     "chain",
     "base_symbol",
     "base_addr",
-    "base_key",
     "pair_addr",
     "score_init",
     "liq_init",
@@ -816,7 +850,6 @@ HIST_FIELDS = [
     "chain",
     "base_symbol",
     "base_addr",
-    "base_key",
     "pair_addr",
     "dex",
     "quote_symbol",
@@ -841,13 +874,10 @@ def save_portfolio(rows: List[Dict[str, Any]]):
 
 def load_monitoring() -> List[Dict[str, Any]]:
     rows = load_csv(MONITORING_CSV)
-    # normalize missing new fields (migration)
     for r in rows:
         for k in MON_FIELDS:
             if k not in r:
                 r[k] = ""
-        if not r.get("base_key"):
-            r["base_key"] = token_key(r.get("chain",""), r.get("base_addr",""))
     return rows
 
 
@@ -856,23 +886,25 @@ def save_monitoring(rows: List[Dict[str, Any]]):
 
 
 def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
-    base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
-    if not base_addr:
+    chain = (p.get("chainId") or "").lower().strip()
+    base_addr_raw = (safe_get(p, "baseToken", "address", default="") or "").strip()
+    if not base_addr_raw:
         return "NO_ADDR"
 
+    base_addr = addr_store(chain, base_addr_raw)
+    key = addr_key(chain, base_addr)
+
     rows = load_monitoring()
-    base_key = token_key((p.get("chainId") or "").lower(), base_addr)
     for r in rows:
-        if r.get("active") == "1" and (r.get("base_key","") == base_key):
+        if r.get("active") == "1" and addr_key(r.get("chain",""), r.get("base_addr","")) == key:
             return "EXISTS"
 
     rows.append(
         {
             "ts_added": now_utc_str(),
-            "chain": (p.get("chainId") or "").lower(),
+            "chain": chain,
             "base_symbol": safe_get(p, "baseToken", "symbol", default="") or "",
             "base_addr": base_addr,
-            "base_key": base_key,
             "pair_addr": p.get("pairAddress", "") or "",
             "score_init": str(score),
             "liq_init": str(safe_get(p, "liquidity", "usd", default=0) or 0),
@@ -889,37 +921,33 @@ def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
     return "OK"
 
 
-def archive_monitoring(base_addr: str, reason: str, last_score: float = 0.0, last_decision: str = "", chain: str = "") -> bool:
+def archive_monitoring(chain: str, base_addr: str, reason: str, last_score: float = 0.0, last_decision: str = "") -> bool:
     if not base_addr:
         return False
+    key = addr_key(chain, base_addr)
     rows = load_monitoring()
-    base_key = token_key(chain or (rows[0].get("chain") if rows else ""), base_addr)
-
     changed = False
     for r in rows:
-        if r.get("active") == "1" and (r.get("base_key","") == base_key or (not r.get("base_key") and r.get("base_addr","") == base_addr)):
+        if r.get("active") == "1" and addr_key(r.get("chain",""), r.get("base_addr","")) == key:
             r["active"] = "0"
             r["ts_archived"] = now_utc_str()
             r["archived_reason"] = reason
-            r["last_score"] = f"{last_score:.2f}" if isinstance(last_score, (int, float)) else str(last_score)
+            r["last_score"] = f"{last_score:.2f}" if last_score else str(last_score)
             r["last_decision"] = last_decision or ""
             changed = True
-
     if changed:
         save_monitoring(rows)
     return changed
 
 
-
-def reactivate_monitoring(base_addr: str, chain: str = "") -> bool:
+def reactivate_monitoring(chain: str, base_addr: str) -> bool:
     if not base_addr:
         return False
+    key = addr_key(chain, base_addr)
     rows = load_monitoring()
-    base_key = token_key(chain or (rows[0].get("chain") if rows else ""), base_addr)
-
     changed = False
     for r in rows:
-        if (r.get("active") != "1") and (r.get("base_key","") == base_key or (not r.get("base_key") and r.get("base_addr","") == base_addr)):
+        if (r.get("active") != "1") and addr_key(r.get("chain",""), r.get("base_addr","")) == key:
             r["active"] = "1"
             r["ts_added"] = now_utc_str()
             r["ts_archived"] = ""
@@ -928,31 +956,32 @@ def reactivate_monitoring(base_addr: str, chain: str = "") -> bool:
             r["last_decision"] = ""
             changed = True
             break
-
     if changed:
         save_monitoring(rows)
     return changed
 
 
-
 def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[str], swap_url: str) -> str:
     rows = load_portfolio()
 
-    chain = (p.get("chainId") or "").lower()
+    chain = (p.get("chainId") or "").lower().strip()
     dex = p.get("dexId") or ""
     base_sym = safe_get(p, "baseToken", "symbol", default="") or ""
     quote_sym = safe_get(p, "quoteToken", "symbol", default="") or ""
-    base_addr = safe_get(p, "baseToken", "address", default="") or ""
-    pair_addr = p.get("pairAddress", "") or ""
+    base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
+    pair_addr = (p.get("pairAddress", "") or "").strip()
     url = p.get("url", "") or ""
     price = safe_get(p, "priceUsd", default="") or ""
+
+    key = addr_key(chain, base_addr)
 
     for r in rows:
         if r.get("active") != "1":
             continue
         if pair_addr and (r.get("pair_address", "").lower() == pair_addr.lower()):
             return "ALREADY_EXISTS"
-        if (not pair_addr) and base_addr and (r.get("base_token_address", "").lower() == base_addr.lower()):
+        # compare base by chain-aware key
+        if addr_key(r.get("chain",""), r.get("base_token_address","")) == key:
             return "ALREADY_EXISTS"
 
     rows.append(
@@ -962,7 +991,7 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
             "dex": dex,
             "base_symbol": base_sym,
             "quote_symbol": quote_sym,
-            "base_token_address": base_addr,
+            "base_token_address": base_addr,  # keep original (sol case sensitive)
             "pair_address": pair_addr,
             "dexscreener_url": url,
             "swap_url": swap_url,
@@ -979,29 +1008,24 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
 
 
 def active_base_sets() -> Tuple[set, set]:
-    """
-    returns:
-      - active monitoring base addrs
-      - active portfolio base addrs
-    """
     mon = load_monitoring()
     port = load_portfolio()
-    mon_set = {r.get('base_key','') or token_key(r.get('chain',''), r.get('base_addr','')) for r in mon if r.get('active')=='1' and (r.get('base_addr') or r.get('base_key'))}
-    port_set = {token_key(r.get('chain',''), r.get('base_token_address','')) for r in port if r.get('active')=='1' and r.get('base_token_address')}
+    mon_set = {addr_key(r.get("chain",""), r.get("base_addr","")) for r in mon if r.get("active") == "1" and r.get("base_addr")}
+    port_set = {addr_key(r.get("chain",""), r.get("base_token_address","")) for r in port if r.get("active") == "1" and r.get("base_token_address")}
     return mon_set, port_set
 
 
 # =============================
 # Monitoring history snapshots
 # =============================
-def should_snapshot(base_key: str, min_interval_sec: int = 60) -> bool:
-    base = (base_key or "").strip()
-    if not base:
+def should_snapshot(chain: str, base_addr: str, min_interval_sec: int = 60) -> bool:
+    key_id = addr_key(chain, base_addr)
+    if not key_id:
         return False
-    key = f"last_snap_{base}"
+    key = f"last_snap_{hashlib.md5(key_id.encode('utf-8')).hexdigest()[:10]}"
     now = time.time()
     last = float(st.session_state.get(key, 0.0))
-    jitter = (int(hashlib.md5(base.encode("utf-8")).hexdigest(), 16) % 7)
+    jitter = (int(hashlib.md5(key_id.encode("utf-8")).hexdigest(), 16) % 7)
     if (now - last) >= float(min_interval_sec + jitter):
         st.session_state[key] = now
         return True
@@ -1015,7 +1039,7 @@ def append_monitoring_history(row: Dict[str, Any]):
 def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Optional[Dict[str, Any]]):
     if not chain or not base_addr or not best:
         return
-    if not should_snapshot(token_key(chain, base_addr), min_interval_sec=60):
+    if not should_snapshot(chain, base_addr, min_interval_sec=60):
         return
 
     s_live = score_pair(best)
@@ -1023,10 +1047,9 @@ def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Op
 
     row = {
         "ts_utc": now_utc_str(),
-        "chain": (chain or "").lower(),
+        "chain": (chain or "").lower().strip(),
         "base_symbol": base_sym or "",
-        "base_addr": (base_addr or ""),
-        "base_key": token_key((chain or "").lower(), base_addr),
+        "base_addr": addr_store(chain, base_addr),
         "pair_addr": best.get("pairAddress", "") or "",
         "dex": best.get("dexId", "") or "",
         "quote_symbol": safe_get(best, "quoteToken", "symbol", default="") or "",
@@ -1043,7 +1066,6 @@ def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Op
 
 
 def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
-    # light tail read (fallback to full if needed)
     ensure_storage()
     if not os.path.exists(MON_HISTORY_CSV):
         return []
@@ -1074,11 +1096,13 @@ def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
 
 
 def token_history_rows(chain: str, base_addr: str, limit: int = 300) -> List[Dict[str, Any]]:
-    base_key = token_key(chain, base_addr)
-    if not base_key:
+    if not base_addr:
+        return []
+    key = addr_key(chain, base_addr)
+    if not key:
         return []
     rows = load_monitoring_history(limit_rows=8000)
-    filt = [r for r in rows if (r.get('base_key','') == base_key) or (not r.get('base_key') and token_key(chain, r.get('base_addr','')) == base_key)]
+    filt = [r for r in rows if addr_key(r.get("chain",""), r.get("base_addr","")) == key]
     return filt[-limit:]
 
 
@@ -1086,17 +1110,11 @@ def token_history_rows(chain: str, base_addr: str, limit: int = 300) -> List[Dic
 # Monitoring ranking helpers
 # =============================
 def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float, liq: float) -> float:
-    """
-    Higher is better.
-    Keeps it conservative: we don't over-reward insane spikes; prefer stable momentum + liquidity.
-    """
     s = 0.0
     s += score_live
     s += max(min(pc1h, 25.0), -25.0) * 3.0
     s += max(min(pc5, 12.0), -12.0) * 2.0
-    # small reward for 5m volume but capped
     s += min(vol5 / 2000.0, 35.0) * 4.0
-    # slight penalty for very low liq
     if liq < 20_000:
         s -= 60.0
     return round(s, 2)
@@ -1106,12 +1124,12 @@ def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float,
 # Pages
 # =============================
 def page_scout(cfg: Dict[str, Any]):
-    st.title("DEX Scout — early candidates (DexScreener API)")
+    st.title("DEX Scout – early candidates (DexScreener API)")
     st.caption("Фокус: дрібні/ранні монети. Majors/stables відсікаються. Core: BSC + Solana.")
 
     seeds = [x.strip() for x in (cfg["seeds_raw"] or "").split(",") if x.strip()]
     if not seeds:
-        st.info("Додай seeds у sidebar (хоча б 5-10).")
+        st.info("Додай seeds у sidebar (хоча б 5–10).")
         return
 
     sampled = sample_seeds(seeds, int(cfg["seed_k"]), bool(cfg["refresh"]))
@@ -1120,7 +1138,6 @@ def page_scout(cfg: Dict[str, Any]):
     all_pairs: List[Dict[str, Any]] = []
     query_failures = 0
     for q in sampled:
-        # DexScreener часто віддає 400 на занадто короткі запити типу 'x'
         if len(q.strip()) < 2:
             continue
         try:
@@ -1128,7 +1145,7 @@ def page_scout(cfg: Dict[str, Any]):
             time.sleep(0.10)
         except Exception as e:
             query_failures += 1
-            st.warning(f"Query failed: {q} — {e}")
+            st.warning(f"Query failed: {q} – {e}")
 
     if query_failures and not all_pairs:
         st.error("All sampled queries failed. Try Refresh / Clear cache / wait a bit.")
@@ -1161,18 +1178,18 @@ def page_scout(cfg: Dict[str, Any]):
 
     ranked = []
     for p in filtered:
+        chain_id = (p.get("chainId") or "").lower().strip()
         base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
         if not base_addr:
             continue
-        # ядро: Scout не показує те, що вже active у Monitoring/Portfolio
-        base_key = token_key(chain_id, base_addr)
-        if base_key in mon_set or base_key in port_set:
+        key = addr_key(chain_id, base_addr)
+
+        if key in mon_set or key in port_set:
             continue
 
         s = score_pair(p)
         decision, tags = build_trade_hint(p)
 
-        # ядро: Scout не показує NO ENTRY
         if decision.strip().upper() == "NO ENTRY":
             continue
 
@@ -1184,10 +1201,10 @@ def page_scout(cfg: Dict[str, Any]):
     st.metric("Passed filters", len(ranked))
 
     with st.expander("Why 0 results? (Filter Debug)", expanded=(len(ranked) == 0)):
-        st.write("**Fetched:**", len(all_pairs), " • **Deduped:**", len(pairs))
-        st.write("**Counts (pipeline):**")
+        st.write("Fetched:", len(all_pairs), " • Deduped:", len(pairs))
+        st.write("Counts (pipeline):")
         st.json(dict(fstats))
-        st.write("**Top reject reasons:**")
+        st.write("Top reject reasons:")
         top = freasons.most_common(15)
         st.write({k: v for k, v in top} if top else "No rejects counted.")
         st.caption("Note: Scout також відсікає tokens, що вже є у Monitoring/Portfolio, і відсікає 'NO ENTRY'.")
@@ -1211,7 +1228,7 @@ def page_scout(cfg: Dict[str, Any]):
         buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
         sells = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
 
-        chain_id = (p.get("chainId") or "").lower()
+        chain_id = (p.get("chainId") or "").lower().strip()
         base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
         pair_addr = (p.get("pairAddress") or "").strip()
 
@@ -1238,22 +1255,21 @@ def page_scout(cfg: Dict[str, Any]):
 
         with mid:
             price_f = parse_float(price, 0.0)
-            st.write(f"**Price:** ${price_f:.8f}" if price_f > 0 else "**Price:** n/a")
-            st.write(f"**Liq:** {fmt_usd(liq)}")
-            st.write(f"**Vol24:** {fmt_usd(vol24)}")
-            st.write(f"**Vol m5:** {fmt_usd(vol5)}")
-            st.write(f"**Δ m5:** {fmt_pct(pc5)}")
-            st.write(f"**Δ h1:** {fmt_pct(pc1h)}")
-            st.write(f"**Buys/Sells (m5):** {buys}/{sells}")
-            st.write(f"**Score:** {s}")
+            st.write(f"Price: ${price_f:.8f}" if price_f > 0 else "Price: n/a")
+            st.write(f"Liq: {fmt_usd(liq)}")
+            st.write(f"Vol24: {fmt_usd(vol24)}")
+            st.write(f"Vol m5: {fmt_usd(vol5)}")
+            st.write(f"Δ m5: {fmt_pct(pc5)}")
+            st.write(f"Δ h1: {fmt_pct(pc1h)}")
+            st.write(f"Buys/Sells (m5): {buys}/{sells}")
+            st.write(f"Score: {s}")
 
         with right:
-            st.write("**Action:**")
+            st.write("Action:")
             st.markdown(action_badge(decision), unsafe_allow_html=True)
 
-            # ядро: WATCH/WAIT → Monitoring, ENTRY → лог/своп (але не в monitoring)
             if decision == "WATCH / WAIT":
-                if st.button("➕ Add to Monitoring", key=f"mon_{kb}", use_container_width=True):
+                if st.button("Add to Monitoring", key=f"mon_{kb}", use_container_width=True):
                     res = add_to_monitoring(p, s)
                     if res == "OK":
                         st.success("Added to Monitoring")
@@ -1263,7 +1279,7 @@ def page_scout(cfg: Dict[str, Any]):
                     elif res == "NO_ADDR":
                         st.error("Missing token address, can't add.")
 
-            st.write("**Tags:**")
+            st.write("Tags:")
             for t in tags:
                 st.write(f"• {t}")
 
@@ -1292,10 +1308,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     archived = [r for r in rows if r.get("active") != "1"]
 
     topbar = st.columns([2, 2, 2, 2])
-    with topbar[0]:
-        st.metric("Active", len(active))
-    with topbar[1]:
-        st.metric("Archived", len(archived))
+    topbar[0].metric("Active", len(active))
+    topbar[1].metric("Archived", len(archived))
     with topbar[2]:
         with open(MONITORING_CSV, "rb") as f:
             st.download_button("Download monitoring.csv", f, file_name="monitoring.csv", use_container_width=True)
@@ -1306,7 +1320,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     st.markdown("---")
 
     if not active:
-        st.info("Monitoring is empty. Go to Scout and click **Add to Monitoring** on a WATCH / WAIT token.")
+        st.info("Monitoring is empty. Go to Scout and add a WATCH / WAIT token.")
         return
 
     st.caption("Snapshots пишуться ~1/хв на токен (throttled).")
@@ -1349,24 +1363,20 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
             if best:
                 if drop_no_entry and decision.strip().upper() == "NO ENTRY":
-                    archive_monitoring(base_addr, reason="auto: NO ENTRY", last_score=s_live, last_decision=decision, chain=chain)
+                    archive_monitoring(chain, base_addr, reason="auto: NO ENTRY", last_score=s_live, last_decision=decision)
                 elif s_live > 0 and s_live < min_score:
-                    archive_monitoring(base_addr, reason=f"auto: score<{min_score:.0f}", last_score=s_live, last_decision=decision, chain=chain)
+                    archive_monitoring(chain, base_addr, reason=f"auto: score<{min_score:.0f}", last_score=s_live, last_decision=decision)
 
-        # deltas vs init
         d_score = s_live - score_init
         d_liq = live["liq"] - liq_init
         d_v24 = live["vol24"] - vol24_init
         d_v5 = live["vol5"] - vol5_init
 
         pr = monitoring_priority(s_live, live["pc1h"], live["pc5"], live["vol5"], live["liq"])
-
         enriched.append((pr, live["pc1h"], r.get("ts_added", ""), idx, r, best, s_live, decision, tags, live, d_score, d_liq, d_v24, d_v5))
 
-    # sorting: priority desc, then pc1h desc, then ts_added desc-ish (string UTC sorts ok)
     enriched.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
 
-    # refresh active after possible auto-archive
     rows = load_monitoring()
     active_now = [r for r in rows if r.get("active") == "1"]
     if len(active_now) != len(active):
@@ -1395,7 +1405,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.caption("Solana: check Jupiter/JupShield warnings before swapping.")
 
         with head[1]:
-            st.markdown("**Live**")
+            st.markdown("Live")
             st.write(f"Price: ${live['price']:.8f}" if live["price"] else "Price: n/a")
             st.write(f"Liq: {fmt_usd(live['liq'])}")
             st.write(f"Vol24: {fmt_usd(live['vol24'])}")
@@ -1403,15 +1413,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption(f"Δ1h {fmt_pct(live['pc1h'])} • Δ5m {fmt_pct(live['pc5'])}")
 
         with head[2]:
-            st.markdown("**Vs init**")
+            st.markdown("Vs init")
             st.write(f"Score: {s_live:.2f} ({d_score:+.2f})")
             st.write(f"Liq: {fmt_usd(live['liq'])} ({fmt_usd_delta(d_liq)})")
             st.write(f"Vol24: {fmt_usd(live['vol24'])} ({fmt_usd_delta(d_v24)})")
             st.write(f"Vol5: {fmt_usd(live['vol5'])} ({fmt_usd_delta(d_v5)})")
 
         with head[3]:
-            st.markdown("**Decision**")
-            # Monitoring shows WATCH/WAIT most of the time; if it flips to NO ENTRY, user can archive manually (or auto)
+            st.markdown("Decision")
             st.markdown(action_badge(decision), unsafe_allow_html=True)
             st.write(f"Score: {s_live:.2f}" if best else "Score: n/a")
 
@@ -1421,21 +1430,18 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             for t in tags:
                 st.write(f"• {t}")
 
-        # quick history (last N decisions) to help понять "чи переживе очікування"
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
         with st.expander("Stability check (last snapshots)", expanded=False):
             if not hist:
                 st.info("No snapshots yet.")
             else:
                 dfh = pd.DataFrame(hist).copy()
-                # Normalize + order
                 if "ts_utc" in dfh.columns:
                     dfh["ts_utc"] = pd.to_datetime(dfh["ts_utc"], errors="coerce")
                     dfh = dfh.sort_values("ts_utc")
                 else:
                     dfh["ts_utc"] = pd.NaT
 
-                # Quick stats
                 last_n = min(30, len(dfh))
                 tail = dfh.tail(last_n)
                 no_entry_cnt = int((tail.get("decision", "").astype(str).str.upper() == "NO ENTRY").sum())
@@ -1443,7 +1449,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
                 avg_score = float(pd.to_numeric(tail.get("score_live", pd.Series([0]*len(tail))), errors="coerce").fillna(0).mean())
                 std_score = float(pd.to_numeric(tail.get("score_live", pd.Series([0]*len(tail))), errors="coerce").fillna(0).std(ddof=0))
-                # A simple "survivability" heuristic: prefers stable score + low NO ENTRY share
+
                 survivability = max(0.0, 100.0 - (no_entry_ratio * 70.0) - min(std_score / 10.0, 30.0))
 
                 c1, c2, c3, c4 = st.columns(4)
@@ -1452,7 +1458,6 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 c3.metric("Avg score (last N)", f"{avg_score:.1f}")
                 c4.metric("Survivability", f"{survivability:.0f}/100")
 
-                # Sparklines (what you missed)
                 chart_df = tail[["ts_utc", "price_usd", "score_live"]].copy()
                 chart_df = chart_df.set_index("ts_utc")
                 chart_df["price_usd"] = pd.to_numeric(chart_df["price_usd"], errors="coerce")
@@ -1466,13 +1471,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.caption("Score (sparkline)")
                     st.line_chart(chart_df[["score_live"]], height=120, use_container_width=True)
 
-                # Why can score be high while decision is NO ENTRY?
-                dec_now = str(best.get("decision", "")).upper()
-                if dec_now == "NO ENTRY":
+                if str(decision).upper() == "NO ENTRY":
                     st.warning(
-                        "Decision = NO ENTRY is rule-based (flow / imbalance / micro-volume guards). "
-                        "A high score can still happen if liquidity/24h volume are strong, but micro-activity is weak or imbalanced."
+                        "Decision = NO ENTRY є rule-based. Навіть при високому score може бути NO ENTRY, "
+                        "якщо micro-flow слабкий, немає sell prints або є сильний дисбаланс."
                     )
+
         actions = st.columns([2, 2, 2, 6])
         with actions[0]:
             if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
@@ -1485,14 +1489,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     else:
                         res = log_to_portfolio(best, s_live, decision, tags, swap_url)
                         if res == "OK":
-                            archive_monitoring(base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision, chain=chain)
+                            archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
                             st.success("Promoted to Portfolio + archived from Monitoring.")
                             st.rerun()
                         else:
                             st.info("Already active in portfolio.")
         with actions[1]:
             if st.button("Archive (manual)", key=f"drop_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
-                archive_monitoring(base_addr, reason="manual", last_score=s_live, last_decision=decision, chain=chain)
+                archive_monitoring(chain, base_addr, reason="manual", last_score=s_live, last_decision=decision)
                 st.success("Archived.")
                 st.rerun()
         with actions[2]:
@@ -1513,7 +1517,6 @@ def page_archive():
         st.info("Archive is empty.")
         return
 
-    # show newest first
     archived.sort(key=lambda x: x.get("ts_archived", "") or x.get("ts_added", ""), reverse=True)
 
     for idx, r in enumerate(archived[:200], start=1):
@@ -1544,7 +1547,7 @@ def page_archive():
                 link_button(swap_label, swap_url, use_container_width=True, key=f"a_sw_{idx}_{hkey(base_addr, chain)}")
 
             if st.button("Re-activate → Monitoring", key=f"rea_{idx}_{hkey(base_addr)}", use_container_width=True):
-                ok = reactivate_monitoring(base_addr, chain=chain)
+                ok = reactivate_monitoring(chain, base_addr)
                 if ok:
                     st.success("Re-activated.")
                     st.rerun()
@@ -1569,17 +1572,15 @@ def portfolio_reco(entry: float, current: float, pc1h: float, pc5: float) -> str
 
 def page_portfolio():
     st.title("Portfolio / Watchlist")
-    st.caption("Entries appear here after clicking **Log → Portfolio (I swapped)** in Scout or Promote in Monitoring.")
+    st.caption("Entries appear here after clicking Log → Portfolio (I swapped) in Scout or Promote in Monitoring.")
 
     rows = load_portfolio()
     active_rows = [r for r in rows if r.get("active") == "1"]
     closed_rows = [r for r in rows if r.get("active") != "1"]
 
     topbar = st.columns([2, 2, 2])
-    with topbar[0]:
-        st.metric("Active", len(active_rows))
-    with topbar[1]:
-        st.metric("Closed", len(closed_rows))
+    topbar[0].metric("Active", len(active_rows))
+    topbar[1].metric("Closed", len(closed_rows))
     with topbar[2]:
         with open(PORTFOLIO_CSV, "rb") as f:
             st.download_button("Download portfolio.csv", f, file_name="portfolio.csv", use_container_width=True)
@@ -1587,8 +1588,8 @@ def page_portfolio():
     st.markdown("---")
 
     if not active_rows:
-        st.info("Portfolio is empty. Use Scout → **Log → Portfolio** or Monitoring → **Promote → Portfolio**.")
-        st.caption("Якщо після деплою все 'скидається' — це persistence Streamlit Cloud. Для 100% стабільності потрібен SQLite/DB або external storage.")
+        st.info("Portfolio is empty. Use Scout → Log → Portfolio or Monitoring → Promote → Portfolio.")
+        st.caption("Якщо після деплою все скидається – це persistence Streamlit Cloud. Для 100% стабільності потрібен SQLite/DB або external storage.")
         return
 
     st.subheader("Active positions")
@@ -1634,15 +1635,15 @@ def page_portfolio():
                 link_button("Swap", r["swap_url"], use_container_width=True, key=f"p_sw_{idx}_{hkey(base_addr, chain)}")
 
         with c2:
-            st.write(f"**Entry:** ${entry_price_str}")
-            st.write(f"**Now:** ${cur_price:.8f}" if cur_price else "**Now:** n/a")
-            st.write(f"**PnL:** {pnl:+.2f}%" if entry_price and cur_price else "**PnL:** n/a")
-            st.write(f"**Liq:** {fmt_usd(liq)}" if liq else "**Liq:** n/a")
+            st.write(f"Entry: ${entry_price_str}")
+            st.write(f"Now: ${cur_price:.8f}" if cur_price else "Now: n/a")
+            st.write(f"PnL: {pnl:+.2f}%" if entry_price and cur_price else "PnL: n/a")
+            st.write(f"Liq: {fmt_usd(liq)}" if liq else "Liq: n/a")
 
         with c3:
-            st.write(f"**Δ m5:** {fmt_pct(pc5)}")
-            st.write(f"**Δ h1:** {fmt_pct(pc1h)}")
-            st.write(f"**Reco:** `{reco}`")
+            st.write(f"Δ m5: {fmt_pct(pc5)}")
+            st.write(f"Δ h1: {fmt_pct(pc1h)}")
+            st.write(f"Reco: {reco}")
             note_key = f"note_{idx}_{hkey(base_addr, chain)}"
             note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
 
@@ -1655,12 +1656,11 @@ def page_portfolio():
 
             if st.button("Apply", key=f"apply_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                 all_rows = load_portfolio()
+                target_key = addr_key(chain, base_addr)
                 for rr in all_rows:
                     if rr.get("active") != "1":
                         continue
-                    if (rr.get("chain") or "").lower().strip() != chain.lower().strip():
-                        continue
-                    if (rr.get("base_token_address") or "").lower().strip() == base_addr.lower().strip():
+                    if addr_key(rr.get("chain",""), rr.get("base_token_address","")) == target_key:
                         rr["note"] = note_val
                         if close:
                             rr["active"] = "0"
@@ -1671,8 +1671,7 @@ def page_portfolio():
                         x for x in all_rows
                         if not (
                             (x.get("active") == "1")
-                            and ((x.get("chain") or "").lower().strip() == chain.lower().strip())
-                            and ((x.get("base_token_address") or "").lower().strip() == base_addr.lower().strip())
+                            and (addr_key(x.get("chain",""), x.get("base_token_address","")) == target_key)
                         )
                     ]
 
@@ -1686,8 +1685,8 @@ def page_portfolio():
         with st.expander("Closed / Archived"):
             for r in closed_rows[-50:]:
                 st.write(
-                    f"{r.get('ts_utc','')} — {r.get('base_symbol','')}/{r.get('quote_symbol','')} "
-                    f"— entry ${r.get('entry_price_usd','')} — {r.get('action','')}"
+                    f"{r.get('ts_utc','')} – {r.get('base_symbol','')}/{r.get('quote_symbol','')} "
+                    f"– entry ${r.get('entry_price_usd','')} – {r.get('action','')}"
                 )
 
 
@@ -1702,11 +1701,14 @@ def main():
         st.markdown("### DEX Scout")
         st.caption(f"Version: v{VERSION}")
 
-        # keep page in session_state
         if "page" not in st.session_state:
             st.session_state["page"] = "Scout"
 
-        page = st.radio("Page", ["Scout", "Monitoring", "Archive", "Portfolio"], index=["Scout","Monitoring","Archive","Portfolio"].index(st.session_state["page"]))
+        page = st.radio(
+            "Page",
+            ["Scout", "Monitoring", "Archive", "Portfolio"],
+            index=["Scout", "Monitoring", "Archive", "Portfolio"].index(st.session_state["page"]),
+        )
         st.session_state["page"] = page
 
         preset_name = st.selectbox("Preset", list(PRESETS.keys()), index=1)
@@ -1715,7 +1717,7 @@ def main():
         st.divider()
 
         chain_default = st.session_state.get("prefill_chain", None)
-        chain_idx = 0 if chain_default not in ["bsc","solana"] else (0 if chain_default=="bsc" else 1)
+        chain_idx = 0 if chain_default not in ["bsc", "solana"] else (0 if chain_default == "bsc" else 1)
         chain = st.selectbox("Chain", options=["bsc", "solana"], index=chain_idx)
         st.session_state["prefill_chain"] = chain
 
@@ -1751,7 +1753,7 @@ def main():
         max_age_min = st.number_input("Max age (minutes)", min_value=30, value=int(preset["max_age_min"]), step=60)
 
         hide_solana_unverified = st.checkbox(
-            "Hide Solana 'unverified-like' (heuristic)",
+            "Hide Solana unverified-like (heuristic)",
             value=bool(preset["hide_solana_unverified"]),
         )
 
@@ -1769,6 +1771,7 @@ def main():
         auto_archive_enabled = st.checkbox("Enable auto-archive", value=True)
         auto_archive_min_score = st.slider("Auto-archive if score < …", 0, 900, 220, step=10)
         auto_archive_on_no_entry = st.checkbox("Auto-archive if decision becomes NO ENTRY", value=True)
+        stability_window_n = st.slider("Stability window (snapshots)", 10, 120, 30, step=5)
 
         colA, colB = st.columns([1, 1])
         with colA:
@@ -1780,7 +1783,6 @@ def main():
 
     if page == "Scout":
         cfg = dict(
-            preset=preset,
             chain=chain,
             any_dex=any_dex,
             selected_dexes=selected_dexes,
@@ -1807,6 +1809,7 @@ def main():
             auto_archive_enabled=auto_archive_enabled,
             auto_archive_min_score=auto_archive_min_score,
             auto_archive_on_no_entry=auto_archive_on_no_entry,
+            stability_window_n=stability_window_n,
         )
         page_monitoring(auto_cfg)
     elif page == "Archive":
