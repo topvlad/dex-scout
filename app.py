@@ -368,6 +368,23 @@ def parse_float(x, default=0.0) -> float:
         return float(default)
 
 
+
+def norm_addr(chain: str, addr: str) -> str:
+    chain = (chain or "").lower().strip()
+    addr = (addr or "").strip()
+    if not addr:
+        return ""
+    # EVM addresses are case-insensitive; keep a normalized form
+    if chain in {"bsc", "ethereum", "polygon", "arbitrum", "optimism", "base", "avalanche"}:
+        return addr.lower()
+    # Solana mints are case-sensitive – DO NOT lower
+    return addr
+
+
+def token_key(chain: str, addr: str) -> str:
+    c = (chain or "").lower().strip()
+    a = norm_addr(c, addr)
+    return f"{c}|{a}" if (c and a) else ""
 def fmt_usd(x: float) -> str:
     try:
         return f"${x:,.0f}"
@@ -1303,6 +1320,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     st.title("Monitoring")
     st.caption("Тут тільки WATCH/WAIT. Сортування: priority → momentum → time since added.")
 
+    sec = int(auto_cfg.get("ui_autorefresh_sec", 0) or 0)
+    if sec > 0:
+        # Streamlit doesn't run in the background. This refresh keeps snapshots flowing while the page is open.
+        st.markdown(f"<meta http-equiv='refresh' content='{sec}'>", unsafe_allow_html=True)
+
     rows = load_monitoring()
     active = [r for r in rows if r.get("active") == "1"]
     archived = [r for r in rows if r.get("active") != "1"]
@@ -1771,6 +1793,7 @@ def main():
         auto_archive_enabled = st.checkbox("Enable auto-archive", value=True)
         auto_archive_min_score = st.slider("Auto-archive if score < …", 0, 900, 220, step=10)
         auto_archive_on_no_entry = st.checkbox("Auto-archive if decision becomes NO ENTRY", value=True)
+        ui_autorefresh_sec = st.slider("Monitoring auto-refresh (sec)", 0, 300, 60, step=10)
         stability_window_n = st.slider("Stability window (snapshots)", 10, 120, 30, step=5)
 
         colA, colB = st.columns([1, 1])
