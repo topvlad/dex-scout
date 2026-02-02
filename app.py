@@ -23,7 +23,7 @@ import requests
 import streamlit as st
 import pandas as pd
 
-VERSION = "0.4.6"
+VERSION = "0.4.9"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -1253,35 +1253,84 @@ def page_scout(cfg: Dict[str, Any]):
         kb = hkey(url or "", pair_addr or "", base_addr or "", str(i))
 
         st.markdown("---")
-        left, mid, right = st.columns([3, 2, 2])
+        
+        left, mid, right = st.columns([1.7, 2.3, 1.4])
 
+        # Left: quick actions
         with left:
-            st.markdown(f"## {base}/{quote}")
-            st.caption(f"{chain_id} • {dex}")
-            if url:
-                link_button("Open DexScreener", url, use_container_width=True, key=f"ds_{kb}")
-            if base_addr:
-                if st.button("Log → Portfolio (I swapped)", key=f"log_{kb}", use_container_width=True):
-                    if not swap_url:
-                        st.info("Add swap URL first (optional but helpful).")
-                    else:
-                        res = log_to_portfolio(base_addr, swap_url)
-                        if res == "OK":
-                            st.success("Logged.")
-                            st.rerun()
-                        elif res == "EXISTS":
-                            st.info("Already active in Portfolio")
-                        else:
-                            st.error(f"Portfolio log failed: {res}")
+            st.link_button("Open DexScreener", p.get("url", ""), use_container_width=True)
 
-            if swap_url:
-                swap_label = "Open Swap (PancakeSwap)" if chain_id == "bsc" else "Open Swap (Jupiter)"
-                link_button(swap_label, swap_url, use_container_width=True, key=f"sw_{kb}")
+            if st.button("Log → Portfolio (I swapped)", key=f"log_pf_{pair_addr}", use_container_width=True):
+                res = log_to_portfolio(p, swap_url)
+                if res == "OK":
+                    st.success("Logged.")
+                    st.rerun()
+                else:
+                    st.error(f"Portfolio log failed: {res}")
 
-            if chain_id == "solana":
-                st.caption("Solana: check Jupiter/JupShield warnings before swapping.")
+        # Middle: core metrics + addresses
+        with mid:
+            def _f(v, default=None):
+                try:
+                    if v is None:
+                        return default
+                    return float(v)
+                except Exception:
+                    return default
 
+            price = _f(p.get("priceUsd"), None)
+            liq = _f((p.get("liquidity") or {}).get("usd"), None)
+            vol24 = _f((p.get("volume") or {}).get("h24"), None)
+            volm5 = _f((p.get("volume") or {}).get("m5"), None)
+            chg_m5 = _f((p.get("priceChange") or {}).get("m5"), None)
+            chg_h1 = _f((p.get("priceChange") or {}).get("h1"), None)
+            buys = (p.get("txns") or {}).get("m5", {}).get("buys")
+            sells = (p.get("txns") or {}).get("m5", {}).get("sells")
 
+            if price is not None:
+                st.write(f"Price: ${price:,.8f}")
+            if liq is not None:
+                st.write(f"Liq: {fmt_usd(liq)}")
+            if vol24 is not None:
+                st.write(f"Vol24: {fmt_usd(vol24)}")
+            if volm5 is not None:
+                st.write(f"Vol m5: {fmt_usd(volm5)}")
+            if chg_m5 is not None:
+                st.write(f"Δ m5: {chg_m5:+.2f}%")
+            if chg_h1 is not None:
+                st.write(f"Δ h1: {chg_h1:+.2f}%")
+            if buys is not None and sells is not None:
+                st.write(f"Buys/Sells (m5): {buys}/{sells}")
+            if p.get("_score") is not None:
+                st.write(f"Score: {p.get('_score')}")
+
+            with st.expander("Addresses", expanded=False):
+                st.caption("Token contract (baseToken.address)")
+                st.code(base_addr)
+                st.caption("Pair / pool address")
+                st.code(pair_addr)
+
+        # Right: decision + monitoring + tags
+        with right:
+            decision, tags = build_trade_hint(p)
+            st.caption("Action")
+            st.write(decision)
+
+            if st.button("Add to Monitoring", key=f"add_mon_{pair_addr}", use_container_width=True):
+                add_to_monitoring(p, float(p.get('_score') or 0))
+                st.success("Added to monitoring.")
+                st.rerun()
+
+            if tags:
+                st.caption("Tags")
+                for t in tags:
+                    st.write(f"• {t}")
+        if swap_url:
+            swap_label = "Open Swap (Jupiter)" if chain_id == "solana" else "Open Swap"
+            st.link_button(swap_label, swap_url, use_container_width=True)
+
+        if chain_id == "solana":
+            st.caption("Solana: check Jupiter/JupShield warnings before swapping.")
 def page_monitoring(auto_cfg: Dict[str, Any]):
     st.title("Monitoring")
     st.caption("Тут тільки WATCH/WAIT. Сортування: priority → momentum → time since added.")
