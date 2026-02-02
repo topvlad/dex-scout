@@ -1261,52 +1261,18 @@ def page_scout(cfg: Dict[str, Any]):
             if url:
                 link_button("Open DexScreener", url, use_container_width=True, key=f"ds_{kb}")
             if base_addr:
-                st.caption("Token contract (baseToken.address)")
-                st.code(base_addr, language="text")
-            if pair_addr:
-                st.caption("Pair / pool address")
-                st.code(pair_addr, language="text")
-            age = pair_age_minutes(p)
-            if age is not None:
-                st.caption(f"Pair age: ~{int(age)} min")
-
-        with mid:
-            price_f = parse_float(price, 0.0)
-            st.write(f"Price: ${price_f:.8f}" if price_f > 0 else "Price: n/a")
-            st.write(f"Liq: {fmt_usd(liq)}")
-            st.write(f"Vol24: {fmt_usd(vol24)}")
-            st.write(f"Vol m5: {fmt_usd(vol5)}")
-            st.write(f"Δ m5: {fmt_pct(pc5)}")
-            st.write(f"Δ h1: {fmt_pct(pc1h)}")
-            st.write(f"Buys/Sells (m5): {buys}/{sells}")
-            st.write(f"Score: {s}")
-
-        with right:
-            st.write("Action:")
-            st.markdown(action_badge(decision), unsafe_allow_html=True)
-
-            if decision == "WATCH / WAIT":
-                if st.button("Add to Monitoring", key=f"mon_{kb}", use_container_width=True):
-                    res = add_to_monitoring(p, s)
-                    if res == "OK":
-                        st.success("Added to Monitoring")
-                        st.rerun()
-                    elif res == "EXISTS":
-                        st.info("Already in Monitoring")
-                    elif res == "NO_ADDR":
-                        st.error("Missing token address, can't add.")
-
-            st.write("Tags:")
-            for t in tags:
-                st.write(f"• {t}")
-
-            if base_addr:
                 if st.button("Log → Portfolio (I swapped)", key=f"log_{kb}", use_container_width=True):
                     if not swap_url:
-                        st.info("Swap URL missing (unexpected for BSC/Solana).")
+                        st.info("Add swap URL first (optional but helpful).")
                     else:
-                        res = log_to_portfolio(p, s, decision, tags, swap_url)
-                        st.success("Logged.") if res == "OK" else st.info("Already active in portfolio.")
+                        res = log_to_portfolio(base_addr, swap_url)
+                        if res == "OK":
+                            st.success("Logged.")
+                            st.rerun()
+                        elif res == "EXISTS":
+                            st.info("Already active in Portfolio")
+                        else:
+                            st.error(f"Portfolio log failed: {res}")
 
             if swap_url:
                 swap_label = "Open Swap (PancakeSwap)" if chain_id == "bsc" else "Open Swap (Jupiter)"
