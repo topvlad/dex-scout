@@ -1,4 +1,4 @@
-# app.py — DEX Scout v0.4.6
+# app.py — DEX Scout v0.4.10
 # ядро: Scout → Monitoring → Archive (+ Portfolio)
 # - Scout: показує тільки re-eligible токени (не в Monitoring active, не в Portfolio active), і НЕ показує "NO ENTRY"
 # - Monitoring: тільки WATCH/WAIT. Сортування: priority → momentum → time since added
@@ -23,7 +23,7 @@ import requests
 import streamlit as st
 import pandas as pd
 
-VERSION = "0.4.9"
+VERSION = "0.4.10"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -1230,107 +1230,121 @@ def page_scout(cfg: Dict[str, Any]):
         st.info("0 results. Спробуй: lower Min Liquidity/Vol24, widen age window, або Refresh (resample seeds).")
         return
 
-    for i, (s, decision, tags, p) in enumerate(ranked, start=1):
-        base = safe_get(p, "baseToken", "symbol", default="???") or "???"
-        quote = safe_get(p, "quoteToken", "symbol", default="???") or "???"
-        dex = p.get("dexId", "?")
-        url = p.get("url", "")
-        price = safe_get(p, "priceUsd", default=None)
 
-        liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
-        vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
-        vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
-        pc5 = float(safe_get(p, "priceChange", "m5", default=0) or 0)
-        pc1h = float(safe_get(p, "priceChange", "h1", default=0) or 0)
-        buys = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
-        sells = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
+    # --- Stable Scout cards (single-column; consistent on mobile/desktop) ---
+    st.session_state.setdefault("scout_hidden", set())
 
-        chain_id = (p.get("chainId") or "").lower().strip()
-        base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
-        pair_addr = (p.get("pairAddress") or "").strip()
+    def _norm_score(pobj: Dict[str, Any]) -> float:
+        v = pobj.get("_score")
+        if v is None:
+            v = pobj.get("score")
+        if v is None:
+            try:
+                v = score_pair(pobj)
+            except Exception:
+                v = 0.0
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    def render_scout_card(pobj: Dict[str, Any], idx: int) -> None:
+        base = safe_get(pobj, "baseToken", "symbol", default="???") or "???"
+        quote = safe_get(pobj, "quoteToken", "symbol", default="???") or "???"
+        chain_id = (pobj.get("chainId") or "").lower().strip()
+        base_addr = (safe_get(pobj, "baseToken", "address", default="") or "").strip()
+        pair_addr = (pobj.get("pairAddress") or "").strip()
+        url = pobj.get("url", "")
+
+        if not base_addr:
+            return
+        if base_addr in st.session_state["scout_hidden"]:
+            return
 
         swap_url = build_swap_url(chain_id, base_addr)
-        kb = hkey(url or "", pair_addr or "", base_addr or "", str(i))
+        score = _norm_score(pobj)
+        pobj["_score"] = score
+        pobj["score"] = score
+
+        decision, tag_list = build_trade_hint(pobj)
 
         st.markdown("---")
-        
-        left, mid, right = st.columns([1.7, 2.3, 1.4])
+        st.subheader(f"{base}/{quote}")
+        st.caption(f"{chain_id or '?'} • {pobj.get('dexId','?')}")
 
-        # Left: quick actions
-        with left:
-            st.link_button("Open DexScreener", p.get("url", ""), use_container_width=True)
+        # Actions first (so on mobile user doesn't hunt for them)
+        btn1, btn2 = st.columns(2)
+        with btn1:
+            st.link_button("Open DexScreener", url or "", use_container_width=True)
+        with btn2:
+            if swap_url:
+                swap_label = "Open Swap (Jupiter)" if chain_id == "solana" else "Open Swap"
+                st.link_button(swap_label, swap_url, use_container_width=True)
+            else:
+                st.button("Open Swap", disabled=True, use_container_width=True)
 
+        btn3, btn4 = st.columns(2)
+        with btn3:
+            if st.button("Add to Monitoring", key=f"add_mon_{pair_addr}", use_container_width=True):
+                add_to_monitoring(pobj, float(score))
+                st.session_state["scout_hidden"].add(base_addr)
+                st.toast("Added to monitoring")
+                st.rerun()
+        with btn4:
             if st.button("Log → Portfolio (I swapped)", key=f"log_pf_{pair_addr}", use_container_width=True):
-                res = log_to_portfolio(p, swap_url)
+                res = log_to_portfolio(pobj, swap_url)
                 if res == "OK":
-                    st.success("Logged.")
+                    st.session_state["scout_hidden"].add(base_addr)
+                    st.toast("Logged to portfolio")
                     st.rerun()
                 else:
                     st.error(f"Portfolio log failed: {res}")
 
-        # Middle: core metrics + addresses
-        with mid:
-            def _f(v, default=None):
-                try:
-                    if v is None:
-                        return default
-                    return float(v)
-                except Exception:
-                    return default
+        # Core metrics (stable order) + score always visible
+        price = parse_float(pobj.get("priceUsd"), None)
+        liq = parse_float(safe_get(pobj, "liquidity", "usd", default=None), None)
+        vol24 = parse_float(safe_get(pobj, "volume", "h24", default=None), None)
+        volm5 = parse_float(safe_get(pobj, "volume", "m5", default=None), None)
+        chg_m5 = parse_float(safe_get(pobj, "priceChange", "m5", default=None), None)
+        chg_h1 = parse_float(safe_get(pobj, "priceChange", "h1", default=None), None)
+        buys = (pobj.get("txns") or {}).get("m5", {}).get("buys")
+        sells = (pobj.get("txns") or {}).get("m5", {}).get("sells")
 
-            price = _f(p.get("priceUsd"), None)
-            liq = _f((p.get("liquidity") or {}).get("usd"), None)
-            vol24 = _f((p.get("volume") or {}).get("h24"), None)
-            volm5 = _f((p.get("volume") or {}).get("m5"), None)
-            chg_m5 = _f((p.get("priceChange") or {}).get("m5"), None)
-            chg_h1 = _f((p.get("priceChange") or {}).get("h1"), None)
-            buys = (p.get("txns") or {}).get("m5", {}).get("buys")
-            sells = (p.get("txns") or {}).get("m5", {}).get("sells")
+        st.write(f"Score: {score:,.2f}")
+        if price is not None:
+            st.write(f"Price: ${price:,.8f}")
+        if liq is not None:
+            st.write(f"Liq: {fmt_usd(liq)}")
+        if vol24 is not None:
+            st.write(f"Vol24: {fmt_usd(vol24)}")
+        if volm5 is not None:
+            st.write(f"Vol m5: {fmt_usd(volm5)}")
+        if chg_m5 is not None:
+            st.write(f"Δ m5: {chg_m5:+.2f}%")
+        if chg_h1 is not None:
+            st.write(f"Δ h1: {chg_h1:+.2f}%")
+        if buys is not None and sells is not None:
+            st.write(f"Buys/Sells (m5): {buys}/{sells}")
 
-            if price is not None:
-                st.write(f"Price: ${price:,.8f}")
-            if liq is not None:
-                st.write(f"Liq: {fmt_usd(liq)}")
-            if vol24 is not None:
-                st.write(f"Vol24: {fmt_usd(vol24)}")
-            if volm5 is not None:
-                st.write(f"Vol m5: {fmt_usd(volm5)}")
-            if chg_m5 is not None:
-                st.write(f"Δ m5: {chg_m5:+.2f}%")
-            if chg_h1 is not None:
-                st.write(f"Δ h1: {chg_h1:+.2f}%")
-            if buys is not None and sells is not None:
-                st.write(f"Buys/Sells (m5): {buys}/{sells}")
-            if p.get("_score") is not None:
-                st.write(f"Score: {p.get('_score')}")
+        st.caption("Action")
+        st.write(decision)
 
-            with st.expander("Addresses", expanded=False):
-                st.caption("Token contract (baseToken.address)")
-                st.code(base_addr)
-                st.caption("Pair / pool address")
-                st.code(pair_addr)
+        if tag_list:
+            st.caption("Tags")
+            for t in tag_list:
+                st.write(f"• {t}")
 
-        # Right: decision + monitoring + tags
-        with right:
-            decision, tags = build_trade_hint(p)
-            st.caption("Action")
-            st.write(decision)
-
-            if st.button("Add to Monitoring", key=f"add_mon_{pair_addr}", use_container_width=True):
-                add_to_monitoring(p, float(p.get('_score') or 0))
-                st.success("Added to monitoring.")
-                st.rerun()
-
-            if tags:
-                st.caption("Tags")
-                for t in tags:
-                    st.write(f"• {t}")
-        if swap_url:
-            swap_label = "Open Swap (Jupiter)" if chain_id == "solana" else "Open Swap"
-            st.link_button(swap_label, swap_url, use_container_width=True)
+        with st.expander("Addresses", expanded=False):
+            st.caption("Token contract (baseToken.address)")
+            st.code(base_addr)
+            st.caption("Pair / pool address")
+            st.code(pair_addr)
 
         if chain_id == "solana":
             st.caption("Solana: check Jupiter/JupShield warnings before swapping.")
+
+    for i, (_s, _decision, _tags, p) in enumerate(ranked, start=1):
+        render_scout_card(p, i)
 def page_monitoring(auto_cfg: Dict[str, Any]):
     st.title("Monitoring")
     st.caption("Тут тільки WATCH/WAIT. Сортування: priority → momentum → time since added.")
