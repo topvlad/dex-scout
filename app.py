@@ -1,10 +1,10 @@
-# app.py — DEX Scout v0.4.10
+# app.py – DEX Scout v0.4.10
 # ядро: Scout → Monitoring → Archive (+ Portfolio)
-# - Scout: показує тільки re-eligible токени (не в Monitoring active, не в Portfolio active), і НЕ показує "NO ENTRY"
-# - Monitoring: тільки WATCH/WAIT. Сортування: priority → momentum → time since added
-# - Archive: автоматична архівація (опційно) по мін. score та/або по "NO ENTRY"
-# - BSC + Solana, swap routing: PancakeSwap (BSC) + Jupiter (Solana)
-# - Address handling: Solana mint addresses are case-sensitive – NEVER lower() them
+# – Scout: показує тільки re-eligible токени (не в Monitoring active, не в Portfolio active), і НЕ показує "NO ENTRY"
+# – Monitoring: тільки WATCH/WAIT. Сортування: priority → momentum → time since added
+# – Archive: автоматична архівація (опційно) по мін. score та/або по "NO ENTRY"
+# – BSC + Solana, swap routing: PancakeSwap (BSC) + Jupiter (Solana)
+# – Address handling: Solana mint addresses are case-sensitive – NEVER lower() them
 #
 # ⚠️ Safety note: Це НЕ ончейн-аудит. Для Solana – завжди дивись JupShield warnings перед swap.
 
@@ -181,13 +181,7 @@ def hkey(*parts: str, n: int = 10) -> str:
 
 
 def link_button(label: str, url: str, use_container_width: bool = True, key: Optional[str] = None):
-    """
-    Streamlit's st.link_button signature differs across versions.
-    This wrapper avoids TypeError by:
-    - trying without key
-    - then with key
-    - falling back to HTML if needed
-    """
+    """Compatibility wrapper for st.link_button across Streamlit versions."""
     if not url:
         return
     if hasattr(st, "link_button"):
@@ -208,8 +202,8 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
 
     st.markdown(
         f"""
-        <a href="{url}" target="_blank" style="text-decoration:none;">
-          <div style="
+        <a href=\"{url}\" target=\"_blank\" style=\"text-decoration:none;\">
+          <div style=\"
             display:inline-block;
             padding:10px 14px;
             border-radius:10px;
@@ -217,7 +211,7 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
             font-weight:800;
             width:100%;
             text-align:center;
-          ">{label}</div>
+          \">{label}</div>
         </a>
         """,
         unsafe_allow_html=True,
@@ -265,7 +259,7 @@ PRESETS = {
         "block_majors": True,
         "enforce_age": True,
         "min_age_min": 20,
-        "max_age_min": 14400,  # 10 days
+        "max_age_min": 14400,
         "hide_solana_unverified": True,
         "seed_k": 16,
         "dedupe_by_base": True,
@@ -282,7 +276,7 @@ PRESETS = {
         "block_majors": True,
         "enforce_age": True,
         "min_age_min": 30,
-        "max_age_min": 43200,  # 30 days
+        "max_age_min": 43200,
         "hide_solana_unverified": True,
         "seed_k": 14,
         "dedupe_by_base": True,
@@ -299,7 +293,7 @@ PRESETS = {
         "block_majors": True,
         "enforce_age": True,
         "min_age_min": 10,
-        "max_age_min": 86400,  # 60 days
+        "max_age_min": 86400,
         "hide_solana_unverified": True,
         "seed_k": 18,
         "dedupe_by_base": True,
@@ -316,7 +310,7 @@ PRESETS = {
         "block_majors": True,
         "enforce_age": True,
         "min_age_min": 20,
-        "max_age_min": 28800,  # 20 days
+        "max_age_min": 28800,
         "hide_solana_unverified": True,
         "seed_k": 14,
         "dedupe_by_base": True,
@@ -334,12 +328,11 @@ def addr_key(chain: str, addr: str) -> str:
     if not a:
         return ""
     if c == "solana":
-        return f"solana:{a}"  # case-sensitive
+        return f"solana:{a}"
     return f"{c}:{a.lower()}"
 
 
 def addr_store(chain: str, addr: str) -> str:
-    """What we store in CSV base_addr field."""
     c = (chain or "").lower().strip()
     a = (addr or "").strip()
     if not a:
@@ -368,16 +361,13 @@ def parse_float(x, default=0.0) -> float:
         return float(default)
 
 
-
 def norm_addr(chain: str, addr: str) -> str:
     chain = (chain or "").lower().strip()
     addr = (addr or "").strip()
     if not addr:
         return ""
-    # EVM addresses are case-insensitive; keep a normalized form
     if chain in {"bsc", "ethereum", "polygon", "arbitrum", "optimism", "base", "avalanche"}:
         return addr.lower()
-    # Solana mints are case-sensitive – DO NOT lower
     return addr
 
 
@@ -385,6 +375,8 @@ def token_key(chain: str, addr: str) -> str:
     c = (chain or "").lower().strip()
     a = norm_addr(c, addr)
     return f"{c}|{a}" if (c and a) else ""
+
+
 def fmt_usd(x: float) -> str:
     try:
         return f"${x:,.0f}"
@@ -506,7 +498,6 @@ def pair_age_minutes(p: Dict[str, Any]) -> Optional[float]:
 
 
 def solana_unverified_heuristic(p: Dict[str, Any]) -> bool:
-    # heuristic only (DexScreener doesn't give "verified" flags like JupShield)
     if (p.get("chainId") or "").lower() != "solana":
         return False
 
@@ -588,7 +579,6 @@ def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
     ]
 
     decision = "NO ENTRY"
-    # entry needs both liquidity+volume + some real prints
     if liq >= 30_000 and vol24 >= 20_000 and trades5 >= 12 and sells5 >= 3:
         if pc1h > 6 and vol5 > 2_500 and pc5 >= -3:
             decision = "ENTRY (scalp)"
@@ -601,22 +591,21 @@ def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
 def action_badge(action: str) -> str:
     a = (action or "").strip().upper()
 
-    # IMPORTANT: "NO ENTRY" contains substring "ENTRY" – handle it first
     if a.startswith("NO ENTRY") or a == "NO ENTRY":
-        color = "#e53e3e"      # red
+        color = "#e53e3e"
         bg = "rgba(229,62,62,0.12)"
     elif a.startswith("ENTRY") or a.startswith("BUY"):
-        color = "#1f9d55"      # green
+        color = "#1f9d55"
         bg = "rgba(31,157,85,0.15)"
     elif "WATCH" in a or "WAIT" in a:
-        color = "#d69e2e"      # yellow
+        color = "#d69e2e"
         bg = "rgba(214,158,46,0.15)"
     else:
         color = "#e53e3e"
         bg = "rgba(229,62,62,0.12)"
 
     return f"""
-    <span style="
+    <span style=\"
       display:inline-block;
       padding:6px 12px;
       border-radius:999px;
@@ -626,7 +615,7 @@ def action_badge(action: str) -> str:
       font-weight:800;
       font-size:12px;
       letter-spacing:0.4px;
-    ">{action}</span>
+    \">{action}</span>
     """
 
 
@@ -690,7 +679,6 @@ def filter_pairs_with_debug(
         liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
         vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
 
-        # txns fallback
         txns_m5 = safe_get(p, "txns", "m5", default=None)
         buys = sells = None
         if isinstance(txns_m5, dict):
@@ -810,7 +798,7 @@ def sample_seeds(seeds: List[str], k: int, refresh: bool) -> List[str]:
 
 
 # =============================
-# Swap URL builders (routing fix)
+# Swap URL builders
 # =============================
 def build_swap_url(chain: str, base_addr: str) -> str:
     chain = (chain or "").lower().strip()
@@ -913,7 +901,7 @@ def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
 
     rows = load_monitoring()
     for r in rows:
-        if r.get("active") == "1" and addr_key(r.get("chain",""), r.get("base_addr","")) == key:
+        if r.get("active") == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
             return "EXISTS"
 
     rows.append(
@@ -945,7 +933,7 @@ def archive_monitoring(chain: str, base_addr: str, reason: str, last_score: floa
     rows = load_monitoring()
     changed = False
     for r in rows:
-        if r.get("active") == "1" and addr_key(r.get("chain",""), r.get("base_addr","")) == key:
+        if r.get("active") == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
             r["active"] = "0"
             r["ts_archived"] = now_utc_str()
             r["archived_reason"] = reason
@@ -964,7 +952,7 @@ def reactivate_monitoring(chain: str, base_addr: str) -> bool:
     rows = load_monitoring()
     changed = False
     for r in rows:
-        if (r.get("active") != "1") and addr_key(r.get("chain",""), r.get("base_addr","")) == key:
+        if (r.get("active") != "1") and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
             r["active"] = "1"
             r["ts_added"] = now_utc_str()
             r["ts_archived"] = ""
@@ -997,8 +985,7 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
             continue
         if pair_addr and (r.get("pair_address", "").lower() == pair_addr.lower()):
             return "ALREADY_EXISTS"
-        # compare base by chain-aware key
-        if addr_key(r.get("chain",""), r.get("base_token_address","")) == key:
+        if addr_key(r.get("chain", ""), r.get("base_token_address", "")) == key:
             return "ALREADY_EXISTS"
 
     rows.append(
@@ -1008,7 +995,7 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
             "dex": dex,
             "base_symbol": base_sym,
             "quote_symbol": quote_sym,
-            "base_token_address": base_addr,  # keep original (sol case sensitive)
+            "base_token_address": base_addr,
             "pair_address": pair_addr,
             "dexscreener_url": url,
             "swap_url": swap_url,
@@ -1027,9 +1014,22 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
 def active_base_sets() -> Tuple[set, set]:
     mon = load_monitoring()
     port = load_portfolio()
-    mon_set = {addr_key(r.get("chain",""), r.get("base_addr","")) for r in mon if r.get("active") == "1" and r.get("base_addr")}
-    port_set = {addr_key(r.get("chain",""), r.get("base_token_address","")) for r in port if r.get("active") == "1" and r.get("base_token_address")}
+    mon_set = {addr_key(r.get("chain", ""), r.get("base_addr", "")) for r in mon if r.get("active") == "1" and r.get("base_addr")}
+    port_set = {addr_key(r.get("chain", ""), r.get("base_token_address", "")) for r in port if r.get("active") == "1" and r.get("base_token_address")}
     return mon_set, port_set
+
+
+def maybe_archive_from_monitoring(chain: str, base_addr: str, last_score: float, last_decision: str) -> None:
+    try:
+        archive_monitoring(
+            (chain or "").lower().strip(),
+            (base_addr or "").strip(),
+            reason="manual: moved_to_portfolio",
+            last_score=float(last_score or 0.0),
+            last_decision=str(last_decision or ""),
+        )
+    except Exception:
+        pass
 
 
 # =============================
@@ -1119,7 +1119,7 @@ def token_history_rows(chain: str, base_addr: str, limit: int = 300) -> List[Dic
     if not key:
         return []
     rows = load_monitoring_history(limit_rows=8000)
-    filt = [r for r in rows if addr_key(r.get("chain",""), r.get("base_addr","")) == key]
+    filt = [r for r in rows if addr_key(r.get("chain", ""), r.get("base_addr", "")) == key]
     return filt[-limit:]
 
 
@@ -1224,14 +1224,12 @@ def page_scout(cfg: Dict[str, Any]):
         st.write("Top reject reasons:")
         top = freasons.most_common(15)
         st.write({k: v for k, v in top} if top else "No rejects counted.")
-        st.caption("Note: Scout також відсікає tokens, що вже є у Monitoring/Portfolio, і відсікає 'NO ENTRY'.")
+        st.caption('Note: Scout також відсікає tokens, що вже є у Monitoring/Portfolio, і відсікає "NO ENTRY".')
 
     if not ranked:
         st.info("0 results. Спробуй: lower Min Liquidity/Vol24, widen age window, або Refresh (resample seeds).")
         return
 
-
-    # --- Stable Scout cards (single-column; consistent on mobile/desktop) ---
     st.session_state.setdefault("scout_hidden", set())
 
     def _norm_score(pobj: Dict[str, Any]) -> float:
@@ -1254,7 +1252,7 @@ def page_scout(cfg: Dict[str, Any]):
         chain_id = (pobj.get("chainId") or "").lower().strip()
         base_addr = (safe_get(pobj, "baseToken", "address", default="") or "").strip()
         pair_addr = (pobj.get("pairAddress") or "").strip()
-        url = pobj.get("url", "")
+        url = pobj.get("url", "") or ""
 
         if not base_addr:
             return
@@ -1272,35 +1270,36 @@ def page_scout(cfg: Dict[str, Any]):
         st.subheader(f"{base}/{quote}")
         st.caption(f"{chain_id or '?'} • {pobj.get('dexId','?')}")
 
-        # Actions first (so on mobile user doesn't hunt for them)
         btn1, btn2 = st.columns(2)
         with btn1:
-            st.link_button("Open DexScreener", url or "", use_container_width=True)
+            link_button("Open DexScreener", url, use_container_width=True, key=f"sc_ds_{idx}_{hkey(pair_addr, base_addr)}")
         with btn2:
             if swap_url:
                 swap_label = "Open Swap (Jupiter)" if chain_id == "solana" else "Open Swap"
-                st.link_button(swap_label, swap_url, use_container_width=True)
+                link_button(swap_label, swap_url, use_container_width=True, key=f"sc_sw_{idx}_{hkey(base_addr, chain_id)}")
             else:
                 st.button("Open Swap", disabled=True, use_container_width=True)
 
         btn3, btn4 = st.columns(2)
         with btn3:
-            if st.button("Add to Monitoring", key=f"add_mon_{pair_addr}", use_container_width=True):
+            if st.button("Add to Monitoring", key=f"add_mon_{idx}_{hkey(pair_addr, base_addr)}", use_container_width=True):
                 add_to_monitoring(pobj, float(score))
                 st.session_state["scout_hidden"].add(base_addr)
                 st.toast("Added to monitoring")
                 st.rerun()
         with btn4:
-            if st.button("Log → Portfolio (I swapped)", key=f"log_pf_{pair_addr}", use_container_width=True):
-                res = log_to_portfolio(pobj, swap_url)
-                if res == "OK":
+            k_log = f"log_pf_{idx}_{hkey(chain_id, base_addr, pair_addr or url or base)}"
+            if st.button("Log → Portfolio (I swapped)", key=k_log, use_container_width=True):
+                res = log_to_portfolio(pobj, float(score), decision, tag_list, swap_url)
+
+                if res == "OK" or res == "ALREADY_EXISTS":
+                    maybe_archive_from_monitoring(chain_id, base_addr, float(score), decision)
                     st.session_state["scout_hidden"].add(base_addr)
-                    st.toast("Logged to portfolio")
+                    st.toast("Logged to portfolio" if res == "OK" else "Already in portfolio")
                     st.rerun()
                 else:
                     st.error(f"Portfolio log failed: {res}")
 
-        # Core metrics (stable order) + score always visible
         price = parse_float(pobj.get("priceUsd"), None)
         liq = parse_float(safe_get(pobj, "liquidity", "usd", default=None), None)
         vol24 = parse_float(safe_get(pobj, "volume", "h24", default=None), None)
@@ -1345,13 +1344,15 @@ def page_scout(cfg: Dict[str, Any]):
 
     for i, (_s, _decision, _tags, p) in enumerate(ranked, start=1):
         render_scout_card(p, i)
+
+
+
 def page_monitoring(auto_cfg: Dict[str, Any]):
     st.title("Monitoring")
     st.caption("Тут тільки WATCH/WAIT. Сортування: priority → momentum → time since added.")
 
     sec = int(auto_cfg.get("ui_autorefresh_sec", 0) or 0)
     if sec > 0:
-        # Streamlit doesn't run in the background. This refresh keeps snapshots flowing while the page is open.
         st.markdown(f"<meta http-equiv='refresh' content='{sec}'>", unsafe_allow_html=True)
 
     rows = load_monitoring()
@@ -1389,7 +1390,18 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
 
-        live = {"price": 0.0, "liq": 0.0, "vol24": 0.0, "vol5": 0.0, "pc1h": 0.0, "pc5": 0.0, "dex": "", "pair_addr": "", "url": "", "quote": ""}
+        live = {
+            "price": 0.0,
+            "liq": 0.0,
+            "vol24": 0.0,
+            "vol5": 0.0,
+            "pc1h": 0.0,
+            "pc5": 0.0,
+            "dex": "",
+            "pair_addr": "",
+            "url": "",
+            "quote": "",
+        }
         if best:
             live["dex"] = best.get("dexId", "") or ""
             live["pair_addr"] = best.get("pairAddress", "") or ""
@@ -1407,7 +1419,6 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         s_live = score_pair(best) if best else 0.0
         decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
 
-        # auto-archive rules (optional)
         if auto_cfg.get("auto_archive_enabled"):
             min_score = float(auto_cfg.get("auto_archive_min_score", 0.0))
             drop_no_entry = bool(auto_cfg.get("auto_archive_on_no_entry", True))
@@ -1498,8 +1509,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 no_entry_cnt = int((tail.get("decision", "").astype(str).str.upper() == "NO ENTRY").sum())
                 no_entry_ratio = no_entry_cnt / max(1, last_n)
 
-                avg_score = float(pd.to_numeric(tail.get("score_live", pd.Series([0]*len(tail))), errors="coerce").fillna(0).mean())
-                std_score = float(pd.to_numeric(tail.get("score_live", pd.Series([0]*len(tail))), errors="coerce").fillna(0).std(ddof=0))
+                avg_score = float(pd.to_numeric(tail.get("score_live", pd.Series([0] * len(tail))), errors="coerce").fillna(0).mean())
+                std_score = float(pd.to_numeric(tail.get("score_live", pd.Series([0] * len(tail))), errors="coerce").fillna(0).std(ddof=0))
 
                 survivability = max(0.0, 100.0 - (no_entry_ratio * 70.0) - min(std_score / 10.0, 30.0))
 
@@ -1711,7 +1722,7 @@ def page_portfolio():
                 for rr in all_rows:
                     if rr.get("active") != "1":
                         continue
-                    if addr_key(rr.get("chain",""), rr.get("base_token_address","")) == target_key:
+                    if addr_key(rr.get("chain", ""), rr.get("base_token_address", "")) == target_key:
                         rr["note"] = note_val
                         if close:
                             rr["active"] = "0"
@@ -1722,7 +1733,7 @@ def page_portfolio():
                         x for x in all_rows
                         if not (
                             (x.get("active") == "1")
-                            and (addr_key(x.get("chain",""), x.get("base_token_address","")) == target_key)
+                            and (addr_key(x.get("chain", ""), x.get("base_token_address", "")) == target_key)
                         )
                     ]
 
@@ -1741,9 +1752,6 @@ def page_portfolio():
                 )
 
 
-# =============================
-# App main
-# =============================
 def main():
     st.set_page_config(page_title="DEX Scout", layout="wide")
     ensure_storage()
@@ -1861,6 +1869,7 @@ def main():
             auto_archive_enabled=auto_archive_enabled,
             auto_archive_min_score=auto_archive_min_score,
             auto_archive_on_no_entry=auto_archive_on_no_entry,
+            ui_autorefresh_sec=ui_autorefresh_sec,
             stability_window_n=stability_window_n,
         )
         page_monitoring(auto_cfg)
