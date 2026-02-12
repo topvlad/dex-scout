@@ -1,16 +1,38 @@
-# app.py – DEX Scout v0.4.10
+# app.py — DEX Scout v0.4.11
 # ядро: Scout → Monitoring → Archive (+ Portfolio)
-# – Scout: показує тільки re-eligible токени (не в Monitoring active, не в Portfolio active), і НЕ показує "NO ENTRY"
-# – Monitoring: тільки WATCH/WAIT. Сортування: priority → momentum → time since added
-# – Archive: автоматична архівація (опційно) по мін. score та/або по "NO ENTRY"
-# – BSC + Solana, swap routing: PancakeSwap (BSC) + Jupiter (Solana)
-# – Address handling: Solana mint addresses are case-sensitive – NEVER lower() them
+# - Scout: показує тільки re-eligible токени (не в Monitoring active, не в Portfolio active), і НЕ показує "NO ENTRY"
+# - Monitoring: тільки WATCH/WAIT. Сортування: priority → momentum → time since added
+# - Archive: автоматична архівація (опційно) по мін. score та/або по "NO ENTRY"
+# - BSC + Solana, swap routing: PancakeSwap (BSC) + Jupiter (Solana)
+# - Address handling: Solana mint addresses are case-sensitive – NEVER lower() them
 #
 # ⚠️ Safety note: Це НЕ ончейн-аудит. Для Solana – завжди дивись JupShield warnings перед swap.
+#
+# =============================
+# Persistence fix (Supabase)
+# =============================
+# Якщо у Streamlit Cloud є secrets:
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_ROLE_KEY
+#
+# то CSV зберігаються у Supabase в таблиці app_storage:
+#
+#   create table if not exists public.app_storage (
+#     key text primary key,
+#     content text not null,
+#     updated_at timestamptz not null default now()
+#   );
+#
+# Перевага: НЕ треба переносити всю логіку на Postgres-таблиці.
+# Ми просто зберігаємо поточні CSV як текст і читаємо/пишемо їх як раніше.
+#
+# Рекомендовано увімкнути RLS? Для service_role воно не критично, але можеш залишити RLS off.
+# Якщо RLS on, треба policy для service_role (або тримати RLS off на цій таблиці).
 
 import os
 import re
 import csv
+import io
 import time
 import random
 import hashlib
@@ -23,58 +45,6 @@ import requests
 import streamlit as st
 import pandas as pd
 
-# =============================
-# Supabase persistence (optional)
-# =============================
-# Streamlit Cloud's filesystem can be ephemeral. If SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY are set
-# in Streamlit Secrets, we use Supabase Postgres as the source of truth for Monitoring/Archive/Portfolio.
-USE_SUPABASE = bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
-
-_sb = None
-def sb():
-    global _sb
-    if _sb is not None:
-        return _sb
-    if not USE_SUPABASE:
-        return None
-    try:
-        from supabase import create_client  # supabase-py
-    except Exception as e:
-        raise RuntimeError("Supabase is enabled but 'supabase' package is missing. Add supabase to requirements.txt") from e
-    _sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
-    return _sb
-
-def sb_upsert(table: str, row: Dict[str, Any], on_conflict: str):
-    client = sb()
-    if client is None:
-        raise RuntimeError("Supabase not configured")
-    return client.table(table).upsert(row, on_conflict=on_conflict).execute()
-
-def sb_select(table: str, filters: Optional[Dict[str, Any]] = None, order: Optional[Tuple[str,bool]] = None, limit: Optional[int]=None):
-    client = sb()
-    if client is None:
-        raise RuntimeError("Supabase not configured")
-    q = client.table(table).select("*")
-    if filters:
-        for k,v in filters.items():
-            q = q.eq(k, v)
-    if order:
-        col, asc = order
-        q = q.order(col, desc=(not asc))
-    if limit:
-        q = q.limit(limit)
-    return q.execute().data or []
-
-def sb_update(table: str, filters: Dict[str, Any], values: Dict[str, Any]):
-    client = sb()
-    if client is None:
-        raise RuntimeError("Supabase not configured")
-    q = client.table(table).update(values)
-    for k,v in filters.items():
-        q = q.eq(k, v)
-    return q.execute()
-
-
 VERSION = "0.4.11"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
@@ -85,7 +55,89 @@ MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
 
 
 # =============================
-# Storage + lock
+# Supabase (optional persistence)
+# =============================
+def _get_secret(name: str, default: str = "") -> str:
+    # Streamlit secrets
+    try:
+        if hasattr(st, "secrets") and name in st.secrets:
+            return str(st.secrets.get(name) or default)
+    except Exception:
+        pass
+    # Env fallback
+    return str(os.environ.get(name, default) or default)
+
+
+SUPABASE_URL = _get_secret("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_ANON_KEY = _get_secret("SUPABASE_ANON_KEY", "").strip()
+
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+
+def _sb_headers() -> Dict[str, str]:
+    # Use service role key for server-side storage
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def _sb_table_url(table: str) -> str:
+    return f"{SUPABASE_URL}/rest/v1/{table}"
+
+
+def sb_get_storage(key: str) -> Optional[str]:
+    """
+    Returns content for key from public.app_storage, or None if not found.
+    """
+    if not SUPABASE_ENABLED:
+        return None
+    try:
+        url = _sb_table_url("app_storage")
+        # key is primary key
+        params = {"select": "content", "key": f"eq.{key}"}
+        r = requests.get(url, headers=_sb_headers(), params=params, timeout=12)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        data = r.json() or []
+        if not data:
+            return None
+        return (data[0].get("content") or "")
+    except Exception:
+        return None
+
+
+def sb_put_storage(key: str, content: str) -> bool:
+    """
+    Upsert (insert or update) content into public.app_storage.
+    """
+    if not SUPABASE_ENABLED:
+        return False
+    try:
+        url = _sb_table_url("app_storage")
+        payload = [{"key": key, "content": content}]
+        headers = _sb_headers().copy()
+        headers["Prefer"] = "resolution=merge-duplicates"
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r.raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def storage_key_for_path(path: str) -> str:
+    # keep it stable and short
+    # examples: data/monitoring.csv -> monitoring.csv
+    base = os.path.basename(path)
+    return base or path
+
+
+# =============================
+# Storage + lock (local only)
 # =============================
 @contextmanager
 def file_lock(lock_path: str, timeout_sec: int = 8):
@@ -111,7 +163,8 @@ def file_lock(lock_path: str, timeout_sec: int = 8):
 def ensure_storage():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # portfolio
+    # For Supabase persistence, we still keep local folder but it is not the source of truth.
+    # Create local CSVs if missing to avoid crashes on local runs.
     if not os.path.exists(PORTFOLIO_CSV):
         with open(PORTFOLIO_CSV, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(
@@ -136,7 +189,6 @@ def ensure_storage():
             )
             w.writeheader()
 
-    # monitoring (now supports archive fields)
     if not os.path.exists(MONITORING_CSV):
         with open(MONITORING_CSV, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(
@@ -152,7 +204,6 @@ def ensure_storage():
                     "vol24_init",
                     "vol5_init",
                     "active",
-                    # archive meta (optional)
                     "ts_archived",
                     "archived_reason",
                     "last_score",
@@ -161,7 +212,6 @@ def ensure_storage():
             )
             w.writeheader()
 
-    # monitoring history snapshots
     if not os.path.exists(MON_HISTORY_CSV):
         with open(MON_HISTORY_CSV, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(
@@ -191,8 +241,39 @@ def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _csv_from_string(content: str) -> List[Dict[str, Any]]:
+    if not content.strip():
+        return []
+    sio = io.StringIO(content)
+    rdr = csv.DictReader(sio)
+    return [row for row in rdr]
+
+
+def _csv_to_string(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
+    sio = io.StringIO()
+    w = csv.DictWriter(sio, fieldnames=fieldnames)
+    w.writeheader()
+    for r in rows:
+        out = {k: r.get(k, "") for k in fieldnames}
+        w.writerow(out)
+    return sio.getvalue()
+
+
 def load_csv(path: str) -> List[Dict[str, Any]]:
     ensure_storage()
+
+    # Supabase source of truth
+    if SUPABASE_ENABLED:
+        key = storage_key_for_path(path)
+        content = sb_get_storage(key)
+        if content is not None:
+            try:
+                return _csv_from_string(content)
+            except Exception:
+                # fall back to local if content corrupt
+                pass
+
+    # Local fallback
     if not os.path.exists(path):
         return []
     rows: List[Dict[str, Any]] = []
@@ -204,6 +285,8 @@ def load_csv(path: str) -> List[Dict[str, Any]]:
 
 def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     ensure_storage()
+
+    # Always write local (helps debugging)
     lockp = path + ".lock"
     with file_lock(lockp):
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -213,15 +296,18 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
                 out = {k: r.get(k, "") for k in fieldnames}
                 w.writerow(out)
 
+    # Supabase persistence
+    if SUPABASE_ENABLED:
+        key = storage_key_for_path(path)
+        content = _csv_to_string(rows, fieldnames)
+        sb_put_storage(key, content)
+
 
 def append_csv(path: str, row: Dict[str, Any], fieldnames: List[str]):
-    ensure_storage()
-    lockp = path + ".lock"
-    with file_lock(lockp):
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            out = {k: row.get(k, "") for k in fieldnames}
-            w.writerow(out)
+    # For Supabase we do read-modify-write (safe for low concurrency).
+    rows = load_csv(path)
+    rows.append({k: row.get(k, "") for k in fieldnames})
+    save_csv(path, rows, fieldnames)
 
 
 # =============================
@@ -233,7 +319,13 @@ def hkey(*parts: str, n: int = 10) -> str:
 
 
 def link_button(label: str, url: str, use_container_width: bool = True, key: Optional[str] = None):
-    """Compatibility wrapper for st.link_button across Streamlit versions."""
+    """
+    Streamlit's st.link_button signature differs across versions.
+    This wrapper avoids TypeError by:
+    - trying without key
+    - then with key
+    - falling back to HTML if needed
+    """
     if not url:
         return
     if hasattr(st, "link_button"):
@@ -254,8 +346,8 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
 
     st.markdown(
         f"""
-        <a href=\"{url}\" target=\"_blank\" style=\"text-decoration:none;\">
-          <div style=\"
+        <a href="{url}" target="_blank" style="text-decoration:none;">
+          <div style="
             display:inline-block;
             padding:10px 14px;
             border-radius:10px;
@@ -263,7 +355,7 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
             font-weight:800;
             width:100%;
             text-align:center;
-          \">{label}</div>
+          ">{label}</div>
         </a>
         """,
         unsafe_allow_html=True,
@@ -657,7 +749,7 @@ def action_badge(action: str) -> str:
         bg = "rgba(229,62,62,0.12)"
 
     return f"""
-    <span style=\"
+    <span style="
       display:inline-block;
       padding:6px 12px;
       border-radius:999px;
@@ -667,7 +759,7 @@ def action_badge(action: str) -> str:
       font-weight:800;
       font-size:12px;
       letter-spacing:0.4px;
-    \">{action}</span>
+    ">{action}</span>
     """
 
 
@@ -922,40 +1014,14 @@ HIST_FIELDS = [
 
 
 def load_portfolio() -> List[Dict[str, Any]]:
-    if USE_SUPABASE:
-        return sb_select("portfolio", order=("ts_utc", True))
     return load_csv(PORTFOLIO_CSV)
 
 
 def save_portfolio(rows: List[Dict[str, Any]]):
-    if USE_SUPABASE:
-        # Portfolio is keyed by token_key (chain+base addr), one row per token.
-        # We upsert rows one by one to avoid destructive rewrites.
-        for r in rows:
-            chain = (r.get("chain") or "").lower().strip()
-            base_addr = (r.get("base_token_address") or "").strip()
-            token_k = addr_key(chain, base_addr)
-            if not token_k:
-                continue
-            rr = dict(r)
-            rr["token_key"] = token_k
-            sb_upsert("portfolio", rr, on_conflict="token_key")
-        return
     save_csv(PORTFOLIO_CSV, rows, PORTFOLIO_FIELDS)
 
 
 def load_monitoring() -> List[Dict[str, Any]]:
-    if USE_SUPABASE:
-        rows = sb_select("monitoring", order=("ts_added", True))
-        for r in rows:
-            for k in MON_FIELDS:
-                if k not in r:
-                    r[k] = ""
-            # normalize active to "1"/"0"
-            if isinstance(r.get("active"), bool):
-                r["active"] = "1" if r["active"] else "0"
-        return rows
-
     rows = load_csv(MONITORING_CSV)
     for r in rows:
         for k in MON_FIELDS:
@@ -965,20 +1031,6 @@ def load_monitoring() -> List[Dict[str, Any]]:
 
 
 def save_monitoring(rows: List[Dict[str, Any]]):
-    if USE_SUPABASE:
-        for r in rows:
-            chain = (r.get("chain") or "").lower().strip()
-            base_addr = (r.get("base_addr") or "").strip()
-            token_k = addr_key(chain, base_addr)
-            if not token_k:
-                continue
-            rr = dict(r)
-            rr["token_key"] = token_k
-            # allow bool active too
-            if rr.get("active") in {True, False}:
-                rr["active"] = "1" if rr["active"] else "0"
-            sb_upsert("monitoring", rr, on_conflict="token_key")
-        return
     save_csv(MONITORING_CSV, rows, MON_FIELDS)
 
 
@@ -991,33 +1043,9 @@ def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
     base_addr = addr_store(chain, base_addr_raw)
     key = addr_key(chain, base_addr)
 
-    if USE_SUPABASE:
-        existing = sb_select("monitoring", filters={"token_key": key}, limit=1)
-        if existing and str(existing[0].get("active","")) == "1":
-            return "EXISTS"
-        row = {
-            "token_key": key,
-            "ts_added": now_utc_str(),
-            "chain": chain,
-            "base_symbol": safe_get(p, "baseToken", "symbol", default="") or "",
-            "base_addr": base_addr,
-            "pair_addr": p.get("pairAddress", "") or "",
-            "score_init": str(score),
-            "liq_init": str(safe_get(p, "liquidity", "usd", default=0) or 0),
-            "vol24_init": str(safe_get(p, "volume", "h24", default=0) or 0),
-            "vol5_init": str(safe_get(p, "volume", "m5", default=0) or 0),
-            "active": "1",
-            "ts_archived": "",
-            "archived_reason": "",
-            "last_score": "",
-            "last_decision": "",
-        }
-        sb_upsert("monitoring", row, on_conflict="token_key")
-        return "OK"
-
     rows = load_monitoring()
     for r in rows:
-        if r.get("active") == "1" and addr_key(r.get("chain",""), r.get("base_addr","")) == key:
+        if r.get("active") == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
             return "EXISTS"
 
     rows.append(
@@ -1046,22 +1074,10 @@ def archive_monitoring(chain: str, base_addr: str, reason: str, last_score: floa
     if not base_addr:
         return False
     key = addr_key(chain, base_addr)
-
-    if USE_SUPABASE:
-        vals = {
-            "active": "0",
-            "ts_archived": now_utc_str(),
-            "archived_reason": reason,
-            "last_score": f"{last_score:.2f}" if last_score else str(last_score),
-            "last_decision": last_decision or "",
-        }
-        sb_update("monitoring", {"token_key": key}, vals)
-        return True
-
     rows = load_monitoring()
     changed = False
     for r in rows:
-        if r.get("active") == "1" and addr_key(r.get("chain",""), r.get("base_addr","")) == key:
+        if r.get("active") == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
             r["active"] = "0"
             r["ts_archived"] = now_utc_str()
             r["archived_reason"] = reason
@@ -1077,23 +1093,10 @@ def reactivate_monitoring(chain: str, base_addr: str) -> bool:
     if not base_addr:
         return False
     key = addr_key(chain, base_addr)
-
-    if USE_SUPABASE:
-        vals = {
-            "active": "1",
-            "ts_added": now_utc_str(),
-            "ts_archived": "",
-            "archived_reason": "",
-            "last_score": "",
-            "last_decision": "",
-        }
-        sb_update("monitoring", {"token_key": key}, vals)
-        return True
-
     rows = load_monitoring()
     changed = False
     for r in rows:
-        if (r.get("active") != "1") and addr_key(r.get("chain",""), r.get("base_addr","")) == key:
+        if (r.get("active") != "1") and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
             r["active"] = "1"
             r["ts_added"] = now_utc_str()
             r["ts_archived"] = ""
@@ -1108,6 +1111,8 @@ def reactivate_monitoring(chain: str, base_addr: str) -> bool:
 
 
 def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[str], swap_url: str) -> str:
+    rows = load_portfolio()
+
     chain = (p.get("chainId") or "").lower().strip()
     dex = p.get("dexId") or ""
     base_sym = safe_get(p, "baseToken", "symbol", default="") or ""
@@ -1117,41 +1122,14 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
     url = p.get("url", "") or ""
     price = safe_get(p, "priceUsd", default="") or ""
 
-    token_k = addr_key(chain, base_addr)
+    key = addr_key(chain, base_addr)
 
-    if USE_SUPABASE:
-        existing = sb_select("portfolio", filters={"token_key": token_k}, limit=1)
-        if existing and str(existing[0].get("active","")) == "1":
-            return "ALREADY_EXISTS"
-
-        row = {
-            "token_key": token_k,
-            "ts_utc": now_utc_str(),
-            "chain": chain,
-            "dex": dex,
-            "base_symbol": base_sym,
-            "quote_symbol": quote_sym,
-            "base_token_address": base_addr,
-            "pair_address": pair_addr,
-            "dexscreener_url": url,
-            "swap_url": swap_url,
-            "score": str(score),
-            "action": action,
-            "tags": " | ".join(tags),
-            "entry_price_usd": str(price),
-            "note": "",
-            "active": "1",
-        }
-        sb_upsert("portfolio", row, on_conflict="token_key")
-        return "OK"
-
-    rows = load_portfolio()
     for r in rows:
         if r.get("active") != "1":
             continue
         if pair_addr and (r.get("pair_address", "").lower() == pair_addr.lower()):
             return "ALREADY_EXISTS"
-        if addr_key(r.get("chain",""), r.get("base_token_address","")) == token_k:
+        if addr_key(r.get("chain", ""), r.get("base_token_address", "")) == key:
             return "ALREADY_EXISTS"
 
     rows.append(
@@ -1180,22 +1158,9 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
 def active_base_sets() -> Tuple[set, set]:
     mon = load_monitoring()
     port = load_portfolio()
-    mon_set = {addr_key(r.get("chain",""), r.get("base_addr","")) for r in mon if str(r.get("active")) == "1" and r.get("base_addr")}
-    port_set = {addr_key(r.get("chain",""), r.get("base_token_address","")) for r in port if str(r.get("active")) == "1" and r.get("base_token_address")}
+    mon_set = {addr_key(r.get("chain", ""), r.get("base_addr", "")) for r in mon if r.get("active") == "1" and r.get("base_addr")}
+    port_set = {addr_key(r.get("chain", ""), r.get("base_token_address", "")) for r in port if r.get("active") == "1" and r.get("base_token_address")}
     return mon_set, port_set
-
-
-def maybe_archive_from_monitoring(chain: str, base_addr: str, last_score: float, last_decision: str) -> None:
-    try:
-        archive_monitoring(
-            (chain or "").lower().strip(),
-            (base_addr or "").strip(),
-            reason="manual: moved_to_portfolio",
-            last_score=float(last_score or 0.0),
-            last_decision=str(last_decision or ""),
-        )
-    except Exception:
-        pass
 
 
 # =============================
@@ -1216,10 +1181,6 @@ def should_snapshot(chain: str, base_addr: str, min_interval_sec: int = 60) -> b
 
 
 def append_monitoring_history(row: Dict[str, Any]):
-    if USE_SUPABASE:
-        # history is append-only
-        sb().table("monitoring_history").insert(row).execute()
-        return
     append_csv(MON_HISTORY_CSV, row, HIST_FIELDS)
 
 
@@ -1253,11 +1214,19 @@ def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Op
 
 
 def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
-    if USE_SUPABASE:
-        # newest first to limit, then we reverse later where needed
-        rows = sb_select("monitoring_history", order=("ts_utc", False), limit=int(limit_rows))
-        return list(reversed(rows))
     ensure_storage()
+
+    # Supabase path
+    if SUPABASE_ENABLED:
+        content = sb_get_storage(storage_key_for_path(MON_HISTORY_CSV))
+        if content is not None:
+            try:
+                rows = _csv_from_string(content)
+                return rows[-limit_rows:]
+            except Exception:
+                pass
+
+    # Local fallback (fixed SyntaxError here: data.count("\n"))
     if not os.path.exists(MON_HISTORY_CSV):
         return []
     try:
@@ -1269,8 +1238,7 @@ def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
         chunk_bytes = 1024 * 1024
         data = ""
         pos = size
-        while pos > 0 and data.count("
-") < (limit_rows + 50):
+        while pos > 0 and data.count("\n") < (limit_rows + 50):
             step = min(chunk_bytes, pos)
             pos -= step
             with open(MON_HISTORY_CSV, "rb") as bf:
@@ -1399,7 +1367,7 @@ def page_scout(cfg: Dict[str, Any]):
         st.write("Top reject reasons:")
         top = freasons.most_common(15)
         st.write({k: v for k, v in top} if top else "No rejects counted.")
-        st.caption('Note: Scout також відсікає tokens, що вже є у Monitoring/Portfolio, і відсікає "NO ENTRY".')
+        st.caption("Note: Scout також відсікає tokens, що вже є у Monitoring/Portfolio, і відсікає 'NO ENTRY'.")
 
     if not ranked:
         st.info("0 results. Спробуй: lower Min Liquidity/Vol24, widen age window, або Refresh (resample seeds).")
@@ -1447,30 +1415,31 @@ def page_scout(cfg: Dict[str, Any]):
 
         btn1, btn2 = st.columns(2)
         with btn1:
-            link_button("Open DexScreener", url, use_container_width=True, key=f"sc_ds_{idx}_{hkey(pair_addr, base_addr)}")
+            st.link_button("Open DexScreener", url, use_container_width=True)
         with btn2:
             if swap_url:
                 swap_label = "Open Swap (Jupiter)" if chain_id == "solana" else "Open Swap"
-                link_button(swap_label, swap_url, use_container_width=True, key=f"sc_sw_{idx}_{hkey(base_addr, chain_id)}")
+                st.link_button(swap_label, swap_url, use_container_width=True)
             else:
                 st.button("Open Swap", disabled=True, use_container_width=True)
 
         btn3, btn4 = st.columns(2)
         with btn3:
-            if st.button("Add to Monitoring", key=f"add_mon_{idx}_{hkey(pair_addr, base_addr)}", use_container_width=True):
+            if st.button("Add to Monitoring", key=f"add_mon_{pair_addr}", use_container_width=True):
                 add_to_monitoring(pobj, float(score))
                 st.session_state["scout_hidden"].add(base_addr)
                 st.toast("Added to monitoring")
                 st.rerun()
         with btn4:
-            k_log = f"log_pf_{idx}_{hkey(chain_id, base_addr, pair_addr or url or base)}"
-            if st.button("Log → Portfolio (I swapped)", key=k_log, use_container_width=True):
+            # FIX: correct call signature
+            if st.button("Log → Portfolio (I swapped)", key=f"log_pf_{pair_addr}", use_container_width=True):
+                if not swap_url:
+                    st.error("Swap URL missing for this chain/address.")
+                    return
                 res = log_to_portfolio(pobj, float(score), decision, tag_list, swap_url)
-
-                if res == "OK" or res == "ALREADY_EXISTS":
-                    maybe_archive_from_monitoring(chain_id, base_addr, float(score), decision)
+                if res == "OK":
                     st.session_state["scout_hidden"].add(base_addr)
-                    st.toast("Logged to portfolio" if res == "OK" else "Already in portfolio")
+                    st.toast("Logged to portfolio")
                     st.rerun()
                 else:
                     st.error(f"Portfolio log failed: {res}")
@@ -1521,7 +1490,6 @@ def page_scout(cfg: Dict[str, Any]):
         render_scout_card(p, i)
 
 
-
 def page_monitoring(auto_cfg: Dict[str, Any]):
     st.title("Monitoring")
     st.caption("Тут тільки WATCH/WAIT. Сортування: priority → momentum → time since added.")
@@ -1565,18 +1533,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
 
-        live = {
-            "price": 0.0,
-            "liq": 0.0,
-            "vol24": 0.0,
-            "vol5": 0.0,
-            "pc1h": 0.0,
-            "pc5": 0.0,
-            "dex": "",
-            "pair_addr": "",
-            "url": "",
-            "quote": "",
-        }
+        live = {"price": 0.0, "liq": 0.0, "vol24": 0.0, "vol5": 0.0, "pc1h": 0.0, "pc5": 0.0, "dex": "", "pair_addr": "", "url": "", "quote": ""}
         if best:
             live["dex"] = best.get("dexId", "") or ""
             live["pair_addr"] = best.get("pairAddress", "") or ""
@@ -1614,8 +1571,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     enriched.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
 
-    rows = load_monitoring()
-    active_now = [r for r in rows if r.get("active") == "1"]
+    rows2 = load_monitoring()
+    active_now = [r for r in rows2 if r.get("active") == "1"]
     if len(active_now) != len(active):
         st.info("Auto-archive applied. Refreshing list…")
         st.rerun()
@@ -1691,7 +1648,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Last N", str(last_n))
-                c2.metric("NO ENTRY (last N)", f"{no_entry_cnt}/{last_n}", f"{no_entry_ratio*100:.0f}%")
+                c2.metric("NO ENTRY (last N)", f"{no_entry_cnt}/{last_n}", f"{no_entry_ratio * 100:.0f}%")
                 c3.metric("Avg score (last N)", f"{avg_score:.1f}")
                 c4.metric("Survivability", f"{survivability:.0f}/100")
 
@@ -1826,7 +1783,7 @@ def page_portfolio():
 
     if not active_rows:
         st.info("Portfolio is empty. Use Scout → Log → Portfolio or Monitoring → Promote → Portfolio.")
-        st.caption("Якщо після деплою все скидається – це persistence Streamlit Cloud. Для 100% стабільності потрібен SQLite/DB або external storage.")
+        st.caption("Якщо після деплою все скидається, увімкни Supabase persistence (див коментар у верхній частині файлу).")
         return
 
     st.subheader("Active positions")
@@ -1927,6 +1884,9 @@ def page_portfolio():
                 )
 
 
+# =============================
+# App main
+# =============================
 def main():
     st.set_page_config(page_title="DEX Scout", layout="wide")
     ensure_storage()
@@ -1934,6 +1894,11 @@ def main():
     with st.sidebar:
         st.markdown("### DEX Scout")
         st.caption(f"Version: v{VERSION}")
+
+        if SUPABASE_ENABLED:
+            st.caption("Persistence: Supabase ON")
+        else:
+            st.caption("Persistence: local files (Streamlit Cloud may reset)")
 
         if "page" not in st.session_state:
             st.session_state["page"] = "Scout"
@@ -2015,41 +1980,6 @@ def main():
             clear_cache = st.button("Clear cache", use_container_width=True)
         if clear_cache:
             st.cache_data.clear()
-
-        # --- Data persistence helpers (Streamlit Cloud resets local files on redeploy) ---
-        with st.expander('Data (backup/restore)', expanded=False):
-            st.caption('Tip: On Streamlit Cloud, files written to data/ may reset after redeploy. Keep backups and restore here when needed.')
-            up_mon = st.file_uploader('Upload monitoring.csv', type=['csv'], key='up_mon')
-            up_hist = st.file_uploader('Upload monitoring_history.csv', type=['csv'], key='up_hist')
-            up_port = st.file_uploader('Upload portfolio.csv', type=['csv'], key='up_port')
-
-            def _restore_file(up, target_path: str):
-                if up is None:
-                    return False
-                try:
-                    ensure_storage()
-                    lockp = target_path + '.lock'
-                    with file_lock(lockp):
-                        with open(target_path, 'wb') as f:
-                            f.write(up.getvalue())
-                    return True
-                except Exception:
-                    return False
-
-            if st.button('Restore uploaded CSVs', use_container_width=True):
-                changed = []
-                if _restore_file(up_mon, MONITORING_CSV):
-                    changed.append('monitoring.csv')
-                if _restore_file(up_hist, MON_HISTORY_CSV):
-                    changed.append('monitoring_history.csv')
-                if _restore_file(up_port, PORTFOLIO_CSV):
-                    changed.append('portfolio.csv')
-
-                if changed:
-                    st.success('Restored: ' + ', '.join(changed))
-                    st.rerun()
-                else:
-                    st.info('No files restored.')
 
     if page == "Scout":
         cfg = dict(
