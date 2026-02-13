@@ -23,6 +23,7 @@
 import os
 import re
 import csv
+import io
 import time
 import random
 import hashlib
@@ -36,7 +37,7 @@ import streamlit as st
 import pandas as pd
 
 
-VERSION = "0.4.16"
+VERSION = "0.4.12"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -46,13 +47,14 @@ MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
 
 
 # =============================
+# Supabase (optional persistence) – v0.4.11 compatible
 # =============================
-# Supabase (optional persistence)
-# =============================
-# If Streamlit Cloud secrets (or env) include:
+# Якщо у Streamlit Cloud є secrets:
 #   SUPABASE_URL
 #   SUPABASE_SERVICE_ROLE_KEY
-# then CSV snapshots are stored in Supabase table public.app_storage:
+# (optional) SUPABASE_ANON_KEY
+#
+# то CSV зберігаються у Supabase в таблиці public.app_storage як текст:
 #
 #   create table if not exists public.app_storage (
 #     key text primary key,
@@ -60,28 +62,30 @@ MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
 #     updated_at timestamptz not null default now()
 #   );
 #
-# This keeps the original CSV-based logic intact (no need to redesign schema).
-
-import io
-
+# Важливо: ми НЕ переносимо логіку в Postgres-таблиці – лише зберігаємо CSV як текст.
+# Так дані й архіви не зникають між деплоями Streamlit Cloud.
 
 def _get_secret(name: str, default: str = "") -> str:
+    # Streamlit secrets
     try:
         if hasattr(st, "secrets") and name in st.secrets:
             return str(st.secrets.get(name) or default)
     except Exception:
         pass
+    # Env fallback
     return str(os.environ.get(name, default) or default)
-
 
 SUPABASE_URL = _get_secret("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 SUPABASE_ANON_KEY = _get_secret("SUPABASE_ANON_KEY", "").strip()
 
-SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
+def _sb_ok() -> bool:
+    return bool(USE_SUPABASE)
 
-def _sb_headers() -> dict:
+def _sb_headers() -> Dict[str, str]:
+    # Use service role key for server-side storage
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -89,19 +93,14 @@ def _sb_headers() -> dict:
         "Accept": "application/json",
     }
 
-
 def _sb_table_url(table: str) -> str:
     return f"{SUPABASE_URL}/rest/v1/{table}"
 
-
-def storage_key_for_path(path: str) -> str:
-    # keep stable: data/monitoring.csv -> monitoring.csv
-    base = os.path.basename(path)
-    return base or path
-
-
-def sb_get_storage(key: str):
-    if not SUPABASE_ENABLED:
+def sb_get_storage(key: str) -> Optional[str]:
+    """
+    Returns content for key from public.app_storage, or None if not found.
+    """
+    if not USE_SUPABASE:
         return None
     try:
         url = _sb_table_url("app_storage")
@@ -117,9 +116,11 @@ def sb_get_storage(key: str):
     except Exception:
         return None
 
-
 def sb_put_storage(key: str, content: str) -> bool:
-    if not SUPABASE_ENABLED:
+    """
+    Upsert (insert or update) content into public.app_storage.
+    """
+    if not USE_SUPABASE:
         return False
     try:
         url = _sb_table_url("app_storage")
@@ -132,23 +133,11 @@ def sb_put_storage(key: str, content: str) -> bool:
     except Exception:
         return False
 
+def storage_key_for_path(path: str) -> str:
+    # keep it stable and short: data/monitoring.csv -> monitoring.csv
+    base = os.path.basename(path)
+    return base or path
 
-def _csv_from_string(content: str):
-    if not content.strip():
-        return []
-    sio = io.StringIO(content)
-    rdr = csv.DictReader(sio)
-    return [row for row in rdr]
-
-
-def _csv_to_string(rows, fieldnames):
-    sio = io.StringIO()
-    w = csv.DictWriter(sio, fieldnames=fieldnames)
-    w.writeheader()
-    for r in rows:
-        out = {k: r.get(k, "") for k in fieldnames}
-        w.writerow(out)
-    return sio.getvalue()
 
 # Storage + lock (CSV fallback)
 # =============================
@@ -255,30 +244,52 @@ def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _csv_from_string(content: str) -> List[Dict[str, Any]]:
+    if not content.strip():
+        return []
+    sio = io.StringIO(content)
+    rdr = csv.DictReader(sio)
+    return [row for row in rdr]
+
+
+def _csv_to_string(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
+    sio = io.StringIO()
+    w = csv.DictWriter(sio, fieldnames=fieldnames)
+    w.writeheader()
+    for r in rows:
+        out = {k: r.get(k, "") for k in fieldnames}
+        w.writerow(out)
+    return sio.getvalue()
+
+
 def load_csv(path: str) -> List[Dict[str, Any]]:
     ensure_storage()
 
-    # Supabase is the source of truth (if enabled)
-    if SUPABASE_ENABLED:
+    # Supabase source of truth
+    if _sb_ok():
         key = storage_key_for_path(path)
         content = sb_get_storage(key)
         if content is not None:
             try:
                 return _csv_from_string(content)
             except Exception:
+                # fall back to local if content corrupt
                 pass
 
     # Local fallback
     if not os.path.exists(path):
         return []
+    rows: List[Dict[str, Any]] = []
     with open(path, "r", newline="", encoding="utf-8") as f:
-        return [row for row in csv.DictReader(f)]
+        for row in csv.DictReader(f):
+            rows.append(row)
+    return rows
 
 
 def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     ensure_storage()
 
-    # Always write local (helps debugging + downloads)
+    # Always write local (helps debugging)
     lockp = path + ".lock"
     with file_lock(lockp):
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -289,16 +300,19 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
                 w.writerow(out)
 
     # Supabase persistence
-    if SUPABASE_ENABLED:
+    if _sb_ok():
         key = storage_key_for_path(path)
         content = _csv_to_string(rows, fieldnames)
         sb_put_storage(key, content)
 
+
 def append_csv(path: str, row: Dict[str, Any], fieldnames: List[str]):
-    # For Supabase we do read-modify-write (OK for low concurrency)
+    # For Supabase we do read-modify-write (safe for low concurrency).
     rows = load_csv(path)
     rows.append({k: row.get(k, "") for k in fieldnames})
     save_csv(path, rows, fieldnames)
+
+
 
 # =============================
 # Streamlit compatibility helpers
@@ -528,22 +542,6 @@ def fmt_usd_delta(x: float) -> str:
         return f"{sign}${x:,.0f}"
     except Exception:
         return "n/a"
-
-def sparkline(df, cols, height: int = 90):
-    """
-    Small helper to render compact line charts without forcing the user to read raw numbers.
-    Expects df with datetime index.
-    """
-    try:
-        if df is None or df.empty:
-            st.info("No history yet.")
-            return
-        if isinstance(cols, str):
-            cols = [cols]
-        st.line_chart(df[cols], height=height, use_container_width=True)
-    except Exception:
-        # don't break the app on chart issues
-        pass
 
 
 # =============================
@@ -1017,10 +1015,17 @@ HIST_FIELDS = [
 
 
 def load_portfolio() -> List[Dict[str, Any]]:
-    return load_csv(PORTFOLIO_CSV)
+    rows = load_csv(PORTFOLIO_CSV)
+    for r in rows:
+        for k in PORTFOLIO_FIELDS:
+            if k not in r:
+                r[k] = ""
+    return rows
+
 
 def save_portfolio(rows: List[Dict[str, Any]]):
     save_csv(PORTFOLIO_CSV, rows, PORTFOLIO_FIELDS)
+
 
 def load_monitoring() -> List[Dict[str, Any]]:
     rows = load_csv(MONITORING_CSV)
@@ -1030,52 +1035,22 @@ def load_monitoring() -> List[Dict[str, Any]]:
                 r[k] = ""
     return rows
 
+
 def save_monitoring(rows: List[Dict[str, Any]]):
     save_csv(MONITORING_CSV, rows, MON_FIELDS)
+
+
+def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
+    # Source of truth: load_csv (Supabase app_storage if enabled, else local)
+    rows = load_csv(MON_HISTORY_CSV)
+    if not rows:
+        return []
+    return rows[-limit_rows:]
+
 
 def append_monitoring_history(row: Dict[str, Any]):
     append_csv(MON_HISTORY_CSV, row, HIST_FIELDS)
 
-def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
-    ensure_storage()
-
-    # Supabase path (app_storage): store monitoring_history.csv as a single CSV text
-    if SUPABASE_ENABLED:
-        content = sb_get_storage(storage_key_for_path(MON_HISTORY_CSV))
-        if content is not None:
-            try:
-                rows = _csv_from_string(content)
-                return rows[-limit_rows:]
-            except Exception:
-                pass
-
-    # Local fallback: memory-safe tail read
-    if not os.path.exists(MON_HISTORY_CSV):
-        return []
-    try:
-        with open(MON_HISTORY_CSV, "r", encoding="utf-8", newline="") as f:
-            header = f.readline()
-        if not header:
-            return []
-        size = os.path.getsize(MON_HISTORY_CSV)
-        chunk_bytes = 1024 * 1024
-        data = ""
-        pos = size
-        while pos > 0 and data.count("\n") < (limit_rows + 50):
-            step = min(chunk_bytes, pos)
-            pos -= step
-            with open(MON_HISTORY_CSV, "rb") as bf:
-                bf.seek(pos)
-                chunk = bf.read(step)
-            data = chunk.decode("utf-8", errors="ignore") + data
-        lines = data.splitlines(True)
-        if pos > 0 and lines:
-            lines = lines[1:]
-        tail = "".join([header] + lines[-limit_rows:])
-        return list(csv.DictReader(tail.splitlines(True)))
-    except Exception:
-        rows = load_csv(MON_HISTORY_CSV)
-        return rows[-limit_rows:]
 
 def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
     chain = (p.get("chainId") or "").lower().strip()
@@ -1280,47 +1255,11 @@ def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float,
 # =============================
 # Portfolio recommendation (fixed)
 # =============================
-def portfolio_reco(entry: float, current: float, pc1h: float, pc5: float, liq: float, decision: str, score: float) -> str:
-    """
-    Portfolio recommendation must be strict on capital protection.
-    We do NOT output HOLD/WAIT for effectively dead positions.
-    """
-    dec = (decision or "").strip().upper()
-    if entry <= 0 or current <= 0:
-        # no entry price = watchlist entry
-        # fall back to decision if present
-        if dec in {"NO ENTRY", "NO DATA"}:
-            return "AVOID / EXIT"
-        if "ENTRY" in dec:
-            return "WATCH / PLAN"
-        return "WATCH / WAIT"
-
+def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h: float, pc5: float, decision: str, score_live: float) -> str:
+    # Hard safety exits first
+    if current <= 0 or entry <= 0:
+        return "REVIEW (no price)"
     pnl = (current - entry) / entry * 100.0
-
-    # hard risk filters
-    if pnl <= -80:
-        return "EXIT (dead)"
-    if pnl <= -50 and (pc1h <= -3 or liq < 15000):
-        return "CUT / RISK"
-    if liq > 0 and liq < 8000:
-        return "EXIT (low liq)"
-    if dec == "NO ENTRY":
-        return "EXIT (no entry)"
-
-    # profit-taking / management
-    if pnl >= 60 and pc5 < 0 and pc1h < 0:
-        return "SELL (take profit)"
-    if pnl >= 35 and pc5 < -1:
-        return "TRIM / TP"
-    if pnl >= 20 and pc5 < -2:
-        return "TRIM / TP"
-
-    # momentum holding
-    if pc1h > 6 and pc5 >= 0 and score >= 220:
-        return "HOLD (momentum)"
-
-    return "HOLD / WAIT"
-
 
     # dead / rug-like symptoms
     if pnl <= -90:
@@ -1787,35 +1726,32 @@ def page_portfolio():
     active_rows = [r for r in rows if r.get("active") == "1"]
     closed_rows = [r for r in rows if r.get("active") != "1"]
 
-    topbar = st.columns([2, 2, 2])
+    topbar = st.columns([2, 2, 3])
     topbar[0].metric("Active", len(active_rows))
     topbar[1].metric("Closed", len(closed_rows))
     with topbar[2]:
-        try:
+        if not _sb_ok():
             with open(PORTFOLIO_CSV, "rb") as f:
                 st.download_button("Download portfolio.csv", f, file_name="portfolio.csv", use_container_width=True)
-        except Exception:
-            st.caption("Download disabled (file missing on this runtime).")
+        else:
+            st.caption("Supabase storage – export via Supabase dashboard.")
 
     st.markdown("---")
 
     if not active_rows:
         st.info("Portfolio is empty. Use Scout → Log → Portfolio or Monitoring → Promote → Portfolio.")
-        st.caption("If after deploy everything resets, enable Supabase persistence (sidebar should show Supabase ON).")
         return
 
     st.subheader("Active positions")
-    st.caption("UI правило: менше цифр. Основне – score + decision + спарклайни (динаміка).")
-
     for idx, r in enumerate(active_rows):
         base_addr = (r.get("base_token_address") or "").strip()
         chain = (r.get("chain") or "").strip().lower()
         base_sym = r.get("base_symbol") or "???"
         quote_sym = r.get("quote_symbol") or "???"
-        entry_price_str = (r.get("entry_price_usd") or "").strip()
+        entry_price_str = r.get("entry_price_usd") or "0"
 
         try:
-            entry_price = float(entry_price_str) if entry_price_str else 0.0
+            entry_price = float(entry_price_str)
         except Exception:
             entry_price = 0.0
 
@@ -1827,110 +1763,62 @@ def page_portfolio():
         liq = parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0) if best else 0.0
         vol24 = parse_float(safe_get(best, "volume", "h24", default=0), 0.0) if best else 0.0
         vol5 = parse_float(safe_get(best, "volume", "m5", default=0), 0.0) if best else 0.0
-
-        score = score_pair(best) if best else 0.0
+        s_live = score_pair(best) if best else 0.0
         decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
 
-        # write snapshots from portfolio too (so history exists even if token never went via Monitoring)
-        if best and chain and base_addr:
+        # ensure history also captures portfolio tokens (same history table)
+        if best:
             snapshot_live_to_history(chain, base_sym, base_addr, best)
+
+        reco = portfolio_reco(entry_price, cur_price, liq, vol24, pc1h, pc5, decision, s_live)
 
         pnl = 0.0
         if entry_price > 0 and cur_price > 0:
             pnl = (cur_price - entry_price) / entry_price * 100.0
 
-        reco = portfolio_reco(entry_price, cur_price, pc1h, pc5, liq, decision, score)
+        c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
 
-        st.markdown("---")
-        head = st.columns([4, 2, 2, 2])
-
-        with head[0]:
-            st.markdown(f"### {base_sym}/{quote_sym}")
-            st.caption(f"Chain: {chain} • DEX: {r.get('dex','')}")
-            st.code(base_addr, language="text")
-
-            btns = st.columns(2)
-            with btns[0]:
-                if r.get("dexscreener_url"):
-                    link_button("DexScreener", r["dexscreener_url"], use_container_width=True, key=f"p_ds_{idx}_{hkey(base_addr)}")
-            with btns[1]:
-                if r.get("swap_url"):
-                    link_button("Swap", r["swap_url"], use_container_width=True, key=f"p_sw_{idx}_{hkey(base_addr, chain)}")
-
-        with head[1]:
-            st.markdown("State")
-            st.markdown(action_badge(decision), unsafe_allow_html=True)
-            st.write(f"Score: {score:.2f}" if best else "Score: n/a")
-            st.write(f"Reco: {reco}")
-
-        with head[2]:
-            st.markdown("PnL")
-            if entry_price and cur_price:
-                st.write(f"Entry: ${entry_price:.8f}" if entry_price < 1 else f"Entry: ${entry_price:.4f}")
-                st.write(f"Now: ${cur_price:.8f}" if cur_price < 1 else f"Now: ${cur_price:.4f}")
-                st.write(f"PnL: {pnl:+.2f}%")
-            else:
-                st.write("Entry: n/a")
-                st.write("Now: n/a")
-                st.write("PnL: n/a")
-
-        with head[3]:
-            st.markdown("Micro")
-            st.write(f"Δ5m: {fmt_pct(pc5)}")
-            st.write(f"Δ1h: {fmt_pct(pc1h)}")
-            st.write(f"Liq: {fmt_usd(liq)}" if liq else "Liq: n/a")
-
-        # Sparklines
-        hist = token_history_rows(chain, base_addr, limit=240)
-        with st.expander("Dynamics (sparklines)", expanded=True):
-            if not hist:
-                st.info("No snapshots yet. Keep it open for a minute or add token to Monitoring for richer history.")
-            else:
-                dfh = pd.DataFrame(hist).copy()
-                dfh["ts_utc"] = pd.to_datetime(dfh.get("ts_utc"), errors="coerce")
-                dfh = dfh.sort_values("ts_utc")
-                dfh = dfh.set_index("ts_utc")
-
-                for col in ["price_usd", "score_live", "liq_usd", "vol5_usd", "vol24_usd"]:
-                    if col in dfh.columns:
-                        dfh[col] = pd.to_numeric(dfh[col], errors="coerce")
-
-                cA, cB = st.columns(2)
-                with cA:
-                    st.caption("Price")
-                    sparkline(dfh, "price_usd", height=110)
-                    st.caption("Score")
-                    sparkline(dfh, "score_live", height=110)
-                with cB:
-                    st.caption("Liquidity")
-                    sparkline(dfh, "liq_usd", height=110)
-                    st.caption("Vol (5m)")
-                    sparkline(dfh, "vol5_usd", height=110)
-
-                # quick sanity flags
-                tail = dfh.tail(30)
-                last_score = float(tail["score_live"].dropna().iloc[-1]) if ("score_live" in tail and tail["score_live"].dropna().size) else 0.0
-                last_liq = float(tail["liq_usd"].dropna().iloc[-1]) if ("liq_usd" in tail and tail["liq_usd"].dropna().size) else 0.0
-                if last_liq and last_liq < 8000:
-                    st.warning("Liquidity is very low – exits can be painful (slippage).")
-                if entry_price and cur_price and pnl <= -80:
-                    st.error("PnL is catastrophic. Treat as dead unless you have a very specific reason to keep it.")
-
-        # Note + actions
-        c1, c2, c3, c4 = st.columns([3, 2, 2, 3])
         with c1:
+            st.markdown(f"### {base_sym}/{quote_sym}")
+            st.caption(f"Chain: {chain} • DEX: {best.get('dexId','') if best else r.get('dex','')}")
+            st.code(base_addr, language="text")
+            if best and best.get("url"):
+                link_button("DexScreener", best.get("url", ""), use_container_width=True, key=f"p_ds_{idx}_{hkey(base_addr)}")
+            elif r.get("dexscreener_url"):
+                link_button("DexScreener", r["dexscreener_url"], use_container_width=True, key=f"p_ds_{idx}_{hkey(base_addr)}")
+            swap_url = r.get("swap_url") or build_swap_url(chain, base_addr)
+            if swap_url:
+                link_button("Swap", swap_url, use_container_width=True, key=f"p_sw_{idx}_{hkey(base_addr, chain)}")
+
+            st.caption("Decision")
+            st.markdown(action_badge(decision), unsafe_allow_html=True)
+
+        with c2:
+            st.write(f"Score: {s_live:.2f}" if best else f"Score: {r.get('score','n/a')}")
+            st.write(f"Entry: ${entry_price_str}")
+            st.write(f"Now: ${cur_price:.8f}" if cur_price else "Now: n/a")
+            st.write(f"PnL: {pnl:+.2f}%" if entry_price and cur_price else "PnL: n/a")
+            st.write(f"Liq: {fmt_usd(liq)}" if best else "Liq: n/a")
+            st.write(f"Vol24: {fmt_usd(vol24)}" if best else "Vol24: n/a")
+
+        with c3:
+            st.write(f"Vol5: {fmt_usd(vol5)}" if best else "Vol5: n/a")
+            st.write(f"Δ m5: {fmt_pct(pc5)}")
+            st.write(f"Δ h1: {fmt_pct(pc1h)}")
+            st.write(f"Reco: {reco}")
             note_key = f"note_{idx}_{hkey(base_addr, chain)}"
             note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
-        with c2:
-            close = st.checkbox("Close (archive)", value=False, key=f"close_{idx}_{hkey(base_addr, chain)}")
-        with c3:
-            delete = st.checkbox("Delete row", value=False, key=f"delete_{idx}_{hkey(base_addr, chain)}")
+
         with c4:
+            close_key = f"close_{idx}_{hkey(base_addr, chain)}"
+            delete_key = f"delete_{idx}_{hkey(base_addr, chain)}"
+
+            close = st.checkbox("Close (archive)", value=False, key=close_key)
+            delete = st.checkbox("Delete row", value=False, key=delete_key)
+
             if st.button("Apply", key=f"apply_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                 all_rows = load_portfolio()
                 target_key = addr_key(chain, base_addr)
-
-                # update note / close
                 for rr in all_rows:
                     if rr.get("active") != "1":
                         continue
@@ -1940,7 +1828,6 @@ def page_portfolio():
                             rr["active"] = "0"
                         break
 
-                # delete means remove active row completely
                 if delete:
                     all_rows = [
                         x for x in all_rows
@@ -1954,9 +1841,46 @@ def page_portfolio():
                 st.success("Saved.")
                 st.rerun()
 
+        # Sparklines for portfolio too (requested)
+        hist = token_history_rows(chain, base_addr, limit=60)
+        with st.expander("Dynamics (sparklines)", expanded=False):
+            if not hist:
+                st.info("No snapshots yet.")
+            else:
+                dfh = pd.DataFrame(hist).copy()
+                dfh["ts_utc"] = pd.to_datetime(dfh.get("ts_utc", ""), errors="coerce")
+                dfh = dfh.sort_values("ts_utc")
+                dfh["price_usd"] = pd.to_numeric(dfh.get("price_usd", 0), errors="coerce")
+                dfh["score_live"] = pd.to_numeric(dfh.get("score_live", 0), errors="coerce")
+                dfh["liq_usd"] = pd.to_numeric(dfh.get("liq_usd", 0), errors="coerce")
+                dfh["vol24_usd"] = pd.to_numeric(dfh.get("vol24_usd", 0), errors="coerce")
+                dfh["vol5_usd"] = pd.to_numeric(dfh.get("vol5_usd", 0), errors="coerce")
+                dfh = dfh.set_index("ts_utc")
+
+                s1, s2, s3 = st.columns(3)
+                with s1:
+                    st.caption("Price")
+                    st.line_chart(dfh[["price_usd"]], height=120, use_container_width=True)
+                with s2:
+                    st.caption("Score")
+                    st.line_chart(dfh[["score_live"]], height=120, use_container_width=True)
+                with s3:
+                    st.caption("Liquidity")
+                    st.line_chart(dfh[["liq_usd"]], height=120, use_container_width=True)
+
+                s4, s5 = st.columns(2)
+                with s4:
+                    st.caption("Vol24")
+                    st.line_chart(dfh[["vol24_usd"]], height=120, use_container_width=True)
+                with s5:
+                    st.caption("Vol5")
+                    st.line_chart(dfh[["vol5_usd"]], height=120, use_container_width=True)
+
+        st.markdown("---")
+
     if closed_rows:
         with st.expander("Closed / Archived"):
-            for r in closed_rows[-80:]:
+            for r in closed_rows[-50:]:
                 st.write(
                     f"{r.get('ts_utc','')} – {r.get('base_symbol','')}/{r.get('quote_symbol','')} "
                     f"– entry ${r.get('entry_price_usd','')} – {r.get('action','')}"
