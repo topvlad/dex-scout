@@ -36,7 +36,7 @@ import streamlit as st
 import pandas as pd
 
 
-VERSION = "0.4.14"
+VERSION = "0.4.16"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -46,14 +46,29 @@ MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
 
 
 # =============================
-# Supabase config (optional)
 # =============================
+# Supabase (optional persistence)
+# =============================
+# If Streamlit Cloud secrets (or env) include:
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_ROLE_KEY
+# then CSV snapshots are stored in Supabase table public.app_storage:
+#
+#   create table if not exists public.app_storage (
+#     key text primary key,
+#     content text not null,
+#     updated_at timestamptz not null default now()
+#   );
+#
+# This keeps the original CSV-based logic intact (no need to redesign schema).
+
+import io
+
+
 def _get_secret(name: str, default: str = "") -> str:
-    # Streamlit secrets (recommended) first, then env
     try:
         if hasattr(st, "secrets") and name in st.secrets:
-            v = st.secrets.get(name, default)
-            return str(v) if v is not None else default
+            return str(st.secrets.get(name) or default)
     except Exception:
         pass
     return str(os.environ.get(name, default) or default)
@@ -63,18 +78,10 @@ SUPABASE_URL = _get_secret("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 SUPABASE_ANON_KEY = _get_secret("SUPABASE_ANON_KEY", "").strip()
 
-# PostgREST endpoint
-SUPABASE_REST = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
-USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_REST)
-
-# Table names (you can rename, but then update these)
-SB_TABLE_PORTFOLIO = "portfolio"
-SB_TABLE_MONITORING = "monitoring"
-SB_TABLE_HISTORY = "monitoring_history"
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
 
-def _sb_headers() -> Dict[str, str]:
-    # service_role bypasses RLS (recommended for server-side app)
+def _sb_headers() -> dict:
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -83,75 +90,66 @@ def _sb_headers() -> Dict[str, str]:
     }
 
 
-def _sb_url(table: str) -> str:
-    return f"{SUPABASE_REST}/{table}"
+def _sb_table_url(table: str) -> str:
+    return f"{SUPABASE_URL}/rest/v1/{table}"
 
 
-def _sb_ok() -> bool:
-    return USE_SUPABASE
+def storage_key_for_path(path: str) -> str:
+    # keep stable: data/monitoring.csv -> monitoring.csv
+    base = os.path.basename(path)
+    return base or path
 
 
-def _sb_select_all(table: str, limit: int = 10000) -> List[Dict[str, Any]]:
-    # safest: order by insertion timestamp when possible, but all fields are text, so just pull all
-    if not _sb_ok():
+def sb_get_storage(key: str):
+    if not SUPABASE_ENABLED:
+        return None
+    try:
+        url = _sb_table_url("app_storage")
+        params = {"select": "content", "key": f"eq.{key}"}
+        r = requests.get(url, headers=_sb_headers(), params=params, timeout=12)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        data = r.json() or []
+        if not data:
+            return None
+        return (data[0].get("content") or "")
+    except Exception:
+        return None
+
+
+def sb_put_storage(key: str, content: str) -> bool:
+    if not SUPABASE_ENABLED:
+        return False
+    try:
+        url = _sb_table_url("app_storage")
+        payload = [{"key": key, "content": content}]
+        headers = _sb_headers().copy()
+        headers["Prefer"] = "resolution=merge-duplicates"
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r.raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def _csv_from_string(content: str):
+    if not content.strip():
         return []
-    try:
-        url = _sb_url(table)
-        params = {
-            "select": "*",
-            "limit": str(int(limit)),
-        }
-        r = requests.get(url, headers=_sb_headers(), params=params, timeout=20)
-        if r.status_code >= 400:
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    sio = io.StringIO(content)
+    rdr = csv.DictReader(sio)
+    return [row for row in rdr]
 
 
-def _sb_insert(table: str, row: Dict[str, Any]) -> bool:
-    if not _sb_ok():
-        return False
-    try:
-        url = _sb_url(table)
-        r = requests.post(url, headers=_sb_headers(), json=[row], timeout=20)
-        return 200 <= r.status_code < 300
-    except Exception:
-        return False
+def _csv_to_string(rows, fieldnames):
+    sio = io.StringIO()
+    w = csv.DictWriter(sio, fieldnames=fieldnames)
+    w.writeheader()
+    for r in rows:
+        out = {k: r.get(k, "") for k in fieldnames}
+        w.writerow(out)
+    return sio.getvalue()
 
-
-def _sb_upsert(table: str, rows: List[Dict[str, Any]]) -> bool:
-    """
-    Upsert requires a primary key or unique constraint in Supabase.
-    To keep it simple and not force schema decisions, we implement "replace-all" for small tables:
-    - delete everything
-    - insert all rows
-    Works fine for monitoring/portfolio sizes (tens/hundreds).
-    """
-    if not _sb_ok():
-        return False
-    try:
-        # delete all
-        url = _sb_url(table)
-        # PostgREST delete requires a filter; use "id=gt.0" only if you have numeric id.
-        # We cannot assume it exists. So we do best-effort: try delete without filter (usually blocked),
-        # then fall back to insert-only.
-        del_ok = False
-        try:
-            rdel = requests.delete(url, headers=_sb_headers(), timeout=20)
-            del_ok = 200 <= rdel.status_code < 300
-        except Exception:
-            del_ok = False
-
-        # insert all (even if delete failed, we won't break – duplicates might appear if you don't have PK)
-        r = requests.post(url, headers=_sb_headers(), json=rows, timeout=30)
-        return 200 <= r.status_code < 300
-    except Exception:
-        return False
-
-
-# =============================
 # Storage + lock (CSV fallback)
 # =============================
 @contextmanager
@@ -259,17 +257,28 @@ def now_utc_str() -> str:
 
 def load_csv(path: str) -> List[Dict[str, Any]]:
     ensure_storage()
+
+    # Supabase is the source of truth (if enabled)
+    if SUPABASE_ENABLED:
+        key = storage_key_for_path(path)
+        content = sb_get_storage(key)
+        if content is not None:
+            try:
+                return _csv_from_string(content)
+            except Exception:
+                pass
+
+    # Local fallback
     if not os.path.exists(path):
         return []
-    rows: List[Dict[str, Any]] = []
     with open(path, "r", newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            rows.append(row)
-    return rows
+        return [row for row in csv.DictReader(f)]
 
 
 def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     ensure_storage()
+
+    # Always write local (helps debugging + downloads)
     lockp = path + ".lock"
     with file_lock(lockp):
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -279,16 +288,17 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
                 out = {k: r.get(k, "") for k in fieldnames}
                 w.writerow(out)
 
+    # Supabase persistence
+    if SUPABASE_ENABLED:
+        key = storage_key_for_path(path)
+        content = _csv_to_string(rows, fieldnames)
+        sb_put_storage(key, content)
 
 def append_csv(path: str, row: Dict[str, Any], fieldnames: List[str]):
-    ensure_storage()
-    lockp = path + ".lock"
-    with file_lock(lockp):
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            out = {k: row.get(k, "") for k in fieldnames}
-            w.writerow(out)
-
+    # For Supabase we do read-modify-write (OK for low concurrency)
+    rows = load_csv(path)
+    rows.append({k: row.get(k, "") for k in fieldnames})
+    save_csv(path, rows, fieldnames)
 
 # =============================
 # Streamlit compatibility helpers
@@ -1007,34 +1017,12 @@ HIST_FIELDS = [
 
 
 def load_portfolio() -> List[Dict[str, Any]]:
-    if _sb_ok():
-        rows = _sb_select_all(SB_TABLE_PORTFOLIO, limit=50000)
-        # normalize missing fields
-        for r in rows:
-            for k in PORTFOLIO_FIELDS:
-                if k not in r:
-                    r[k] = ""
-        return rows
     return load_csv(PORTFOLIO_CSV)
 
-
 def save_portfolio(rows: List[Dict[str, Any]]):
-    if _sb_ok():
-        # replace-all (best-effort) to keep behavior deterministic
-        ok = _sb_upsert(SB_TABLE_PORTFOLIO, [{k: (r.get(k, "") or "") for k in PORTFOLIO_FIELDS} for r in rows])
-        if ok:
-            return
     save_csv(PORTFOLIO_CSV, rows, PORTFOLIO_FIELDS)
 
-
 def load_monitoring() -> List[Dict[str, Any]]:
-    if _sb_ok():
-        rows = _sb_select_all(SB_TABLE_MONITORING, limit=50000)
-        for r in rows:
-            for k in MON_FIELDS:
-                if k not in r:
-                    r[k] = ""
-        return rows
     rows = load_csv(MONITORING_CSV)
     for r in rows:
         for k in MON_FIELDS:
@@ -1042,35 +1030,26 @@ def load_monitoring() -> List[Dict[str, Any]]:
                 r[k] = ""
     return rows
 
-
 def save_monitoring(rows: List[Dict[str, Any]]):
-    if _sb_ok():
-        ok = _sb_upsert(SB_TABLE_MONITORING, [{k: (r.get(k, "") or "") for k in MON_FIELDS} for r in rows])
-        if ok:
-            return
     save_csv(MONITORING_CSV, rows, MON_FIELDS)
 
-
 def append_monitoring_history(row: Dict[str, Any]):
-    if _sb_ok():
-        _sb_insert(SB_TABLE_HISTORY, {k: (row.get(k, "") or "") for k in HIST_FIELDS})
-        return
     append_csv(MON_HISTORY_CSV, row, HIST_FIELDS)
 
-
 def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
-    # Supabase path: fetch latest rows; since we may not have an index, we just cap
-    if _sb_ok():
-        rows = _sb_select_all(SB_TABLE_HISTORY, limit=max(1000, int(limit_rows)))
-        # try to sort by ts_utc
-        try:
-            rows.sort(key=lambda x: str(x.get("ts_utc", "")))
-        except Exception:
-            pass
-        return rows[-limit_rows:]
-
-    # CSV fallback: memory-safe tail read (fixed SyntaxError)
     ensure_storage()
+
+    # Supabase path (app_storage): store monitoring_history.csv as a single CSV text
+    if SUPABASE_ENABLED:
+        content = sb_get_storage(storage_key_for_path(MON_HISTORY_CSV))
+        if content is not None:
+            try:
+                rows = _csv_from_string(content)
+                return rows[-limit_rows:]
+            except Exception:
+                pass
+
+    # Local fallback: memory-safe tail read
     if not os.path.exists(MON_HISTORY_CSV):
         return []
     try:
@@ -1082,7 +1061,6 @@ def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
         chunk_bytes = 1024 * 1024
         data = ""
         pos = size
-        # NOTE: the bug in v0.4.11 was an accidentally broken "\n" literal while copying.
         while pos > 0 and data.count("\n") < (limit_rows + 50):
             step = min(chunk_bytes, pos)
             pos -= step
@@ -1098,7 +1076,6 @@ def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
     except Exception:
         rows = load_csv(MON_HISTORY_CSV)
         return rows[-limit_rows:]
-
 
 def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
     chain = (p.get("chainId") or "").lower().strip()
