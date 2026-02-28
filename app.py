@@ -37,7 +37,7 @@ import streamlit as st
 import pandas as pd
 
 
-VERSION = "0.4.12"
+VERSION = "0.4.14"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -1294,6 +1294,12 @@ def page_scout(cfg: Dict[str, Any]):
     st.title("DEX Scout – early candidates (DexScreener API)")
     st.caption("Фокус: дрібні/ранні монети. Majors/stables відсікаються. Core: BSC + Solana.")
 
+    with st.expander("Як сортувати у Jupiter Cooking (manual triage)", expanded=False):
+        st.write("1) Liquidity / TVL (щоб не застрягти у thin pool)")
+        st.write("2) 24h Volume або Volume/TVL (щоб був реальний попит)")
+        st.write("3) Trades / Txns (щоб був живий flow, а не один памп)")
+        st.caption("У цій апці ми надійно беремо Liquidity/Volume/Txns через DexScreener. Для Solana можна додати трендовий сорс через Birdeye (за ключем).")
+
     if _sb_ok():
         st.caption("Storage: Supabase (persistent)")
     else:
@@ -1323,6 +1329,19 @@ def page_scout(cfg: Dict[str, Any]):
         st.error("All sampled queries failed. Try Refresh / Clear cache / wait a bit.")
         return
 
+
+    # Optional: extra Solana source – trending mints from Birdeye ("Cooking"-like feed)
+    if cfg.get("use_birdeye_trending") and (cfg.get("chain") == "solana") and BIRDEYE_ENABLED:
+        mints = birdeye_trending_solana(limit=int(cfg.get("birdeye_limit", 50)))
+        if mints:
+            st.caption(f"Birdeye trending added: {len(mints)} mints")
+            for mint in mints:
+                try:
+                    bp = best_pair_for_token("solana", mint)
+                    if bp:
+                        all_pairs.append(bp)
+                except Exception:
+                    pass
     pairs = dedupe_mode(all_pairs, by_base_token=False)
     pairs = dedupe_mode(pairs, by_base_token=bool(cfg["dedupe_by_base"]))
 
@@ -1918,6 +1937,26 @@ def main():
         chain = st.selectbox("Chain", options=["bsc", "solana"], index=chain_idx)
         st.session_state["prefill_chain"] = chain
 
+        # Solana: optional "Cooking" style source via Birdeye trending list
+        use_birdeye_trending = False
+        birdeye_limit = 50
+        if chain == "solana":
+            use_birdeye_trending = st.checkbox(
+                "Add Solana trending (Birdeye) – extra source",
+                value=False,
+                disabled=(not BIRDEYE_ENABLED),
+            )
+            if not BIRDEYE_ENABLED:
+                st.caption("Birdeye key missing: add BIRDEYE_API_KEY to secrets to enable.")
+            birdeye_limit = st.slider(
+                "Trending list size",
+                10,
+                100,
+                50,
+                step=10,
+                disabled=(not use_birdeye_trending),
+            )
+
         st.caption("DEX filter")
         any_dex = st.checkbox("Any DEX (no filter)", value=True)
 
@@ -2005,6 +2044,8 @@ def main():
             seed_k=seed_k,
             seeds_raw=seeds_raw,
             refresh=refresh,
+            use_birdeye_trending=use_birdeye_trending,
+            birdeye_limit=birdeye_limit,
         )
         page_scout(cfg)
     elif page == "Monitoring":
@@ -2023,3 +2064,47 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# =============================
+# Birdeye (optional, Solana trending + extra stats)
+# =============================
+BIRDEYE_API_KEY = _get_secret("BIRDEYE_API_KEY", "").strip()
+BIRDEYE_ENABLED = bool(BIRDEYE_API_KEY)
+
+def birdeye_get(path: str, params: Optional[dict] = None, timeout: int = 15) -> dict:
+    """Minimal Birdeye public API wrapper."""
+    if not BIRDEYE_ENABLED:
+        return {}
+    url = "https://public-api.birdeye.so" + path
+    headers = {"X-API-KEY": BIRDEYE_API_KEY, "Accept": "application/json"}
+    r = requests.get(url, headers=headers, params=params or {}, timeout=timeout)
+    r.raise_for_status()
+    return r.json() or {}
+
+@st.cache_data(ttl=45, show_spinner=False)
+def birdeye_trending_solana(limit: int = 50, offset: int = 0) -> list[str]:
+    """
+    Returns a list of Solana mint addresses from Birdeye trending endpoint.
+    If Birdeye changes params – we fail soft and return [].
+    """
+    if not BIRDEYE_ENABLED:
+        return []
+    try:
+        params = {
+            "chain": "solana",
+            "offset": int(offset),
+            "limit": int(limit),
+            "sort_by": "rank",
+            "sort_type": "asc",
+        }
+        data = birdeye_get("/defi/token_trending", params=params, timeout=15)
+        items = (data.get("data") or {}).get("items") or (data.get("data") or {}).get("tokens") or []
+        out = []
+        for it in items:
+            addr = (it.get("address") or it.get("mint") or it.get("tokenAddress") or "").strip()
+            if addr:
+                out.append(addr)
+        return out[: int(limit)]
+    except Exception:
+        return []
+
