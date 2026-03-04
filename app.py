@@ -1909,10 +1909,6 @@ def page_portfolio():
 # =============================
 # App main
 # =============================
-
-BIRDEYE_API_KEY = _get_secret("BIRDEYE_API_KEY", "").strip()
-BIRDEYE_ENABLED = bool(BIRDEYE_API_KEY)
-
 def main():
     st.set_page_config(page_title="DEX Scout", layout="wide")
     ensure_storage()
@@ -2065,14 +2061,11 @@ def main():
     else:
         page_portfolio()
 
-
-if __name__ == "__main__":
-    main()
-
 # =============================
 # Birdeye (optional, Solana trending + extra stats)
 # =============================
-
+BIRDEYE_API_KEY = _get_secret("BIRDEYE_API_KEY", "").strip()
+BIRDEYE_ENABLED = bool(BIRDEYE_API_KEY)
 
 def birdeye_get(path: str, params: Optional[dict] = None, timeout: int = 15) -> dict:
     """Minimal Birdeye public API wrapper."""
@@ -2110,4 +2103,7 @@ def birdeye_trending_solana(limit: int = 50, offset: int = 0) -> list[str]:
         return out[: int(limit)]
     except Exception:
         return []
+
+if __name__ == "__main__":
+    main()
 
