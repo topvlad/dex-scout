@@ -71,6 +71,7 @@ USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_REST
 SB_TABLE_PORTFOLIO = "portfolio"
 SB_TABLE_MONITORING = "monitoring"
 SB_TABLE_HISTORY = "monitoring_history"
+SB_TABLE_APP_STORAGE = "app_storage"  # legacy key-value storage
 
 
 def _sb_headers() -> Dict[str, str]:
@@ -121,6 +122,85 @@ def _sb_insert(table: str, row: Dict[str, Any]) -> bool:
         return False
 
 
+
+def _sb_select_eq(table: str, col: str, val: str, limit: int = 1) -> List[Dict[str, Any]]:
+    """Select rows where col == val (Supabase REST)."""
+    if not _sb_ok():
+        return []
+    try:
+        from urllib.parse import quote
+        url = _sb_url(f"{table}?select=*&{col}=eq.{quote(str(val))}&limit={int(limit)}")
+        r = requests.get(url, headers=_sb_headers(), timeout=20)
+        if r.status_code == 200:
+            return r.json() or []
+    except Exception:
+        return []
+    return []
+
+
+def _sb_get_app_storage(key: str) -> str:
+    """Read legacy CSV blob from app_storage table (key/content)."""
+    rows = _sb_select_eq(SB_TABLE_APP_STORAGE, "key", key, limit=1)
+    if not rows:
+        return ""
+    return str(rows[0].get("content") or "")
+
+
+def _parse_csv_blob(blob: str) -> List[Dict[str, Any]]:
+    blob = (blob or "").strip("\ufeff\n\r ")
+    if not blob:
+        return []
+    try:
+        import io, csv as _csv
+        f = io.StringIO(blob)
+        reader = _csv.DictReader(f)
+        return [dict(r) for r in reader]
+    except Exception:
+        return []
+
+
+def _legacy_migrate_if_needed():
+    """One-shot migration from legacy app_storage CSV blobs to normalized tables.
+
+    Runs only when tables are empty – it will NOT overwrite existing rows.
+    """
+    if not _sb_ok():
+        return
+    # Monitoring
+    try:
+        cur = _sb_select_all(SB_TABLE_MONITORING, limit=1)
+        if not cur:
+            blob = _sb_get_app_storage("monitoring.csv")
+            rows = _parse_csv_blob(blob)
+            if rows:
+                save_monitoring(rows)
+    except Exception:
+        pass
+    # History
+    try:
+        cur = _sb_select_all(SB_TABLE_HISTORY, limit=1)
+        if not cur:
+            blob = _sb_get_app_storage("monitoring_history.csv")
+            rows = _parse_csv_blob(blob)
+            if rows:
+                for r in rows:
+                    # best-effort insert (avoid upsert complexity)
+                    try:
+                        _sb_insert(SB_TABLE_HISTORY, {k: (r.get(k, "") or "") for k in HIST_FIELDS})
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    # Portfolio
+    try:
+        cur = _sb_select_all(SB_TABLE_PORTFOLIO, limit=1)
+        if not cur:
+            blob = _sb_get_app_storage("portfolio.csv")
+            rows = _parse_csv_blob(blob)
+            if rows:
+                save_portfolio(rows)
+    except Exception:
+        pass
 def _sb_upsert(table: str, rows: List[Dict[str, Any]]) -> bool:
     """
     Upsert requires a primary key or unique constraint in Supabase.
