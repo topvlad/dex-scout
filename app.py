@@ -36,7 +36,7 @@ import streamlit as st
 import pandas as pd
 
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -969,12 +969,6 @@ MON_FIELDS = [
     "archived_reason",
     "last_score",
     "last_decision",
-    "source_window",
-    "source_preset",
-    "risk",
-    "tp_target_pct",
-    "entry_suggest_usd",
-    "ts_last_seen",
 ]
 
 HIST_FIELDS = [
@@ -1120,12 +1114,6 @@ def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
             "archived_reason": "",
             "last_score": "",
             "last_decision": "",
-            "source_window": "",
-            "source_preset": "",
-            "risk": "",
-            "tp_target_pct": "",
-            "entry_suggest_usd": "",
-            "ts_last_seen": "",
         }
     )
     save_monitoring(rows)
@@ -1285,6 +1273,57 @@ def token_history_rows(chain: str, base_addr: str, limit: int = 180) -> List[Dic
 # =============================
 # Monitoring ranking helpers
 # =============================
+
+def _parse_utc_ts(ts: str) -> Optional[datetime]:
+    """
+    Parses 'YYYY-MM-DD HH:MM:SS UTC' into datetime (naive UTC).
+    Returns None if parsing fails.
+    """
+    try:
+        ts = (ts or "").strip().replace(" UTC", "")
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def auto_revisit_archived(days: int = 7, auto_only: bool = True) -> int:
+    """
+    Re-activate archived Monitoring rows after N days.
+    By default only touches rows archived by automation (archived_reason starts with 'auto:').
+    Returns number of re-activated rows.
+    """
+    days = int(days or 0)
+    if days <= 0:
+        return 0
+
+    rows = load_monitoring()
+    now = datetime.utcnow()
+    changed = 0
+
+    for r in rows:
+        if r.get("active") == "1":
+            continue
+        reason = (r.get("archived_reason") or "").strip()
+        if auto_only and not reason.lower().startswith("auto:"):
+            continue
+
+        ts_a = _parse_utc_ts(r.get("ts_archived") or "")
+        if not ts_a:
+            continue
+
+        if (now - ts_a) >= timedelta(days=days):
+            # same behavior as reactivate_monitoring but without early break
+            r["active"] = "1"
+            r["ts_added"] = now_utc_str()
+            r["ts_archived"] = ""
+            r["archived_reason"] = ""
+            r["last_score"] = ""
+            r["last_decision"] = ""
+            changed += 1
+
+    if changed:
+        save_monitoring(rows)
+    return changed
 def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float, liq: float) -> float:
     s = 0.0
     s += score_live
@@ -1329,227 +1368,6 @@ def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h:
     if pnl <= -35:
         return "CUT / RISK"
     return "HOLD / WATCH"
-
-
-# =============================
-# v0.5.0 – Monitoring automation helpers
-# =============================
-
-SCOUT_WINDOWS = [
-    ("Ultra Early (safer)", "ultra"),
-    ("Balanced (default)", "balanced"),
-    ("Wide Net (explore)", "wide"),
-    ("Momentum (hot)", "momentum"),
-]
-
-
-def _safe_dt_parse(s: str) -> Optional[datetime]:
-    try:
-        # expect "YYYY-MM-DD HH:MM:SS UTC"
-        return datetime.strptime((s or "").replace(" UTC", ""), "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
-
-
-def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tuple[str, str]:
-    """
-    Returns (entry_suggest_usd, tp_target_pct) as strings for display/storage.
-    Keep it simple – heuristics only.
-    """
-    if not p:
-        return ("", "")
-    liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
-    vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
-
-    # Suggested entry size (USD): small for illiquid, slightly larger for healthier pools.
-    # cap to keep "test bets" reasonable.
-    base = 6.0
-    base += min(liq / 50_000.0 * 6.0, 10.0)
-    base += min(vol24 / 250_000.0 * 4.0, 6.0)
-    if (risk or "").upper() == "EARLY":
-        base *= 0.75  # smaller size for early / higher risk
-    entry = max(3.0, min(base, 20.0))
-
-    # TP target %: higher for early (because odds are worse, you need asymmetric upside)
-    tp = 40.0 if (risk or "").upper() == "EARLY" else 25.0
-
-    return (f"{entry:.0f}", f"{tp:.0f}")
-
-
-def upsert_monitoring_row_from_pair(p: Dict[str, Any], score: float, window_name: str, preset_key: str) -> str:
-    """
-    Add token to Monitoring if not active. If exists archived – keep archived unless user enables auto-reactivate.
-    """
-    chain = (p.get("chainId") or "").lower().strip()
-    base_addr_raw = (safe_get(p, "baseToken", "address", default="") or "").strip()
-    if not base_addr_raw:
-        return "NO_ADDR"
-
-    base_addr = addr_store(chain, base_addr_raw)
-    key = addr_key(chain, base_addr)
-
-    rows = load_monitoring()
-
-    # if already active – skip
-    for r in rows:
-        if r.get("active") == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
-            return "EXISTS_ACTIVE"
-
-    # if exists archived – don't duplicate
-    for r in rows:
-        if r.get("active") != "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
-            # update last_seen for visibility
-            r["ts_last_seen"] = now_utc_str()
-            save_monitoring(rows)
-            return "EXISTS_ARCHIVED"
-
-    decision, _tags = build_trade_hint(p)
-    risk = "EARLY" if preset_key in {"ultra", "momentum"} else ""
-
-    entry_s, tp_s = suggest_entry_and_tp_usd(p, risk=risk)
-
-    rows.append(
-        {
-            "ts_added": now_utc_str(),
-            "chain": chain,
-            "base_symbol": safe_get(p, "baseToken", "symbol", default="") or "",
-            "base_addr": base_addr,
-            "pair_addr": p.get("pairAddress", "") or "",
-            "score_init": str(score),
-            "liq_init": str(safe_get(p, "liquidity", "usd", default=0) or 0),
-            "vol24_init": str(safe_get(p, "volume", "h24", default=0) or 0),
-            "vol5_init": str(safe_get(p, "volume", "m5", default=0) or 0),
-            "active": "1",
-            "ts_archived": "",
-            "archived_reason": "",
-            "last_score": str(score),
-            "last_decision": decision,
-            "source_window": window_name,
-            "source_preset": preset_key,
-            "risk": risk,
-            "tp_target_pct": tp_s,
-            "entry_suggest_usd": entry_s,
-            "ts_last_seen": now_utc_str(),
-        }
-    )
-    save_monitoring(rows)
-    return "OK"
-
-
-def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any], seeds_raw: str) -> List[Dict[str, Any]]:
-    """
-    Runs Scout logic for a given window and returns filtered pairs (without excluding 'NO ENTRY' by default).
-    """
-    seeds = [x.strip() for x in (seeds_raw or "").split(",") if x.strip()]
-    if not seeds:
-        return []
-
-    sampled = sample_seeds(seeds, int(preset.get("seed_k", 12)), refresh=False)
-
-    all_pairs: List[Dict[str, Any]] = []
-    for q in sampled:
-        if len(q.strip()) < 2:
-            continue
-        try:
-            all_pairs.extend(fetch_latest_pairs_for_query(q))
-            time.sleep(0.06)
-        except Exception:
-            continue
-
-    pairs = dedupe_mode(all_pairs, by_base_token=False)
-    pairs = dedupe_mode(pairs, by_base_token=bool(preset.get("dedupe_by_base", True)))
-
-    allowed = set([d.lower() for d in CHAIN_DEX_PRESETS.get(chain, [])[:3]])
-    filtered, _fstats, _freasons = filter_pairs_with_debug(
-        pairs=pairs,
-        chain=chain,
-        any_dex=True,              # ingest should be wide, monitoring will decide
-        allowed_dexes=allowed,
-        min_liq=float(preset.get("min_liq", 1000)),
-        min_vol24=float(preset.get("min_vol24", 5000)),
-        min_trades_m5=int(preset.get("min_trades_m5", 0)),
-        min_sells_m5=int(preset.get("min_sells_m5", 0)),
-        max_buy_sell_imbalance=int(preset.get("max_imbalance", 30)),
-        block_suspicious_names=bool(preset.get("block_suspicious_names", True)),
-        block_majors=bool(preset.get("block_majors", True)),
-        min_age_min=int(preset.get("min_age_min", 0)),
-        max_age_min=int(preset.get("max_age_min", 999999)),
-        enforce_age=bool(preset.get("enforce_age", True)),
-        hide_solana_unverified=bool(preset.get("hide_solana_unverified", True)),
-    )
-
-    # remove obvious junk with no base addr
-    out = []
-    for p in filtered:
-        base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
-        if base_addr:
-            out.append(p)
-    return out
-
-
-def ingest_scout_to_monitoring(chain: str, seeds_raw: str, max_per_window: int = 25) -> Dict[str, int]:
-    """
-    Ingests tokens from 4 Scout windows into Monitoring.
-    """
-    counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "errors": 0, "seen": 0}
-    for window_name, preset_key in SCOUT_WINDOWS:
-        preset = PRESETS.get(window_name, {})
-        pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw)
-        # rank by score
-        ranked = []
-        for p in pairs:
-            s = score_pair(p)
-            ranked.append((s, p))
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        ranked = ranked[: max(1, int(max_per_window))]
-
-        for s, p in ranked:
-            counts["seen"] += 1
-            try:
-                res = upsert_monitoring_row_from_pair(p, float(s), window_name=window_name, preset_key=preset_key)
-                if res == "OK":
-                    counts["added"] += 1
-                elif res == "EXISTS_ACTIVE":
-                    counts["skipped_active"] += 1
-                elif res == "EXISTS_ARCHIVED":
-                    counts["skipped_archived"] += 1
-            except Exception:
-                counts["errors"] += 1
-                continue
-    return counts
-
-
-def auto_reactivate_archived(days: int = 7) -> int:
-    """
-    Reactivate archived tokens that were auto-archived (reason startswith 'auto:') older than N days.
-    """
-    days = max(1, int(days))
-    rows = load_monitoring()
-    changed = 0
-    now_dt = datetime.utcnow()
-
-    for r in rows:
-        if r.get("active") == "1":
-            continue
-        reason = (r.get("archived_reason") or "").strip().lower()
-        if not reason.startswith("auto:"):
-            continue
-        ts = _safe_dt_parse(r.get("ts_archived", ""))
-        if not ts:
-            continue
-        age_days = (now_dt - ts).total_seconds() / 86400.0
-        if age_days >= float(days):
-            r["active"] = "1"
-            r["ts_added"] = now_utc_str()
-            r["ts_archived"] = ""
-            r["archived_reason"] = ""
-            # keep last_score/last_decision as-is, but mark last_seen
-            r["ts_last_seen"] = now_utc_str()
-            changed += 1
-
-    if changed:
-        save_monitoring(rows)
-    return changed
 
 
 # =============================
@@ -1636,6 +1454,22 @@ def page_scout(cfg: Dict[str, Any]):
     ranked = ranked[: int(cfg["top_n"])]
 
     st.metric("Passed filters", len(ranked))
+
+    c_auto1, c_auto2 = st.columns([2, 8])
+    with c_auto1:
+        if st.button("Auto-send → Monitoring", use_container_width=True):
+            added = 0
+            for _s, _decision, _tags, _p in ranked:
+                try:
+                    res = add_to_monitoring(_p, float(_s))
+                    if res == "OK":
+                        added += 1
+                except Exception:
+                    pass
+            st.toast(f"Sent to Monitoring: {added}")
+            st.rerun()
+    with c_auto2:
+        st.caption("Додає всі токени з поточного списку Scout у Monitoring (без дублювання).")
 
     with st.expander("Why 0 results? (Filter Debug)", expanded=(len(ranked) == 0)):
         st.write("Fetched:", len(all_pairs), " • Deduped:", len(pairs))
@@ -1744,6 +1578,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     st.title("Monitoring")
     st.caption("Тут тільки WATCH/WAIT. Сортування: priority → momentum → time since added.")
 
+    # Optional: revisit auto-archived rows after N days
+    try:
+        if bool(auto_cfg.get("auto_revisit_enabled", False)):
+            n = auto_revisit_archived(days=int(auto_cfg.get("auto_revisit_days", 7)), auto_only=True)
+            if n:
+                st.caption(f"Auto-revisited: {n}")
+    except Exception:
+        pass
+
     rows = load_monitoring()
     active = [r for r in rows if r.get("active") == "1"]
     archived = [r for r in rows if r.get("active") != "1"]
@@ -1830,112 +1673,129 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         st.info("Auto-archive applied. Refreshing list…")
         st.rerun()
 
-    # Split into sections: Signals first, then Watchlist
-def _is_entry(dec: str) -> bool:
-    d = (dec or "").upper()
-    return d.startswith("ENTRY") or d.startswith("BUY")
+    
+    # Split into SIGNALS vs WATCHLIST
+    signals = []
+    watchlist = []
+    for item in enriched:
+        _decision = str(item[7] or "").upper()
+        if _decision.startswith("ENTRY") or _decision.startswith("BUY"):
+            signals.append(item)
+        else:
+            watchlist.append(item)
 
-signals = []
-watch = []
-for row in enriched:
-    (_pr, _pc1h, _ts_added, _idx, _r, _best, _s_live, _decision, _tags, _live, _d_score, _d_liq, _d_v24, _d_v5) = row
-    (signals if _is_entry(_decision) else watch).append(row)
+    def _render_group(title: str, items: list):
+        st.subheader(title)
+        if not items:
+            st.caption("Немає токенів у цьому блоці.")
+            return
+        for pr, pc1h, ts_added, idx, r, best, s_live, decision, tags, live, d_score, d_liq, d_v24, d_v5 in items:
+            chain = (r.get("chain") or "").strip().lower()
+            base_sym = r.get("base_symbol") or "???"
+            base_addr = (r.get("base_addr") or "").strip()
 
-st.markdown("### Signals")
-if not signals:
-    st.caption("No entry signals right now.")
-else:
-    for pr, pc1h, ts_added, idx, r, best, s_live, decision, tags, live, d_score, d_liq, d_v24, d_v5 in signals:
-        chain = (r.get("chain") or "").lower().strip()
-        base_addr = r.get("base_addr") or ""
-        pair_addr = r.get("pair_addr") or ""
-        sym = r.get("base_symbol") or ""
-        risk = (r.get("risk") or "").strip()
-        tp = (r.get("tp_target_pct") or "").strip()
-        entry_usd = (r.get("entry_suggest_usd") or "").strip()
-        window = (r.get("source_window") or "").strip()
+            st.markdown("---")
+            head = st.columns([3, 2, 2, 2])
 
-        title = f"{sym} · {chain}"
-        if risk:
-            title += f" · {risk}"
-        st.write(title)
+            with head[0]:
+                st.subheader(f"{base_sym}")
+                st.caption(f"Added: {ts_added} • Chain: {chain} • Priority: {pr:.2f}")
+                st.code(base_addr, language="text")
+                if live["url"]:
+                    link_button("DexScreener", live["url"], use_container_width=True, key=f"m_ds_{idx}_{hkey(base_addr)}")
+                swap_url = build_swap_url(chain, base_addr)
+                if swap_url:
+                    swap_label = "Swap (PancakeSwap)" if chain == "bsc" else "Swap (Jupiter)"
+                    link_button(swap_label, swap_url, use_container_width=True, key=f"m_sw_{idx}_{hkey(base_addr, chain)}")
+                if chain == "solana":
+                    st.caption("Solana: check Jupiter/JupShield warnings before swapping.")
 
-        # hint line
-        hint = f"Decision: {decision} · Score {s_live:.1f}"
-        if entry_usd:
-            hint += f" · Suggested entry ${entry_usd}"
-        if tp:
-            hint += f" · TP {tp}%"
-        if window:
-            hint += f" · Source: {window}"
-        st.caption(hint)
+            with head[1]:
+                st.markdown("Live")
+                st.write(f"Score: {s_live:.2f}" if best else "Score: n/a")
+                st.write(f"Price: ${live['price']:.8f}" if live["price"] else "Price: n/a")
+                st.write(f"Liq: {fmt_usd(live['liq'])}")
+                st.write(f"Vol24: {fmt_usd(live['vol24'])}")
+                st.write(f"Vol5: {fmt_usd(live['vol5'])}")
+                st.caption(f"Δ1h {fmt_pct(live['pc1h'])} • Δ5m {fmt_pct(live['pc5'])}")
 
-        cols = st.columns([1.2, 1.2, 1.2, 1.0, 1.0, 1.4, 1.2])
-        with cols[0]:
-            st.metric("Price", f"{pr:.8f}".rstrip("0").rstrip(".") if isinstance(pr, (int, float)) else "—", delta=f"{pc1h:+.1f}%" if isinstance(pc1h, (int, float)) else None)
-        with cols[1]:
-            st.metric("Δscore", f"{d_score:+.1f}")
-        with cols[2]:
-            st.metric("Δliq", f"{d_liq:+.0f}")
-        with cols[3]:
-            st.metric("Δv24", f"{d_v24:+.0f}")
-        with cols[4]:
-            st.metric("Δv5", f"{d_v5:+.0f}")
-        with cols[5]:
-            st.caption(f"Added: {ts_added}")
-        with cols[6]:
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Archive", key=f"arch_sig_{idx}"):
-                    archive_token(idx, reason="manual")
+            with head[2]:
+                st.markdown("Vs init")
+                st.write(f"Score: {s_live:.2f} ({d_score:+.2f})")
+                st.write(f"Liq: {fmt_usd(live['liq'])} ({fmt_usd_delta(d_liq)})")
+                st.write(f"Vol24: {fmt_usd(live['vol24'])} ({fmt_usd_delta(d_v24)})")
+                st.write(f"Vol5: {fmt_usd(live['vol5'])} ({fmt_usd_delta(d_v5)})")
+
+            with head[3]:
+                st.markdown("Decision")
+                st.markdown(action_badge(decision), unsafe_allow_html=True)
+
+            hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
+            with st.expander("Dynamics (sparklines)", expanded=False):
+                if not hist:
+                    st.info("No snapshots yet.")
+                else:
+                    dfh = pd.DataFrame(hist).copy()
+                    dfh["ts_utc"] = pd.to_datetime(dfh.get("ts_utc", ""), errors="coerce")
+                    dfh = dfh.sort_values("ts_utc")
+                    dfh["price_usd"] = pd.to_numeric(dfh.get("price_usd", 0), errors="coerce")
+                    dfh["score_live"] = pd.to_numeric(dfh.get("score_live", 0), errors="coerce")
+                    dfh["liq_usd"] = pd.to_numeric(dfh.get("liq_usd", 0), errors="coerce")
+                    dfh["vol24_usd"] = pd.to_numeric(dfh.get("vol24_usd", 0), errors="coerce")
+                    dfh["vol5_usd"] = pd.to_numeric(dfh.get("vol5_usd", 0), errors="coerce")
+                    dfh = dfh.set_index("ts_utc")
+
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.caption("Price")
+                        st.line_chart(dfh[["price_usd"]], height=120, use_container_width=True)
+                    with c2:
+                        st.caption("Score")
+                        st.line_chart(dfh[["score_live"]], height=120, use_container_width=True)
+                    with c3:
+                        st.caption("Liquidity")
+                        st.line_chart(dfh[["liq_usd"]], height=120, use_container_width=True)
+
+                    c4, c5 = st.columns(2)
+                    with c4:
+                        st.caption("Vol24")
+                        st.line_chart(dfh[["vol24_usd"]], height=120, use_container_width=True)
+                    with c5:
+                        st.caption("Vol5")
+                        st.line_chart(dfh[["vol5_usd"]], height=120, use_container_width=True)
+
+            actions = st.columns([2, 2, 2, 6])
+            with actions[0]:
+                if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
+                    if not best:
+                        st.error("No live pool found. Can't promote.")
+                    else:
+                        swap_url = build_swap_url(chain, base_addr)
+                        if not swap_url:
+                            st.error("Swap URL missing for this chain/address.")
+                        else:
+                            res = log_to_portfolio(best, s_live, decision, tags, swap_url)
+                            if res == "OK":
+                                archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
+                                st.success("Promoted to Portfolio + archived from Monitoring.")
+                                st.rerun()
+                            else:
+                                st.info("Already active in portfolio.")
+            with actions[1]:
+                if st.button("Archive (manual)", key=f"drop_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
+                    archive_monitoring(chain, base_addr, reason="manual", last_score=s_live, last_decision=decision)
+                    st.success("Archived.")
                     st.rerun()
-            with c2:
-                if st.button("Open", key=f"open_sig_{idx}") and pair_addr:
-                    st.write(dex_url(chain, pair_addr))
-
-        st.divider()
-
-st.markdown("### Watchlist")
-if not watch:
-    st.caption("Nothing in watchlist.")
-else:
-    for pr, pc1h, ts_added, idx, r, best, s_live, decision, tags, live, d_score, d_liq, d_v24, d_v5 in watch:
-        chain = (r.get("chain") or "").lower().strip()
-        base_addr = r.get("base_addr") or ""
-        pair_addr = r.get("pair_addr") or ""
-        sym = r.get("base_symbol") or ""
-        window = (r.get("source_window") or "").strip()
-
-        st.write(f"{sym} · {chain}")
-        hint = f"Decision: {decision} · Score {s_live:.1f}"
-        if window:
-            hint += f" · Source: {window}"
-        st.caption(hint)
-
-        cols = st.columns([1.2, 1.2, 1.2, 1.0, 1.0, 1.4, 1.2])
-        with cols[0]:
-            st.metric("Price", f"{pr:.8f}".rstrip("0").rstrip(".") if isinstance(pr, (int, float)) else "—", delta=f"{pc1h:+.1f}%" if isinstance(pc1h, (int, float)) else None)
-        with cols[1]:
-            st.metric("Δscore", f"{d_score:+.1f}")
-        with cols[2]:
-            st.metric("Δliq", f"{d_liq:+.0f}")
-        with cols[3]:
-            st.metric("Δv24", f"{d_v24:+.0f}")
-        with cols[4]:
-            st.metric("Δv5", f"{d_v5:+.0f}")
-        with cols[5]:
-            st.caption(f"Added: {ts_added}")
-        with cols[6]:
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Archive", key=f"arch_w_{idx}"):
-                    archive_token(idx, reason="manual")
+            with actions[2]:
+                if st.button("Open in Scout (re-check)", key=f"rechk_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
+                    st.session_state["prefill_chain"] = chain
+                    st.session_state["page"] = "Scout"
                     st.rerun()
-            with c2:
-                if st.button("Open", key=f"open_w_{idx}") and pair_addr:
-                    st.write(dex_url(chain, pair_addr))
 
-        st.divider()
+    _render_group("Signals", signals)
+    st.markdown('---')
+    _render_group("Watchlist", watchlist)
+
 
 def page_archive():
     st.title("Archive")
@@ -2236,11 +2096,9 @@ def main():
         auto_archive_enabled = st.checkbox("Enable auto-archive", value=True)
         auto_archive_min_score = st.slider("Auto-archive if score < …", 0, 900, 150, step=10)
         auto_archive_on_no_entry = st.checkbox("Auto-archive if decision becomes NO ENTRY", value=False)
+        auto_revisit_enabled = st.checkbox("Auto-revisit archived (auto only)", value=True)
+        auto_revisit_days = st.slider("Auto-revisit after (days)", 1, 30, 7, step=1)
         stability_window_n = st.slider("Stability window (snapshots)", 10, 120, 30, step=5)
-        auto_reactivate_enabled = st.checkbox("Auto-reactivate auto-archived tokens after N days", value=True)
-        auto_reactivate_days = st.number_input("Auto-reactivate after (days)", min_value=1, max_value=60, value=7, step=1)
-        auto_ingest_enabled = st.checkbox("Auto-ingest Scout windows into Monitoring (on refresh)", value=True)
-        ingest_max_per_window = st.slider("Ingest cap per Scout window", 5, 60, 25, step=5)
 
         colA, colB = st.columns([1, 1])
         with colA:
@@ -2281,16 +2139,13 @@ def main():
         page_scout(cfg)
     elif page == "Monitoring":
         auto_cfg = dict(
-    auto_archive_enabled=auto_archive_enabled,
-    auto_archive_min_score=auto_archive_min_score,
-    auto_archive_on_no_entry=auto_archive_on_no_entry,
-    stability_window_n=stability_window_n,
-    auto_reactivate_enabled=auto_reactivate_enabled,
-    auto_reactivate_days=int(auto_reactivate_days),
-    auto_ingest_enabled=auto_ingest_enabled,
-    ingest_max_per_window=int(ingest_max_per_window),
-    scout_seeds_raw=SCOUT_SEEDS_RAW,
-)
+            auto_archive_enabled=auto_archive_enabled,
+            auto_archive_min_score=auto_archive_min_score,
+            auto_archive_on_no_entry=auto_archive_on_no_entry,
+            auto_revisit_enabled=auto_revisit_enabled,
+            auto_revisit_days=auto_revisit_days,
+            stability_window_n=stability_window_n,
+        )
         page_monitoring(auto_cfg)
     elif page == "Archive":
         page_archive()
