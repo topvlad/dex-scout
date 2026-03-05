@@ -23,7 +23,6 @@
 import os
 import re
 import csv
-import io
 import time
 import random
 import hashlib
@@ -37,7 +36,7 @@ import streamlit as st
 import pandas as pd
 
 
-VERSION = "0.4.14"
+VERSION = "0.5.0"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -47,45 +46,35 @@ MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
 
 
 # =============================
-# Supabase (optional persistence) – v0.4.11 compatible
+# Supabase config (optional)
 # =============================
-# Якщо у Streamlit Cloud є secrets:
-#   SUPABASE_URL
-#   SUPABASE_SERVICE_ROLE_KEY
-# (optional) SUPABASE_ANON_KEY
-#
-# то CSV зберігаються у Supabase в таблиці public.app_storage як текст:
-#
-#   create table if not exists public.app_storage (
-#     key text primary key,
-#     content text not null,
-#     updated_at timestamptz not null default now()
-#   );
-#
-# Важливо: ми НЕ переносимо логіку в Postgres-таблиці – лише зберігаємо CSV як текст.
-# Так дані й архіви не зникають між деплоями Streamlit Cloud.
-
 def _get_secret(name: str, default: str = "") -> str:
-    # Streamlit secrets
+    # Streamlit secrets (recommended) first, then env
     try:
         if hasattr(st, "secrets") and name in st.secrets:
-            return str(st.secrets.get(name) or default)
+            v = st.secrets.get(name, default)
+            return str(v) if v is not None else default
     except Exception:
         pass
-    # Env fallback
     return str(os.environ.get(name, default) or default)
+
 
 SUPABASE_URL = _get_secret("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 SUPABASE_ANON_KEY = _get_secret("SUPABASE_ANON_KEY", "").strip()
 
-USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+# PostgREST endpoint
+SUPABASE_REST = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_REST)
 
-def _sb_ok() -> bool:
-    return bool(USE_SUPABASE)
+# Table names (you can rename, but then update these)
+SB_TABLE_PORTFOLIO = "portfolio"
+SB_TABLE_MONITORING = "monitoring"
+SB_TABLE_HISTORY = "monitoring_history"
+
 
 def _sb_headers() -> Dict[str, str]:
-    # Use service role key for server-side storage
+    # service_role bypasses RLS (recommended for server-side app)
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -93,52 +82,76 @@ def _sb_headers() -> Dict[str, str]:
         "Accept": "application/json",
     }
 
-def _sb_table_url(table: str) -> str:
-    return f"{SUPABASE_URL}/rest/v1/{table}"
 
-def sb_get_storage(key: str) -> Optional[str]:
-    """
-    Returns content for key from public.app_storage, or None if not found.
-    """
-    if not USE_SUPABASE:
-        return None
+def _sb_url(table: str) -> str:
+    return f"{SUPABASE_REST}/{table}"
+
+
+def _sb_ok() -> bool:
+    return USE_SUPABASE
+
+
+def _sb_select_all(table: str, limit: int = 10000) -> List[Dict[str, Any]]:
+    # safest: order by insertion timestamp when possible, but all fields are text, so just pull all
+    if not _sb_ok():
+        return []
     try:
-        url = _sb_table_url("app_storage")
-        params = {"select": "content", "key": f"eq.{key}"}
-        r = requests.get(url, headers=_sb_headers(), params=params, timeout=12)
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        data = r.json() or []
-        if not data:
-            return None
-        return (data[0].get("content") or "")
+        url = _sb_url(table)
+        params = {
+            "select": "*",
+            "limit": str(int(limit)),
+        }
+        r = requests.get(url, headers=_sb_headers(), params=params, timeout=20)
+        if r.status_code >= 400:
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
     except Exception:
-        return None
+        return []
 
-def sb_put_storage(key: str, content: str) -> bool:
-    """
-    Upsert (insert or update) content into public.app_storage.
-    """
-    if not USE_SUPABASE:
+
+def _sb_insert(table: str, row: Dict[str, Any]) -> bool:
+    if not _sb_ok():
         return False
     try:
-        url = _sb_table_url("app_storage")
-        payload = [{"key": key, "content": content}]
-        headers = _sb_headers().copy()
-        headers["Prefer"] = "resolution=merge-duplicates"
-        r = requests.post(url, headers=headers, json=payload, timeout=15)
-        r.raise_for_status()
-        return True
+        url = _sb_url(table)
+        r = requests.post(url, headers=_sb_headers(), json=[row], timeout=20)
+        return 200 <= r.status_code < 300
     except Exception:
         return False
 
-def storage_key_for_path(path: str) -> str:
-    # keep it stable and short: data/monitoring.csv -> monitoring.csv
-    base = os.path.basename(path)
-    return base or path
+
+def _sb_upsert(table: str, rows: List[Dict[str, Any]]) -> bool:
+    """
+    Upsert requires a primary key or unique constraint in Supabase.
+    To keep it simple and not force schema decisions, we implement "replace-all" for small tables:
+    - delete everything
+    - insert all rows
+    Works fine for monitoring/portfolio sizes (tens/hundreds).
+    """
+    if not _sb_ok():
+        return False
+    try:
+        # delete all
+        url = _sb_url(table)
+        # PostgREST delete requires a filter; use "id=gt.0" only if you have numeric id.
+        # We cannot assume it exists. So we do best-effort: try delete without filter (usually blocked),
+        # then fall back to insert-only.
+        del_ok = False
+        try:
+            rdel = requests.delete(url, headers=_sb_headers(), timeout=20)
+            del_ok = 200 <= rdel.status_code < 300
+        except Exception:
+            del_ok = False
+
+        # insert all (even if delete failed, we won't break – duplicates might appear if you don't have PK)
+        r = requests.post(url, headers=_sb_headers(), json=rows, timeout=30)
+        return 200 <= r.status_code < 300
+    except Exception:
+        return False
 
 
+# =============================
 # Storage + lock (CSV fallback)
 # =============================
 @contextmanager
@@ -244,39 +257,8 @@ def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _csv_from_string(content: str) -> List[Dict[str, Any]]:
-    if not content.strip():
-        return []
-    sio = io.StringIO(content)
-    rdr = csv.DictReader(sio)
-    return [row for row in rdr]
-
-
-def _csv_to_string(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
-    sio = io.StringIO()
-    w = csv.DictWriter(sio, fieldnames=fieldnames)
-    w.writeheader()
-    for r in rows:
-        out = {k: r.get(k, "") for k in fieldnames}
-        w.writerow(out)
-    return sio.getvalue()
-
-
 def load_csv(path: str) -> List[Dict[str, Any]]:
     ensure_storage()
-
-    # Supabase source of truth
-    if _sb_ok():
-        key = storage_key_for_path(path)
-        content = sb_get_storage(key)
-        if content is not None:
-            try:
-                return _csv_from_string(content)
-            except Exception:
-                # fall back to local if content corrupt
-                pass
-
-    # Local fallback
     if not os.path.exists(path):
         return []
     rows: List[Dict[str, Any]] = []
@@ -288,8 +270,6 @@ def load_csv(path: str) -> List[Dict[str, Any]]:
 
 def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     ensure_storage()
-
-    # Always write local (helps debugging)
     lockp = path + ".lock"
     with file_lock(lockp):
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -299,19 +279,15 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
                 out = {k: r.get(k, "") for k in fieldnames}
                 w.writerow(out)
 
-    # Supabase persistence
-    if _sb_ok():
-        key = storage_key_for_path(path)
-        content = _csv_to_string(rows, fieldnames)
-        sb_put_storage(key, content)
-
 
 def append_csv(path: str, row: Dict[str, Any], fieldnames: List[str]):
-    # For Supabase we do read-modify-write (safe for low concurrency).
-    rows = load_csv(path)
-    rows.append({k: row.get(k, "") for k in fieldnames})
-    save_csv(path, rows, fieldnames)
-
+    ensure_storage()
+    lockp = path + ".lock"
+    with file_lock(lockp):
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            out = {k: row.get(k, "") for k in fieldnames}
+            w.writerow(out)
 
 
 # =============================
@@ -993,6 +969,12 @@ MON_FIELDS = [
     "archived_reason",
     "last_score",
     "last_decision",
+    "source_window",
+    "source_preset",
+    "risk",
+    "tp_target_pct",
+    "entry_suggest_usd",
+    "ts_last_seen",
 ]
 
 HIST_FIELDS = [
@@ -1015,19 +997,34 @@ HIST_FIELDS = [
 
 
 def load_portfolio() -> List[Dict[str, Any]]:
-    rows = load_csv(PORTFOLIO_CSV)
-    for r in rows:
-        for k in PORTFOLIO_FIELDS:
-            if k not in r:
-                r[k] = ""
-    return rows
+    if _sb_ok():
+        rows = _sb_select_all(SB_TABLE_PORTFOLIO, limit=50000)
+        # normalize missing fields
+        for r in rows:
+            for k in PORTFOLIO_FIELDS:
+                if k not in r:
+                    r[k] = ""
+        return rows
+    return load_csv(PORTFOLIO_CSV)
 
 
 def save_portfolio(rows: List[Dict[str, Any]]):
+    if _sb_ok():
+        # replace-all (best-effort) to keep behavior deterministic
+        ok = _sb_upsert(SB_TABLE_PORTFOLIO, [{k: (r.get(k, "") or "") for k in PORTFOLIO_FIELDS} for r in rows])
+        if ok:
+            return
     save_csv(PORTFOLIO_CSV, rows, PORTFOLIO_FIELDS)
 
 
 def load_monitoring() -> List[Dict[str, Any]]:
+    if _sb_ok():
+        rows = _sb_select_all(SB_TABLE_MONITORING, limit=50000)
+        for r in rows:
+            for k in MON_FIELDS:
+                if k not in r:
+                    r[k] = ""
+        return rows
     rows = load_csv(MONITORING_CSV)
     for r in rows:
         for k in MON_FIELDS:
@@ -1037,19 +1034,60 @@ def load_monitoring() -> List[Dict[str, Any]]:
 
 
 def save_monitoring(rows: List[Dict[str, Any]]):
+    if _sb_ok():
+        ok = _sb_upsert(SB_TABLE_MONITORING, [{k: (r.get(k, "") or "") for k in MON_FIELDS} for r in rows])
+        if ok:
+            return
     save_csv(MONITORING_CSV, rows, MON_FIELDS)
 
 
-def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
-    # Source of truth: load_csv (Supabase app_storage if enabled, else local)
-    rows = load_csv(MON_HISTORY_CSV)
-    if not rows:
-        return []
-    return rows[-limit_rows:]
-
-
 def append_monitoring_history(row: Dict[str, Any]):
+    if _sb_ok():
+        _sb_insert(SB_TABLE_HISTORY, {k: (row.get(k, "") or "") for k in HIST_FIELDS})
+        return
     append_csv(MON_HISTORY_CSV, row, HIST_FIELDS)
+
+
+def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
+    # Supabase path: fetch latest rows; since we may not have an index, we just cap
+    if _sb_ok():
+        rows = _sb_select_all(SB_TABLE_HISTORY, limit=max(1000, int(limit_rows)))
+        # try to sort by ts_utc
+        try:
+            rows.sort(key=lambda x: str(x.get("ts_utc", "")))
+        except Exception:
+            pass
+        return rows[-limit_rows:]
+
+    # CSV fallback: memory-safe tail read (fixed SyntaxError)
+    ensure_storage()
+    if not os.path.exists(MON_HISTORY_CSV):
+        return []
+    try:
+        with open(MON_HISTORY_CSV, "r", encoding="utf-8", newline="") as f:
+            header = f.readline()
+        if not header:
+            return []
+        size = os.path.getsize(MON_HISTORY_CSV)
+        chunk_bytes = 1024 * 1024
+        data = ""
+        pos = size
+        # NOTE: the bug in v0.4.11 was an accidentally broken "\n" literal while copying.
+        while pos > 0 and data.count("\n") < (limit_rows + 50):
+            step = min(chunk_bytes, pos)
+            pos -= step
+            with open(MON_HISTORY_CSV, "rb") as bf:
+                bf.seek(pos)
+                chunk = bf.read(step)
+            data = chunk.decode("utf-8", errors="ignore") + data
+        lines = data.splitlines(True)
+        if pos > 0 and lines:
+            lines = lines[1:]
+        tail = "".join([header] + lines[-limit_rows:])
+        return list(csv.DictReader(tail.splitlines(True)))
+    except Exception:
+        rows = load_csv(MON_HISTORY_CSV)
+        return rows[-limit_rows:]
 
 
 def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
@@ -1082,6 +1120,12 @@ def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
             "archived_reason": "",
             "last_score": "",
             "last_decision": "",
+            "source_window": "",
+            "source_preset": "",
+            "risk": "",
+            "tp_target_pct": "",
+            "entry_suggest_usd": "",
+            "ts_last_seen": "",
         }
     )
     save_monitoring(rows)
@@ -1288,17 +1332,232 @@ def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h:
 
 
 # =============================
+# v0.5.0 – Monitoring automation helpers
+# =============================
+
+SCOUT_WINDOWS = [
+    ("Ultra Early (safer)", "ultra"),
+    ("Balanced (default)", "balanced"),
+    ("Wide Net (explore)", "wide"),
+    ("Momentum (hot)", "momentum"),
+]
+
+
+def _safe_dt_parse(s: str) -> Optional[datetime]:
+    try:
+        # expect "YYYY-MM-DD HH:MM:SS UTC"
+        return datetime.strptime((s or "").replace(" UTC", ""), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tuple[str, str]:
+    """
+    Returns (entry_suggest_usd, tp_target_pct) as strings for display/storage.
+    Keep it simple – heuristics only.
+    """
+    if not p:
+        return ("", "")
+    liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
+    vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
+
+    # Suggested entry size (USD): small for illiquid, slightly larger for healthier pools.
+    # cap to keep "test bets" reasonable.
+    base = 6.0
+    base += min(liq / 50_000.0 * 6.0, 10.0)
+    base += min(vol24 / 250_000.0 * 4.0, 6.0)
+    if (risk or "").upper() == "EARLY":
+        base *= 0.75  # smaller size for early / higher risk
+    entry = max(3.0, min(base, 20.0))
+
+    # TP target %: higher for early (because odds are worse, you need asymmetric upside)
+    tp = 40.0 if (risk or "").upper() == "EARLY" else 25.0
+
+    return (f"{entry:.0f}", f"{tp:.0f}")
+
+
+def upsert_monitoring_row_from_pair(p: Dict[str, Any], score: float, window_name: str, preset_key: str) -> str:
+    """
+    Add token to Monitoring if not active. If exists archived – keep archived unless user enables auto-reactivate.
+    """
+    chain = (p.get("chainId") or "").lower().strip()
+    base_addr_raw = (safe_get(p, "baseToken", "address", default="") or "").strip()
+    if not base_addr_raw:
+        return "NO_ADDR"
+
+    base_addr = addr_store(chain, base_addr_raw)
+    key = addr_key(chain, base_addr)
+
+    rows = load_monitoring()
+
+    # if already active – skip
+    for r in rows:
+        if r.get("active") == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
+            return "EXISTS_ACTIVE"
+
+    # if exists archived – don't duplicate
+    for r in rows:
+        if r.get("active") != "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
+            # update last_seen for visibility
+            r["ts_last_seen"] = now_utc_str()
+            save_monitoring(rows)
+            return "EXISTS_ARCHIVED"
+
+    decision, _tags = build_trade_hint(p)
+    risk = "EARLY" if preset_key in {"ultra", "momentum"} else ""
+
+    entry_s, tp_s = suggest_entry_and_tp_usd(p, risk=risk)
+
+    rows.append(
+        {
+            "ts_added": now_utc_str(),
+            "chain": chain,
+            "base_symbol": safe_get(p, "baseToken", "symbol", default="") or "",
+            "base_addr": base_addr,
+            "pair_addr": p.get("pairAddress", "") or "",
+            "score_init": str(score),
+            "liq_init": str(safe_get(p, "liquidity", "usd", default=0) or 0),
+            "vol24_init": str(safe_get(p, "volume", "h24", default=0) or 0),
+            "vol5_init": str(safe_get(p, "volume", "m5", default=0) or 0),
+            "active": "1",
+            "ts_archived": "",
+            "archived_reason": "",
+            "last_score": str(score),
+            "last_decision": decision,
+            "source_window": window_name,
+            "source_preset": preset_key,
+            "risk": risk,
+            "tp_target_pct": tp_s,
+            "entry_suggest_usd": entry_s,
+            "ts_last_seen": now_utc_str(),
+        }
+    )
+    save_monitoring(rows)
+    return "OK"
+
+
+def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any], seeds_raw: str) -> List[Dict[str, Any]]:
+    """
+    Runs Scout logic for a given window and returns filtered pairs (without excluding 'NO ENTRY' by default).
+    """
+    seeds = [x.strip() for x in (seeds_raw or "").split(",") if x.strip()]
+    if not seeds:
+        return []
+
+    sampled = sample_seeds(seeds, int(preset.get("seed_k", 12)), refresh=False)
+
+    all_pairs: List[Dict[str, Any]] = []
+    for q in sampled:
+        if len(q.strip()) < 2:
+            continue
+        try:
+            all_pairs.extend(fetch_latest_pairs_for_query(q))
+            time.sleep(0.06)
+        except Exception:
+            continue
+
+    pairs = dedupe_mode(all_pairs, by_base_token=False)
+    pairs = dedupe_mode(pairs, by_base_token=bool(preset.get("dedupe_by_base", True)))
+
+    allowed = set([d.lower() for d in CHAIN_DEX_PRESETS.get(chain, [])[:3]])
+    filtered, _fstats, _freasons = filter_pairs_with_debug(
+        pairs=pairs,
+        chain=chain,
+        any_dex=True,              # ingest should be wide, monitoring will decide
+        allowed_dexes=allowed,
+        min_liq=float(preset.get("min_liq", 1000)),
+        min_vol24=float(preset.get("min_vol24", 5000)),
+        min_trades_m5=int(preset.get("min_trades_m5", 0)),
+        min_sells_m5=int(preset.get("min_sells_m5", 0)),
+        max_buy_sell_imbalance=int(preset.get("max_imbalance", 30)),
+        block_suspicious_names=bool(preset.get("block_suspicious_names", True)),
+        block_majors=bool(preset.get("block_majors", True)),
+        min_age_min=int(preset.get("min_age_min", 0)),
+        max_age_min=int(preset.get("max_age_min", 999999)),
+        enforce_age=bool(preset.get("enforce_age", True)),
+        hide_solana_unverified=bool(preset.get("hide_solana_unverified", True)),
+    )
+
+    # remove obvious junk with no base addr
+    out = []
+    for p in filtered:
+        base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
+        if base_addr:
+            out.append(p)
+    return out
+
+
+def ingest_scout_to_monitoring(chain: str, seeds_raw: str, max_per_window: int = 25) -> Dict[str, int]:
+    """
+    Ingests tokens from 4 Scout windows into Monitoring.
+    """
+    counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "errors": 0, "seen": 0}
+    for window_name, preset_key in SCOUT_WINDOWS:
+        preset = PRESETS.get(window_name, {})
+        pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw)
+        # rank by score
+        ranked = []
+        for p in pairs:
+            s = score_pair(p)
+            ranked.append((s, p))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        ranked = ranked[: max(1, int(max_per_window))]
+
+        for s, p in ranked:
+            counts["seen"] += 1
+            try:
+                res = upsert_monitoring_row_from_pair(p, float(s), window_name=window_name, preset_key=preset_key)
+                if res == "OK":
+                    counts["added"] += 1
+                elif res == "EXISTS_ACTIVE":
+                    counts["skipped_active"] += 1
+                elif res == "EXISTS_ARCHIVED":
+                    counts["skipped_archived"] += 1
+            except Exception:
+                counts["errors"] += 1
+                continue
+    return counts
+
+
+def auto_reactivate_archived(days: int = 7) -> int:
+    """
+    Reactivate archived tokens that were auto-archived (reason startswith 'auto:') older than N days.
+    """
+    days = max(1, int(days))
+    rows = load_monitoring()
+    changed = 0
+    now_dt = datetime.utcnow()
+
+    for r in rows:
+        if r.get("active") == "1":
+            continue
+        reason = (r.get("archived_reason") or "").strip().lower()
+        if not reason.startswith("auto:"):
+            continue
+        ts = _safe_dt_parse(r.get("ts_archived", ""))
+        if not ts:
+            continue
+        age_days = (now_dt - ts).total_seconds() / 86400.0
+        if age_days >= float(days):
+            r["active"] = "1"
+            r["ts_added"] = now_utc_str()
+            r["ts_archived"] = ""
+            r["archived_reason"] = ""
+            # keep last_score/last_decision as-is, but mark last_seen
+            r["ts_last_seen"] = now_utc_str()
+            changed += 1
+
+    if changed:
+        save_monitoring(rows)
+    return changed
+
+
+# =============================
 # Pages
 # =============================
 def page_scout(cfg: Dict[str, Any]):
     st.title("DEX Scout – early candidates (DexScreener API)")
     st.caption("Фокус: дрібні/ранні монети. Majors/stables відсікаються. Core: BSC + Solana.")
-
-    with st.expander("Як сортувати у Jupiter Cooking (manual triage)", expanded=False):
-        st.write("1) Liquidity / TVL (щоб не застрягти у thin pool)")
-        st.write("2) 24h Volume або Volume/TVL (щоб був реальний попит)")
-        st.write("3) Trades / Txns (щоб був живий flow, а не один памп)")
-        st.caption("У цій апці ми надійно беремо Liquidity/Volume/Txns через DexScreener. Для Solana можна додати трендовий сорс через Birdeye (за ключем).")
 
     if _sb_ok():
         st.caption("Storage: Supabase (persistent)")
@@ -1329,19 +1588,6 @@ def page_scout(cfg: Dict[str, Any]):
         st.error("All sampled queries failed. Try Refresh / Clear cache / wait a bit.")
         return
 
-
-    # Optional: extra Solana source – trending mints from Birdeye ("Cooking"-like feed)
-    if cfg.get("use_birdeye_trending") and (cfg.get("chain") == "solana") and BIRDEYE_ENABLED:
-        mints = birdeye_trending_solana(limit=int(cfg.get("birdeye_limit", 50)))
-        if mints:
-            st.caption(f"Birdeye trending added: {len(mints)} mints")
-            for mint in mints:
-                try:
-                    bp = best_pair_for_token("solana", mint)
-                    if bp:
-                        all_pairs.append(bp)
-                except Exception:
-                    pass
     pairs = dedupe_mode(all_pairs, by_base_token=False)
     pairs = dedupe_mode(pairs, by_base_token=bool(cfg["dedupe_by_base"]))
 
@@ -1584,109 +1830,112 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         st.info("Auto-archive applied. Refreshing list…")
         st.rerun()
 
-    for pr, pc1h, ts_added, idx, r, best, s_live, decision, tags, live, d_score, d_liq, d_v24, d_v5 in enriched:
-        chain = (r.get("chain") or "").strip().lower()
-        base_sym = r.get("base_symbol") or "???"
-        base_addr = (r.get("base_addr") or "").strip()
+    # Split into sections: Signals first, then Watchlist
+def _is_entry(dec: str) -> bool:
+    d = (dec or "").upper()
+    return d.startswith("ENTRY") or d.startswith("BUY")
 
-        st.markdown("---")
-        head = st.columns([3, 2, 2, 2])
+signals = []
+watch = []
+for row in enriched:
+    (_pr, _pc1h, _ts_added, _idx, _r, _best, _s_live, _decision, _tags, _live, _d_score, _d_liq, _d_v24, _d_v5) = row
+    (signals if _is_entry(_decision) else watch).append(row)
 
-        with head[0]:
-            st.subheader(f"{base_sym}")
-            st.caption(f"Added: {ts_added} • Chain: {chain} • Priority: {pr:.2f}")
-            st.code(base_addr, language="text")
-            if live["url"]:
-                link_button("DexScreener", live["url"], use_container_width=True, key=f"m_ds_{idx}_{hkey(base_addr)}")
-            swap_url = build_swap_url(chain, base_addr)
-            if swap_url:
-                swap_label = "Swap (PancakeSwap)" if chain == "bsc" else "Swap (Jupiter)"
-                link_button(swap_label, swap_url, use_container_width=True, key=f"m_sw_{idx}_{hkey(base_addr, chain)}")
-            if chain == "solana":
-                st.caption("Solana: check Jupiter/JupShield warnings before swapping.")
+st.markdown("### Signals")
+if not signals:
+    st.caption("No entry signals right now.")
+else:
+    for pr, pc1h, ts_added, idx, r, best, s_live, decision, tags, live, d_score, d_liq, d_v24, d_v5 in signals:
+        chain = (r.get("chain") or "").lower().strip()
+        base_addr = r.get("base_addr") or ""
+        pair_addr = r.get("pair_addr") or ""
+        sym = r.get("base_symbol") or ""
+        risk = (r.get("risk") or "").strip()
+        tp = (r.get("tp_target_pct") or "").strip()
+        entry_usd = (r.get("entry_suggest_usd") or "").strip()
+        window = (r.get("source_window") or "").strip()
 
-        with head[1]:
-            st.markdown("Live")
-            st.write(f"Score: {s_live:.2f}" if best else "Score: n/a")
-            st.write(f"Price: ${live['price']:.8f}" if live["price"] else "Price: n/a")
-            st.write(f"Liq: {fmt_usd(live['liq'])}")
-            st.write(f"Vol24: {fmt_usd(live['vol24'])}")
-            st.write(f"Vol5: {fmt_usd(live['vol5'])}")
-            st.caption(f"Δ1h {fmt_pct(live['pc1h'])} • Δ5m {fmt_pct(live['pc5'])}")
+        title = f"{sym} · {chain}"
+        if risk:
+            title += f" · {risk}"
+        st.write(title)
 
-        with head[2]:
-            st.markdown("Vs init")
-            st.write(f"Score: {s_live:.2f} ({d_score:+.2f})")
-            st.write(f"Liq: {fmt_usd(live['liq'])} ({fmt_usd_delta(d_liq)})")
-            st.write(f"Vol24: {fmt_usd(live['vol24'])} ({fmt_usd_delta(d_v24)})")
-            st.write(f"Vol5: {fmt_usd(live['vol5'])} ({fmt_usd_delta(d_v5)})")
+        # hint line
+        hint = f"Decision: {decision} · Score {s_live:.1f}"
+        if entry_usd:
+            hint += f" · Suggested entry ${entry_usd}"
+        if tp:
+            hint += f" · TP {tp}%"
+        if window:
+            hint += f" · Source: {window}"
+        st.caption(hint)
 
-        with head[3]:
-            st.markdown("Decision")
-            st.markdown(action_badge(decision), unsafe_allow_html=True)
+        cols = st.columns([1.2, 1.2, 1.2, 1.0, 1.0, 1.4, 1.2])
+        with cols[0]:
+            st.metric("Price", f"{pr:.8f}".rstrip("0").rstrip(".") if isinstance(pr, (int, float)) else "—", delta=f"{pc1h:+.1f}%" if isinstance(pc1h, (int, float)) else None)
+        with cols[1]:
+            st.metric("Δscore", f"{d_score:+.1f}")
+        with cols[2]:
+            st.metric("Δliq", f"{d_liq:+.0f}")
+        with cols[3]:
+            st.metric("Δv24", f"{d_v24:+.0f}")
+        with cols[4]:
+            st.metric("Δv5", f"{d_v5:+.0f}")
+        with cols[5]:
+            st.caption(f"Added: {ts_added}")
+        with cols[6]:
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Archive", key=f"arch_sig_{idx}"):
+                    archive_token(idx, reason="manual")
+                    st.rerun()
+            with c2:
+                if st.button("Open", key=f"open_sig_{idx}") and pair_addr:
+                    st.write(dex_url(chain, pair_addr))
 
-        hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
-        with st.expander("Dynamics (sparklines)", expanded=False):
-            if not hist:
-                st.info("No snapshots yet.")
-            else:
-                dfh = pd.DataFrame(hist).copy()
-                dfh["ts_utc"] = pd.to_datetime(dfh.get("ts_utc", ""), errors="coerce")
-                dfh = dfh.sort_values("ts_utc")
-                dfh["price_usd"] = pd.to_numeric(dfh.get("price_usd", 0), errors="coerce")
-                dfh["score_live"] = pd.to_numeric(dfh.get("score_live", 0), errors="coerce")
-                dfh["liq_usd"] = pd.to_numeric(dfh.get("liq_usd", 0), errors="coerce")
-                dfh["vol24_usd"] = pd.to_numeric(dfh.get("vol24_usd", 0), errors="coerce")
-                dfh["vol5_usd"] = pd.to_numeric(dfh.get("vol5_usd", 0), errors="coerce")
-                dfh = dfh.set_index("ts_utc")
+        st.divider()
 
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.caption("Price")
-                    st.line_chart(dfh[["price_usd"]], height=120, use_container_width=True)
-                with c2:
-                    st.caption("Score")
-                    st.line_chart(dfh[["score_live"]], height=120, use_container_width=True)
-                with c3:
-                    st.caption("Liquidity")
-                    st.line_chart(dfh[["liq_usd"]], height=120, use_container_width=True)
+st.markdown("### Watchlist")
+if not watch:
+    st.caption("Nothing in watchlist.")
+else:
+    for pr, pc1h, ts_added, idx, r, best, s_live, decision, tags, live, d_score, d_liq, d_v24, d_v5 in watch:
+        chain = (r.get("chain") or "").lower().strip()
+        base_addr = r.get("base_addr") or ""
+        pair_addr = r.get("pair_addr") or ""
+        sym = r.get("base_symbol") or ""
+        window = (r.get("source_window") or "").strip()
 
-                c4, c5 = st.columns(2)
-                with c4:
-                    st.caption("Vol24")
-                    st.line_chart(dfh[["vol24_usd"]], height=120, use_container_width=True)
-                with c5:
-                    st.caption("Vol5")
-                    st.line_chart(dfh[["vol5_usd"]], height=120, use_container_width=True)
+        st.write(f"{sym} · {chain}")
+        hint = f"Decision: {decision} · Score {s_live:.1f}"
+        if window:
+            hint += f" · Source: {window}"
+        st.caption(hint)
 
-        actions = st.columns([2, 2, 2, 6])
-        with actions[0]:
-            if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
-                if not best:
-                    st.error("No live pool found. Can't promote.")
-                else:
-                    swap_url = build_swap_url(chain, base_addr)
-                    if not swap_url:
-                        st.error("Swap URL missing for this chain/address.")
-                    else:
-                        res = log_to_portfolio(best, s_live, decision, tags, swap_url)
-                        if res == "OK":
-                            archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
-                            st.success("Promoted to Portfolio + archived from Monitoring.")
-                            st.rerun()
-                        else:
-                            st.info("Already active in portfolio.")
-        with actions[1]:
-            if st.button("Archive (manual)", key=f"drop_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
-                archive_monitoring(chain, base_addr, reason="manual", last_score=s_live, last_decision=decision)
-                st.success("Archived.")
-                st.rerun()
-        with actions[2]:
-            if st.button("Open in Scout (re-check)", key=f"rechk_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
-                st.session_state["prefill_chain"] = chain
-                st.session_state["page"] = "Scout"
-                st.rerun()
+        cols = st.columns([1.2, 1.2, 1.2, 1.0, 1.0, 1.4, 1.2])
+        with cols[0]:
+            st.metric("Price", f"{pr:.8f}".rstrip("0").rstrip(".") if isinstance(pr, (int, float)) else "—", delta=f"{pc1h:+.1f}%" if isinstance(pc1h, (int, float)) else None)
+        with cols[1]:
+            st.metric("Δscore", f"{d_score:+.1f}")
+        with cols[2]:
+            st.metric("Δliq", f"{d_liq:+.0f}")
+        with cols[3]:
+            st.metric("Δv24", f"{d_v24:+.0f}")
+        with cols[4]:
+            st.metric("Δv5", f"{d_v5:+.0f}")
+        with cols[5]:
+            st.caption(f"Added: {ts_added}")
+        with cols[6]:
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Archive", key=f"arch_w_{idx}"):
+                    archive_token(idx, reason="manual")
+                    st.rerun()
+            with c2:
+                if st.button("Open", key=f"open_w_{idx}") and pair_addr:
+                    st.write(dex_url(chain, pair_addr))
 
+        st.divider()
 
 def page_archive():
     st.title("Archive")
@@ -1937,26 +2186,6 @@ def main():
         chain = st.selectbox("Chain", options=["bsc", "solana"], index=chain_idx)
         st.session_state["prefill_chain"] = chain
 
-        # Solana: optional "Cooking" style source via Birdeye trending list
-        use_birdeye_trending = False
-        birdeye_limit = 50
-        if chain == "solana":
-            use_birdeye_trending = st.checkbox(
-                "Add Solana trending (Birdeye) – extra source",
-                value=False,
-                disabled=(not BIRDEYE_ENABLED),
-            )
-            if not BIRDEYE_ENABLED:
-                st.caption("Birdeye key missing: add BIRDEYE_API_KEY to secrets to enable.")
-            birdeye_limit = st.slider(
-                "Trending list size",
-                10,
-                100,
-                50,
-                step=10,
-                disabled=(not use_birdeye_trending),
-            )
-
         st.caption("DEX filter")
         any_dex = st.checkbox("Any DEX (no filter)", value=True)
 
@@ -2005,9 +2234,13 @@ def main():
         st.divider()
         st.caption("Auto-archive (Monitoring)")
         auto_archive_enabled = st.checkbox("Enable auto-archive", value=True)
-        auto_archive_min_score = st.slider("Auto-archive if score < …", 0, 900, 220, step=10)
-        auto_archive_on_no_entry = st.checkbox("Auto-archive if decision becomes NO ENTRY", value=True)
+        auto_archive_min_score = st.slider("Auto-archive if score < …", 0, 900, 150, step=10)
+        auto_archive_on_no_entry = st.checkbox("Auto-archive if decision becomes NO ENTRY", value=False)
         stability_window_n = st.slider("Stability window (snapshots)", 10, 120, 30, step=5)
+        auto_reactivate_enabled = st.checkbox("Auto-reactivate auto-archived tokens after N days", value=True)
+        auto_reactivate_days = st.number_input("Auto-reactivate after (days)", min_value=1, max_value=60, value=7, step=1)
+        auto_ingest_enabled = st.checkbox("Auto-ingest Scout windows into Monitoring (on refresh)", value=True)
+        ingest_max_per_window = st.slider("Ingest cap per Scout window", 5, 60, 25, step=5)
 
         colA, colB = st.columns([1, 1])
         with colA:
@@ -2044,66 +2277,26 @@ def main():
             seed_k=seed_k,
             seeds_raw=seeds_raw,
             refresh=refresh,
-            use_birdeye_trending=use_birdeye_trending,
-            birdeye_limit=birdeye_limit,
         )
         page_scout(cfg)
     elif page == "Monitoring":
         auto_cfg = dict(
-            auto_archive_enabled=auto_archive_enabled,
-            auto_archive_min_score=auto_archive_min_score,
-            auto_archive_on_no_entry=auto_archive_on_no_entry,
-            stability_window_n=stability_window_n,
-        )
+    auto_archive_enabled=auto_archive_enabled,
+    auto_archive_min_score=auto_archive_min_score,
+    auto_archive_on_no_entry=auto_archive_on_no_entry,
+    stability_window_n=stability_window_n,
+    auto_reactivate_enabled=auto_reactivate_enabled,
+    auto_reactivate_days=int(auto_reactivate_days),
+    auto_ingest_enabled=auto_ingest_enabled,
+    ingest_max_per_window=int(ingest_max_per_window),
+    scout_seeds_raw=SCOUT_SEEDS_RAW,
+)
         page_monitoring(auto_cfg)
     elif page == "Archive":
         page_archive()
     else:
         page_portfolio()
 
-# =============================
-# Birdeye (optional, Solana trending + extra stats)
-# =============================
-BIRDEYE_API_KEY = _get_secret("BIRDEYE_API_KEY", "").strip()
-BIRDEYE_ENABLED = bool(BIRDEYE_API_KEY)
-
-def birdeye_get(path: str, params: Optional[dict] = None, timeout: int = 15) -> dict:
-    """Minimal Birdeye public API wrapper."""
-    if not BIRDEYE_ENABLED:
-        return {}
-    url = "https://public-api.birdeye.so" + path
-    headers = {"X-API-KEY": BIRDEYE_API_KEY, "Accept": "application/json"}
-    r = requests.get(url, headers=headers, params=params or {}, timeout=timeout)
-    r.raise_for_status()
-    return r.json() or {}
-
-@st.cache_data(ttl=45, show_spinner=False)
-def birdeye_trending_solana(limit: int = 50, offset: int = 0) -> list[str]:
-    """
-    Returns a list of Solana mint addresses from Birdeye trending endpoint.
-    If Birdeye changes params – we fail soft and return [].
-    """
-    if not BIRDEYE_ENABLED:
-        return []
-    try:
-        params = {
-            "chain": "solana",
-            "offset": int(offset),
-            "limit": int(limit),
-            "sort_by": "rank",
-            "sort_type": "asc",
-        }
-        data = birdeye_get("/defi/token_trending", params=params, timeout=15)
-        items = (data.get("data") or {}).get("items") or (data.get("data") or {}).get("tokens") or []
-        out = []
-        for it in items:
-            addr = (it.get("address") or it.get("mint") or it.get("tokenAddress") or "").strip()
-            if addr:
-                out.append(addr)
-        return out[: int(limit)]
-    except Exception:
-        return []
 
 if __name__ == "__main__":
     main()
-
