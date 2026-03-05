@@ -35,8 +35,23 @@ import requests
 import streamlit as st
 import pandas as pd
 
+def _maybe_autorefresh(interval_ms: int, key: str):
+    """Best-effort autorefresh without extra deps."""
+    try:
+        from streamlit_autorefresh import st_autorefresh  # type: ignore
+        st_autorefresh(interval=interval_ms, key=key)
+        return
+    except Exception:
+        pass
+    try:
+        st.autorefresh(interval=interval_ms, key=key)  # type: ignore
+        return
+    except Exception:
+        pass
 
-VERSION = "0.5.1"
+
+
+VERSION = "0.5.3"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -521,6 +536,79 @@ PRESETS = {
         "seeds": DEFAULT_SEEDS,
     },
 }
+
+# Auto-ingest rotation (one scan every 10 minutes; cycles through 4 presets, then switches chain)
+SCAN_PRESET_ORDER = ["Ultra Early (safer)", "Balanced (default)", "Wide Net (explore)", "Momentum (hot)"]
+SCAN_CHAIN_ORDER = ["solana", "bsc"]  # change order here if needed
+
+def current_scan_slot(now_ts: float = None) -> Tuple[str, str, int]:
+    """Returns (preset_name, chain, step_index). One step == 10 minutes."""
+    if now_ts is None:
+        now_ts = time.time()
+    step = int(now_ts // 600)  # 10-min buckets
+    preset = SCAN_PRESET_ORDER[step % len(SCAN_PRESET_ORDER)]
+    chain = SCAN_CHAIN_ORDER[(step // len(SCAN_PRESET_ORDER)) % len(SCAN_CHAIN_ORDER)]
+    return preset, chain, step
+
+def preset_priority(preset_name: str) -> int:
+    """Higher means show earlier in Monitoring."""
+    try:
+        return max(0, len(SCAN_PRESET_ORDER) - 1 - SCAN_PRESET_ORDER.index(preset_name))
+    except Exception:
+        return 0
+
+def run_ingest_once(preset_name: str, chain: str, top_n: int = 25) -> Dict[str, Any]:
+    """Runs one scan (preset+chain) and auto-sends eligible tokens to Monitoring. Returns stats."""
+    preset = PRESETS.get(preset_name, PRESETS.get("Balanced (default)"))
+    cfg = dict(preset or {})
+    cfg["chain"] = chain
+    cfg["top_n"] = int(top_n)
+
+    stats = {"preset": preset_name, "chain": chain, "scanned": 0, "passed": 0, "sent": 0}
+
+    seeds_raw = sample_seeds(cfg["chain"], k=int(cfg.get("seeds_k", 0) or 0))
+    stats["scanned"] = len(seeds_raw)
+
+    pairs: List[Dict[str, Any]] = []
+    for addr in seeds_raw:
+        try:
+            pairs.extend(fetch_latest_pairs_for_query(cfg["chain"], addr))
+        except Exception:
+            continue
+
+    seen = set()
+    pairs_u: List[Dict[str, Any]] = []
+    for p in pairs:
+        key = (str(p.get("chainId", "")).lower(), str(p.get("pairAddress", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs_u.append(p)
+
+    ranked: List[Dict[str, Any]] = []
+    for p in pairs_u:
+        s = score_pair(p, cfg)
+        dec, reasons = decision_from_score(s, cfg)
+        p["_score"] = s
+        p["_decision"] = dec
+        p["_reasons"] = reasons
+        if dec != "NO ENTRY":
+            ranked.append(p)
+
+    ranked.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    ranked = ranked[: int(cfg["top_n"])]
+
+    stats["passed"] = len(ranked)
+
+    pr = preset_priority(preset_name)
+    sent = 0
+    for p in ranked:
+        res = add_to_monitoring(p, float(p.get("_score", 0) or 0), priority=pr, tags=[preset_name], origin=f"{preset_name}:{chain}")
+        if res == "OK":
+            sent += 1
+    stats["sent"] = sent
+    return stats
+
 
 
 # =============================
@@ -1164,7 +1252,7 @@ def load_monitoring_history(limit_rows: int = 6000) -> List[Dict[str, Any]]:
         return rows[-limit_rows:]
 
 
-def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
+def add_to_monitoring(p: Dict[str, Any], score: float, priority: int = 0, tags: List[str] = None, origin: str = "") -> str:
     chain = (p.get("chainId") or "").lower().strip()
     base_addr_raw = (safe_get(p, "baseToken", "address", default="") or "").strip()
     if not base_addr_raw:
@@ -1186,6 +1274,9 @@ def add_to_monitoring(p: Dict[str, Any], score: float) -> str:
             "base_addr": base_addr,
             "pair_addr": p.get("pairAddress", "") or "",
             "score_init": str(score),
+            "priority": str(int(priority) if priority else 0),
+            "tags": ",".join(tags or []),
+            "source": origin or "",
             "liq_init": str(safe_get(p, "liquidity", "usd", default=0) or 0),
             "vol24_init": str(safe_get(p, "volume", "h24", default=0) or 0),
             "vol5_init": str(safe_get(p, "volume", "m5", default=0) or 0),
@@ -2194,30 +2285,7 @@ def main():
         else:
             st.caption("Supabase: OFF (CSV fallback)")
 
-    if page == "Scout":
-        cfg = dict(
-            chain=chain,
-            any_dex=any_dex,
-            selected_dexes=selected_dexes,
-            top_n=top_n,
-            min_liq=min_liq,
-            min_vol24=min_vol24,
-            min_trades_m5=min_trades_m5,
-            min_sells_m5=min_sells_m5,
-            max_buy_sell_imbalance=max_buy_sell_imbalance,
-            block_majors=block_majors,
-            block_suspicious_names=block_suspicious_names,
-            enforce_age=enforce_age,
-            min_age_min=min_age_min,
-            max_age_min=max_age_min,
-            hide_solana_unverified=hide_solana_unverified,
-            dedupe_by_base=dedupe_by_base,
-            seed_k=seed_k,
-            seeds_raw=seeds_raw,
-            refresh=refresh,
-        )
-        page_scout(cfg)
-    elif page == "Monitoring":
+    if page == "Monitoring":
         auto_cfg = dict(
             auto_archive_enabled=auto_archive_enabled,
             auto_archive_min_score=auto_archive_min_score,
