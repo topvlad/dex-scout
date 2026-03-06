@@ -51,7 +51,7 @@ def _maybe_autorefresh(interval_ms: int, key: str):
 
 
 
-VERSION = "0.5.3"
+VERSION = "0.5.4 Recovery"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -173,6 +173,54 @@ def _parse_csv_blob(blob: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
+
+_RECOVERY_ATTEMPTED = False
+
+
+def _recover_table_from_app_storage(storage_key: str, table: str, fields: List[str]) -> int:
+    """Restore one normalized table from legacy CSV blob in app_storage."""
+    blob = _sb_get_app_storage(storage_key)
+    if not blob:
+        return 0
+    try:
+        import io
+        df = pd.read_csv(io.StringIO(blob))
+    except Exception:
+        return 0
+
+    inserted = 0
+    for row in df.to_dict(orient="records"):
+        payload: Dict[str, Any] = {}
+        for k in fields:
+            val = row.get(k, "")
+            if pd.isna(val):
+                val = ""
+            payload[k] = str(val)
+        if _sb_insert(table, payload):
+            inserted += 1
+    return inserted
+
+
+def recover_from_app_storage_if_needed():
+    """One-shot recovery from legacy app_storage into normalized tables.
+
+    Runs only when `monitoring` table is empty.
+    """
+    global _RECOVERY_ATTEMPTED
+    if _RECOVERY_ATTEMPTED or not _sb_ok():
+        return
+    _RECOVERY_ATTEMPTED = True
+
+    try:
+        if _sb_select_all(SB_TABLE_MONITORING, limit=1):
+            return
+
+        _recover_table_from_app_storage("monitoring.csv", SB_TABLE_MONITORING, MON_FIELDS)
+        _recover_table_from_app_storage("monitoring_history.csv", SB_TABLE_HISTORY, HIST_FIELDS)
+        _recover_table_from_app_storage("portfolio.csv", SB_TABLE_PORTFOLIO, PORTFOLIO_FIELDS)
+        print("Recovery completed from app_storage")
+    except Exception:
+        return
 
 def _legacy_migrate_if_needed():
     """One-shot migration from legacy app_storage CSV blobs to normalized tables.
@@ -537,17 +585,26 @@ PRESETS = {
     },
 }
 
-# Auto-ingest rotation (one scan every 10 minutes; cycles through 4 presets, then switches chain)
+# Auto-ingest rotation (one scan every 5 minutes; BSC/SOL alternate per preset)
 SCAN_PRESET_ORDER = ["Ultra Early (safer)", "Balanced (default)", "Wide Net (explore)", "Momentum (hot)"]
-SCAN_CHAIN_ORDER = ["solana", "bsc"]  # change order here if needed
+
+SCAN_ROTATION: List[Tuple[str, str]] = [
+    ("Ultra Early (safer)", "bsc"),
+    ("Ultra Early (safer)", "solana"),
+    ("Balanced (default)", "bsc"),
+    ("Balanced (default)", "solana"),
+    ("Wide Net (explore)", "bsc"),
+    ("Wide Net (explore)", "solana"),
+    ("Momentum (hot)", "bsc"),
+    ("Momentum (hot)", "solana"),
+]
 
 def current_scan_slot(now_ts: float = None) -> Tuple[str, str, int]:
-    """Returns (preset_name, chain, step_index). One step == 10 minutes."""
+    """Returns (preset_name, chain, step_index). One step == 5 minutes."""
     if now_ts is None:
         now_ts = time.time()
-    step = int(now_ts // 600)  # 10-min buckets
-    preset = SCAN_PRESET_ORDER[step % len(SCAN_PRESET_ORDER)]
-    chain = SCAN_CHAIN_ORDER[(step // len(SCAN_PRESET_ORDER)) % len(SCAN_CHAIN_ORDER)]
+    step = int(now_ts // 300)  # 5-min buckets
+    preset, chain = SCAN_ROTATION[step % len(SCAN_ROTATION)]
     return preset, chain, step
 
 def preset_priority(preset_name: str) -> int:
@@ -557,7 +614,7 @@ def preset_priority(preset_name: str) -> int:
     except Exception:
         return 0
 
-def run_ingest_once(preset_name: str, chain: str, top_n: int = 25) -> Dict[str, Any]:
+def run_ingest_once(preset_name: str, chain: str, top_n: int = 100) -> Dict[str, Any]:
     """Runs one scan (preset+chain) and auto-sends eligible tokens to Monitoring. Returns stats."""
     preset = PRESETS.get(preset_name, PRESETS.get("Balanced (default)"))
     cfg = dict(preset or {})
@@ -2192,6 +2249,7 @@ def page_portfolio():
 def main():
     st.set_page_config(page_title="DEX Scout", layout="wide")
     ensure_storage()
+    recover_from_app_storage_if_needed()
 
     with st.sidebar:
         st.markdown("### DEX Scout")
