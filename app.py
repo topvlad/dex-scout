@@ -2290,9 +2290,13 @@ def main():
 
         if "page" not in st.session_state:
             st.session_state["page"] = "Monitoring"
-
-        page = st.radio("Page", ["Monitoring", "Archive", "Portfolio"], index=["Monitoring", "Archive", "Portfolio"].index(st.session_state["page"]))
-        st.session_state["page"] = page
+        
+        pages = ["Monitoring", "Archive", "Portfolio"]
+        
+        if st.session_state.get("page") not in pages:
+            st.session_state["page"] = "Monitoring"
+        
+        page = st.radio("Page", pages, index=pages.index(st.session_state["page"]))
 
         st.divider()
         st.caption("Scanner")
