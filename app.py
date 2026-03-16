@@ -800,6 +800,80 @@ def score_pair(p: Optional[Dict[str, Any]]) -> float:
     return round(s, 2)
 
 
+def detect_snipers(pair: Optional[Dict[str, Any]]) -> bool:
+    if not pair:
+        return False
+
+    txns = safe_get(pair, "txns", "h1", default={})
+    buys = parse_float(txns.get("buys", 0))
+    sells = parse_float(txns.get("sells", 0))
+
+    vol = parse_float(safe_get(pair, "volume", "h24", default=0))
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0))
+
+    if buys > 40 and sells < buys * 0.25 and vol > liq * 0.5:
+        return True
+
+    return False
+
+
+def pump_probability(pair: Optional[Dict[str, Any]]) -> int:
+    if not pair:
+        return 0
+
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0))
+    vol = parse_float(safe_get(pair, "volume", "h24", default=0))
+    pc1h = parse_float(safe_get(pair, "priceChange", "h1", default=0))
+    pc5m = parse_float(safe_get(pair, "priceChange", "m5", default=0))
+    txns = safe_get(pair, "txns", "h1", default={})
+
+    buys = parse_float(txns.get("buys", 0))
+    sells = parse_float(txns.get("sells", 0))
+
+    score = 0
+
+    if liq > 20000:
+        score += 1
+
+    if vol > liq * 1.5:
+        score += 2
+
+    if pc1h > 15:
+        score += 2
+
+    if pc5m > 5:
+        score += 1
+
+    if buys > sells * 1.8:
+        score += 2
+
+    return score
+
+
+def liquidity_trap(pair: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not pair:
+        return None
+
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0))
+    vol = parse_float(safe_get(pair, "volume", "h24", default=0))
+    pc1h = parse_float(safe_get(pair, "priceChange", "h1", default=0))
+    txns = safe_get(pair, "txns", "h1", default={})
+
+    buys = parse_float(txns.get("buys", 0))
+    sells = parse_float(txns.get("sells", 0))
+
+    if liq < 8000 and vol > liq * 5:
+        return "LOW_LIQ_TRAP"
+
+    if sells > buys * 2 and pc1h < -10:
+        return "DUMP_PATTERN"
+
+    if vol > liq * 10:
+        return "FAKE_VOLUME"
+
+    return None
+
+
 def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
     if not p:
         return "NO DATA", []
@@ -1406,7 +1480,7 @@ def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float,
 # =============================
 # Portfolio recommendation (fixed)
 # =============================
-def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h: float, pc5: float, decision: str, score_live: float) -> str:
+def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h: float, pc5: float, decision: str, score_live: float, pair: Optional[Dict[str, Any]] = None) -> str:
     # Hard safety exits first
     if current <= 0 or entry <= 0:
         return "REVIEW (no price)"
@@ -1433,6 +1507,16 @@ def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h:
     # momentum hold with guardrails
     if pnl >= -10 and pc1h > 5 and pc5 >= -1 and score_live >= 180:
         return "HOLD (momentum)"
+
+    if pair:
+        pump = pump_probability(pair)
+        trap = liquidity_trap(pair)
+
+        if trap:
+            return "⚠️ EXIT (liquidity risk)"
+
+        if pump >= 7:
+            return "🚀 HOLD (possible 10x)"
 
     # default: explicit review (not blind hold)
     if pnl <= -35:
@@ -1904,6 +1988,7 @@ def page_scout(cfg: Dict[str, Any]):
             continue
 
         s = score_pair(p)
+        s += pump_probability(p) * 0.5
         decision, tags = build_trade_hint(p)
 
         if decision.strip().upper() == "NO ENTRY":
@@ -1947,7 +2032,11 @@ def page_scout(cfg: Dict[str, Any]):
 
         swap_url = build_swap_url(chain_id, base_addr)
         score = score_pair(pobj)
+        pump_score = pump_probability(pobj)
+        score += pump_score * 0.5
         decision, tag_list = build_trade_hint(pobj)
+        sniper_flag = detect_snipers(pobj)
+        trap_signal = liquidity_trap(pobj)
 
         st.markdown("---")
         st.subheader(f"{base}/{quote}")
@@ -1993,8 +2082,17 @@ def page_scout(cfg: Dict[str, Any]):
         st.write(f"Meme Score: {int(pobj.get('meme_score', 0) or 0)}")
         smart_money_label = "YES" if int(pobj.get("smart_money", 0) or 0) == 1 else "NO"
         st.write(f"Smart Money: {smart_money_label}")
+        st.write(f"Sniper: {'YES' if sniper_flag else 'NO'}")
+        st.write(f"Pump Score: {pump_score}")
+        st.write(f"Trap: {trap_signal or '—'}")
         if detect_auto_signal(pobj):
             st.warning("AUTO SIGNAL DETECTED")
+        if sniper_flag:
+            st.markdown("🧠 sniper activity")
+        if pump_score >= 6:
+            st.markdown("🚀 pump probability HIGH")
+        if trap_signal:
+            st.markdown(f"⚠️ {trap_signal}")
         st.write(f"Price: ${price:,.8f}" if price else "Price: n/a")
         st.write(f"Liq: {fmt_usd(liq)}")
         st.write(f"Vol24: {fmt_usd(vol24)}")
@@ -2097,6 +2195,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             snapshot_live_to_history(chain, base_sym, base_addr, best)
 
         s_live = score_pair(best) if best else 0.0
+        pump_live = pump_probability(best)
+        s_live += pump_live * 0.5
         decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
 
@@ -2139,7 +2239,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         elif (r.get("risk") or "").upper() == "EARLY":
             stage = "SIGNAL" if s_live >= 300 else "WATCHLIST"
 
-        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave))
+        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, detect_snipers(best), pump_live, liquidity_trap(best)))
 
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
@@ -2161,7 +2261,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if not items:
             st.caption("Порожньо")
             return
-        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave in items:
+        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, sniper_flag, pump_score, trap_signal in items:
             chain = (r.get("chain") or "").strip().lower()
             base_sym = r.get("base_symbol") or "???"
             base_addr = (r.get("base_addr") or "").strip()
@@ -2192,6 +2292,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"Vol24: {fmt_usd(live['vol24'])}")
                 st.write(f"Vol5: {fmt_usd(live['vol5'])}")
                 st.caption(f"Δ1h {fmt_pct(live['pc1h'])} • Δ5m {fmt_pct(live['pc5'])}")
+                st.write(f"SNIPER: {'YES' if sniper_flag else 'NO'}")
+                st.write(f"PUMP: {pump_score}")
+                st.write(f"TRAP: {trap_signal or '—'}")
             with c3:
                 st.markdown("Plan")
                 st.write(f"Decision: {decision}")
@@ -2205,6 +2308,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 if second_wave and not str(decision).upper().startswith("ENTRY"):
                     label = f"ENTRY (2nd wave) {stars}".strip()
                 st.markdown(action_badge(label), unsafe_allow_html=True)
+                if sniper_flag:
+                    st.markdown("🧠 sniper activity")
+                if pump_score >= 6:
+                    st.markdown("🚀 pump probability HIGH")
+                if trap_signal:
+                    st.markdown(f"⚠️ {trap_signal}")
                 st.write(f"Window: {r.get('source_window') or '—'}")
                 st.write(f"Preset tags: {r.get('source_preset') or '—'}")
                 if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
@@ -2317,8 +2426,9 @@ def portfolio_alert_count() -> int:
 
         decision, _ = build_trade_hint(best)
         score = score_pair(best)
+        score += pump_probability(best) * 0.5
 
-        reco = portfolio_reco(entry, price, liq, vol24, pc1h, pc5, decision, score)
+        reco = portfolio_reco(entry, price, liq, vol24, pc1h, pc5, decision, score, best)
 
         reco_upper = str(reco).upper()
         if any(x in reco_upper for x in ("TAKE PROFIT", "TRIM", "CLOSE", "CUT")):
@@ -2373,13 +2483,14 @@ def page_portfolio():
         vol24 = parse_float(safe_get(best, "volume", "h24", default=0), 0.0) if best else 0.0
         vol5 = parse_float(safe_get(best, "volume", "m5", default=0), 0.0) if best else 0.0
         s_live = score_pair(best) if best else 0.0
+        s_live += pump_probability(best) * 0.5 if best else 0.0
         decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
 
         # ensure history also captures portfolio tokens (same history table)
         if best:
             snapshot_live_to_history(chain, base_sym, base_addr, best)
 
-        reco = portfolio_reco(entry_price, cur_price, liq, vol24, pc1h, pc5, decision, s_live)
+        reco = portfolio_reco(entry_price, cur_price, liq, vol24, pc1h, pc5, decision, s_live, best)
 
         pnl = 0.0
         if entry_price > 0 and cur_price > 0:
