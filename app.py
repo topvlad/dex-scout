@@ -57,10 +57,31 @@ def _maybe_autorefresh(interval_ms: int, key: str):
 VERSION = "0.7.0"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
+SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
 
 PORTFOLIO_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 MONITORING_CSV = os.path.join(DATA_DIR, "monitoring.csv")
 MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
+
+
+def request_rerun() -> None:
+    st.session_state["_rerun_flag"] = True
+
+
+def load_smart_wallets() -> Dict[str, Any]:
+    if os.path.exists(SMART_WALLET_FILE):
+        try:
+            return json.loads(Path(SMART_WALLET_FILE).read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_smart_wallets(data: Dict[str, Any]):
+    try:
+        Path(SMART_WALLET_FILE).write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # =============================
@@ -728,13 +749,31 @@ def meme_token_score(token: Dict[str, Any]) -> int:
     return min(score, 100)
 
 
+def detect_smart_money(pair: Optional[Dict[str, Any]]) -> bool:
+    if not pair:
+        return False
+
+    txns = safe_get(pair, "txns", "h1", default={})
+
+    buys = parse_float(txns.get("buys", 0))
+    sells = parse_float(txns.get("sells", 0))
+
+    vol = parse_float(
+        safe_get(pair, "volume", "h24", default=0)
+    )
+
+    liq = parse_float(
+        safe_get(pair, "liquidity", "usd", default=0)
+    )
+
+    if buys > sells * 2 and vol > liq:
+        return True
+
+    return False
+
+
 def detect_smart_wallet_activity(pair: Dict[str, Any]) -> int:
-    txns = pair.get("txns") or {}
-    buys = int(safe_get(txns, "m5", "buys", default=txns.get("buys", 0)) or 0)
-    sells = int(safe_get(txns, "m5", "sells", default=txns.get("sells", 0)) or 0)
-    if buys > sells * 2 and buys > 20:
-        return 1
-    return 0
+    return 1 if detect_smart_money(pair) else 0
 
 
 def detect_auto_signal(token: Dict[str, Any]) -> bool:
@@ -750,10 +789,11 @@ def detect_auto_signal(token: Dict[str, Any]) -> bool:
 def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
     row = dict(pair)
     row["meme_score"] = meme_token_score(row)
-    row["smart_money"] = detect_smart_wallet_activity(row)
+    row["smart_money"] = detect_smart_money(row)
     row["fresh_lp"] = fresh_lp(row)
     row["dev_risk"] = dev_wallet_risk(row)
     row["whale"] = whale_accumulation(row)
+    row["signal"] = classify_signal(row)
     return row
 
 
@@ -851,6 +891,25 @@ def pump_probability(pair: Optional[Dict[str, Any]]) -> int:
         score += 2
 
     return score
+
+
+
+
+def classify_signal(pair: Optional[Dict[str, Any]]) -> str:
+
+    pump = pump_probability(pair)
+    trap, level = liquidity_trap(pair)
+
+    if level == "CRITICAL":
+        return "RED"
+
+    if pump >= 6:
+        return "GREEN"
+
+    if pump >= 3:
+        return "YELLOW"
+
+    return "RED"
 
 
 def liquidity_trap(pair: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
@@ -1242,6 +1301,8 @@ MON_FIELDS = [
     "tp_target_pct",
     "entry_suggest_usd",
     "ts_last_seen",
+    "signal",
+    "smart_money",
 ]
 
 HIST_FIELDS = [
@@ -1362,6 +1423,8 @@ def add_to_monitoring(p: Dict[str, Any], score: float, window_name: str = "", pr
             "tp_target_pct": tp_s,
             "entry_suggest_usd": entry_s,
             "ts_last_seen": now_utc_str(),
+            "signal": classify_signal(p),
+            "smart_money": "1" if detect_smart_money(p) else "0",
         }
     )
     save_monitoring(rows)
@@ -1385,6 +1448,12 @@ def archive_monitoring(chain: str, base_addr: str, reason: str, last_score: floa
     if changed:
         save_monitoring(rows)
     return changed
+
+
+
+
+def add_to_archive(chain: str, base_addr: str, reason: str) -> bool:
+    return archive_monitoring(chain, base_addr, reason=reason)
 
 
 def reactivate_monitoring(chain: str, base_addr: str) -> bool:
@@ -1743,13 +1812,33 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     ranked = []
+    smart_wallets = load_smart_wallets()
     for p in pairs:
-        ranked.append((score_pair(p), p))
+        smart = detect_smart_money(p)
+        signal = classify_signal(p)
+        score = score_pair(p)
+        if smart:
+            score += 4
+        ranked.append((score, p, smart, signal))
     ranked.sort(key=lambda x: x[0], reverse=True)
     ranked = ranked[: max(1, int(max_items))]
-    for s, p in ranked:
+    for s, p, smart, signal in ranked:
         counts["seen"] += 1
         row = normalize_pair_row(p)
+        row["smart_money"] = smart
+        row["signal"] = signal
+        if row["signal"] == "RED":
+            add_to_archive(
+                chain=row.get("chainId"),
+                base_addr=safe_get(row, "baseToken", "address", default=""),
+                reason="auto_filter"
+            )
+            continue
+        if smart:
+            chain = (row.get("chainId") or "").lower()
+            base_addr = (safe_get(row, "baseToken", "address", default="") or "").strip()
+            key = addr_key(chain, base_addr)
+            smart_wallets[key] = {"last_seen": now_utc_str(), "symbol": safe_get(row, "baseToken", "symbol", default="") or ""}
         try:
             res = add_to_monitoring(row, float(s), window_name=window_name, preset_key=preset_key)
             if res == "OK":
@@ -1762,6 +1851,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 add_to_monitoring(row, float(s), window_name="AUTO_SIGNAL", preset_key="AUTO_SIGNAL")
         except Exception:
             counts["errors"] += 1
+    save_smart_wallets(smart_wallets)
     return counts
 
 def auto_reactivate_archived(days: int = 7) -> int:
@@ -2100,6 +2190,8 @@ def page_scout(cfg: Dict[str, Any]):
         whale = whale_accumulation(pobj)
 
         score = score_pair(pobj)
+        if pobj.get("smart_money"):
+            score += 4
         if whale:
             score += 3
         if fresh == "VERY_NEW":
@@ -2130,14 +2222,14 @@ def page_scout(cfg: Dict[str, Any]):
                 add_to_monitoring(pobj, float(score))
                 st.session_state["scout_hidden"].add(base_addr)
                 st.toast("Added to monitoring")
-                st.rerun()
+                request_rerun()
         with btn4:
             if st.button("Log → Portfolio (I swapped)", key=f"log_pf_{pair_addr}", use_container_width=True):
                 res = log_to_portfolio(pobj, float(score), decision, tag_list, swap_url)
                 if res == "OK":
                     st.session_state["scout_hidden"].add(base_addr)
                     st.toast("Logged to portfolio")
-                    st.rerun()
+                    request_rerun()
                 else:
                     st.error(f"Portfolio log failed: {res}")
 
@@ -2238,10 +2330,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 birdeye_limit=int(auto_cfg.get("birdeye_limit", 50)),
             )
             st.success(f"Scanner ran: {res['window']} / {res['chain']} / {res['stats']}")
-            st.rerun()
+            request_rerun()
     with cbtn2:
         if st.button("Refresh live data", use_container_width=True):
-            st.rerun()
+            request_rerun()
     with cbtn3:
         st.caption("The app checks scanner slot on every load. One slot = 5 minutes, rotating across 4 presets × 2 chains.")
 
@@ -2275,6 +2367,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             snapshot_live_to_history(chain, base_sym, base_addr, best)
 
         s_live = score_pair(best) if best else 0.0
+        smart_money = detect_smart_money(best) if best else False
+        if smart_money:
+            s_live += 4
         pump_live = pump_probability(best)
         s_live += pump_live * 0.5
         decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
@@ -2323,19 +2418,20 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         fresh = fresh_lp(best)
         dev = dev_wallet_risk(best)
         whale = whale_accumulation(best)
+        signal = classify_signal(best) if best else (r.get("signal") or "RED")
 
-        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale))
+        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money))
 
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
         st.info("Archive/revisit changes applied. Refreshing list…")
-        st.rerun()
+        request_rerun()
 
+    priority = {"GREEN": 0, "YELLOW": 1, "RED": 2}
     enriched.sort(
         key=lambda x: (
-            0 if x[0] == "SIGNAL" else 1,
-            -x[1],
-            x[3].get("ts_added", "")
+            priority.get(x[23], 2),
+            -x[5],
         )
     )
     signals = [x for x in enriched if x[0] == "SIGNAL"]
@@ -2346,7 +2442,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if not items:
             st.caption("Порожньо")
             return
-        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale in items:
+        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money in items:
+            if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
+                continue
             chain = (r.get("chain") or "").strip().lower()
             base_sym = r.get("base_symbol") or "???"
             base_addr = (r.get("base_addr") or "").strip()
@@ -2393,6 +2491,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 if second_wave and not str(decision).upper().startswith("ENTRY"):
                     label = f"ENTRY (2nd wave) {stars}".strip()
                 st.markdown(action_badge(label), unsafe_allow_html=True)
+                if signal == "GREEN":
+                    st.success("ENTRY signal")
+                elif signal == "YELLOW":
+                    st.warning("WATCH")
+                else:
+                    st.error("NO ENTRY")
                 if sniper_flag:
                     st.markdown("🧠 sniper activity")
                 if pump_score >= 6:
@@ -2405,6 +2509,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.markdown("🌱 new token")
                 if whale:
                     st.markdown("🐋 whale accumulation")
+                if smart_money:
+                    st.markdown("🐋 smart money entry")
                 if dev:
                     st.markdown("⚠ dev risk")
                 st.write(f"Window: {r.get('source_window') or '—'}")
@@ -2418,13 +2524,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                         if res == "OK":
                             archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
                             st.success("Promoted to Portfolio.")
-                            st.rerun()
+                            request_rerun()
                         else:
                             st.info("Already in portfolio.")
                 if st.button("Archive (manual)", key=f"drop_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                     archive_monitoring(chain, base_addr, reason="manual", last_score=s_live, last_decision=decision)
                     st.success("Archived.")
-                    st.rerun()
+                    request_rerun()
             with st.expander("Dynamics / sparklines", expanded=False):
                 if not hist:
                     st.info("No snapshots yet.")
@@ -2491,7 +2597,7 @@ def page_archive():
                 ok = reactivate_monitoring(chain, base_addr)
                 if ok:
                     st.success("Re-activated.")
-                    st.rerun()
+                    request_rerun()
                 else:
                     st.info("Nothing changed (not found).")
 
@@ -2660,7 +2766,7 @@ def page_portfolio():
 
                 save_portfolio(all_rows)
                 st.success("Saved.")
-                st.rerun()
+                request_rerun()
 
         # Sparklines for portfolio too (requested)
         hist = token_history_rows(chain, base_addr, limit=60)
@@ -2712,6 +2818,10 @@ def page_portfolio():
 # App main
 # =============================
 def main():
+    if st.session_state.get("_rerun_flag"):
+        st.session_state["_rerun_flag"] = False
+        st.rerun()
+
     st.set_page_config(page_title="DEX Scout", layout="wide")
     ensure_storage()
 
@@ -2763,16 +2873,17 @@ def main():
         auto_revisit_enabled = st.checkbox("Auto-revisit auto-archived", value=True)
         auto_revisit_days = st.slider("Auto-revisit after (days)", 1, 30, 7, step=1)
         stability_window_n = st.slider("Stability window (snapshots)", 10, 120, 30, step=5)
+        hide_red = st.checkbox("Hide weak signals", value=True)
 
         st.divider()
         if st.button("Run scanner now", use_container_width=True):
             res = run_scanner_now(scanner_seeds_raw, max_items=int(scanner_max_items), use_birdeye_trending=bool(use_birdeye_trending), birdeye_limit=int(birdeye_limit))
             st.session_state["_scan_feedback"] = f"Scanner ran: {res['window']} / {res['chain']} / {res['stats']}"
-            st.rerun()
+            request_rerun()
 
         if st.button("Clear cache", use_container_width=True):
             st.cache_data.clear()
-            st.rerun()
+            request_rerun()
 
         st.divider()
         if _sb_ok():
@@ -2800,6 +2911,7 @@ def main():
         use_birdeye_trending=use_birdeye_trending,
         birdeye_limit=birdeye_limit,
         ui_autorefresh_sec=ui_autorefresh_sec,
+        hide_red=hide_red,
     )
 
     if page == "Monitoring":
