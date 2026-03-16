@@ -946,6 +946,68 @@ def detect_cex_listing_probability(pair: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def passes_monitoring_gate(row: Dict[str, Any], score: float) -> Tuple[bool, str]:
+    """
+    Final noise-reduction gate before token is added to Monitoring.
+    Returns: (allowed, reason)
+    """
+
+    decision = str(build_trade_hint(row)[0] or "").upper()
+
+    liq = parse_float(safe_get(row, "liquidity", "usd", default=0), 0.0)
+    vol5 = parse_float(safe_get(row, "volume", "m5", default=0), 0.0)
+    pc1h = parse_float(safe_get(row, "priceChange", "h1", default=0), 0.0)
+
+    buys5 = int(safe_get(row, "txns", "m5", "buys", default=0) or 0)
+    sells5 = int(safe_get(row, "txns", "m5", "sells", default=0) or 0)
+
+    meme_score = int(row.get("meme_score", 0) or 0)
+    smart_money = int(row.get("smart_money", 0) or 0)
+    cex_prob = int(row.get("cex_prob", 0) or 0)
+
+    trap = str(row.get("trap_signal", "") or "").upper()
+    migration = str(row.get("migration_signal", "") or "").upper()
+
+    strength_flags = 0
+    if smart_money:
+        strength_flags += 1
+    if meme_score >= 60:
+        strength_flags += 1
+    if cex_prob >= 3:
+        strength_flags += 1
+    if migration:
+        strength_flags += 1
+    if pc1h >= 12:
+        strength_flags += 1
+    if vol5 >= 8000:
+        strength_flags += 1
+
+    if trap == "FAKE_VOLUME":
+        if not (smart_money or cex_prob >= 4):
+            return False, "gate: fake_volume"
+
+    if liq < 7000:
+        return False, "gate: low_liq"
+
+    if buys5 < 4 and vol5 < 1500:
+        return False, "gate: dead_flow"
+
+    if decision == "NO ENTRY":
+        if score < 260 and strength_flags < 2:
+            return False, "gate: no_entry_weak"
+
+    if score < 180 and strength_flags < 2:
+        return False, "gate: weak_score"
+
+    if score < 230 and vol5 < 2500 and pc1h < 5 and strength_flags < 3:
+        return False, "gate: low_conviction"
+
+    if sells5 > buys5 * 1.5 and strength_flags < 3:
+        return False, "gate: sell_pressure"
+
+    return True, "ok"
+
+
 def detect_auto_signal(token: Dict[str, Any]) -> bool:
     liq = parse_float(safe_get(token, "liquidity", "usd", default=token.get("liquidity", 0)), 0.0)
     vol = parse_float(safe_get(token, "volume", "h24", default=token.get("volume", 0)), 0.0)
@@ -969,6 +1031,10 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
     cex = detect_cex_listing_probability(row)
     row["cex_prob"] = cex.get("cex_prob", 0)
     row["cex_label"] = cex.get("cex_label", "")
+
+    trap_signal, _trap_level = liquidity_trap(row)
+    row["trap_signal"] = trap_signal or ""
+    row["migration_signal"] = row.get("migration_label", "") if int(row.get("migration", 0) or 0) == 1 else ""
 
     row["fresh_lp"] = fresh_lp(row)
     row["dev_risk"] = dev_wallet_risk(row)
@@ -2019,7 +2085,7 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
 
 def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, int]:
     preset = PRESETS.get(window_name, {})
-    counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "errors": 0, "seen": 0}
+    counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     ranked = []
     smart_wallets = load_smart_wallets()
@@ -2044,6 +2110,12 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 reason="auto_filter"
             )
             continue
+
+        allowed, _gate_reason = passes_monitoring_gate(row, float(s))
+        if not allowed:
+            counts["skipped_noise"] = counts.get("skipped_noise", 0) + 1
+            continue
+
         if smart:
             chain = (row.get("chainId") or "").lower()
             base_addr = (safe_get(row, "baseToken", "address", default="") or "").strip()
