@@ -54,7 +54,7 @@ def _maybe_autorefresh(interval_ms: int, key: str):
         pass
 
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
@@ -410,6 +410,24 @@ def link_button(label: str, url: str, use_container_width: bool = True, key: Opt
 CHAIN_DEX_PRESETS = {
     "bsc": ["pancakeswap", "thena", "biswap", "apeswap", "babyswap", "mdex", "woofi"],
     "solana": ["raydium", "orca", "meteora", "pumpfun", "pumpswap"],
+}
+
+DEX_RANK = {
+    "solana": {
+        "pumpfun": 1,
+        "pumpswap": 1,
+        "meteora": 2,
+        "raydium": 3,
+        "orca": 4,
+    },
+    "bsc": {
+        "babyswap": 1,
+        "biswap": 2,
+        "apeswap": 2,
+        "thena": 3,
+        "pancakeswap": 4,
+        "woofi": 4,
+    },
 }
 
 NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
@@ -776,6 +794,106 @@ def detect_smart_wallet_activity(pair: Dict[str, Any]) -> int:
     return 1 if detect_smart_money(pair) else 0
 
 
+def dex_rank(chain: str, dex_id: str) -> int:
+    chain = (chain or "").lower().strip()
+    dex_id = (dex_id or "").lower().strip()
+    return int((DEX_RANK.get(chain) or {}).get(dex_id, 0))
+
+
+def detect_liquidity_migration(pair: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Detects whether token likely migrated to a stronger / deeper DEX pool.
+    Returns:
+    {
+        "migration": 0/1,
+        "migration_label": "...",
+        "migration_score": int
+    }
+    """
+    if not pair:
+        return {
+            "migration": 0,
+            "migration_label": "",
+            "migration_score": 0,
+        }
+
+    chain = (pair.get("chainId") or "").lower().strip()
+    base_addr = (safe_get(pair, "baseToken", "address", default="") or "").strip()
+    cur_dex = (pair.get("dexId") or "").lower().strip()
+
+    if not chain or not base_addr or not cur_dex:
+        return {
+            "migration": 0,
+            "migration_label": "",
+            "migration_score": 0,
+        }
+
+    try:
+        pools = fetch_token_pairs(chain, base_addr)
+    except Exception:
+        pools = []
+
+    if not pools or len(pools) < 2:
+        return {
+            "migration": 0,
+            "migration_label": "",
+            "migration_score": 0,
+        }
+
+    norm = []
+    for p in pools:
+        dex_id = (p.get("dexId") or "").lower().strip()
+        liq = parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0)
+        vol24 = parse_float(safe_get(p, "volume", "h24", default=0), 0.0)
+        age_min = pair_age_minutes(p)
+        norm.append({
+            "dex": dex_id,
+            "liq": liq,
+            "vol24": vol24,
+            "age_min": age_min if age_min is not None else 999999,
+            "pair": p,
+        })
+
+    norm.sort(key=lambda x: (x["liq"], x["vol24"]), reverse=True)
+
+    best = norm[0]
+    if best["dex"] != cur_dex:
+        return {
+            "migration": 0,
+            "migration_label": "",
+            "migration_score": 0,
+        }
+
+    label = ""
+    score = 0
+
+    for prev in norm[1:]:
+        old_rank = dex_rank(chain, prev["dex"])
+        new_rank = dex_rank(chain, cur_dex)
+
+        if old_rank <= 0 or new_rank <= 0:
+            continue
+
+        liq_jump = best["liq"] / max(prev["liq"], 1.0)
+        newer_pool = best["age_min"] < prev["age_min"]
+
+        if new_rank > old_rank and liq_jump >= 1.8 and newer_pool:
+            label = f"{prev['dex']} → {cur_dex}"
+            score = min(10, int((new_rank - old_rank) * 2 + min(liq_jump, 4)))
+            break
+
+    if label:
+        trap_label_value, trap_level = liquidity_trap(pair)
+        if trap_level == "CRITICAL":
+            score = max(0, score - 3)
+
+    return {
+        "migration": 1 if label else 0,
+        "migration_label": label,
+        "migration_score": score,
+    }
+
+
 def detect_auto_signal(token: Dict[str, Any]) -> bool:
     liq = parse_float(safe_get(token, "liquidity", "usd", default=token.get("liquidity", 0)), 0.0)
     vol = parse_float(safe_get(token, "volume", "h24", default=token.get("volume", 0)), 0.0)
@@ -789,7 +907,13 @@ def detect_auto_signal(token: Dict[str, Any]) -> bool:
 def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
     row = dict(pair)
     row["meme_score"] = meme_token_score(row)
-    row["smart_money"] = detect_smart_money(row)
+    row["smart_money"] = detect_smart_wallet_activity(row)
+
+    mig = detect_liquidity_migration(row)
+    row["migration"] = mig.get("migration", 0)
+    row["migration_label"] = mig.get("migration_label", "")
+    row["migration_score"] = mig.get("migration_score", 0)
+
     row["fresh_lp"] = fresh_lp(row)
     row["dev_risk"] = dev_wallet_risk(row)
     row["whale"] = whale_accumulation(row)
@@ -840,6 +964,7 @@ def score_pair(p: Optional[Dict[str, Any]]) -> float:
     s += min(trades5 * 2.0, 140.0)
     s += max(min(pc1h, 90.0), -90.0) * 0.25
     s += max(min(pc5, 40.0), -40.0) * 0.15
+    s += parse_float(p.get("migration_score", 0), 0.0) * 4.0
     return round(s, 2)
 
 
@@ -1019,8 +1144,15 @@ def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
         f"Vol(5m): {fmt_usd(vol5)}",
     ]
 
+    if int(p.get("migration", 0) or 0) == 1:
+        tags.append(f"Migration: {p.get('migration_label', '')}")
+
+    migration_bonus = int(p.get("migration", 0) or 0) == 1
+
     decision = "NO ENTRY"
-    if liq >= 30_000 and vol24 >= 20_000 and trades5 >= 12 and sells5 >= 3:
+    liq_gate = 25_000 if migration_bonus else 30_000
+    vol_gate = 16_000 if migration_bonus else 20_000
+    if liq >= liq_gate and vol24 >= vol_gate and trades5 >= 12 and sells5 >= 3:
         if pc1h > 6 and vol5 > 2_500 and pc5 >= -3:
             decision = "ENTRY (scalp)"
         else:
@@ -1590,7 +1722,15 @@ def token_history_rows(chain: str, base_addr: str, limit: int = 180) -> List[Dic
 # =============================
 # Monitoring ranking helpers
 # =============================
-def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float, liq: float, meme_score: float = 0.0) -> float:
+def monitoring_priority(
+    score_live: float,
+    pc1h: float,
+    pc5: float,
+    vol5: float,
+    liq: float,
+    meme_score: float = 0.0,
+    migration_score: float = 0.0,
+) -> float:
     s = 0.0
     s += score_live * 1.2
     s += max(min(pc1h, 25.0), -25.0) * 3.0
@@ -1600,6 +1740,8 @@ def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float,
         s -= 60.0
     if meme_score > 60:
         s += 10.0
+    if migration_score > 0:
+        s += migration_score * 8.0
     return round(s, 2)
 
 
@@ -2246,6 +2388,8 @@ def page_scout(cfg: Dict[str, Any]):
         st.write(f"Meme Score: {int(pobj.get('meme_score', 0) or 0)}")
         smart_money_label = "YES" if int(pobj.get("smart_money", 0) or 0) == 1 else "NO"
         st.write(f"Smart Money: {smart_money_label}")
+        if int(pobj.get("migration", 0) or 0) == 1:
+            st.write(f"Migration: {pobj.get('migration_label', '')}")
         st.write(f"Sniper: {'YES' if sniper_flag else 'NO'}")
         st.write(f"Pump Score: {pump_score}")
         st.write(f"Trap: {trap_label(trap_signal)}")
@@ -2398,7 +2542,23 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 continue
 
         meme_score = meme_token_score(best) if best else 0.0
-        pr = source_priority(r) * 10000 + monitoring_priority(s_live, live["pc1h"], live["pc5"], live["vol5"], live["liq"], meme_score=meme_score)
+        migration_score = 0.0
+        migration_label = ""
+
+        if best:
+            mig = detect_liquidity_migration(best)
+            migration_score = parse_float(mig.get("migration_score", 0), 0.0)
+            migration_label = mig.get("migration_label", "")
+
+        pr = source_priority(r) * 10000 + monitoring_priority(
+            s_live,
+            live["pc1h"],
+            live["pc5"],
+            live["vol5"],
+            live["liq"],
+            meme_score=meme_score,
+            migration_score=migration_score,
+        )
         d_score = s_live - parse_float(r.get("score_init"), 0.0)
         d_liq = live["liq"] - parse_float(r.get("liq_init"), 0.0)
         d_v24 = live["vol24"] - parse_float(r.get("vol24_init"), 0.0)
@@ -2420,7 +2580,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         whale = whale_accumulation(best)
         signal = classify_signal(best) if best else (r.get("signal") or "RED")
 
-        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money))
+        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money))
 
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
@@ -2430,7 +2590,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     priority = {"GREEN": 0, "YELLOW": 1, "RED": 2}
     enriched.sort(
         key=lambda x: (
-            priority.get(x[23], 2),
+            priority.get(x[25], 2),
             -x[5],
         )
     )
@@ -2442,7 +2602,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if not items:
             st.caption("Порожньо")
             return
-        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money in items:
+        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money in items:
             if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
                 continue
             chain = (r.get("chain") or "").strip().lower()
@@ -2485,6 +2645,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"Suggested entry: ${r.get('entry_suggest_usd') or '—'}")
                 st.write(f"TP target: {r.get('tp_target_pct') or '—'}%")
                 st.write(f"Δscore: {d_score:+.2f}")
+                if migration_label:
+                    st.info(f"MIGRATION: {migration_label}")
             with c4:
                 st.markdown("Status")
                 label = f"{decision} {stars}".strip()
