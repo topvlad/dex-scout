@@ -54,7 +54,7 @@ def _maybe_autorefresh(interval_ms: int, key: str):
         pass
 
 
-VERSION = "0.6.2"
+VERSION = "0.7.0"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -688,6 +688,70 @@ def pair_age_minutes(p: Dict[str, Any]) -> Optional[float]:
         return age_sec / 60.0
     except Exception:
         return None
+
+
+def meme_token_score(token: Dict[str, Any]) -> int:
+    score = 0
+
+    name = (safe_get(token, "baseToken", "name", default="") or token.get("name") or "").lower()
+    symbol = (safe_get(token, "baseToken", "symbol", default="") or token.get("symbol") or "").lower()
+
+    meme_keywords = [
+        "dog", "inu", "cat", "pepe", "frog",
+        "elon", "ai", "meme", "moon", "baby"
+    ]
+
+    for k in meme_keywords:
+        if k in name or k in symbol:
+            score += 10
+
+    liq = parse_float(safe_get(token, "liquidity", "usd", default=token.get("liquidity", 0)), 0.0)
+    if liq > 50000:
+        score += 20
+    elif liq > 10000:
+        score += 10
+
+    vol = parse_float(safe_get(token, "volume", "h24", default=token.get("volume", 0)), 0.0)
+    if vol > 100000:
+        score += 20
+    elif vol > 20000:
+        score += 10
+
+    age = token.get("pairAge")
+    if age is None:
+        age_min = pair_age_minutes(token)
+        age = (age_min / 60.0) if age_min is not None else 0
+    age = parse_float(age, 0.0)
+    if 0 < age < 24:
+        score += 10
+
+    return min(score, 100)
+
+
+def detect_smart_wallet_activity(pair: Dict[str, Any]) -> int:
+    txns = pair.get("txns") or {}
+    buys = int(safe_get(txns, "m5", "buys", default=txns.get("buys", 0)) or 0)
+    sells = int(safe_get(txns, "m5", "sells", default=txns.get("sells", 0)) or 0)
+    if buys > sells * 2 and buys > 20:
+        return 1
+    return 0
+
+
+def detect_auto_signal(token: Dict[str, Any]) -> bool:
+    liq = parse_float(safe_get(token, "liquidity", "usd", default=token.get("liquidity", 0)), 0.0)
+    vol = parse_float(safe_get(token, "volume", "h24", default=token.get("volume", 0)), 0.0)
+    txns = token.get("txns") or {}
+    buys = int(safe_get(txns, "m5", "buys", default=txns.get("buys", 0)) or 0)
+    if liq > 20000 and vol > 50000 and buys > 30:
+        return True
+    return False
+
+
+def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
+    row = dict(pair)
+    row["meme_score"] = meme_token_score(row)
+    row["smart_money"] = detect_smart_wallet_activity(row)
+    return row
 
 
 def solana_unverified_heuristic(p: Dict[str, Any]) -> bool:
@@ -1326,7 +1390,7 @@ def token_history_rows(chain: str, base_addr: str, limit: int = 180) -> List[Dic
 # =============================
 # Monitoring ranking helpers
 # =============================
-def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float, liq: float) -> float:
+def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float, liq: float, meme_score: float = 0.0) -> float:
     s = 0.0
     s += score_live * 1.2
     s += max(min(pc1h, 25.0), -25.0) * 3.0
@@ -1334,6 +1398,8 @@ def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float,
     s += min(vol5 / 2000.0, 35.0) * 4.0
     if liq < 20_000:
         s -= 60.0
+    if meme_score > 60:
+        s += 10.0
     return round(s, 2)
 
 
@@ -1540,14 +1606,17 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     ranked = ranked[: max(1, int(max_items))]
     for s, p in ranked:
         counts["seen"] += 1
+        row = normalize_pair_row(p)
         try:
-            res = add_to_monitoring(p, float(s), window_name=window_name, preset_key=preset_key)
+            res = add_to_monitoring(row, float(s), window_name=window_name, preset_key=preset_key)
             if res == "OK":
                 counts["added"] += 1
             elif res == "EXISTS_ACTIVE":
                 counts["skipped_active"] += 1
             elif res == "EXISTS_ARCHIVED":
                 counts["skipped_archived"] += 1
+            if detect_auto_signal(row):
+                add_to_monitoring(row, float(s), window_name="AUTO_SIGNAL", preset_key="AUTO_SIGNAL")
         except Exception:
             counts["errors"] += 1
     return counts
@@ -1838,7 +1907,8 @@ def page_scout(cfg: Dict[str, Any]):
         if decision.strip().upper() == "NO ENTRY":
             continue
 
-        ranked.append((s, decision, tags, p))
+        row = normalize_pair_row(p)
+        ranked.append((s, decision, tags, row))
 
     ranked.sort(key=lambda x: x[0], reverse=True)
     ranked = ranked[: int(cfg["top_n"])]
@@ -1918,6 +1988,11 @@ def page_scout(cfg: Dict[str, Any]):
         sells = (pobj.get("txns") or {}).get("m5", {}).get("sells")
 
         st.write(f"Score: {score:,.2f}")
+        st.write(f"Meme Score: {int(pobj.get('meme_score', 0) or 0)}")
+        smart_money_label = "YES" if int(pobj.get("smart_money", 0) or 0) == 1 else "NO"
+        st.write(f"Smart Money: {smart_money_label}")
+        if detect_auto_signal(pobj):
+            st.warning("AUTO SIGNAL DETECTED")
         st.write(f"Price: ${price:,.8f}" if price else "Price: n/a")
         st.write(f"Liq: {fmt_usd(liq)}")
         st.write(f"Vol24: {fmt_usd(vol24)}")
@@ -2045,7 +2120,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 archive_monitoring(chain, base_addr, reason=f"auto: LOW SCORE<{int(min_score)}", last_score=s_live, last_decision=decision)
                 continue
 
-        pr = source_priority(r) * 10000 + monitoring_priority(s_live, live["pc1h"], live["pc5"], live["vol5"], live["liq"])
+        meme_score = meme_token_score(best) if best else 0.0
+        pr = source_priority(r) * 10000 + monitoring_priority(s_live, live["pc1h"], live["pc5"], live["vol5"], live["liq"], meme_score=meme_score)
         d_score = s_live - parse_float(r.get("score_init"), 0.0)
         d_liq = live["liq"] - parse_float(r.get("liq_init"), 0.0)
         d_v24 = live["vol24"] - parse_float(r.get("vol24_init"), 0.0)
@@ -2522,4 +2598,3 @@ def birdeye_trending_solana(limit: int = 50, offset: int = 0) -> list[str]:
 
 if __name__ == "__main__":
     main()
-
