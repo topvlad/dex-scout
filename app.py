@@ -28,6 +28,7 @@ import time
 import json
 import random
 import hashlib
+from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 from collections import Counter
@@ -1506,14 +1507,13 @@ def scanner_state_load() -> Dict[str, Any]:
             try:
                 return json.loads(blob)
             except Exception:
-                pass
+                    pass
     if os.path.exists(path):
         try:
-            return json.loads(Path(path).read_text(encoding="utf-8"))
+            txt = Path(path).read_text(encoding="utf-8")
+            return json.loads(txt) if txt else {}
         except Exception:
-            pass
-    return {}
-
+            return {}
 def scanner_state_save(state: Dict[str, Any]):
     path = os.path.join(DATA_DIR, "scanner_state.json")
     ensure_storage()
