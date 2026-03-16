@@ -1867,7 +1867,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     cbtn1, cbtn2, cbtn3 = st.columns([2,2,6])
     with cbtn1:
-        if st.button("Run scanner now", use_container_width=True):
+        if st.button("Run scanner now", use_container_width=True, key="run_scanner_now"):
             res = run_scanner_now(
                 seeds_raw=str(auto_cfg.get("scanner_seeds_raw", DEFAULT_SEEDS)),
                 max_items=int(auto_cfg.get("scanner_max_items", 100)),
