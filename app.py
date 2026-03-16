@@ -597,20 +597,20 @@ def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, m
 # =============================
 # API
 # =============================
-@st.cache_data(ttl=25, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_latest_pairs_for_query(q: str) -> List[Dict[str, Any]]:
     url = f"{DEX_BASE}/latest/dex/search"
     data = _http_get_json(url, params={"q": q.strip()}, timeout=20, max_retries=3)
     return data.get("pairs", []) or []
 
 
-@st.cache_data(ttl=25, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_token_pairs(chain: str, token_address: str) -> List[Dict[str, Any]]:
     url = f"{DEX_BASE}/token-pairs/v1/{chain}/{token_address}"
     data = _http_get_json(url, params=None, timeout=20, max_retries=3)
     return data or []
 
-
+@st.cache_data(ttl=30)
 def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, Any]]:
     try:
         pools = fetch_token_pairs(chain, token_address)
