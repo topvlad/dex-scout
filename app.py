@@ -1423,6 +1423,8 @@ def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h:
         return "CUT (signal flipped)"
 
     # take profit / trim
+    if pnl >= 120:
+        return "TAKE PROFIT (moon)"
     if pnl >= 60 and pc5 < 0 and pc1h < 0:
         return "TAKE PROFIT"
     if pnl >= 30 and pc5 < -2:
@@ -1967,14 +1969,14 @@ def page_scout(cfg: Dict[str, Any]):
                 add_to_monitoring(pobj, float(score))
                 st.session_state["scout_hidden"].add(base_addr)
                 st.toast("Added to monitoring")
-                st.experimental_rerun()
+                st.rerun()
         with btn4:
             if st.button("Log → Portfolio (I swapped)", key=f"log_pf_{pair_addr}", use_container_width=True):
                 res = log_to_portfolio(pobj, float(score), decision, tag_list, swap_url)
                 if res == "OK":
                     st.session_state["scout_hidden"].add(base_addr)
                     st.toast("Logged to portfolio")
-                    st.experimental_rerun()
+                    st.rerun()
                 else:
                     st.error(f"Portfolio log failed: {res}")
 
@@ -2058,10 +2060,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 birdeye_limit=int(auto_cfg.get("birdeye_limit", 50)),
             )
             st.success(f"Scanner ran: {res['window']} / {res['chain']} / {res['stats']}")
-            st.experimental_rerun()
+            st.rerun()
     with cbtn2:
         if st.button("Refresh live data", use_container_width=True):
-            st.experimental_rerun()
+            st.rerun()
     with cbtn3:
         st.caption("The app checks scanner slot on every load. One slot = 5 minutes, rotating across 4 presets × 2 chains.")
 
@@ -2142,7 +2144,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
         st.info("Archive/revisit changes applied. Refreshing list…")
-        st.experimental_rerun()
+        st.rerun()
 
     enriched.sort(
         key=lambda x: (
@@ -2214,13 +2216,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                         if res == "OK":
                             archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
                             st.success("Promoted to Portfolio.")
-                            st.experimental_rerun()
+                            st.rerun()
                         else:
                             st.info("Already in portfolio.")
                 if st.button("Archive (manual)", key=f"drop_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                     archive_monitoring(chain, base_addr, reason="manual", last_score=s_live, last_decision=decision)
                     st.success("Archived.")
-                    st.experimental_rerun()
+                    st.rerun()
             with st.expander("Dynamics / sparklines", expanded=False):
                 if not hist:
                     st.info("No snapshots yet.")
@@ -2287,9 +2289,42 @@ def page_archive():
                 ok = reactivate_monitoring(chain, base_addr)
                 if ok:
                     st.success("Re-activated.")
-                    st.experimental_rerun()
+                    st.rerun()
                 else:
                     st.info("Nothing changed (not found).")
+
+
+def portfolio_alert_count() -> int:
+    rows = load_portfolio()
+    active_rows = [r for r in rows if r.get("active") == "1"]
+
+    alerts = 0
+    for r in active_rows:
+        chain = (r.get("chain") or "").lower()
+        base_addr = r.get("base_token_address")
+
+        best = best_pair_for_token(chain, base_addr)
+        if not best:
+            continue
+
+        price = parse_float(best.get("priceUsd"), 0)
+        liq = parse_float(safe_get(best, "liquidity", "usd", default=0))
+        vol24 = parse_float(safe_get(best, "volume", "h24", default=0))
+        pc1h = parse_float(safe_get(best, "priceChange", "h1", default=0))
+        pc5 = parse_float(safe_get(best, "priceChange", "m5", default=0))
+
+        entry = parse_float(r.get("entry_price_usd"), 0)
+
+        decision, _ = build_trade_hint(best)
+        score = score_pair(best)
+
+        reco = portfolio_reco(entry, price, liq, vol24, pc1h, pc5, decision, score)
+
+        reco_upper = str(reco).upper()
+        if any(x in reco_upper for x in ("TAKE PROFIT", "TRIM", "CLOSE", "CUT")):
+            alerts += 1
+
+    return alerts
 
 
 def page_portfolio():
@@ -2413,7 +2448,7 @@ def page_portfolio():
 
                 save_portfolio(all_rows)
                 st.success("Saved.")
-                st.experimental_rerun()
+                st.rerun()
 
         # Sparklines for portfolio too (requested)
         hist = token_history_rows(chain, base_addr, limit=60)
@@ -2481,12 +2516,22 @@ def main():
         if "page" not in st.session_state:
             st.session_state["page"] = "Monitoring"
         
-        pages = ["Monitoring", "Archive", "Portfolio"]
-        
+        alert_n = portfolio_alert_count()
+        portfolio_label = "Portfolio"
+        if alert_n > 0:
+            portfolio_label = f"Portfolio 🔴 {alert_n}"
+
+        pages = ["Monitoring", "Archive", portfolio_label]
+
+        if str(st.session_state.get("page", "Monitoring")).startswith("Portfolio"):
+            st.session_state["page"] = portfolio_label
+
         if st.session_state.get("page") not in pages:
             st.session_state["page"] = "Monitoring"
-        
+
         page = st.radio("Page", pages, index=pages.index(st.session_state["page"]))
+        if page.startswith("Portfolio"):
+            page = "Portfolio"
 
         st.divider()
         st.caption("Scanner")
@@ -2511,11 +2556,11 @@ def main():
         if st.button("Run scanner now", use_container_width=True):
             res = run_scanner_now(scanner_seeds_raw, max_items=int(scanner_max_items), use_birdeye_trending=bool(use_birdeye_trending), birdeye_limit=int(birdeye_limit))
             st.session_state["_scan_feedback"] = f"Scanner ran: {res['window']} / {res['chain']} / {res['stats']}"
-            st.experimental_rerun()
+            st.rerun()
 
         if st.button("Clear cache", use_container_width=True):
             st.cache_data.clear()
-            st.experimental_rerun()
+            st.rerun()
 
         st.divider()
         if _sb_ok():
