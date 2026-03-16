@@ -54,7 +54,7 @@ def _maybe_autorefresh(interval_ms: int, key: str):
         pass
 
 
-VERSION = "0.8.0"
+VERSION = "0.5.5"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
@@ -124,6 +124,8 @@ def _sb_ok() -> bool:
 
 def _sb_headers() -> Dict[str, str]:
     # Use service role key for server-side storage
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        return {}
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -1083,7 +1085,7 @@ def score_pair(p: Optional[Dict[str, Any]]) -> float:
     s += min(liq / 1000.0, 380.0)
     s += min(vol24 / 10000.0, 280.0)
     s += min(vol5 / 2000.0, 220.0)
-    s += min(trades5 * 2.0, 140.0)
+    s += min(trades5 * 2.0, 120.0)
     s += max(min(pc1h, 90.0), -90.0) * 0.25
     s += max(min(pc5, 40.0), -40.0) * 0.15
     s += parse_float(p.get("migration_score", 0), 0.0) * 4.0
@@ -1288,7 +1290,7 @@ def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
             decision = "WATCH / WAIT"
 
     trap, trap_level = liquidity_trap(p)
-    if trap_level == "CRITICAL":
+    if trap_level == "CRITICAL" and liq < 50000:
         decision = "AVOID"
         if trap:
             tags.append(f"Trap: {trap}")
@@ -1500,7 +1502,7 @@ def sample_seeds(seeds: List[str], k: int, refresh: bool) -> List[str]:
     k = max(1, min(int(k), len(cleaned)))
 
     if "seed_sample" not in st.session_state or refresh:
-        st.session_state["seed_sample"] = random.sample(cleaned, k)
+        st.session_state["seed_sample"] = random.sample(cleaned, min(k, len(cleaned)))
 
     return st.session_state["seed_sample"]
 
@@ -1662,7 +1664,7 @@ def add_to_monitoring(p: Dict[str, Any], score: float, window_name: str = "", pr
     entry_s, tp_s = suggest_entry_and_tp_usd(p, risk=risk)
     decision, _tags = build_trade_hint(p)
 
-    rows.append(
+    rows.insert(0,
         {
             "ts_added": now_utc_str(),
             "chain": chain,
@@ -1947,7 +1949,7 @@ def scanner_acquire_lock(slot: int, ttl_sec: int = 240) -> bool:
             data = json.loads(blob)
             ts = float(data.get("ts", 0))
 
-            if time.time() - ts < ttl_sec:
+            if ts and time.time() - ts < ttl_sec:
                 return False
 
         payload = json.dumps({
@@ -2052,6 +2054,11 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
             pass
 
     pairs = dedupe_mode(all_pairs, by_base_token=False)
+    pairs = sorted(
+        pairs,
+        key=lambda p: float(safe_get(p, "volume", "h24", default=0) or 0),
+        reverse=True,
+    )
     pairs = dedupe_mode(pairs, by_base_token=bool(preset.get("dedupe_by_base", True)))
 
     filtered, _fstats, _freasons = filter_pairs_with_debug(
@@ -2120,7 +2127,10 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             chain = (row.get("chainId") or "").lower()
             base_addr = (safe_get(row, "baseToken", "address", default="") or "").strip()
             key = addr_key(chain, base_addr)
-            smart_wallets[key] = {"last_seen": now_utc_str(), "symbol": safe_get(row, "baseToken", "symbol", default="") or ""}
+            smart_wallets[key] = {
+                "last_seen": now_utc_str(),
+                "symbol": row.get("base_symbol", "")
+            }
         try:
             res = add_to_monitoring(row, float(s), window_name=window_name, preset_key=preset_key)
             if res == "OK":
@@ -2294,18 +2304,22 @@ def confidence_stars(best: Optional[Dict[str, Any]], hist: List[Dict[str, Any]])
 def second_wave_label(hist: List[Dict[str, Any]]) -> str:
     if not hist or len(hist) < 5:
         return ""
+
     try:
-        prices = [parse_float(x.get("price_usd", 0), 0.0) for x in hist if parse_float(x.get("price_usd", 0), 0.0) > 0]
-        vols = [parse_float(x.get("vol5_usd", 0), 0.0) for x in hist]
+        prices = [parse_float(x.get("price_usd", 0), 0.0) for x in hist]
         if len(prices) < 5:
             return ""
-        ath = max(prices)
-        cur = prices[-1]
-        dd = (ath - cur) / max(ath, 1e-9)
-        if dd > 0.35 and len(vols) >= 3 and vols[-1] > vols[-3] * 1.4 and prices[-1] > prices[-3]:
-            return "2ND WAVE"
+
+        first = prices[0]
+        mid = prices[len(prices)//2]
+        last = prices[-1]
+
+        if mid < first * 0.8 and last > mid * 1.2:
+            return "SECOND WAVE"
+
     except Exception:
         pass
+
     return ""
 
 def rug_like(best: Optional[Dict[str, Any]], hist: List[Dict[str, Any]]) -> bool:
