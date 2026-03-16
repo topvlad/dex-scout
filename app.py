@@ -54,7 +54,7 @@ def _maybe_autorefresh(interval_ms: int, key: str):
         pass
 
 
-VERSION = "0.6.0"
+VERSION = "0.6.2"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 
@@ -603,7 +603,7 @@ def fetch_dexscreener_latest(chain: str, limit: int = 40):
     try:
         r = requests.get(url, timeout=10)
         data = r.json()
-        pairs = data.get("pairs", [])
+        pairs = data.get("pairs") or []
         return pairs[:limit]
     except Exception:
         return []
@@ -617,7 +617,7 @@ def fetch_dexscreener_trending(chain: str, limit: int = 40) -> List[Dict[str, An
         url = f"{DEX_BASE}/latest/dex/pairs/{chain}"
         data = _http_get_json(url, timeout=20)
 
-        pairs = data.get("pairs", []) or []
+        pairs = data.get("pairs") or []
 
         pairs.sort(
             key=lambda p: float(safe_get(p, "volume", "h24", default=0) or 0),
@@ -629,20 +629,20 @@ def fetch_dexscreener_trending(chain: str, limit: int = 40) -> List[Dict[str, An
     except Exception:
         return []
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=500, show_spinner=False)
 def fetch_latest_pairs_for_query(q: str) -> List[Dict[str, Any]]:
     url = f"{DEX_BASE}/latest/dex/search"
     data = _http_get_json(url, params={"q": q.strip()}, timeout=20, max_retries=3)
     return data.get("pairs", []) or []
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=500, show_spinner=False)
 def fetch_token_pairs(chain: str, token_address: str) -> List[Dict[str, Any]]:
     url = f"{DEX_BASE}/token-pairs/v1/{chain}/{token_address}"
     data = _http_get_json(url, params=None, timeout=20, max_retries=3)
     return data or []
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=60, max_entries=500)
 def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, Any]]:
     try:
         pools = fetch_token_pairs(chain, token_address)
@@ -1116,6 +1116,9 @@ def add_to_monitoring(p: Dict[str, Any], score: float, window_name: str = "", pr
     key = addr_key(chain, base_addr)
     rows = load_monitoring()
 
+    if not base_addr:
+        return "NO_ADDR"
+
     for r in rows:
         if r.get("active") == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
             # refresh lightweight fields
@@ -1283,7 +1286,7 @@ def should_snapshot(chain: str, base_addr: str, min_interval_sec: int = 60) -> b
 def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Optional[Dict[str, Any]]):
     if not chain or not base_addr or not best:
         return
-    if not should_snapshot(chain, base_addr, min_interval_sec=60):
+    if not should_snapshot(chain, base_addr, min_interval_sec=120):
         return
 
     s_live = score_pair(best)
@@ -1325,7 +1328,7 @@ def token_history_rows(chain: str, base_addr: str, limit: int = 180) -> List[Dic
 # =============================
 def monitoring_priority(score_live: float, pc1h: float, pc5: float, vol5: float, liq: float) -> float:
     s = 0.0
-    s += score_live
+    s += score_live * 1.2
     s += max(min(pc1h, 25.0), -25.0) * 3.0
     s += max(min(pc5, 12.0), -12.0) * 2.0
     s += min(vol5 / 2000.0, 35.0) * 4.0
@@ -1393,7 +1396,11 @@ def scanner_acquire_lock(slot: int, ttl_sec: int = 240) -> bool:
             if time.time() - ts < ttl_sec:
                 return False
 
-        payload = json.dumps({"ts": time.time()})
+        payload = json.dumps({
+            "ts": time.time(),
+            "host": os.getenv("HOSTNAME", "local"),
+            "version": VERSION
+        })
         sb_put_storage(key, payload)
 
         return True
@@ -1575,7 +1582,7 @@ def scanner_state_load() -> Dict[str, Any]:
     path = os.path.join(DATA_DIR, "scanner_state.json")
     ensure_storage()
 
-    # try Supabase first
+    # 1. Supabase
     if _sb_ok():
         try:
             blob = sb_get_storage("scanner_state.json")
@@ -1586,7 +1593,7 @@ def scanner_state_load() -> Dict[str, Any]:
         except Exception:
             pass
 
-    # try local file
+    # 2. Local fallback
     if os.path.exists(path):
         try:
             txt = Path(path).read_text(encoding="utf-8")
@@ -1597,8 +1604,16 @@ def scanner_state_load() -> Dict[str, Any]:
         except Exception:
             pass
 
-    # fallback
-    return {}
+    # 3. Default
+    return {
+        "last_slot": -1,
+        "last_run_ts": "",
+        "last_window": "",
+        "last_preset": "",
+        "last_chain": "",
+        "last_stats": {}
+    }
+
 def scanner_state_save(state: Dict[str, Any]):
     path = os.path.join(DATA_DIR, "scanner_state.json")
     ensure_storage()
@@ -1731,6 +1746,7 @@ def rug_like(best: Optional[Dict[str, Any]], hist: List[Dict[str, Any]]) -> bool
 def page_scout(cfg: Dict[str, Any]):
     st.title("DEX Scout – early candidates (DexScreener API)")
     st.caption("Фокус: дрібні/ранні монети. Majors/stables відсікаються. Core: BSC + Solana.")
+    st.caption(f"DEX Scout {VERSION}")
 
     with st.expander("Як сортувати у Jupiter Cooking (manual triage)", expanded=False):
         st.write("1) Liquidity / TVL (щоб не застрягти у thin pool)")
@@ -1881,14 +1897,14 @@ def page_scout(cfg: Dict[str, Any]):
                 add_to_monitoring(pobj, float(score))
                 st.session_state["scout_hidden"].add(base_addr)
                 st.toast("Added to monitoring")
-                st.rerun()
+                st.experimental_rerun()
         with btn4:
             if st.button("Log → Portfolio (I swapped)", key=f"log_pf_{pair_addr}", use_container_width=True):
                 res = log_to_portfolio(pobj, float(score), decision, tag_list, swap_url)
                 if res == "OK":
                     st.session_state["scout_hidden"].add(base_addr)
                     st.toast("Logged to portfolio")
-                    st.rerun()
+                    st.experimental_rerun()
                 else:
                     st.error(f"Portfolio log failed: {res}")
 
@@ -1967,10 +1983,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 birdeye_limit=int(auto_cfg.get("birdeye_limit", 50)),
             )
             st.success(f"Scanner ran: {res['window']} / {res['chain']} / {res['stats']}")
-            st.rerun()
+            st.experimental_rerun()
     with cbtn2:
         if st.button("Refresh live data", use_container_width=True):
-            st.rerun()
+            st.experimental_rerun()
     with cbtn3:
         st.caption("The app checks scanner slot on every load. One slot = 5 minutes, rotating across 4 presets × 2 chains.")
 
@@ -2050,9 +2066,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
         st.info("Archive/revisit changes applied. Refreshing list…")
-        st.rerun()
+        st.experimental_rerun()
 
-    enriched.sort(key=lambda x: (0 if x[0]=="SIGNAL" else 1, -x[1], x[3].get("ts_added","")))
+    enriched.sort(
+        key=lambda x: (
+            0 if x[0] == "SIGNAL" else 1,
+            -x[1],
+            x[3].get("ts_added", "")
+        )
+    )
     signals = [x for x in enriched if x[0] == "SIGNAL"]
     watchlist = [x for x in enriched if x[0] != "SIGNAL"]
 
@@ -2116,13 +2138,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                         if res == "OK":
                             archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
                             st.success("Promoted to Portfolio.")
-                            st.rerun()
+                            st.experimental_rerun()
                         else:
                             st.info("Already in portfolio.")
                 if st.button("Archive (manual)", key=f"drop_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                     archive_monitoring(chain, base_addr, reason="manual", last_score=s_live, last_decision=decision)
                     st.success("Archived.")
-                    st.rerun()
+                    st.experimental_rerun()
             with st.expander("Dynamics / sparklines", expanded=False):
                 if not hist:
                     st.info("No snapshots yet.")
@@ -2189,7 +2211,7 @@ def page_archive():
                 ok = reactivate_monitoring(chain, base_addr)
                 if ok:
                     st.success("Re-activated.")
-                    st.rerun()
+                    st.experimental_rerun()
                 else:
                     st.info("Nothing changed (not found).")
 
@@ -2315,7 +2337,7 @@ def page_portfolio():
 
                 save_portfolio(all_rows)
                 st.success("Saved.")
-                st.rerun()
+                st.experimental_rerun()
 
         # Sparklines for portfolio too (requested)
         hist = token_history_rows(chain, base_addr, limit=60)
@@ -2413,11 +2435,11 @@ def main():
         if st.button("Run scanner now", use_container_width=True):
             res = run_scanner_now(scanner_seeds_raw, max_items=int(scanner_max_items), use_birdeye_trending=bool(use_birdeye_trending), birdeye_limit=int(birdeye_limit))
             st.session_state["_scan_feedback"] = f"Scanner ran: {res['window']} / {res['chain']} / {res['stats']}"
-            st.rerun()
+            st.experimental_rerun()
 
         if st.button("Clear cache", use_container_width=True):
             st.cache_data.clear()
-            st.rerun()
+            st.experimental_rerun()
 
         st.divider()
         if _sb_ok():
