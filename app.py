@@ -598,6 +598,37 @@ def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, m
 # =============================
 # API
 # =============================
+def fetch_dexscreener_latest(chain: str, limit: int = 40):
+    url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}"
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        pairs = data.get("pairs", [])
+        return pairs[:limit]
+    except Exception:
+        return []
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_dexscreener_trending(chain: str, limit: int = 40) -> List[Dict[str, Any]]:
+    """
+    Fetch trending pairs from Dexscreener.
+    """
+    try:
+        url = f"{DEX_BASE}/latest/dex/pairs/{chain}"
+        data = _http_get_json(url, timeout=20)
+
+        pairs = data.get("pairs", []) or []
+
+        pairs.sort(
+            key=lambda p: float(safe_get(p, "volume", "h24", default=0) or 0),
+            reverse=True,
+        )
+
+        return pairs[:limit]
+
+    except Exception:
+        return []
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_latest_pairs_for_query(q: str) -> List[Dict[str, Any]]:
     url = f"{DEX_BASE}/latest/dex/search"
@@ -1341,6 +1372,35 @@ def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h:
 # =============================
 # v0.6.0 – automation / scheduler helpers
 # =============================
+
+def scanner_acquire_lock(slot: int, ttl_sec: int = 240) -> bool:
+    """
+    Prevent multiple tabs running the scanner simultaneously.
+    Uses Supabase app_storage as a distributed lock.
+    """
+    if not _sb_ok():
+        return True
+
+    key = f"scanner_lock_{slot}"
+
+    try:
+        blob = sb_get_storage(key)
+
+        if blob:
+            data = json.loads(blob)
+            ts = float(data.get("ts", 0))
+
+            if time.time() - ts < ttl_sec:
+                return False
+
+        payload = json.dumps({"ts": time.time()})
+        sb_put_storage(key, payload)
+
+        return True
+
+    except Exception:
+        return True
+
 SCOUT_WINDOWS = [
     ("Ultra Early (safer)", "ultra"),
     ("Balanced (default)", "balanced"),
@@ -1395,6 +1455,13 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     sampled = sample_seeds(seeds, int(preset.get("seed_k", 12)), refresh=False)
     all_pairs: List[Dict[str, Any]] = []
     for q in sampled:
+        # Ultra early pairs
+        try:
+            latest = fetch_dexscreener_latest(chain, limit=40)
+            if latest:
+                all_pairs.extend(latest)
+        except Exception:
+            pass
         if len(q.strip()) < 2:
             continue
         try:
@@ -1402,7 +1469,14 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
             time.sleep(0.06)
         except Exception:
             continue
-
+        # Dexscreener trending pairs
+        try:
+            trending = fetch_dexscreener_trending(chain, limit=40)
+            if trending:
+                all_pairs.extend(trending)
+        except Exception:
+            pass
+            
     # Optional Solana extra stream via Birdeye trending
     if chain == "solana" and use_birdeye_trending and BIRDEYE_ENABLED:
         try:
@@ -1551,6 +1625,11 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
         state = {}
     window_name, preset_key, chain, slot = current_scan_slot()
     last_slot = int(state.get("last_slot", -1) or -1)
+
+    # distributed lock (prevents multi-tab race)
+    if not scanner_acquire_lock(slot):
+        return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {})}
+    
     if last_slot == slot:
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {})}
     stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
@@ -2314,7 +2393,7 @@ def main():
         st.divider()
         st.caption("Scanner")
         scanner_max_items = st.slider("Max tokens per slot", 10, 100, 100, step=10)
-        ui_autorefresh_sec = st.slider("UI auto-refresh (sec)", 0, 300, 60, step=10)
+        ui_autorefresh_sec = st.slider("UI auto-refresh (sec)", 0, 300, 20, step=10)
         use_birdeye_trending = st.checkbox("Use Solana extra stream (Birdeye)", value=True, disabled=(not BIRDEYE_ENABLED))
         if not BIRDEYE_ENABLED:
             st.caption("Birdeye key missing: add BIRDEYE_API_KEY to secrets to enable extra Solana stream.")
