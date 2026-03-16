@@ -894,6 +894,58 @@ def detect_liquidity_migration(pair: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def detect_cex_listing_probability(pair: Dict[str, Any]) -> Dict[str, Any]:
+    if not pair:
+        return {
+            "cex_prob": 0,
+            "cex_label": "",
+        }
+
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0))
+    vol24 = parse_float(safe_get(pair, "volume", "h24", default=0))
+    vol5 = parse_float(safe_get(pair, "volume", "m5", default=0))
+    pc1h = parse_float(safe_get(pair, "priceChange", "h1", default=0))
+
+    base_addr = safe_get(pair, "baseToken", "address", default="")
+    chain = pair.get("chainId")
+
+    try:
+        pools = fetch_token_pairs(chain, base_addr)
+    except Exception:
+        pools = []
+
+    pool_count = len(pools)
+
+    score = 0
+
+    if liq > 100000:
+        score += 1
+
+    if vol24 > 200000:
+        score += 1
+
+    if vol5 > 5000:
+        score += 1
+
+    if pc1h > 15:
+        score += 1
+
+    if pool_count >= 3:
+        score += 1
+
+    label = ""
+
+    if score >= 4:
+        label = "HIGH"
+    elif score >= 3:
+        label = "MEDIUM"
+
+    return {
+        "cex_prob": score,
+        "cex_label": label,
+    }
+
+
 def detect_auto_signal(token: Dict[str, Any]) -> bool:
     liq = parse_float(safe_get(token, "liquidity", "usd", default=token.get("liquidity", 0)), 0.0)
     vol = parse_float(safe_get(token, "volume", "h24", default=token.get("volume", 0)), 0.0)
@@ -913,6 +965,10 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
     row["migration"] = mig.get("migration", 0)
     row["migration_label"] = mig.get("migration_label", "")
     row["migration_score"] = mig.get("migration_score", 0)
+
+    cex = detect_cex_listing_probability(row)
+    row["cex_prob"] = cex.get("cex_prob", 0)
+    row["cex_label"] = cex.get("cex_label", "")
 
     row["fresh_lp"] = fresh_lp(row)
     row["dev_risk"] = dev_wallet_risk(row)
@@ -965,6 +1021,13 @@ def score_pair(p: Optional[Dict[str, Any]]) -> float:
     s += max(min(pc1h, 90.0), -90.0) * 0.25
     s += max(min(pc5, 40.0), -40.0) * 0.15
     s += parse_float(p.get("migration_score", 0), 0.0) * 4.0
+
+    cex_prob = parse_float(p.get("cex_prob", 0), 0.0)
+    if cex_prob >= 4:
+        s += 20
+    elif cex_prob >= 3:
+        s += 10
+
     return round(s, 2)
 
 
@@ -1730,6 +1793,7 @@ def monitoring_priority(
     liq: float,
     meme_score: float = 0.0,
     migration_score: float = 0.0,
+    cex_prob: float = 0.0,
 ) -> float:
     s = 0.0
     s += score_live * 1.2
@@ -1742,6 +1806,10 @@ def monitoring_priority(
         s += 10.0
     if migration_score > 0:
         s += migration_score * 8.0
+    if cex_prob >= 4:
+        s += 30
+    elif cex_prob >= 3:
+        s += 15
     return round(s, 2)
 
 
@@ -2544,11 +2612,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         meme_score = meme_token_score(best) if best else 0.0
         migration_score = 0.0
         migration_label = ""
+        cex_prob = 0.0
 
         if best:
             mig = detect_liquidity_migration(best)
             migration_score = parse_float(mig.get("migration_score", 0), 0.0)
             migration_label = mig.get("migration_label", "")
+            cex_prob = parse_float(best.get("cex_prob", 0), 0.0)
 
         pr = source_priority(r) * 10000 + monitoring_priority(
             s_live,
@@ -2558,6 +2628,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             live["liq"],
             meme_score=meme_score,
             migration_score=migration_score,
+            cex_prob=cex_prob,
         )
         d_score = s_live - parse_float(r.get("score_init"), 0.0)
         d_liq = live["liq"] - parse_float(r.get("liq_init"), 0.0)
@@ -2663,6 +2734,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.markdown("🧠 sniper activity")
                 if pump_score >= 6:
                     st.markdown("🚀 pump probability HIGH")
+                cex_label = (best or {}).get("cex_label") or r.get("cex_label")
+                if cex_label == "HIGH":
+                    st.success("Possible CEX listing")
+                elif cex_label == "MEDIUM":
+                    st.caption("CEX watch")
                 if trap_signal:
                     st.markdown(f"⚠️ {trap_label(trap_signal)}")
                 if fresh == "VERY_NEW":
