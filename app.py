@@ -1500,20 +1500,31 @@ def auto_reactivate_archived(days: int = 7) -> int:
 def scanner_state_load() -> Dict[str, Any]:
     path = os.path.join(DATA_DIR, "scanner_state.json")
     ensure_storage()
-    # app_storage backup if enabled
+
+    # try Supabase first
     if _sb_ok():
-        blob = sb_get_storage("scanner_state.json")
-        if blob:
-            try:
-                return json.loads(blob)
-            except Exception:
-                    pass
+        try:
+            blob = sb_get_storage("scanner_state.json")
+            if blob:
+                data = json.loads(blob)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+
+    # try local file
     if os.path.exists(path):
         try:
             txt = Path(path).read_text(encoding="utf-8")
-            return json.loads(txt) if txt else {}
+            if txt:
+                data = json.loads(txt)
+                if isinstance(data, dict):
+                    return data
         except Exception:
-            return {}
+            pass
+
+    # fallback
+    return {}
 def scanner_state_save(state: Dict[str, Any]):
     path = os.path.join(DATA_DIR, "scanner_state.json")
     ensure_storage()
@@ -1535,7 +1546,9 @@ def current_scan_slot(now_ts: Optional[float] = None) -> Tuple[str, str, str, in
     return window_name, preset_key, chain, step
 
 def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
-    state = scanner_state_load()
+    state = scanner_state_load() or {}
+    if not isinstance(state, dict):
+        state = {}
     window_name, preset_key, chain, slot = current_scan_slot()
     last_slot = int(state.get("last_slot", -1) or -1)
     if last_slot == slot:
