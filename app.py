@@ -2155,46 +2155,67 @@ def exit_before_dump_detector(
     pair: Optional[Dict[str, Any]],
     hist: Optional[List[Dict[str, Any]]] = None,
     entry_price: float = 0.0,
-) -> str:
-    if not pair:
-        return "WATCH"
+) -> Dict[str, Any]:
+    if not pair or not hist or len(hist) < 5:
+        return {
+            "exit_level": "WATCH",
+            "exit_score": 0,
+            "exit_flags": [],
+        }
 
-    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)
-    vol5 = parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)
-    pc1h = parse_float(safe_get(pair, "priceChange", "h1", default=0), 0.0)
-    pc5 = parse_float(safe_get(pair, "priceChange", "m5", default=0), 0.0)
-    buys5 = int(safe_get(pair, "txns", "m5", "buys", default=0) or 0)
-    sells5 = int(safe_get(pair, "txns", "m5", "sells", default=0) or 0)
+    try:
+        h1_change = float(safe_get(pair, "priceChange", "h1", default=0) or 0)
+        m5_change = float(safe_get(pair, "priceChange", "m5", default=0) or 0)
 
-    trap_signal, trap_level = liquidity_trap(pair)
-    if trap_level == "CRITICAL":
-        return "EXIT (critical liquidity trap)"
+        prev = hist[-5:] if len(hist) >= 5 else hist
+        liq_vals = [float(x.get("liquidity_usd") or x.get("liq_usd") or 0) for x in prev]
+        vol_vals = [float(x.get("volume_5m") or x.get("vol5_usd") or 0) for x in prev]
 
-    if liq > 0 and liq < 6000 and pc1h <= -18:
-        return "EXIT (low liquidity breakdown)"
+        liq_trend = (liq_vals[-1] - liq_vals[0]) if len(liq_vals) >= 2 else 0
+        avg_vol = (sum(vol_vals) / len(vol_vals)) if vol_vals else 0
+        vol_spike = bool(vol_vals) and max(vol_vals) > (avg_vol * 2 if avg_vol > 0 else 1)
 
-    if sells5 > max(1, int(buys5 * 1.8)) and pc5 < -5:
-        return "EXIT (strong sell pressure)"
+        flags: List[str] = []
+        score = 0
 
-    if vol5 < 700 and pc1h < -10:
-        return "EXIT (flow vanished)"
+        if h1_change < -25:
+            flags.append("hard_dump_h1")
+            score += 3
 
-    if hist and len(hist) >= 3:
-        try:
-            recent = hist[-3:]
-            scores = [parse_float(x.get("score_live", 0), 0.0) for x in recent]
-            if scores[-1] < scores[0] - 25 and pc5 < -3:
-                return "TRIM (score fading)"
-        except Exception:
-            pass
+        if liq_trend < -0.3 * max(liq_vals or [1]):
+            flags.append("liquidity_drop")
+            score += 2
 
-    price = parse_float(pair.get("priceUsd"), 0.0)
-    if entry_price > 0 and price > 0:
-        pnl = (price - entry_price) / entry_price * 100.0
-        if pnl >= 35 and pc5 < -3:
-            return "TRIM (protect profit)"
+        if vol_spike and m5_change < -10:
+            flags.append("capitulation")
+            score += 2
 
-    return "WATCH"
+        if h1_change < -15:
+            flags.append("weak_h1")
+            score += 1
+
+        if m5_change < -7:
+            flags.append("weak_m5")
+            score += 1
+
+        if score >= 4:
+            level = "EXIT"
+        elif score >= 2:
+            level = "EARLY"
+        else:
+            level = "WATCH"
+
+        return {
+            "exit_level": level,
+            "exit_score": score,
+            "exit_flags": flags,
+        }
+    except Exception:
+        return {
+            "exit_level": "WATCH",
+            "exit_score": 0,
+            "exit_flags": ["error"],
+        }
 
 
 def position_sizing_engine(
@@ -3274,6 +3295,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status in items:
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
+            exit_level = exit_signal["exit_level"]
             if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
                 continue
 
@@ -3310,7 +3332,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"SNIPER: {'YES' if sniper_flag else 'NO'}")
                 st.write(f"PUMP: {pump_score}")
                 st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
-                if exit_signal.startswith("TRIM"):
+                if exit_level == "EARLY":
                     st.caption("⚠ early exit forming")
             with c3:
                 st.markdown("Plan")
@@ -3370,17 +3392,19 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.markdown("⚠ dev risk")
                 st.write(f"Window: {r.get('source_window') or '—'}")
                 st.write(f"Preset tags: {r.get('source_preset') or '—'}")
-                if exit_signal.startswith("EXIT"):
-                    st.warning(exit_signal)
-                elif exit_signal.startswith("TRIM"):
-                    st.caption(exit_signal)
+                if exit_level == "EXIT":
+                    st.warning(f"EXIT ({exit_signal['exit_score']})")
+                elif exit_level == "EARLY":
+                    st.caption(f"EARLY ({exit_signal['exit_score']})")
                 if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                     if not best:
                         st.error("No live pool found.")
                     elif size_info["size_label"] == "SKIP":
                         st.warning("Too risky (position sizing).")
-                    elif exit_signal.startswith("EXIT"):
+                    elif exit_signal["exit_level"] == "EXIT":
                         st.warning("Exit signal – blocked.")
+                    elif exit_signal["exit_level"] == "EARLY":
+                        st.warning("Early warning – consider smaller position")
                     elif final_status == "BLOCK":
                         st.warning("Blocked by correlation governor")
                     else:
@@ -3471,7 +3495,7 @@ def portfolio_alert_count() -> int:
     rows = load_portfolio()
     active_rows = [r for r in rows if r.get("active") == "1"]
 
-    alerts = 0
+    red_count = 0
     for r in active_rows:
         chain = (r.get("chain") or "").lower()
         base_addr = r.get("base_token_address")
@@ -3480,35 +3504,14 @@ def portfolio_alert_count() -> int:
         if not best:
             continue
 
-        price = parse_float(best.get("priceUsd"), 0)
-        liq = parse_float(safe_get(best, "liquidity", "usd", default=0))
-        vol24 = parse_float(safe_get(best, "volume", "h24", default=0))
-        pc1h = parse_float(safe_get(best, "priceChange", "h1", default=0))
-        pc5 = parse_float(safe_get(best, "priceChange", "m5", default=0))
-
         entry = parse_float(r.get("entry_price_usd"), 0)
-
-        decision, _ = build_trade_hint(best)
-        score = score_pair(best)
-        if whale_accumulation(best):
-            score += 3
-        if fresh_lp(best) == "VERY_NEW":
-            score += 2
-        score += pump_probability(best) * 0.5
-
-        reco = portfolio_reco(entry, price, liq, vol24, pc1h, pc5, decision, score, best)
         hist = token_history_rows(chain, base_addr, limit=60)
         exit_signal = exit_before_dump_detector(best, hist, entry)
 
-        if str(exit_signal).startswith("EXIT") or str(exit_signal).startswith("TRIM"):
-            alerts += 1
-            continue
+        if exit_signal["exit_level"] == "EXIT":
+            red_count += 1
 
-        reco_upper = str(reco).upper()
-        if any(x in reco_upper for x in ("TAKE PROFIT", "TRIM", "CLOSE", "CUT")):
-            alerts += 1
-
-    return alerts
+    return red_count
 
 
 def page_portfolio():
@@ -3571,6 +3574,7 @@ def page_portfolio():
         hist = token_history_rows(chain, base_addr, limit=60)
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
         exit_signal = exit_before_dump_detector(best, hist, entry_price)
+        level = exit_signal["exit_level"]
 
         reco = portfolio_reco(entry_price, cur_price, liq, vol24, pc1h, pc5, decision, s_live, best)
         if trap["trap_level"] == "CRITICAL":
@@ -3578,9 +3582,9 @@ def page_portfolio():
         elif trap["trap_level"] == "WARNING" and str(reco).startswith("HOLD"):
             reco = "HOLD / WATCH CAREFULLY"
 
-        if str(exit_signal).startswith("EXIT"):
+        if level == "EXIT":
             reco = "EXIT NOW"
-        elif str(exit_signal).startswith("TRIM") and str(reco).startswith("HOLD"):
+        elif level == "EARLY" and str(reco).startswith("HOLD"):
             reco = "TRIM / WATCH"
 
         pnl = 0.0
@@ -3591,9 +3595,10 @@ def page_portfolio():
 
         with c1:
             symbol = f"{base_sym}/{quote_sym}"
-            is_alert = str(exit_signal).startswith("EXIT") or str(exit_signal).startswith("TRIM")
-            if is_alert:
+            if level == "EXIT":
                 st.markdown("### 🔴 " + symbol)
+            elif level == "EARLY":
+                st.markdown("### 🟡 " + symbol)
             else:
                 st.markdown("### " + symbol)
             st.caption(f"Chain: {chain} • DEX: {best.get('dexId','') if best else r.get('dex','')}")
@@ -3623,9 +3628,11 @@ def page_portfolio():
             st.write(f"Δ h1: {fmt_pct(pc1h)}")
             st.write(f"Reco: {reco}")
             st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
-            st.write(f"Exit signal: {exit_signal}")
-            if is_alert:
-                st.error(f"{exit_signal}")
+            st.write(f"Exit signal: {level}")
+            if level in ("EXIT", "EARLY"):
+                st.error(f"{level} ({exit_signal['exit_score']})")
+                for f in exit_signal["exit_flags"][:3]:
+                    st.caption(f"– {f}")
             note_key = f"note_{idx}_{hkey(base_addr, chain)}"
             note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
 
