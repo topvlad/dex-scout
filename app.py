@@ -39,6 +39,9 @@ import streamlit as st
 import pandas as pd
 
 
+st.set_page_config(page_title="DEX Scout", layout="wide")
+
+
 def _maybe_autorefresh(interval_ms: int, key: str):
     """Best-effort autorefresh without extra deps."""
     try:
@@ -1384,6 +1387,45 @@ def trap_label(trap_signal: Optional[str]) -> str:
     if trap_signal == "FAKE_VOLUME":
         return "volume anomaly"
     return trap_signal or "—"
+
+
+def entry_timing_signal(best: Optional[Dict[str, Any]], hist: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    if not best:
+        return {"timing": "SKIP", "reason": ["no_data"]}
+
+    try:
+        m5 = parse_float(safe_get(best, "priceChange", "m5", default=0), 0.0)
+        h1 = parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0)
+
+        # keep for future tuning; intentionally not used as hard gates in safe version
+        _vol5 = parse_float(safe_get(best, "volume", "m5", default=0), 0.0)
+        _liq = parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0)
+
+        if m5 > 20:
+            return {"timing": "SKIP", "reason": ["overextended_m5"]}
+        if h1 > 60:
+            return {"timing": "SKIP", "reason": ["overextended_h1"]}
+        if m5 < -12:
+            return {"timing": "SKIP", "reason": ["dumping"]}
+
+        if 5 < m5 < 20 and h1 > 0:
+            return {"timing": "GOOD", "reason": ["controlled_breakout"]}
+        if 0 < m5 < 5 and h1 > 0:
+            return {"timing": "GOOD", "reason": ["early_trend"]}
+
+        if hist and len(hist) >= 5:
+            prices = [parse_float(x.get("price_usd"), 0.0) for x in hist[-5:]]
+            prices = [p for p in prices if p > 0]
+            if prices:
+                local_max = max(prices)
+                last = prices[-1]
+                drop = (local_max - last) / max(local_max, 1e-9)
+                if 0.05 < drop < 0.25 and m5 > 0:
+                    return {"timing": "GOOD", "reason": ["pullback_entry"]}
+
+        return {"timing": "NEUTRAL", "reason": ["no_clear_edge"]}
+    except Exception:
+        return {"timing": "NEUTRAL", "reason": ["error"]}
 
 
 def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
@@ -3261,6 +3303,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             archive_monitoring(chain, base_addr, reason="weak_signal", last_score=s_live, last_decision=decision)
             continue
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
+        timing = entry_timing_signal(best, hist)
+        if timing["timing"] == "SKIP":
+            decision = "NO ENTRY"
+        elif timing["timing"] == "NEUTRAL" and decision == "ENTRY (scalp)":
+            decision = "WATCH / WAIT"
         size_info = position_sizing_engine(
             best,
             portfolio_value_usd=float(auto_cfg.get("portfolio_value_usd", 1000.0)),
@@ -3348,7 +3395,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         whale = whale_accumulation(best)
         signal = classify_signal(best) if best else (r.get("signal") or "RED")
 
-        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status))
+        enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status))
 
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
@@ -3356,9 +3403,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         request_rerun()
 
     priority = {"GREEN": 0, "YELLOW": 1, "RED": 2}
+    timing_priority = {"GOOD": 0, "NEUTRAL": 1, "SKIP": 2}
     enriched.sort(
         key=lambda x: (
-            priority.get(x[26], 2),
+            timing_priority.get(((x[7] or {}).get("timing") or "SKIP"), 2),
+            priority.get(x[27], 2),
             -x[5],
         )
     )
@@ -3371,7 +3420,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption("Порожньо")
             return
 
-        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status in items:
+        for stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status in items:
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
             persistence = exit_persistence_state(hist, min_points=3)
             level = str(exit_signal.get("exit_level", "WATCH"))
@@ -3417,6 +3466,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             with c3:
                 st.markdown("Plan")
                 st.write(f"Decision: {decision}")
+                st.write(f"Entry timing: {timing['timing']}")
+                for reason in timing.get("reason", []):
+                    st.caption(f"– {reason}")
                 st.write(f"Risk: {(r.get('risk') or 'standard')}")
                 st.write(f"Suggested entry: ${r.get('entry_suggest_usd') or '—'}")
                 st.write(f"TP target: {r.get('tp_target_pct') or '—'}%")
@@ -3488,6 +3540,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                         st.warning("Early warning – use caution / smaller size.")
                     elif final_status == "BLOCK":
                         st.warning("Blocked by correlation governor")
+                    elif timing["timing"] == "SKIP":
+                        st.warning("Bad entry timing – wait.")
                     else:
                         swap_url = build_swap_url(chain, base_addr)
                         res = log_to_portfolio(best, s_live, decision, tags, swap_url)
@@ -3819,7 +3873,6 @@ def main():
         st.session_state["_rerun_flag"] = False
         st.rerun()
 
-    st.set_page_config(page_title="DEX Scout", layout="wide")
     ensure_storage()
 
     scanner_seeds_raw = str(DEFAULT_SEEDS)
