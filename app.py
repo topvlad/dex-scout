@@ -30,7 +30,7 @@ import random
 import hashlib
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set
 from collections import Counter
 from contextlib import contextmanager
 
@@ -728,6 +728,22 @@ def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, An
 
     pools.sort(key=key, reverse=True)
     return pools[0]
+
+
+def detect_narrative(pair: Dict[str, Any]) -> str:
+    name = (pair.get("baseToken", {}).get("name") or "").lower()
+    symbol = (pair.get("baseToken", {}).get("symbol") or "").lower()
+    txt = f"{name} {symbol}"
+
+    if any(x in txt for x in ["pepe", "frog", "bonk"]):
+        return "frog_meme"
+    if any(x in txt for x in ["dog", "inu", "shib"]):
+        return "dog_meme"
+    if any(x in txt for x in ["ai", "agent", "gpt"]):
+        return "ai"
+    if any(x in txt for x in ["pump", "moon", "100x"]):
+        return "pump"
+    return "other"
 
 
 # =============================
@@ -1741,6 +1757,57 @@ def active_portfolio_addresses() -> Set[str]:
         (r.get("base_token_address") or "").strip().lower()
         for r in rows
         if r.get("active") == "1"
+    }
+
+
+def build_live_portfolio_pairs() -> List[Dict[str, Any]]:
+    pairs: List[Dict[str, Any]] = []
+    for r in load_portfolio():
+        if r.get("active") != "1":
+            continue
+        chain = (r.get("chain") or "").strip().lower()
+        base_addr = (r.get("base_token_address") or "").strip().lower()
+        if not chain or not base_addr:
+            continue
+        best = best_pair_for_token(chain, base_addr)
+        if best:
+            pairs.append(best)
+    return pairs
+
+
+def portfolio_allocation_governor(size_info: Dict[str, Any]) -> Dict[str, Any]:
+    size_label = str(size_info.get("size_label") or "").upper()
+    if size_label == "SKIP":
+        return {"status": "BLOCK", "reason": ["allocation_skip"]}
+    return {"status": "ALLOW", "reason": ["allocation_ok"]}
+
+
+def correlation_governor(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    current = build_live_portfolio_pairs()
+    narrative_counts: Dict[str, int] = {}
+
+    for p in current:
+        n = detect_narrative(p)
+        narrative_counts[n] = narrative_counts.get(n, 0) + 1
+
+    cand_narr = detect_narrative(candidate)
+    count = narrative_counts.get(cand_narr, 0)
+
+    if count >= 3:
+        return {
+            "status": "BLOCK",
+            "reason": [f"too_many_{cand_narr}"]
+        }
+
+    if count == 2:
+        return {
+            "status": "ALLOW_SMALL_ONLY",
+            "reason": [f"{cand_narr}_overloaded"]
+        }
+
+    return {
+        "status": "ALLOW",
+        "reason": ["ok"]
     }
 
 
@@ -3106,6 +3173,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             "risk_score": 10,
             "risk_flags": ["no_data"],
         }
+        gov = portfolio_allocation_governor(size_info)
+        corr = correlation_governor(best) if best else {"status": "BLOCK", "reason": ["no_data"]}
+        final_status = gov["status"]
+        if corr["status"] == "BLOCK":
+            final_status = "BLOCK"
+        elif corr["status"] == "ALLOW_SMALL_ONLY" and final_status == "ALLOW":
+            final_status = "ALLOW_SMALL_ONLY"
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
 
         # smart auto-archive
@@ -3175,7 +3249,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         whale = whale_accumulation(best)
         signal = classify_signal(best) if best else (r.get("signal") or "RED")
 
-        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info))
+        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status))
 
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
@@ -3198,7 +3272,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption("Порожньо")
             return
 
-        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info in items:
+        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status in items:
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
             if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
                 continue
@@ -3249,6 +3323,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"Suggested size: {size_info['size_pct']}%")
                 st.write(f"USD size: ${size_info['usd_size']}")
                 st.write(f"Risk score: {size_info['risk_score']}")
+                st.write(f"Correlation: {corr['status']}")
+                for rr in corr["reason"]:
+                    st.caption(f"– {rr}")
                 if size_info["risk_flags"]:
                     st.caption("Risk flags:")
                     for rf in size_info["risk_flags"]:
@@ -3304,6 +3381,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                         st.warning("Too risky (position sizing).")
                     elif exit_signal.startswith("EXIT"):
                         st.warning("Exit signal – blocked.")
+                    elif final_status == "BLOCK":
+                        st.warning("Blocked by correlation governor")
                     else:
                         swap_url = build_swap_url(chain, base_addr)
                         res = log_to_portfolio(best, s_live, decision, tags, swap_url)
