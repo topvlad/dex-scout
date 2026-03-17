@@ -1227,6 +1227,77 @@ def classify_signal(pair: Optional[Dict[str, Any]]) -> str:
     return "RED"
 
 
+def liquidity_trap_detector(pair: Optional[Dict[str, Any]], hist: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    if not pair:
+        return {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
+
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)
+    vol24 = parse_float(safe_get(pair, "volume", "h24", default=0), 0.0)
+    vol5 = parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)
+    pc1h = parse_float(safe_get(pair, "priceChange", "h1", default=0), 0.0)
+    pc5 = parse_float(safe_get(pair, "priceChange", "m5", default=0), 0.0)
+
+    buys5 = int(safe_get(pair, "txns", "m5", "buys", default=0) or 0)
+    sells5 = int(safe_get(pair, "txns", "m5", "sells", default=0) or 0)
+    age = pair_age_minutes(pair)
+
+    trap_score = 0
+    flags: List[str] = []
+
+    if liq > 0:
+        vliq24 = vol24 / max(liq, 1.0)
+        vliq5 = vol5 / max(liq, 1.0)
+
+        if vliq24 >= 12:
+            trap_score += 2
+            flags.append("vol/liquidity anomaly 24h")
+        if vliq5 >= 1.5:
+            trap_score += 2
+            flags.append("vol/liquidity anomaly 5m")
+
+    if buys5 >= 12 and sells5 <= 1:
+        trap_score += 2
+        flags.append("buy-only flow")
+
+    if liq < 12000 and (pc1h >= 35 or pc5 >= 12):
+        trap_score += 2
+        flags.append("pump on tiny liquidity")
+
+    if age is not None and age < 90 and liq < 20000 and vol24 > 50000:
+        trap_score += 2
+        flags.append("fresh LP overheating")
+
+    if hist and len(hist) >= 4:
+        try:
+            liqs = [parse_float(x.get("liq_usd", 0), 0.0) for x in hist[-4:]]
+            vols = [parse_float(x.get("vol5_usd", 0), 0.0) for x in hist[-4:]]
+            prices = [parse_float(x.get("price_usd", 0), 0.0) for x in hist[-4:]]
+
+            if liqs[-1] < max(liqs[-3], 1.0) * 0.55:
+                trap_score += 3
+                flags.append("liquidity collapse")
+
+            if vols[-1] < max(vols[-3], 1.0) * 0.25 and max(vols[:-1]) > 0:
+                trap_score += 2
+                flags.append("volume collapse")
+
+            peak = max(prices[:-1]) if len(prices) >= 2 else 0
+            if peak > 0 and prices[-1] < peak * 0.72:
+                trap_score += 3
+                flags.append("post-pump dump")
+        except Exception:
+            pass
+
+    if trap_score >= 6:
+        level = "CRITICAL"
+    elif trap_score >= 3:
+        level = "WARNING"
+    else:
+        level = "SAFE"
+
+    return {"trap_score": trap_score, "trap_level": level, "trap_flags": flags}
+
+
 def liquidity_trap(pair: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
     if not pair:
         return None, None
@@ -1348,11 +1419,16 @@ def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
         else:
             decision = "WATCH / WAIT"
 
-    trap, trap_level = liquidity_trap(p)
-    if trap_level == "CRITICAL" and liq < 50000:
-        decision = "AVOID"
-        if trap:
-            tags.append(f"Trap: {trap}")
+    trap = liquidity_trap_detector(p, None)
+
+    if trap["trap_level"] == "WARNING" and decision.startswith("ENTRY"):
+        decision = "WATCH / WAIT"
+
+    if trap["trap_level"] == "CRITICAL":
+        decision = "NO ENTRY"
+        tags.append("Trap risk: CRITICAL")
+    elif trap["trap_level"] == "WARNING":
+        tags.append("Trap risk: WARNING")
 
     return decision, tags
 
@@ -2411,10 +2487,15 @@ def confidence_stars(best: Optional[Dict[str, Any]], hist: List[Dict[str, Any]])
     vol24 = parse_float(safe_get(best, "volume", "h24", default=0), 0.0)
     pc1h = parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0)
     score = score_pair(best)
+    trap = liquidity_trap_detector(best, hist)
+
     stars = 0
-    if score >= 220: stars += 1
-    if liq >= 30000 and vol24 >= 20000: stars += 1
-    if pc1h > 3: stars += 1
+    if score >= 220:
+        stars += 1
+    if liq >= 30000 and vol24 >= 20000:
+        stars += 1
+    if pc1h > 3:
+        stars += 1
     if hist and len(hist) >= 3:
         try:
             scores = [parse_float(x.get("score_live", 0), 0.0) for x in hist[-3:]]
@@ -2422,8 +2503,14 @@ def confidence_stars(best: Optional[Dict[str, Any]], hist: List[Dict[str, Any]])
                 stars += 1
         except Exception:
             pass
-    stars = max(1, min(3, stars))
-    return "★" * stars
+
+    if trap["trap_level"] == "WARNING":
+        stars -= 1
+    elif trap["trap_level"] == "CRITICAL":
+        stars -= 2
+
+    stars = max(0, min(3, stars))
+    return "★" * stars if stars > 0 else ""
 
 def second_wave_label(hist: List[Dict[str, Any]]) -> str:
     if not hist or len(hist) < 5:
@@ -2796,6 +2883,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         s_live += pump_live * 0.5
         decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
+        trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
 
         # smart auto-archive
         if best and auto_cfg.get("auto_archive_enabled"):
@@ -2809,6 +2897,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             target_score = avg_score if avg_score > 0 else s_live
             if rug_like(best, hist):
                 archive_monitoring(chain, base_addr, reason="auto: RUG", last_score=s_live, last_decision=decision)
+                continue
+            if trap["trap_level"] == "CRITICAL":
+                archive_monitoring(chain, base_addr, reason="auto: TRAP", last_score=s_live, last_decision=decision)
                 continue
             if persistent_no_entry and hist:
                 last_decisions = [str(x.get("decision", "")).upper() for x in hist[-4:]]
@@ -2861,7 +2952,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         whale = whale_accumulation(best)
         signal = classify_signal(best) if best else (r.get("signal") or "RED")
 
-        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money))
+        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money))
 
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
@@ -2871,7 +2962,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     priority = {"GREEN": 0, "YELLOW": 1, "RED": 2}
     enriched.sort(
         key=lambda x: (
-            priority.get(x[25], 2),
+            priority.get(x[26], 2),
             -x[5],
         )
     )
@@ -2883,7 +2974,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if not items:
             st.caption("Порожньо")
             return
-        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money in items:
+        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money in items:
             if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
                 continue
             chain = (r.get("chain") or "").strip().lower()
@@ -2918,7 +3009,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.caption(f"Δ1h {fmt_pct(live['pc1h'])} • Δ5m {fmt_pct(live['pc5'])}")
                 st.write(f"SNIPER: {'YES' if sniper_flag else 'NO'}")
                 st.write(f"PUMP: {pump_score}")
-                st.write(f"TRAP: {trap_label(trap_signal)}")
+                st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
             with c3:
                 st.markdown("Plan")
                 st.write(f"Decision: {decision}")
@@ -2951,6 +3042,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.caption("CEX watch")
                 if trap_signal:
                     st.markdown(f"⚠️ {trap_label(trap_signal)}")
+                if trap.get("trap_flags"):
+                    for fl in trap["trap_flags"][:3]:
+                        st.caption(f"– {fl}")
                 if fresh == "VERY_NEW":
                     st.markdown("🆕 fresh LP")
                 elif fresh == "NEW":
@@ -3145,7 +3239,14 @@ def page_portfolio():
         if best:
             snapshot_live_to_history(chain, base_sym, base_addr, best)
 
+        hist = token_history_rows(chain, base_addr, limit=60)
+        trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
+
         reco = portfolio_reco(entry_price, cur_price, liq, vol24, pc1h, pc5, decision, s_live, best)
+        if trap["trap_level"] == "CRITICAL":
+            reco = "EXIT / RISK"
+        elif trap["trap_level"] == "WARNING" and str(reco).startswith("HOLD"):
+            reco = "HOLD / WATCH CAREFULLY"
 
         pnl = 0.0
         if entry_price > 0 and cur_price > 0:
@@ -3181,6 +3282,7 @@ def page_portfolio():
             st.write(f"Δ m5: {fmt_pct(pc5)}")
             st.write(f"Δ h1: {fmt_pct(pc1h)}")
             st.write(f"Reco: {reco}")
+            st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
             note_key = f"note_{idx}_{hkey(base_addr, chain)}"
             note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
 
@@ -3217,7 +3319,6 @@ def page_portfolio():
                 request_rerun()
 
         # Sparklines for portfolio too (requested)
-        hist = token_history_rows(chain, base_addr, limit=60)
         with st.expander("Dynamics (sparklines)", expanded=False):
             if not hist:
                 st.info("No snapshots yet.")
