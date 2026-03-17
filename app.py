@@ -2041,6 +2041,9 @@ def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Op
 
     s_live = score_pair(best)
     decision, _tags = build_trade_hint(best)
+    hist_rows = token_history_rows(chain, base_addr, limit=20)
+    exit_signal = exit_before_dump_detector(best, hist_rows, 0.0)
+    exit_level = str(exit_signal.get("exit_level", "WATCH"))
 
     row = {
         "ts_utc": now_utc_str(),
@@ -2057,7 +2060,7 @@ def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Op
         "pc1h": str(parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0)),
         "pc5": str(parse_float(safe_get(best, "priceChange", "m5", default=0), 0.0)),
         "score_live": str(s_live),
-        "decision": decision,
+        "decision": f"{decision} | {exit_level}",
     }
     append_monitoring_history(row)
 
@@ -2161,6 +2164,7 @@ def exit_before_dump_detector(
             "exit_level": "WATCH",
             "exit_score": 0,
             "exit_flags": [],
+            "suggested_action": "HOLD",
         }
 
     try:
@@ -2205,17 +2209,91 @@ def exit_before_dump_detector(
         else:
             level = "WATCH"
 
+        if level == "EXIT":
+            suggested_action = "EXIT_100"
+        elif level == "EARLY":
+            suggested_action = "REDUCE_50" if score >= 3 else "REDUCE_30"
+        else:
+            suggested_action = "HOLD"
+
         return {
             "exit_level": level,
             "exit_score": score,
             "exit_flags": flags,
+            "suggested_action": suggested_action,
         }
     except Exception:
         return {
             "exit_level": "WATCH",
             "exit_score": 0,
             "exit_flags": ["error"],
+            "suggested_action": "HOLD",
         }
+
+
+def exit_persistence_state(hist: Optional[List[Dict[str, Any]]], min_points: int = 3) -> Dict[str, Any]:
+    if not hist:
+        return {
+            "exit_hits": 0,
+            "early_hits": 0,
+            "persistent_exit": False,
+            "persistent_early": False,
+        }
+
+    recent = hist[-max(3, min_points):]
+    exit_hits = 0
+    early_hits = 0
+
+    for row in recent:
+        decision = str(row.get("decision", "") or "").upper()
+        if "EXIT" in decision:
+            exit_hits += 1
+        elif "EARLY" in decision or "TRIM" in decision:
+            early_hits += 1
+
+    return {
+        "exit_hits": exit_hits,
+        "early_hits": early_hits,
+        "persistent_exit": exit_hits >= 2,
+        "persistent_early": early_hits >= 2,
+    }
+
+
+def action_from_exit_signal(exit_signal: Dict[str, Any], persistence: Dict[str, Any]) -> Dict[str, str]:
+    level = str(exit_signal.get("exit_level", "WATCH"))
+    base_action = str(exit_signal.get("suggested_action", "HOLD"))
+
+    if level == "EXIT":
+        if persistence.get("persistent_exit"):
+            return {
+                "action_code": "EXIT_100",
+                "action_label": "Exit fully now",
+            }
+        return {
+            "action_code": "EXIT_CONFIRM",
+            "action_label": "Exit likely – confirm next cycle",
+        }
+
+    if level == "EARLY":
+        if persistence.get("persistent_early"):
+            if base_action == "REDUCE_50":
+                return {
+                    "action_code": "REDUCE_50",
+                    "action_label": "Reduce 50%",
+                }
+            return {
+                "action_code": "REDUCE_30",
+                "action_label": "Reduce 30%",
+            }
+        return {
+            "action_code": "WATCH_TIGHT",
+            "action_label": "Watch closely",
+        }
+
+    return {
+        "action_code": "HOLD",
+        "action_label": "Hold",
+    }
 
 
 def position_sizing_engine(
@@ -3295,7 +3373,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status in items:
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
-            exit_level = exit_signal["exit_level"]
+            persistence = exit_persistence_state(hist, min_points=3)
+            level = str(exit_signal.get("exit_level", "WATCH"))
+            action_plan = action_from_exit_signal(exit_signal, persistence)
             if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
                 continue
 
@@ -3332,7 +3412,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"SNIPER: {'YES' if sniper_flag else 'NO'}")
                 st.write(f"PUMP: {pump_score}")
                 st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
-                if exit_level == "EARLY":
+                if level == "EARLY":
                     st.caption("⚠ early exit forming")
             with c3:
                 st.markdown("Plan")
@@ -3392,19 +3472,20 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.markdown("⚠ dev risk")
                 st.write(f"Window: {r.get('source_window') or '—'}")
                 st.write(f"Preset tags: {r.get('source_preset') or '—'}")
-                if exit_level == "EXIT":
+                st.write(f"Exit action: {action_plan['action_label']}")
+                if level == "EXIT":
                     st.warning(f"EXIT ({exit_signal['exit_score']})")
-                elif exit_level == "EARLY":
+                elif level == "EARLY":
                     st.caption(f"EARLY ({exit_signal['exit_score']})")
                 if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                     if not best:
                         st.error("No live pool found.")
                     elif size_info["size_label"] == "SKIP":
                         st.warning("Too risky (position sizing).")
-                    elif exit_signal["exit_level"] == "EXIT":
-                        st.warning("Exit signal – blocked.")
-                    elif exit_signal["exit_level"] == "EARLY":
-                        st.warning("Early warning – consider smaller position")
+                    elif level == "EXIT" and persistence.get("persistent_exit"):
+                        st.warning("Persistent exit signal – blocked.")
+                    elif level == "EARLY" and persistence.get("persistent_early"):
+                        st.warning("Early warning – use caution / smaller size.")
                     elif final_status == "BLOCK":
                         st.warning("Blocked by correlation governor")
                     else:
@@ -3495,7 +3576,7 @@ def portfolio_alert_count() -> int:
     rows = load_portfolio()
     active_rows = [r for r in rows if r.get("active") == "1"]
 
-    red_count = 0
+    alerts = 0
     for r in active_rows:
         chain = (r.get("chain") or "").lower()
         base_addr = r.get("base_token_address")
@@ -3507,11 +3588,12 @@ def portfolio_alert_count() -> int:
         entry = parse_float(r.get("entry_price_usd"), 0)
         hist = token_history_rows(chain, base_addr, limit=60)
         exit_signal = exit_before_dump_detector(best, hist, entry)
+        persistence = exit_persistence_state(hist, min_points=3)
 
-        if exit_signal["exit_level"] == "EXIT":
-            red_count += 1
+        if exit_signal.get("exit_level") == "EXIT" and persistence.get("persistent_exit"):
+            alerts += 1
 
-    return red_count
+    return alerts
 
 
 def page_portfolio():
@@ -3574,7 +3656,9 @@ def page_portfolio():
         hist = token_history_rows(chain, base_addr, limit=60)
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
         exit_signal = exit_before_dump_detector(best, hist, entry_price)
-        level = exit_signal["exit_level"]
+        persistence = exit_persistence_state(hist, min_points=3)
+        action_plan = action_from_exit_signal(exit_signal, persistence)
+        level = str(exit_signal.get("exit_level", "WATCH"))
 
         reco = portfolio_reco(entry_price, cur_price, liq, vol24, pc1h, pc5, decision, s_live, best)
         if trap["trap_level"] == "CRITICAL":
@@ -3582,10 +3666,16 @@ def page_portfolio():
         elif trap["trap_level"] == "WARNING" and str(reco).startswith("HOLD"):
             reco = "HOLD / WATCH CAREFULLY"
 
-        if level == "EXIT":
+        if action_plan["action_code"] == "EXIT_100":
             reco = "EXIT NOW"
-        elif level == "EARLY" and str(reco).startswith("HOLD"):
-            reco = "TRIM / WATCH"
+        elif action_plan["action_code"] == "EXIT_CONFIRM":
+            reco = "EXIT LIKELY"
+        elif action_plan["action_code"] == "REDUCE_50":
+            reco = "REDUCE 50%"
+        elif action_plan["action_code"] == "REDUCE_30":
+            reco = "REDUCE 30%"
+        elif action_plan["action_code"] == "WATCH_TIGHT" and str(reco).startswith("HOLD"):
+            reco = "WATCH CLOSELY"
 
         pnl = 0.0
         if entry_price > 0 and cur_price > 0:
@@ -3595,7 +3685,7 @@ def page_portfolio():
 
         with c1:
             symbol = f"{base_sym}/{quote_sym}"
-            if level == "EXIT":
+            if level == "EXIT" and persistence.get("persistent_exit"):
                 st.markdown("### 🔴 " + symbol)
             elif level == "EARLY":
                 st.markdown("### 🟡 " + symbol)
@@ -3629,10 +3719,18 @@ def page_portfolio():
             st.write(f"Reco: {reco}")
             st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
             st.write(f"Exit signal: {level}")
+            st.write(f"Recommended action: {action_plan['action_label']}")
             if level in ("EXIT", "EARLY"):
-                st.error(f"{level} ({exit_signal['exit_score']})")
-                for f in exit_signal["exit_flags"][:3]:
+                if level == "EXIT":
+                    st.error(f"{level} ({exit_signal.get('exit_score', 0)})")
+                else:
+                    st.warning(f"{level} ({exit_signal.get('exit_score', 0)})")
+                for f in exit_signal.get("exit_flags", [])[:3]:
                     st.caption(f"– {f}")
+                st.caption(
+                    f"Persistence: exit_hits={persistence.get('exit_hits', 0)}, "
+                    f"early_hits={persistence.get('early_hits', 0)}"
+                )
             note_key = f"note_{idx}_{hkey(base_addr, chain)}"
             note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
 
