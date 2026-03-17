@@ -2468,6 +2468,28 @@ def rotation_actions(engine: Dict[str, Any]) -> List[Dict[str, Any]]:
     return actions
 
 
+def rotation_exit_plan(engine: Dict[str, Any]) -> List[Dict[str, Any]]:
+    plans: List[Dict[str, Any]] = []
+
+    strong = engine.get("strong", [])
+    weak = engine.get("weak", [])
+
+    if not strong or not weak:
+        return plans
+
+    for w in weak:
+        plans.append(
+            {
+                "symbol": w.get("base_symbol") or w.get("symbol") or "?",
+                "action": "PARTIAL_EXIT",
+                "exit_pct": 0.5,
+                "reason": "weak_rotation",
+            }
+        )
+
+    return plans
+
+
 def position_sizing_engine(
     pair: Optional[Dict[str, Any]],
     portfolio_value_usd: float = 1000.0,
@@ -3820,6 +3842,9 @@ def page_portfolio():
 
     rot = capital_rotation_engine(active_rows)
     actions = rotation_actions(rot)
+    rotation_plan = rotation_exit_plan(rot)
+    weak_rotation_symbols = {str(p.get("symbol") or "") for p in rotation_plan}
+    best_strong = rot["strong"][0] if rot.get("strong") else None
 
     if actions:
         st.markdown("## 🔁 Capital Rotation Signals")
@@ -3868,6 +3893,16 @@ def page_portfolio():
         persistence = exit_persistence_state(hist, min_points=3)
         action_plan = action_from_exit_signal(exit_signal, persistence)
         level = str(exit_signal.get("exit_level", "WATCH"))
+
+        if level.startswith("EXIT"):
+            exit_pct = 1.0
+        elif level.startswith("EARLY"):
+            exit_pct = 0.7
+        else:
+            exit_pct = 0.0
+
+        if strength_cls == "WEAK" and exit_pct < 1.0:
+            exit_pct = max(exit_pct, 0.5)
 
         reco = portfolio_reco(entry_price, cur_price, liq, vol24, pc1h, pc5, decision, s_live, best)
         if trap["trap_level"] == "CRITICAL":
@@ -3929,6 +3964,11 @@ def page_portfolio():
             st.write(f"Strength: {strength_cls} ({strength_score:.1f})")
             if strength_cls == "WEAK":
                 st.caption("⚠ weak position – candidate for rotation")
+                if base_sym in weak_rotation_symbols:
+                    st.error(f"Sell {int(exit_pct * 100)}% – rotation/exit signal")
+                    if best_strong:
+                        rotate_to = best_strong.get("base_symbol") or best_strong.get("symbol") or "?"
+                        st.caption(f"→ rotate into {rotate_to}")
             st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
             st.write(f"Exit signal: {level}")
             st.write(f"Recommended action: {action_plan['action_label']}")
