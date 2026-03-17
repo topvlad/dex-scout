@@ -1853,6 +1853,30 @@ def correlation_governor(candidate: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def correlation_size_modifier(corr: Dict[str, Any]) -> float:
+    corr = corr or {"status": "ALLOW", "reason": []}
+    status = str(corr.get("status", "ALLOW"))
+
+    if status == "BLOCK":
+        return 0.25
+
+    if status == "ALLOW_SMALL_ONLY":
+        return 0.5
+
+    return 1.0
+
+
+def risk_adjusted_size(base_size: float, corr: Dict[str, Any]) -> Dict[str, Any]:
+    factor = correlation_size_modifier(corr)
+    final_size = base_size * factor
+
+    return {
+        "base_size": base_size,
+        "final_size": final_size,
+        "factor": factor,
+    }
+
+
 def load_monitoring() -> List[Dict[str, Any]]:
     rows = load_csv(MONITORING_CSV)
     for r in rows:
@@ -3321,11 +3345,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         }
         gov = portfolio_allocation_governor(size_info)
         corr = correlation_governor(best) if best else {"status": "BLOCK", "reason": ["no_data"]}
-        final_status = gov["status"]
-        if corr["status"] == "BLOCK":
-            final_status = "BLOCK"
-        elif corr["status"] == "ALLOW_SMALL_ONLY" and final_status == "ALLOW":
-            final_status = "ALLOW_SMALL_ONLY"
+        if not corr:
+            corr = {"status": "ALLOW", "reason": []}
+        adj = risk_adjusted_size(float(size_info.get("usd_size", 0.0) or 0.0), corr)
+        size_info["usd_size_adj"] = round(adj["final_size"], 2)
+        size_info["size_factor"] = adj["factor"]
+        final_status = gov["status"]  # correlation no longer blocks promote
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
 
         # smart auto-archive
@@ -3475,11 +3500,21 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"Δscore: {d_score:+.2f}")
                 st.write(f"Size: {size_info['size_label']}")
                 st.write(f"Suggested size: {size_info['size_pct']}%")
-                st.write(f"USD size: ${size_info['usd_size']}")
+                base_usd_size = float(size_info.get("usd_size", 0.0) or 0.0)
+                adjusted_usd_size = float(size_info.get("usd_size_adj", base_usd_size) or base_usd_size)
+                size_factor = float(size_info.get("size_factor", 1.0) or 1.0)
+                if size_factor < 1.0:
+                    st.write(f"USD size: ${adjusted_usd_size:.2f} (reduced from ${base_usd_size:.2f})")
+                else:
+                    st.write(f"USD size: ${base_usd_size:.2f}")
                 st.write(f"Risk score: {size_info['risk_score']}")
-                st.write(f"Correlation: {corr['status']}")
-                for rr in corr["reason"]:
-                    st.caption(f"– {rr}")
+                corr_status = str(corr.get("status", "ALLOW"))
+                corr_reasons = corr.get("reason", []) or []
+                st.write(f"Correlation: {corr_status}")
+                if corr_status != "ALLOW":
+                    for rr in corr_reasons:
+                        st.caption(f"– {rr}")
+                    st.caption(f"size factor: {float(size_info.get('size_factor', 1.0) or 1.0):.2f}")
                 if size_info["risk_flags"]:
                     st.caption("Risk flags:")
                     for rf in size_info["risk_flags"]:
@@ -3538,11 +3573,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                         st.warning("Persistent exit signal – blocked.")
                     elif level == "EARLY" and persistence.get("persistent_early"):
                         st.warning("Early warning – use caution / smaller size.")
-                    elif final_status == "BLOCK":
-                        st.warning("Blocked by correlation governor")
+                    elif corr.get("status", "ALLOW") == "BLOCK":
+                        st.warning("High correlation risk – size will be reduced")
                     elif timing["timing"] == "SKIP":
                         st.warning("Bad entry timing – wait.")
                     else:
+                        usd_size = float(size_info.get("usd_size_adj", size_info.get("usd_size", 0.0)) or 0.0)
+                        if usd_size < 5:
+                            st.warning("Position too small after risk adjustment")
                         swap_url = build_swap_url(chain, base_addr)
                         res = log_to_portfolio(best, s_live, decision, tags, swap_url)
                         if res == "OK":
