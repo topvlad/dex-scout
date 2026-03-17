@@ -2362,6 +2362,112 @@ def action_from_exit_signal(exit_signal: Dict[str, Any], persistence: Dict[str, 
     }
 
 
+def position_strength_score(best: Dict[str, Any], hist: List[Dict[str, Any]], entry_price: float) -> float:
+    if not best:
+        return 0.0
+
+    price = float(best.get("priceUsd") or 0)
+    liq = float(best.get("liquidity", {}).get("usd") or 0)
+    vol = float(best.get("volume", {}).get("h24") or 0)
+
+    pnl = 0.0
+    if entry_price and entry_price > 0:
+        pnl = (price - entry_price) / entry_price
+
+    score = 0.0
+
+    if pnl > 0.5:
+        score += 2
+    elif pnl > 0.2:
+        score += 1
+    elif pnl < -0.2:
+        score -= 2
+
+    if liq > 200_000:
+        score += 1
+    elif liq < 30_000:
+        score -= 1
+
+    if vol > 2_000_000:
+        score += 1
+    elif vol < 200_000:
+        score -= 1
+
+    return score
+
+
+def classify_position_strength(score: float) -> str:
+    if score >= 3:
+        return "STRONG"
+    if score <= -1:
+        return "WEAK"
+    return "NEUTRAL"
+
+
+def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    strong: List[Dict[str, Any]] = []
+    weak: List[Dict[str, Any]] = []
+    neutral: List[Dict[str, Any]] = []
+    enriched: List[Dict[str, Any]] = []
+
+    for r in active_rows:
+        chain = (r.get("chain") or "").strip().lower()
+        base_addr = (r.get("base_token_address") or "").lower().strip()
+        entry_price = parse_float(r.get("entry_price_usd") or r.get("entry_price") or 0, 0.0)
+
+        best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
+        hist = token_history_rows(chain, base_addr, limit=60)
+
+        score = position_strength_score(best or {}, hist, entry_price)
+        cls = classify_position_strength(score)
+
+        enriched_row = {
+            "row": r,
+            "class": cls,
+            "score": score,
+            "best": best,
+            "hist": hist,
+        }
+        enriched.append(enriched_row)
+
+        if cls == "STRONG":
+            strong.append(r)
+        elif cls == "WEAK":
+            weak.append(r)
+        else:
+            neutral.append(r)
+
+    return {
+        "strong": strong,
+        "weak": weak,
+        "neutral": neutral,
+        "enriched": enriched,
+    }
+
+
+def rotation_actions(engine: Dict[str, Any]) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+
+    strong = engine["strong"]
+    weak = engine["weak"]
+
+    if not strong or not weak:
+        return actions
+
+    for w in weak[:2]:
+        for s in strong[:2]:
+            actions.append(
+                {
+                    "type": "ROTATE",
+                    "from": w.get("base_symbol") or w.get("symbol") or "?",
+                    "to": s.get("base_symbol") or s.get("symbol") or "?",
+                    "reason": "capital_shift_weak_to_strong",
+                }
+            )
+
+    return actions
+
+
 def position_sizing_engine(
     pair: Optional[Dict[str, Any]],
     portfolio_value_usd: float = 1000.0,
@@ -3712,6 +3818,15 @@ def page_portfolio():
         st.info("Portfolio is empty. Use Scout → Log → Portfolio or Monitoring → Promote → Portfolio.")
         return
 
+    rot = capital_rotation_engine(active_rows)
+    actions = rotation_actions(rot)
+
+    if actions:
+        st.markdown("## 🔁 Capital Rotation Signals")
+        for a in actions:
+            st.warning(f"Rotate: {a['from']} → {a['to']}")
+            st.caption(a["reason"])
+
     st.subheader("Active positions")
     for idx, r in enumerate(active_rows):
         base_addr = (r.get("base_token_address") or "").lower().strip()
@@ -3746,6 +3861,8 @@ def page_portfolio():
             snapshot_live_to_history(chain, base_sym, base_addr, best)
 
         hist = token_history_rows(chain, base_addr, limit=60)
+        strength_score = position_strength_score(best or {}, hist, entry_price)
+        strength_cls = classify_position_strength(strength_score)
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
         exit_signal = exit_before_dump_detector(best, hist, entry_price)
         persistence = exit_persistence_state(hist, min_points=3)
@@ -3809,6 +3926,9 @@ def page_portfolio():
             st.write(f"Δ m5: {fmt_pct(pc5)}")
             st.write(f"Δ h1: {fmt_pct(pc1h)}")
             st.write(f"Reco: {reco}")
+            st.write(f"Strength: {strength_cls} ({strength_score:.1f})")
+            if strength_cls == "WEAK":
+                st.caption("⚠ weak position – candidate for rotation")
             st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
             st.write(f"Exit signal: {level}")
             st.write(f"Recommended action: {action_plan['action_label']}")
