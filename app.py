@@ -2075,6 +2075,52 @@ def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h:
     return "HOLD / WATCH"
 
 
+def exit_before_dump_detector(
+    pair: Optional[Dict[str, Any]],
+    hist: Optional[List[Dict[str, Any]]] = None,
+    entry_price: float = 0.0,
+) -> str:
+    if not pair:
+        return "WATCH"
+
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)
+    vol5 = parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)
+    pc1h = parse_float(safe_get(pair, "priceChange", "h1", default=0), 0.0)
+    pc5 = parse_float(safe_get(pair, "priceChange", "m5", default=0), 0.0)
+    buys5 = int(safe_get(pair, "txns", "m5", "buys", default=0) or 0)
+    sells5 = int(safe_get(pair, "txns", "m5", "sells", default=0) or 0)
+
+    trap_signal, trap_level = liquidity_trap(pair)
+    if trap_level == "CRITICAL":
+        return "EXIT (critical liquidity trap)"
+
+    if liq > 0 and liq < 6000 and pc1h <= -18:
+        return "EXIT (low liquidity breakdown)"
+
+    if sells5 > max(1, int(buys5 * 1.8)) and pc5 < -5:
+        return "EXIT (strong sell pressure)"
+
+    if vol5 < 700 and pc1h < -10:
+        return "EXIT (flow vanished)"
+
+    if hist and len(hist) >= 3:
+        try:
+            recent = hist[-3:]
+            scores = [parse_float(x.get("score_live", 0), 0.0) for x in recent]
+            if scores[-1] < scores[0] - 25 and pc5 < -3:
+                return "TRIM (score fading)"
+        except Exception:
+            pass
+
+    price = parse_float(pair.get("priceUsd"), 0.0)
+    if entry_price > 0 and price > 0:
+        pnl = (price - entry_price) / entry_price * 100.0
+        if pnl >= 35 and pc5 < -3:
+            return "TRIM (protect profit)"
+
+    return "WATCH"
+
+
 def position_sizing_engine(
     pair: Optional[Dict[str, Any]],
     portfolio_value_usd: float = 1000.0,
@@ -3136,6 +3182,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption("Порожньо")
             return
         for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info in items:
+            exit_signal = exit_before_dump_detector(best, hist, 0.0)
             if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
                 continue
             chain = (r.get("chain") or "").strip().lower()
@@ -3226,11 +3273,17 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.markdown("⚠ dev risk")
                 st.write(f"Window: {r.get('source_window') or '—'}")
                 st.write(f"Preset tags: {r.get('source_preset') or '—'}")
+                if exit_signal.startswith("EXIT"):
+                    st.warning(exit_signal)
+                elif exit_signal.startswith("TRIM"):
+                    st.caption(exit_signal)
                 if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                     if not best:
                         st.error("No live pool found.")
                     elif size_info["size_label"] == "SKIP":
                         st.warning("Position sizing engine says SKIP. Too risky for portfolio.")
+                    elif exit_signal.startswith("EXIT"):
+                        st.warning("Exit-before-dump detector says EXIT. Promotion blocked.")
                     else:
                         swap_url = build_swap_url(chain, base_addr)
                         res = log_to_portfolio(best, s_live, decision, tags, swap_url)
