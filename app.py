@@ -2156,6 +2156,202 @@ def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h:
     return "HOLD / WATCH"
 
 
+def exit_before_dump_detector(
+    pair: Optional[Dict[str, Any]],
+    hist: Optional[List[Dict[str, Any]]] = None,
+    entry_price: float = 0.0,
+) -> str:
+    if not pair:
+        return "WATCH"
+
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)
+    vol5 = parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)
+    pc1h = parse_float(safe_get(pair, "priceChange", "h1", default=0), 0.0)
+    pc5 = parse_float(safe_get(pair, "priceChange", "m5", default=0), 0.0)
+    buys5 = int(safe_get(pair, "txns", "m5", "buys", default=0) or 0)
+    sells5 = int(safe_get(pair, "txns", "m5", "sells", default=0) or 0)
+
+    trap_signal, trap_level = liquidity_trap(pair)
+    if trap_level == "CRITICAL":
+        return "EXIT (critical liquidity trap)"
+
+    if liq > 0 and liq < 6000 and pc1h <= -18:
+        return "EXIT (low liquidity breakdown)"
+
+    if sells5 > max(1, int(buys5 * 1.8)) and pc5 < -5:
+        return "EXIT (strong sell pressure)"
+
+    if vol5 < 700 and pc1h < -10:
+        return "EXIT (flow vanished)"
+
+    if hist and len(hist) >= 3:
+        try:
+            recent = hist[-3:]
+            scores = [parse_float(x.get("score_live", 0), 0.0) for x in recent]
+            if scores[-1] < scores[0] - 25 and pc5 < -3:
+                return "TRIM (score fading)"
+        except Exception:
+            pass
+
+    price = parse_float(pair.get("priceUsd"), 0.0)
+    if entry_price > 0 and price > 0:
+        pnl = (price - entry_price) / entry_price * 100.0
+        if pnl >= 35 and pc5 < -3:
+            return "TRIM (protect profit)"
+
+    return "WATCH"
+
+
+def position_sizing_engine(
+    pair: Optional[Dict[str, Any]],
+    portfolio_value_usd: float = 1000.0,
+    hist: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    if not pair:
+        return {
+            "size_pct": 0.0,
+            "size_label": "SKIP",
+            "usd_size": 0.0,
+            "risk_score": 10,
+            "risk_flags": ["no_data"],
+        }
+
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)
+    vol5 = parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)
+    pc1h = parse_float(safe_get(pair, "priceChange", "h1", default=0), 0.0)
+
+    score = score_pair(pair)
+    signal = classify_signal(pair)
+    smart_money = detect_smart_money(pair)
+    whale = whale_accumulation(pair)
+    dev = dev_wallet_risk(pair)
+    fresh = fresh_lp(pair)
+    sniper = detect_snipers(pair)
+
+    trap_signal, trap_level = liquidity_trap(pair)
+
+    migration = detect_liquidity_migration(pair)
+    migration_score = parse_float(migration.get("migration_score", 0), 0.0)
+
+    cex = detect_cex_listing_probability(pair)
+    cex_prob = parse_float(cex.get("cex_prob", 0), 0.0)
+
+    strength = 0.0
+    risk = 0.0
+    risk_flags: List[str] = []
+
+    if score >= 300:
+        strength += 3
+    elif score >= 220:
+        strength += 2
+    elif score >= 180:
+        strength += 1
+
+    if signal == "GREEN":
+        strength += 2
+    elif signal == "YELLOW":
+        strength += 1
+
+    if smart_money:
+        strength += 2
+    if whale:
+        strength += 1
+    if migration_score > 0:
+        strength += 1.5
+
+    if cex_prob >= 4:
+        strength += 2
+    elif cex_prob >= 3:
+        strength += 1
+
+    if pc1h > 10:
+        strength += 1
+    if vol5 > 5000:
+        strength += 1
+
+    if liq < 10000:
+        risk += 3
+        risk_flags.append("low_liq")
+    elif liq < 25000:
+        risk += 1.5
+        risk_flags.append("mid_liq")
+
+    if trap_level == "CRITICAL":
+        risk += 4
+        risk_flags.append("critical_trap")
+    elif trap_signal:
+        risk += 2
+        risk_flags.append(str(trap_signal).lower())
+
+    if dev:
+        risk += 2
+        risk_flags.append("dev_risk")
+    if sniper:
+        risk += 2
+        risk_flags.append("sniper_activity")
+
+    if fresh == "VERY_NEW":
+        risk += 2
+        risk_flags.append("very_new_lp")
+    elif fresh == "NEW":
+        risk += 1
+        risk_flags.append("new_lp")
+
+    if hist and len(hist) >= 3:
+        try:
+            scores = [parse_float(x.get("score_live", 0), 0.0) for x in hist[-3:]]
+            if scores[-1] < scores[0]:
+                risk += 1
+                risk_flags.append("score_fading")
+        except Exception:
+            pass
+
+    buys5 = int(safe_get(pair, "txns", "m5", "buys", default=0) or 0)
+    sells5 = int(safe_get(pair, "txns", "m5", "sells", default=0) or 0)
+    if sells5 > buys5 * 1.2:
+        risk += 1.5
+        risk_flags.append("sell_pressure")
+
+    total = strength - risk
+
+    if signal == "RED" or trap_level == "CRITICAL":
+        size_pct = 0.0
+        label = "SKIP"
+    elif total >= 6:
+        size_pct = 0.10
+        label = "LARGE"
+    elif total >= 4:
+        size_pct = 0.07
+        label = "MEDIUM"
+    elif total >= 2:
+        size_pct = 0.04
+        label = "SMALL"
+    elif total >= 1:
+        size_pct = 0.02
+        label = "PROBE"
+    else:
+        size_pct = 0.0
+        label = "SKIP"
+
+    if liq < 15000 and size_pct > 0.04:
+        size_pct = 0.04
+        label = "SMALL"
+
+    if fresh == "VERY_NEW" and size_pct > 0.02:
+        size_pct = 0.02
+        label = "PROBE"
+
+    usd_size = round(portfolio_value_usd * size_pct, 2)
+
+    return {
+        "size_pct": round(size_pct * 100, 1),
+        "size_label": label,
+        "usd_size": usd_size,
+        "risk_score": round(risk, 1),
+        "risk_flags": risk_flags[:5],
+    }
+
+
 # =============================
 # v0.6.0 – automation / scheduler helpers
 # =============================
@@ -2964,6 +3160,17 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         s_live += pump_live * 0.5
         decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
+        size_info = position_sizing_engine(
+            best,
+            portfolio_value_usd=float(auto_cfg.get("portfolio_value_usd", 1000.0)),
+            hist=hist,
+        ) if best else {
+            "size_pct": 0.0,
+            "size_label": "SKIP",
+            "usd_size": 0.0,
+            "risk_score": 10,
+            "risk_flags": ["no_data"],
+        }
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
 
         # smart auto-archive
@@ -3033,7 +3240,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         whale = whale_accumulation(best)
         signal = classify_signal(best) if best else (r.get("signal") or "RED")
 
-        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money))
+        enriched.append((stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info))
 
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
@@ -3055,7 +3262,40 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if not items:
             st.caption("Порожньо")
             return
-        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money in items:
+        if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
+
+            if not best:
+                st.error("No live pool found.")
+
+            elif size_info["size_label"] == "SKIP":
+                st.warning("Position sizing engine says SKIP. Too risky.")
+
+            elif exit_signal.startswith("EXIT"):
+                st.warning("Exit-before-dump detector says EXIT.")
+
+            else:
+                # 🔥 governor check
+                gov = portfolio_allocation_governor(
+                    best,
+                    candidate_size_pct=float(size_info.get("size_pct", 0.0)),
+                )
+
+                if gov["status"] == "BLOCK":
+                    st.warning("Portfolio Allocation Governor blocked this entry.")
+
+                elif gov["status"] == "ALLOW_SMALL_ONLY" and float(size_info.get("size_pct", 0.0)) > float(gov.get("max_size_pct", 0.0)):
+                    st.warning(f"Governor allows only reduced size ≤ {gov['max_size_pct']}%")
+
+                else:
+                    swap_url = build_swap_url(chain, base_addr)
+                    res = log_to_portfolio(best, s_live, decision, tags, swap_url)
+
+                    if res == "OK":
+                        archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
+                        st.success("Promoted to Portfolio.")
+                        request_rerun()
+                    else:
+                        st.info("Already in portfolio.")
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
             if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
                 continue
@@ -3101,6 +3341,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"Suggested entry: ${r.get('entry_suggest_usd') or '—'}")
                 st.write(f"TP target: {r.get('tp_target_pct') or '—'}%")
                 st.write(f"Δscore: {d_score:+.2f}")
+                st.write(f"Size: {size_info['size_label']}")
+                st.write(f"Suggested size: {size_info['size_pct']}%")
+                st.write(f"USD size: ${size_info['usd_size']}")
+                st.write(f"Risk score: {size_info['risk_score']}")
+                if size_info["risk_flags"]:
+                    st.caption("Risk flags:")
+                    for rf in size_info["risk_flags"]:
+                        st.caption(f"– {rf}")
                 if migration_label:
                     st.info(f"MIGRATION: {migration_label}")
             with c4:
@@ -3141,9 +3389,17 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.markdown("⚠ dev risk")
                 st.write(f"Window: {r.get('source_window') or '—'}")
                 st.write(f"Preset tags: {r.get('source_preset') or '—'}")
+                if exit_signal.startswith("EXIT"):
+                    st.warning(exit_signal)
+                elif exit_signal.startswith("TRIM"):
+                    st.caption(exit_signal)
                 if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                     if not best:
                         st.error("No live pool found.")
+                    elif size_info["size_label"] == "SKIP":
+                        st.warning("Position sizing engine says SKIP. Too risky for portfolio.")
+                    elif exit_signal.startswith("EXIT"):
+                        st.warning("Exit-before-dump detector says EXIT. Promotion blocked.")
                     else:
                         swap_url = build_swap_url(chain, base_addr)
                         res = log_to_portfolio(best, s_live, decision, tags, swap_url)
@@ -3523,6 +3779,13 @@ def main():
         auto_revisit_days = st.slider("Auto-revisit after (days)", 1, 30, 7, step=1)
         stability_window_n = st.slider("Stability window (snapshots)", 10, 120, 30, step=5)
         hide_red = st.checkbox("Hide weak signals", value=True)
+        portfolio_value_usd = st.number_input(
+            "Portfolio size (USD)",
+            min_value=100.0,
+            max_value=1000000.0,
+            value=1000.0,
+            step=100.0,
+        )
 
         st.divider()
         if st.button("Run scanner now", use_container_width=True):
@@ -3561,6 +3824,7 @@ def main():
         birdeye_limit=birdeye_limit,
         ui_autorefresh_sec=ui_autorefresh_sec,
         hide_red=hide_red,
+        portfolio_value_usd=portfolio_value_usd,
     )
 
     if page == "Monitoring":
