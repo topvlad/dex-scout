@@ -1298,87 +1298,6 @@ def liquidity_trap_detector(pair: Optional[Dict[str, Any]], hist: Optional[List[
     return {"trap_score": trap_score, "trap_level": level, "trap_flags": flags}
 
 
-def exit_before_dump_detector(
-    pair: Optional[Dict[str, Any]],
-    hist: Optional[List[Dict[str, Any]]] = None,
-    entry_price: float = 0.0,
-) -> Dict[str, Any]:
-    if not pair:
-        return {"exit_score": 0, "exit_level": "SAFE", "exit_flags": []}
-
-    _liq = parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)
-    _vol24 = parse_float(safe_get(pair, "volume", "h24", default=0), 0.0)
-    _vol5 = parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)
-    pc1h = parse_float(safe_get(pair, "priceChange", "h1", default=0), 0.0)
-
-    buys5 = int(safe_get(pair, "txns", "m5", "buys", default=0) or 0)
-    sells5 = int(safe_get(pair, "txns", "m5", "sells", default=0) or 0)
-
-    price = parse_float(pair.get("priceUsd"), 0.0)
-
-    score = 0
-    flags: List[str] = []
-
-    if hist and len(hist) >= 4:
-        try:
-            vols = [parse_float(x.get("vol5_usd", 0), 0.0) for x in hist[-4:]]
-            if vols[-1] < vols[-2] < vols[-3]:
-                score += 2
-                flags.append("volume fading")
-        except Exception:
-            pass
-
-    if hist and len(hist) >= 4:
-        try:
-            liqs = [parse_float(x.get("liq_usd", 0), 0.0) for x in hist[-4:]]
-            if liqs[-1] < liqs[-2] < liqs[-3]:
-                score += 2
-                flags.append("liquidity decreasing")
-        except Exception:
-            pass
-
-    if sells5 > buys5 * 1.2:
-        score += 2
-        flags.append("sell pressure rising")
-
-    if hist and len(hist) >= 5:
-        try:
-            prices = [parse_float(x.get("price_usd", 0), 0.0) for x in hist[-5:]]
-            if prices[-1] < prices[-2] and prices[-2] < max(prices[:-2]):
-                score += 2
-                flags.append("lower highs forming")
-        except Exception:
-            pass
-
-    if pc1h < 0:
-        score += 1
-        flags.append("momentum lost")
-
-    if entry_price > 0 and price > 0:
-        pnl = (price - entry_price) / entry_price * 100
-
-        if pnl >= 80 and pc1h < 5:
-            score += 2
-            flags.append("profit zone weakening")
-
-        if pnl >= 150 and sells5 > buys5:
-            score += 3
-            flags.append("blowoff top risk")
-
-    if score >= 6:
-        level = "EXIT"
-    elif score >= 3:
-        level = "EARLY"
-    else:
-        level = "SAFE"
-
-    return {
-        "exit_score": score,
-        "exit_level": level,
-        "exit_flags": flags,
-    }
-
-
 def liquidity_trap(pair: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
     if not pair:
         return None, None
@@ -1814,6 +1733,15 @@ def load_portfolio() -> List[Dict[str, Any]]:
 
 def save_portfolio(rows: List[Dict[str, Any]]):
     save_csv(PORTFOLIO_CSV, rows, PORTFOLIO_FIELDS)
+
+
+def active_portfolio_addresses() -> Set[str]:
+    rows = load_portfolio()
+    return {
+        (r.get("base_token_address") or "").strip().lower()
+        for r in rows
+        if r.get("active") == "1"
+    }
 
 
 def load_monitoring() -> List[Dict[str, Any]]:
@@ -3131,11 +3059,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     if chain_filter != "all":
         active = [r for r in active if (r.get("chain") or "").strip().lower() == chain_filter]
 
+    active_set = active_portfolio_addresses()
+
     enriched = []
     for idx, r in enumerate(active, start=1):
         chain = (r.get("chain") or "").strip().lower()
         base_sym = r.get("base_symbol") or "???"
-        base_addr = (r.get("base_addr") or "").strip()
+        base_addr = (r.get("base_addr") or "").lower().strip()
+        if base_addr in active_set:
+            continue
         best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
 
         live = {"price": 0.0, "liq": 0.0, "vol24": 0.0, "vol5": 0.0, "pc1h": 0.0, "pc5": 0.0, "dex": "", "pair_addr": "", "url": "", "quote": ""}
@@ -3159,6 +3091,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         pump_live = pump_probability(best)
         s_live += pump_live * 0.5
         decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
+        if decision == "NO ENTRY" and s_live < 200:
+            archive_monitoring(chain, base_addr, reason="weak_signal", last_score=s_live, last_decision=decision)
+            continue
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
         size_info = position_sizing_engine(
             best,
@@ -3262,46 +3197,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if not items:
             st.caption("Порожньо")
             return
-        if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
 
-            if not best:
-                st.error("No live pool found.")
-
-            elif size_info["size_label"] == "SKIP":
-                st.warning("Position sizing engine says SKIP. Too risky.")
-
-            elif exit_signal.startswith("EXIT"):
-                st.warning("Exit-before-dump detector says EXIT.")
-
-            else:
-                # 🔥 governor check
-                gov = portfolio_allocation_governor(
-                    best,
-                    candidate_size_pct=float(size_info.get("size_pct", 0.0)),
-                )
-
-                if gov["status"] == "BLOCK":
-                    st.warning("Portfolio Allocation Governor blocked this entry.")
-
-                elif gov["status"] == "ALLOW_SMALL_ONLY" and float(size_info.get("size_pct", 0.0)) > float(gov.get("max_size_pct", 0.0)):
-                    st.warning(f"Governor allows only reduced size ≤ {gov['max_size_pct']}%")
-
-                else:
-                    swap_url = build_swap_url(chain, base_addr)
-                    res = log_to_portfolio(best, s_live, decision, tags, swap_url)
-
-                    if res == "OK":
-                        archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
-                        st.success("Promoted to Portfolio.")
-                        request_rerun()
-                    else:
-                        st.info("Already in portfolio.")
+        for stage, pr, idx, r, best, s_live, decision, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info in items:
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
             if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
                 continue
+
             chain = (r.get("chain") or "").strip().lower()
             base_sym = r.get("base_symbol") or "???"
-            base_addr = (r.get("base_addr") or "").strip()
+            base_addr = (r.get("base_addr") or "").lower().strip()
             st.markdown("---")
             c1, c2, c3, c4 = st.columns([3,2,2,2])
             with c1:
@@ -3332,7 +3236,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.write(f"SNIPER: {'YES' if sniper_flag else 'NO'}")
                 st.write(f"PUMP: {pump_score}")
                 st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
-                if exit_signal["exit_level"] == "EARLY":
+                if exit_signal.startswith("TRIM"):
                     st.caption("⚠ early exit forming")
             with c3:
                 st.markdown("Plan")
@@ -3397,15 +3301,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     if not best:
                         st.error("No live pool found.")
                     elif size_info["size_label"] == "SKIP":
-                        st.warning("Position sizing engine says SKIP. Too risky for portfolio.")
+                        st.warning("Too risky (position sizing).")
                     elif exit_signal.startswith("EXIT"):
-                        st.warning("Exit-before-dump detector says EXIT. Promotion blocked.")
+                        st.warning("Exit signal – blocked.")
                     else:
                         swap_url = build_swap_url(chain, base_addr)
                         res = log_to_portfolio(best, s_live, decision, tags, swap_url)
                         if res == "OK":
                             archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
-                            st.success("Promoted to Portfolio.")
+                            st.success("Promoted.")
                             request_rerun()
                         else:
                             st.info("Already in portfolio.")
@@ -3517,7 +3421,7 @@ def portfolio_alert_count() -> int:
         hist = token_history_rows(chain, base_addr, limit=60)
         exit_signal = exit_before_dump_detector(best, hist, entry)
 
-        if exit_signal["exit_level"] in ("EXIT", "EARLY"):
+        if str(exit_signal).startswith("EXIT") or str(exit_signal).startswith("TRIM"):
             alerts += 1
             continue
 
@@ -3554,7 +3458,7 @@ def page_portfolio():
 
     st.subheader("Active positions")
     for idx, r in enumerate(active_rows):
-        base_addr = (r.get("base_token_address") or "").strip()
+        base_addr = (r.get("base_token_address") or "").lower().strip()
         chain = (r.get("chain") or "").strip().lower()
         base_sym = r.get("base_symbol") or "???"
         quote_sym = r.get("quote_symbol") or "???"
@@ -3595,9 +3499,9 @@ def page_portfolio():
         elif trap["trap_level"] == "WARNING" and str(reco).startswith("HOLD"):
             reco = "HOLD / WATCH CAREFULLY"
 
-        if exit_signal["exit_level"] == "EXIT":
+        if str(exit_signal).startswith("EXIT"):
             reco = "EXIT NOW"
-        elif exit_signal["exit_level"] == "EARLY" and str(reco).startswith("HOLD"):
+        elif str(exit_signal).startswith("TRIM") and str(reco).startswith("HOLD"):
             reco = "TRIM / WATCH"
 
         pnl = 0.0
@@ -3607,7 +3511,12 @@ def page_portfolio():
         c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
 
         with c1:
-            st.markdown(f"### {base_sym}/{quote_sym}")
+            symbol = f"{base_sym}/{quote_sym}"
+            is_alert = str(exit_signal).startswith("EXIT") or str(exit_signal).startswith("TRIM")
+            if is_alert:
+                st.markdown("### 🔴 " + symbol)
+            else:
+                st.markdown("### " + symbol)
             st.caption(f"Chain: {chain} • DEX: {best.get('dexId','') if best else r.get('dex','')}")
             st.code(base_addr, language="text")
             if best and best.get("url"):
@@ -3635,10 +3544,9 @@ def page_portfolio():
             st.write(f"Δ h1: {fmt_pct(pc1h)}")
             st.write(f"Reco: {reco}")
             st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
-            st.write(f"Exit signal: {exit_signal['exit_level']} ({exit_signal['exit_score']})")
-            if exit_signal["exit_flags"]:
-                for fl in exit_signal["exit_flags"][:3]:
-                    st.caption(f"– {fl}")
+            st.write(f"Exit signal: {exit_signal}")
+            if is_alert:
+                st.error(f"{exit_signal}")
             note_key = f"note_{idx}_{hkey(base_addr, chain)}"
             note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
 
@@ -3778,7 +3686,7 @@ def main():
         auto_revisit_enabled = st.checkbox("Auto-revisit auto-archived", value=True)
         auto_revisit_days = st.slider("Auto-revisit after (days)", 1, 30, 7, step=1)
         stability_window_n = st.slider("Stability window (snapshots)", 10, 120, 30, step=5)
-        hide_red = st.checkbox("Hide weak signals", value=True)
+        hide_red = st.checkbox("Hide red signals", value=True)
         portfolio_value_usd = st.number_input(
             "Portfolio size (USD)",
             min_value=100.0,
