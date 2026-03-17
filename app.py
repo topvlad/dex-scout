@@ -59,6 +59,21 @@ DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
 
+SCAN_CACHE: Dict[str, Dict[str, Any]] = {}
+CACHE_TTL = 300
+
+MEME_KEYWORDS = [
+    "dog",
+    "cat",
+    "pepe",
+    "inu",
+    "elon",
+    "moon",
+    "pump",
+    "bonk",
+    "frog",
+]
+
 PORTFOLIO_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 MONITORING_CSV = os.path.join(DATA_DIR, "monitoring.csv")
 MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
@@ -66,6 +81,20 @@ MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
 
 def request_rerun() -> None:
     st.session_state["_rerun_flag"] = True
+
+
+def safe_json(data: Any) -> str:
+    try:
+        return json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return json.dumps({"error": "serialization_failed"})
+
+
+def log_error(err: Exception):
+    try:
+        print(f"[scanner-error] {type(err).__name__}: {err}")
+    except Exception:
+        pass
 
 
 def load_smart_wallets() -> Dict[str, Any]:
@@ -167,7 +196,7 @@ def sb_put_storage(key: str, content: str) -> bool:
         payload = [{"key": key, "content": content}]
         headers = _sb_headers().copy()
         headers["Prefer"] = "resolution=merge-duplicates"
-        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r = requests.post(url, headers=headers, data=safe_json(payload), timeout=15)
         r.raise_for_status()
         return True
     except Exception:
@@ -767,6 +796,36 @@ def meme_token_score(token: Dict[str, Any]) -> int:
         score += 10
 
     return min(score, 100)
+
+
+def meme_score(name: str) -> int:
+    nm = (name or "").lower()
+    for word in MEME_KEYWORDS:
+        if word in nm:
+            return 1
+    return 0
+
+
+def scout_priority(token: Dict[str, Any]) -> int:
+    score = 0
+    liq = parse_float(safe_get(token, "liquidity", "usd", default=token.get("liquidity", 0)), 0.0)
+    vol5 = parse_float(safe_get(token, "volume", "m5", default=token.get("volume_5m", 0)), 0.0)
+    buys_5m = int(safe_get(token, "txns", "m5", "buys", default=token.get("buys_5m", 0)) or 0)
+    sells_5m = int(safe_get(token, "txns", "m5", "sells", default=token.get("sells_5m", 0)) or 0)
+    age_minutes = pair_age_minutes(token)
+    age_minutes = parse_float(age_minutes if age_minutes is not None else token.get("age_minutes", 999999), 999999.0)
+    name = str(safe_get(token, "baseToken", "name", default=token.get("name", "")) or "")
+
+    if liq > 50000:
+        score += 2
+    if vol5 > liq * 0.4:
+        score += 2
+    if age_minutes < 120:
+        score += 2
+    if buys_5m > sells_5m:
+        score += 1
+    score += meme_score(name)
+    return score
 
 
 def detect_smart_money(pair: Optional[Dict[str, Any]]) -> bool:
@@ -1622,7 +1681,19 @@ def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
 
 
 def append_monitoring_history(row: Dict[str, Any]):
-    append_csv(MON_HISTORY_CSV, row, HIST_FIELDS)
+    payload = {k: row.get(k, "") for k in HIST_FIELDS}
+    append_csv(MON_HISTORY_CSV, payload, HIST_FIELDS)
+
+
+def token_exists(contract: str) -> bool:
+    contract = (contract or "").strip()
+    if not contract:
+        return False
+    rows = load_monitoring()
+    for r in rows:
+        if r.get("active") == "1" and (r.get("base_addr", "").strip() == contract):
+            return True
+    return False
 
 
 def add_to_monitoring(p: Dict[str, Any], score: float, window_name: str = "", preset_key: str = "") -> str:
@@ -2009,6 +2080,19 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
     return (f"{entry:.0f}", f"{tp:.0f}")
 
 def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any], seeds_raw: str, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> List[Dict[str, Any]]:
+    cache_key = safe_json({
+        "chain": chain,
+        "window_name": window_name,
+        "preset": preset,
+        "seeds_raw": seeds_raw,
+        "use_birdeye_trending": bool(use_birdeye_trending),
+        "birdeye_limit": int(birdeye_limit),
+    })
+    cached = SCAN_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and (now_ts - float(cached.get("ts", 0.0))) < CACHE_TTL:
+        return list(cached.get("pairs", []))
+
     seeds = [x.strip() for x in (seeds_raw or "").split(",") if x.strip()]
     if not seeds:
         seeds = [x.strip() for x in str(preset.get("seeds", DEFAULT_SEEDS)).split(",") if x.strip()]
@@ -2088,6 +2172,8 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         if str(decision).upper() == "NO ENTRY":
             continue
         out.append(p)
+
+    SCAN_CACHE[cache_key] = {"ts": now_ts, "pairs": out}
     return out
 
 def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, int]:
@@ -2131,8 +2217,37 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 "last_seen": now_utc_str(),
                 "symbol": row.get("base_symbol", "")
             }
+        priority = scout_priority(row)
+        if priority < 3:
+            counts["skipped_noise"] = counts.get("skipped_noise", 0) + 1
+            continue
+
         try:
+            contract = addr_store(row.get("chainId", ""), safe_get(row, "baseToken", "address", default=""))
+            if token_exists(contract):
+                counts["skipped_active"] += 1
+                continue
+
             res = add_to_monitoring(row, float(s), window_name=window_name, preset_key=preset_key)
+
+            append_monitoring_history({
+                "ts_utc": now_utc_str(),
+                "chain": (row.get("chainId") or "").lower().strip(),
+                "base_symbol": safe_get(row, "baseToken", "symbol", default="") or "",
+                "base_addr": contract,
+                "pair_addr": row.get("pairAddress", "") or "",
+                "dex": row.get("dexId", "") or "",
+                "quote_symbol": safe_get(row, "quoteToken", "symbol", default="") or "",
+                "price_usd": str(parse_float(row.get("priceUsd"), 0.0)),
+                "liq_usd": str(parse_float(safe_get(row, "liquidity", "usd", default=0), 0.0)),
+                "vol24_usd": str(parse_float(safe_get(row, "volume", "h24", default=0), 0.0)),
+                "vol5_usd": str(parse_float(safe_get(row, "volume", "m5", default=0), 0.0)),
+                "pc1h": str(parse_float(safe_get(row, "priceChange", "h1", default=0), 0.0)),
+                "pc5": str(parse_float(safe_get(row, "priceChange", "m5", default=0), 0.0)),
+                "score_live": str(float(s)),
+                "decision": "SCOUT_SCAN",
+            })
+
             if res == "OK":
                 counts["added"] += 1
             elif res == "EXISTS_ACTIVE":
@@ -2141,7 +2256,8 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["skipped_archived"] += 1
             if detect_auto_signal(row):
                 add_to_monitoring(row, float(s), window_name="AUTO_SIGNAL", preset_key="AUTO_SIGNAL")
-        except Exception:
+        except Exception as e:
+            log_error(e)
             counts["errors"] += 1
     save_smart_wallets(smart_wallets)
     return counts
@@ -2241,7 +2357,11 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
     
     if last_slot == slot:
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {})}
-    stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
+    try:
+        stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
+    except Exception as e:
+        log_error(e)
+        return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {}), "error": str(e)}
     state.update({
         "last_slot": slot,
         "last_run_ts": now_utc_str(),
@@ -2255,7 +2375,11 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
 
 def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
     window_name, preset_key, chain, slot = current_scan_slot()
-    stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
+    try:
+        stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
+    except Exception as e:
+        log_error(e)
+        return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": {}, "error": str(e)}
     state = scanner_state_load()
     state.update({
         "last_slot": slot,
