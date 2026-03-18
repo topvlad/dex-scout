@@ -2383,6 +2383,60 @@ def liquidity_health(best: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def apply_liquidity_exit_override(
+    exit_signal: Dict[str, Any],
+    liq_health: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    signal = dict(exit_signal or {})
+    liq_action = str((liq_health or {}).get("action", "") or "").upper()
+    liq_level = str((liq_health or {}).get("level", "") or "").upper()
+
+    if liq_action in ("EXIT_NOW", "EXIT"):
+        flags = list(signal.get("exit_flags", []) or [])
+        if "liquidity_collapse" not in flags:
+            flags.append("liquidity_collapse")
+        signal.update(
+            {
+                "exit_level": "EXIT",
+                "exit_flags": flags,
+                "suggested_action": "EXIT_100",
+            }
+        )
+        if liq_level == "DEAD":
+            signal["exit_score"] = max(int(signal.get("exit_score", 0) or 0), 999)
+        else:
+            signal["exit_score"] = max(int(signal.get("exit_score", 0) or 0), 5)
+        return signal
+
+    if liq_action == "REDUCE" and str(signal.get("exit_level", "WATCH")).upper() == "WATCH":
+        flags = list(signal.get("exit_flags", []) or [])
+        if "liquidity_weak" not in flags:
+            flags.append("liquidity_weak")
+        signal.update(
+            {
+                "exit_level": "EARLY",
+                "exit_score": max(int(signal.get("exit_score", 0) or 0), 2),
+                "exit_flags": flags,
+                "suggested_action": "REDUCE_50",
+            }
+        )
+
+    return signal
+
+
+def apply_liquidity_reco_override(reco: str, liq_health: Optional[Dict[str, Any]]) -> str:
+    liq_level = str((liq_health or {}).get("level", "") or "").upper()
+    reco_text = str(reco or "")
+
+    if liq_level == "DEAD":
+        return "FORCE EXIT"
+    if liq_level == "CRITICAL":
+        return "EXIT NOW"
+    if liq_level == "WEAK" and "HOLD" in reco_text.upper():
+        return "REDUCE / WATCH"
+    return reco_text
+
+
 def action_from_exit_signal(exit_signal: Dict[str, Any], persistence: Dict[str, Any]) -> Dict[str, str]:
     level = str(exit_signal.get("exit_level", "WATCH"))
     base_action = str(exit_signal.get("suggested_action", "HOLD"))
@@ -2474,6 +2528,9 @@ def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]
         entry_price = parse_float(r.get("entry_price_usd") or r.get("entry_price") or 0, 0.0)
 
         best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
+        liq_health = liquidity_health(best)
+        if liq_health.get("level") == "DEAD":
+            continue
         hist = token_history_rows(chain, base_addr, limit=60)
 
         score = position_strength_score(best or {}, hist, entry_price)
@@ -2615,9 +2672,15 @@ def position_sizing_engine(
     if vol5 > 5000:
         strength += 1
 
-    if liq < 10000:
+    if liq < 100:
+        risk += 10
+        risk_flags.append("dead_liq")
+    elif liq < 1000:
+        risk += 6
+        risk_flags.append("critical_liq")
+    elif liq < 5000:
         risk += 3
-        risk_flags.append("low_liq")
+        risk_flags.append("weak_liq")
     elif liq < 25000:
         risk += 1.5
         risk_flags.append("mid_liq")
@@ -3635,7 +3698,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         for stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health in items:
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
+            exit_signal = apply_liquidity_exit_override(exit_signal, liq_health)
             persistence = exit_persistence_state(hist, min_points=3)
+            if liq_health["action"] in ("EXIT_NOW", "EXIT"):
+                persistence = {**persistence, "persistent_exit": True}
             level = str(exit_signal.get("exit_level", "WATCH"))
             action_plan = action_from_exit_signal(exit_signal, persistence)
             if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
@@ -3780,7 +3846,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                             st.warning("Bad entry timing – manual promote only.")
 
                         if liq_level in ("DEAD", "CRITICAL"):
-                            st.error("Liquidity too weak for safe entry.")
+                            st.error("Liquidity too low for entry")
                         else:
                             if adj_size < 5:
                                 st.warning("Position too small after risk adjustment.")
@@ -3889,7 +3955,10 @@ def portfolio_alert_count() -> int:
             continue
 
         exit_signal = exit_before_dump_detector(best, hist, entry)
+        exit_signal = apply_liquidity_exit_override(exit_signal, liq_health)
         persistence = exit_persistence_state(hist, min_points=3)
+        if liq_health["action"] in ("EXIT_NOW", "EXIT"):
+            persistence = {**persistence, "persistent_exit": True}
 
         if exit_signal.get("exit_level") == "EXIT" and persistence.get("persistent_exit"):
             alerts += 1
@@ -3951,7 +4020,17 @@ def page_portfolio():
         st.info("Portfolio is empty. Use Scout → Log → Portfolio or Monitoring → Promote → Portfolio.")
         return
 
-    rot = capital_rotation_engine(active_rows)
+    rotation_rows = [
+        r for r in active_rows
+        if liquidity_health(
+            best_pair_for_token(
+                (r.get("chain") or "").strip().lower(),
+                (r.get("base_token_address") or "").lower().strip(),
+            )
+        )["level"] not in ("DEAD",)
+    ]
+
+    rot = capital_rotation_engine(rotation_rows)
     actions = rotation_actions(rot)
     rotation_plan = rotation_exit_plan(rot)
     weak_rotation_symbols = {str(p.get("symbol") or "") for p in rotation_plan}
@@ -4002,27 +4081,7 @@ def page_portfolio():
         strength_cls = classify_position_strength(strength_score)
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
         exit_signal = exit_before_dump_detector(best, hist, entry_price)
-        if liq_health["action"] == "EXIT_NOW":
-            exit_signal = {
-                "exit_level": "EXIT",
-                "exit_score": 999,
-                "exit_flags": ["liquidity_dead"],
-                "suggested_action": "EXIT_100",
-            }
-        elif liq_health["action"] == "EXIT":
-            exit_signal = {
-                "exit_level": "EXIT",
-                "exit_score": max(int(exit_signal.get("exit_score", 0)), 5),
-                "exit_flags": list(set(exit_signal.get("exit_flags", []) + ["liquidity_critical"])),
-                "suggested_action": "EXIT_100",
-            }
-        elif liq_health["action"] == "REDUCE" and str(exit_signal.get("exit_level", "WATCH")) == "WATCH":
-            exit_signal = {
-                "exit_level": "EARLY",
-                "exit_score": max(int(exit_signal.get("exit_score", 0)), 2),
-                "exit_flags": list(set(exit_signal.get("exit_flags", []) + ["liquidity_weak"])),
-                "suggested_action": "REDUCE_50",
-            }
+        exit_signal = apply_liquidity_exit_override(exit_signal, liq_health)
         persistence = exit_persistence_state(hist, min_points=3)
         if liq_health["action"] in ("EXIT_NOW", "EXIT"):
             persistence = {**persistence, "persistent_exit": True}
@@ -4056,12 +4115,7 @@ def page_portfolio():
         elif action_plan["action_code"] == "WATCH_TIGHT" and str(reco).startswith("HOLD"):
             reco = "WATCH CLOSELY"
 
-        if liq_health["level"] == "DEAD":
-            reco = "FORCE EXIT / DEAD LIQUIDITY"
-        elif liq_health["level"] == "CRITICAL":
-            reco = "EXIT NOW"
-        elif liq_health["level"] == "WEAK" and str(reco).startswith("HOLD"):
-            reco = "REDUCE / WATCH"
+        reco = apply_liquidity_reco_override(reco, liq_health)
 
         pnl = 0.0
         if entry_price > 0 and cur_price > 0:
