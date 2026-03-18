@@ -1795,11 +1795,21 @@ def save_portfolio(rows: List[Dict[str, Any]]):
 
 def active_portfolio_addresses() -> Set[str]:
     rows = load_portfolio()
-    return {
-        (r.get("base_token_address") or "").strip().lower()
-        for r in rows
-        if r.get("active") == "1"
-    }
+    out: Set[str] = set()
+
+    for r in rows:
+        if r.get("active") != "1":
+            continue
+
+        chain = str(r.get("chain") or "").strip().casefold()
+        raw = (r.get("base_token_address") or "").strip()
+        stored = addr_store(chain, raw)
+        if not stored:
+            continue
+
+        out.add(addr_key(chain, stored))
+
+    return out
 
 
 def build_live_portfolio_pairs() -> List[Dict[str, Any]]:
@@ -1808,7 +1818,7 @@ def build_live_portfolio_pairs() -> List[Dict[str, Any]]:
         if r.get("active") != "1":
             continue
         chain = (r.get("chain") or "").strip().lower()
-        base_addr = (r.get("base_token_address") or "").strip().lower()
+        base_addr = addr_store(chain, (r.get("base_token_address") or "").strip())
         if not chain or not base_addr:
             continue
         best = best_pair_for_token(chain, base_addr)
@@ -2143,6 +2153,7 @@ def snapshot_live_to_history(chain: str, base_sym: str, base_addr: str, best: Op
 
 
 def token_history_rows(chain: str, base_addr: str, limit: int = 180) -> List[Dict[str, Any]]:
+    base_addr = addr_store(chain, base_addr)
     if not base_addr:
         return []
     key = addr_key(chain, base_addr)
@@ -2229,6 +2240,84 @@ def portfolio_reco(entry: float, current: float, liq: float, vol24: float, pc1h:
     if pnl <= -35:
         return "CUT / RISK"
     return "HOLD / WATCH"
+
+
+def anti_rug_early_detector(
+    pair: Optional[Dict[str, Any]],
+    hist: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    if not pair:
+        return {
+            "level": "SAFE",
+            "score": 0,
+            "flags": ["no_data"],
+            "action": "WATCH",
+        }
+
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)
+    vol24 = parse_float(safe_get(pair, "volume", "h24", default=0), 0.0)
+    vol5 = parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)
+
+    h1 = parse_float(safe_get(pair, "priceChange", "h1", default=0), 0.0)
+    m5 = parse_float(safe_get(pair, "priceChange", "m5", default=0), 0.0)
+
+    buys5 = int(safe_get(pair, "txns", "m5", "buys", default=0) or 0)
+    sells5 = int(safe_get(pair, "txns", "m5", "sells", default=0) or 0)
+
+    score = 0
+    flags: List[str] = []
+
+    if liq > 0 and vol24 / max(liq, 1.0) > 8:
+        score += 1
+        flags.append("vol_liq_stretched")
+
+    if sells5 > max(1, buys5 * 1.8):
+        score += 2
+        flags.append("sell_pressure")
+
+    if h1 < -12:
+        score += 1
+        flags.append("weak_h1")
+
+    if m5 < -6:
+        score += 1
+        flags.append("weak_m5")
+
+    if liq < 15000:
+        score += 1
+        flags.append("thin_liquidity")
+
+    if hist and len(hist) >= 4:
+        try:
+            recent = hist[-4:]
+
+            liqs = [parse_float(x.get("liq_usd", 0), 0.0) for x in recent]
+            vols = [parse_float(x.get("vol5_usd", 0), 0.0) for x in recent]
+            prices = [parse_float(x.get("price_usd", 0), 0.0) for x in recent]
+
+            if liqs[-1] < liqs[0] * 0.75:
+                score += 2
+                flags.append("liq_fading")
+
+            if vols[-1] < max(vols[:-1] or [0]) * 0.4:
+                score += 1
+                flags.append("flow_fading")
+
+            peak = max(prices[:-1]) if prices[:-1] else 0
+            if peak > 0 and prices[-1] < peak * 0.85:
+                score += 1
+                flags.append("failed_reclaim")
+
+        except Exception:
+            flags.append("hist_error")
+
+    if score >= 5:
+        return {"level": "CRITICAL", "score": score, "flags": flags, "action": "EXIT"}
+
+    if score >= 3:
+        return {"level": "WARNING", "score": score, "flags": flags, "action": "REDUCE"}
+
+    return {"level": "SAFE", "score": score, "flags": flags, "action": "WATCH"}
 
 
 def exit_before_dump_detector(
@@ -2524,7 +2613,7 @@ def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]
 
     for r in active_rows:
         chain = (r.get("chain") or "").strip().lower()
-        base_addr = (r.get("base_token_address") or "").lower().strip()
+        base_addr = addr_store(chain, (r.get("base_token_address") or "").strip())
         entry_price = parse_float(r.get("entry_price_usd") or r.get("entry_price") or 0, 0.0)
 
         best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
@@ -2532,6 +2621,7 @@ def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]
         if liq_health.get("level") == "DEAD":
             continue
         hist = token_history_rows(chain, base_addr, limit=60)
+        anti_rug = anti_rug_early_detector(best, hist)
 
         score = position_strength_score(best or {}, hist, entry_price)
         cls = classify_position_strength(score)
@@ -2542,6 +2632,7 @@ def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]
             "score": score,
             "best": best,
             "hist": hist,
+            "anti_rug": anti_rug,
         }
         enriched.append(enriched_row)
 
@@ -3546,8 +3637,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     for idx, r in enumerate(active, start=1):
         chain = (r.get("chain") or "").strip().lower()
         base_sym = r.get("base_symbol") or "???"
-        base_addr = (r.get("base_addr") or "").lower().strip()
-        if base_addr in active_set:
+        base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
+        if addr_key(chain, base_addr) in active_set:
             continue
         best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
 
@@ -3576,10 +3667,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             archive_monitoring(chain, base_addr, reason="weak_signal", last_score=s_live, last_decision=decision)
             continue
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
+        anti_rug = anti_rug_early_detector(best, hist)
         timing = entry_timing_signal(best, hist)
         if timing["timing"] == "SKIP":
             decision = "NO ENTRY"
         elif timing["timing"] == "NEUTRAL" and decision == "ENTRY (scalp)":
+            decision = "WATCH / WAIT"
+
+        if anti_rug["level"] == "CRITICAL":
+            decision = "NO ENTRY"
+        elif anti_rug["level"] == "WARNING" and decision == "ENTRY (scalp)":
             decision = "WATCH / WAIT"
         size_info = position_sizing_engine(
             best,
@@ -3614,6 +3711,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 if scores:
                     avg_score = sum(scores)/len(scores)
             target_score = avg_score if avg_score > 0 else s_live
+            if anti_rug["level"] == "CRITICAL":
+                archive_monitoring(chain, base_addr, reason="auto: EARLY_RUG", last_score=s_live, last_decision=decision)
+                continue
             if rug_like(best, hist):
                 archive_monitoring(chain, base_addr, reason="auto: RUG", last_score=s_live, last_decision=decision)
                 continue
@@ -3671,7 +3771,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         whale = whale_accumulation(best)
         signal = classify_signal(best) if best else (r.get("signal") or "RED")
 
-        enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health))
+        enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug))
 
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
@@ -3696,9 +3796,32 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption("Порожньо")
             return
 
-        for stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health in items:
+        for stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug in items:
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
             exit_signal = apply_liquidity_exit_override(exit_signal, liq_health)
+
+            if anti_rug["level"] == "CRITICAL":
+                flags = list(exit_signal.get("exit_flags", []) or [])
+                for f in anti_rug.get("flags", []):
+                    if f not in flags:
+                        flags.append(f)
+                exit_signal.update({
+                    "exit_level": "EXIT",
+                    "exit_score": max(int(exit_signal.get("exit_score", 0)), 4),
+                    "exit_flags": flags,
+                    "suggested_action": "EXIT_100",
+                })
+            elif anti_rug["level"] == "WARNING" and str(exit_signal.get("exit_level", "WATCH")).upper() == "WATCH":
+                flags = list(exit_signal.get("exit_flags", []) or [])
+                for f in anti_rug.get("flags", []):
+                    if f not in flags:
+                        flags.append(f)
+                exit_signal.update({
+                    "exit_level": "EARLY",
+                    "exit_score": max(int(exit_signal.get("exit_score", 0)), 2),
+                    "exit_flags": flags,
+                    "suggested_action": "REDUCE_50",
+                })
             persistence = exit_persistence_state(hist, min_points=3)
             if liq_health["action"] in ("EXIT_NOW", "EXIT"):
                 persistence = {**persistence, "persistent_exit": True}
@@ -3709,7 +3832,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
             chain = (r.get("chain") or "").strip().lower()
             base_sym = r.get("base_symbol") or "???"
-            base_addr = (r.get("base_addr") or "").lower().strip()
+            base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
             st.markdown("---")
             c1, c2, c3, c4 = st.columns([3,2,2,2])
             with c1:
@@ -3768,8 +3891,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 for rr in corr_reasons:
                     st.caption(f"– {rr}")
                 st.write(f"Liquidity health: {liq_health['level']}")
+                st.write(f"Anti-rug: {anti_rug['level']} ({anti_rug['score']})")
                 st.caption(f"size factor: {float(size_info.get('size_factor', 1.0) or 1.0):.2f}")
                 for fl in liq_health.get("flags", []):
+                    st.caption(f"– {fl}")
+                for fl in anti_rug.get("flags", [])[:4]:
                     st.caption(f"– {fl}")
                 if size_info["risk_flags"]:
                     st.caption("Risk flags:")
@@ -3806,6 +3932,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.error("🔴 liquidity critical – avoid entry")
                 elif liq_health["level"] == "WEAK":
                     st.warning("⚠ liquidity weak – size reduced")
+
+                if anti_rug["level"] == "CRITICAL":
+                    st.error("early rug risk – exit")
+                elif anti_rug["level"] == "WARNING":
+                    st.warning("rug risk building – reduce/watch")
                 if trap.get("trap_flags"):
                     for fl in trap["trap_flags"][:3]:
                         st.caption(f"– {fl}")
@@ -3844,6 +3975,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
                         if timing["timing"] == "SKIP":
                             st.warning("Bad entry timing – manual promote only.")
+
+                        if anti_rug["level"] == "CRITICAL":
+                            st.error("Early rug risk – entry blocked.")
+                            return
+                        elif anti_rug["level"] == "WARNING":
+                            st.warning("Rug risk building – manual entry risky.")
 
                         if liq_level in ("DEAD", "CRITICAL"):
                             st.error("Liquidity too low for entry")
@@ -3993,6 +4130,30 @@ def core_safety_selfcheck() -> List[str]:
     except Exception:
         issues.append("cannot inspect page_monitoring")
 
+    try:
+        import inspect
+        src = inspect.getsource(page_portfolio)
+        if "anti_rug_early_detector(" not in src:
+            issues.append("portfolio missing anti-rug")
+    except Exception:
+        issues.append("inspect portfolio failed")
+
+    try:
+        import inspect
+        src = inspect.getsource(page_monitoring)
+        if "anti_rug_early_detector(" not in src:
+            issues.append("monitoring missing anti-rug")
+    except Exception:
+        issues.append("inspect monitoring failed")
+
+    try:
+        import inspect
+        src = inspect.getsource(active_portfolio_addresses)
+        if ".lower()" in src:
+            issues.append("address lower() still present")
+    except Exception:
+        issues.append("inspect address normalization failed")
+
     return issues
 
 
@@ -4025,7 +4186,7 @@ def page_portfolio():
         if liquidity_health(
             best_pair_for_token(
                 (r.get("chain") or "").strip().lower(),
-                (r.get("base_token_address") or "").lower().strip(),
+                addr_store((r.get("chain") or "").strip().lower(), (r.get("base_token_address") or "").strip()),
             )
         )["level"] not in ("DEAD",)
     ]
@@ -4044,8 +4205,8 @@ def page_portfolio():
 
     st.subheader("Active positions")
     for idx, r in enumerate(active_rows):
-        base_addr = (r.get("base_token_address") or "").lower().strip()
         chain = (r.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, (r.get("base_token_address") or "").strip())
         base_sym = r.get("base_symbol") or "???"
         quote_sym = r.get("quote_symbol") or "???"
         entry_price_str = r.get("entry_price_usd") or "0"
@@ -4077,11 +4238,35 @@ def page_portfolio():
             snapshot_live_to_history(chain, base_sym, base_addr, best)
 
         hist = token_history_rows(chain, base_addr, limit=60)
+        anti_rug = anti_rug_early_detector(best, hist)
         strength_score = position_strength_score(best or {}, hist, entry_price)
         strength_cls = classify_position_strength(strength_score)
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
         exit_signal = exit_before_dump_detector(best, hist, entry_price)
         exit_signal = apply_liquidity_exit_override(exit_signal, liq_health)
+
+        if anti_rug["level"] == "CRITICAL":
+            flags = list(exit_signal.get("exit_flags", []) or [])
+            for f in anti_rug.get("flags", []):
+                if f not in flags:
+                    flags.append(f)
+            exit_signal.update({
+                "exit_level": "EXIT",
+                "exit_score": max(int(exit_signal.get("exit_score", 0)), 4),
+                "exit_flags": flags,
+                "suggested_action": "EXIT_100",
+            })
+        elif anti_rug["level"] == "WARNING" and str(exit_signal.get("exit_level", "WATCH")).upper() == "WATCH":
+            flags = list(exit_signal.get("exit_flags", []) or [])
+            for f in anti_rug.get("flags", []):
+                if f not in flags:
+                    flags.append(f)
+            exit_signal.update({
+                "exit_level": "EARLY",
+                "exit_score": max(int(exit_signal.get("exit_score", 0)), 2),
+                "exit_flags": flags,
+                "suggested_action": "REDUCE_50",
+            })
         persistence = exit_persistence_state(hist, min_points=3)
         if liq_health["action"] in ("EXIT_NOW", "EXIT"):
             persistence = {**persistence, "persistent_exit": True}
@@ -4116,6 +4301,11 @@ def page_portfolio():
             reco = "WATCH CLOSELY"
 
         reco = apply_liquidity_reco_override(reco, liq_health)
+
+        if anti_rug["level"] == "CRITICAL":
+            reco = "EXIT NOW / EARLY RUG RISK"
+        elif anti_rug["level"] == "WARNING" and "HOLD" in str(reco).upper():
+            reco = "REDUCE / EARLY RUG RISK"
 
         pnl = 0.0
         if entry_price > 0 and cur_price > 0:
@@ -4171,6 +4361,13 @@ def page_portfolio():
             st.write(f"Exit signal: {level}")
             st.write(f"Recommended action: {action_plan['action_label']}")
             st.write(f"Liquidity health: {liq_health['level']}")
+            st.write(f"Anti-rug: {anti_rug['level']} ({anti_rug['score']})")
+            for f in anti_rug.get("flags", [])[:4]:
+                st.caption(f"– {f}")
+            if anti_rug["level"] == "CRITICAL":
+                st.error("early rug risk – exit")
+            elif anti_rug["level"] == "WARNING":
+                st.warning("rug risk building – reduce/watch")
             if liq_health["level"] == "DEAD":
                 st.error("☠ liquidity dead – pool practically unusable")
             elif liq_health["level"] == "CRITICAL":
