@@ -1866,9 +1866,20 @@ def correlation_size_modifier(corr: Dict[str, Any]) -> float:
     return 1.0
 
 
-def risk_adjusted_size(base_size: float, corr: Dict[str, Any]) -> Dict[str, Any]:
+def risk_adjusted_size(
+    base_size: float,
+    corr: Dict[str, Any],
+    liq_health: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     factor = correlation_size_modifier(corr)
-    final_size = base_size * factor
+
+    if liq_health:
+        if liq_health.get("level") == "WEAK":
+            factor *= 0.5
+        elif liq_health.get("level") in ("CRITICAL", "DEAD"):
+            factor *= 0.0
+
+    final_size = max(0.0, base_size * factor)
 
     return {
         "base_size": base_size,
@@ -2325,19 +2336,51 @@ def exit_persistence_state(hist: Optional[List[Dict[str, Any]]], min_points: int
     }
 
 
-def liquidity_health(best: Dict[str, Any]) -> Dict[str, Any]:
-    liq = float(best.get("liquidity", {}).get("usd") or 0)
+def liquidity_health(best: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not best:
+        return {
+            "level": "UNKNOWN",
+            "liq_usd": 0.0,
+            "action": "WATCH",
+            "flags": ["no_data"],
+        }
+
+    liq = parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0)
+    flags: List[str] = []
 
     if liq < 100:
-        return {"level": "DEAD", "action": "EXIT_NOW"}
+        flags.append("liquidity_dead")
+        return {
+            "level": "DEAD",
+            "liq_usd": liq,
+            "action": "EXIT_NOW",
+            "flags": flags,
+        }
 
     if liq < 1000:
-        return {"level": "CRITICAL", "action": "EXIT"}
+        flags.append("liquidity_critical")
+        return {
+            "level": "CRITICAL",
+            "liq_usd": liq,
+            "action": "EXIT",
+            "flags": flags,
+        }
 
     if liq < 5000:
-        return {"level": "WEAK", "action": "REDUCE"}
+        flags.append("liquidity_weak")
+        return {
+            "level": "WEAK",
+            "liq_usd": liq,
+            "action": "REDUCE",
+            "flags": flags,
+        }
 
-    return {"level": "OK", "action": "HOLD"}
+    return {
+        "level": "OK",
+        "liq_usd": liq,
+        "action": "HOLD",
+        "flags": flags,
+    }
 
 
 def action_from_exit_signal(exit_signal: Dict[str, Any], persistence: Dict[str, Any]) -> Dict[str, str]:
@@ -3490,9 +3533,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         corr = correlation_governor(best) if best else {"status": "BLOCK", "reason": ["no_data"]}
         if not corr:
             corr = {"status": "ALLOW", "reason": []}
-        adj = risk_adjusted_size(float(size_info.get("usd_size", 0.0) or 0.0), corr)
+        liq_health = liquidity_health(best)
+        adj = risk_adjusted_size(float(size_info.get("usd_size", 0.0) or 0.0), corr, liq_health)
         size_info["usd_size_adj"] = round(adj["final_size"], 2)
         size_info["size_factor"] = adj["factor"]
+        size_info["liq_health"] = liq_health["level"]
         final_status = gov["status"]  # correlation no longer blocks promote
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
 
@@ -3563,7 +3608,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         whale = whale_accumulation(best)
         signal = classify_signal(best) if best else (r.get("signal") or "RED")
 
-        enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status))
+        enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health))
 
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
@@ -3588,7 +3633,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption("Порожньо")
             return
 
-        for stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status in items:
+        for stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health in items:
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
             persistence = exit_persistence_state(hist, min_points=3)
             level = str(exit_signal.get("exit_level", "WATCH"))
@@ -3654,10 +3699,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 corr_status = str(corr.get("status", "ALLOW"))
                 corr_reasons = corr.get("reason", []) or []
                 st.write(f"Correlation: {corr_status}")
-                if corr_status != "ALLOW":
-                    for rr in corr_reasons:
-                        st.caption(f"– {rr}")
-                    st.caption(f"size factor: {float(size_info.get('size_factor', 1.0) or 1.0):.2f}")
+                for rr in corr_reasons:
+                    st.caption(f"– {rr}")
+                st.write(f"Liquidity health: {liq_health['level']}")
+                st.caption(f"size factor: {float(size_info.get('size_factor', 1.0) or 1.0):.2f}")
+                for fl in liq_health.get("flags", []):
+                    st.caption(f"– {fl}")
                 if size_info["risk_flags"]:
                     st.caption("Risk flags:")
                     for rf in size_info["risk_flags"]:
@@ -3687,6 +3734,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.caption("CEX watch")
                 if trap_signal:
                     st.markdown(f"⚠️ {trap_label(trap_signal)}")
+                if liq_health["level"] == "DEAD":
+                    st.error("☠ liquidity dead – manual promote disabled")
+                elif liq_health["level"] == "CRITICAL":
+                    st.error("🔴 liquidity critical – avoid entry")
+                elif liq_health["level"] == "WEAK":
+                    st.warning("⚠ liquidity weak – size reduced")
                 if trap.get("trap_flags"):
                     for fl in trap["trap_flags"][:3]:
                         st.caption(f"– {fl}")
@@ -3708,30 +3761,37 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 elif level == "EARLY":
                     st.caption(f"EARLY ({exit_signal['exit_score']})")
                 if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
+                    adj_size = float(size_info.get("usd_size_adj", size_info.get("usd_size", 0.0)) or 0.0)
+                    liq_level = liq_health.get("level", "UNKNOWN")
                     if not best:
                         st.error("No live pool found.")
-                    elif size_info["size_label"] == "SKIP":
-                        st.warning("Too risky (position sizing).")
-                    elif level == "EXIT" and persistence.get("persistent_exit"):
-                        st.warning("Persistent exit signal – blocked.")
-                    elif level == "EARLY" and persistence.get("persistent_early"):
-                        st.warning("Early warning – use caution / smaller size.")
-                    elif corr.get("status", "ALLOW") == "BLOCK":
-                        st.warning("High correlation risk – size will be reduced")
-                    elif timing["timing"] == "SKIP":
-                        st.warning("Bad entry timing – wait.")
                     else:
-                        usd_size = float(size_info.get("usd_size_adj", size_info.get("usd_size", 0.0)) or 0.0)
-                        if usd_size < 5:
-                            st.warning("Position too small after risk adjustment")
-                        swap_url = build_swap_url(chain, base_addr)
-                        res = log_to_portfolio(best, s_live, decision, tags, swap_url)
-                        if res == "OK":
-                            archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
-                            st.success("Promoted.")
-                            request_rerun()
+                        if level == "EXIT" and persistence.get("persistent_exit"):
+                            st.warning("Persistent exit signal – manual promote is risky.")
+                        elif level == "EARLY" and persistence.get("persistent_early"):
+                            st.warning("Early warning – use caution / smaller size.")
+
+                        if corr.get("status", "ALLOW") == "BLOCK":
+                            st.warning("High correlation risk – size will be reduced")
+                        elif corr.get("status", "ALLOW") == "ALLOW_SMALL_ONLY":
+                            st.warning("Correlation elevated – use smaller size")
+
+                        if timing["timing"] == "SKIP":
+                            st.warning("Bad entry timing – manual promote only.")
+
+                        if liq_level in ("DEAD", "CRITICAL"):
+                            st.error("Liquidity too weak for safe entry.")
                         else:
-                            st.info("Already in portfolio.")
+                            if adj_size < 5:
+                                st.warning("Position too small after risk adjustment.")
+                            swap_url = build_swap_url(chain, base_addr)
+                            res = log_to_portfolio(best, s_live, decision, tags, swap_url)
+                            if res == "OK":
+                                archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
+                                st.success("Promoted.")
+                                request_rerun()
+                            else:
+                                st.info("Already in portfolio.")
                 if st.button("Archive (manual)", key=f"drop_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                     archive_monitoring(chain, base_addr, reason="manual", last_score=s_live, last_decision=decision)
                     st.success("Archived.")
@@ -3820,8 +3880,14 @@ def portfolio_alert_count() -> int:
         if not best:
             continue
 
-        entry = parse_float(r.get("entry_price_usd"), 0)
+        entry = parse_float(r.get("entry_price_usd"), 0.0)
         hist = token_history_rows(chain, base_addr, limit=60)
+
+        liq_health = liquidity_health(best)
+        if liq_health["level"] in ("DEAD", "CRITICAL"):
+            alerts += 1
+            continue
+
         exit_signal = exit_before_dump_detector(best, hist, entry)
         persistence = exit_persistence_state(hist, min_points=3)
 
@@ -3829,6 +3895,36 @@ def portfolio_alert_count() -> int:
             alerts += 1
 
     return alerts
+
+
+def core_safety_selfcheck() -> List[str]:
+    issues: List[str] = []
+
+    try:
+        import inspect
+        src = inspect.getsource(exit_before_dump_detector)
+        if '"suggested_action"' not in src and "'suggested_action'" not in src:
+            issues.append("exit_before_dump_detector missing suggested_action")
+    except Exception:
+        issues.append("cannot inspect exit_before_dump_detector")
+
+    try:
+        import inspect
+        src = inspect.getsource(page_portfolio)
+        if "liquidity_health(" not in src:
+            issues.append("page_portfolio missing liquidity_health integration")
+    except Exception:
+        issues.append("cannot inspect page_portfolio")
+
+    try:
+        import inspect
+        src = inspect.getsource(page_monitoring)
+        if "correlation_size_modifier(" not in src and "risk_adjusted_size(" not in src:
+            issues.append("page_monitoring missing risk-adjusted sizing")
+    except Exception:
+        issues.append("cannot inspect page_monitoring")
+
+    return issues
 
 
 def page_portfolio():
@@ -3881,7 +3977,7 @@ def page_portfolio():
             entry_price = 0.0
 
         best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
-        liq_health = liquidity_health(best) if best else {"level": "OK", "action": "HOLD"}
+        liq_health = liquidity_health(best)
 
         cur_price = parse_float(best.get("priceUsd"), 0.0) if best else 0.0
         pc1h = parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0) if best else 0.0
@@ -3906,12 +4002,26 @@ def page_portfolio():
         strength_cls = classify_position_strength(strength_score)
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
         exit_signal = exit_before_dump_detector(best, hist, entry_price)
-        if liq_health["action"] in ("EXIT_NOW", "EXIT"):
+        if liq_health["action"] == "EXIT_NOW":
             exit_signal = {
                 "exit_level": "EXIT",
-                "exit_flags": ["liquidity_collapse"],
-                "exit_score": exit_signal.get("exit_score", 0),
+                "exit_score": 999,
+                "exit_flags": ["liquidity_dead"],
                 "suggested_action": "EXIT_100",
+            }
+        elif liq_health["action"] == "EXIT":
+            exit_signal = {
+                "exit_level": "EXIT",
+                "exit_score": max(int(exit_signal.get("exit_score", 0)), 5),
+                "exit_flags": list(set(exit_signal.get("exit_flags", []) + ["liquidity_critical"])),
+                "suggested_action": "EXIT_100",
+            }
+        elif liq_health["action"] == "REDUCE" and str(exit_signal.get("exit_level", "WATCH")) == "WATCH":
+            exit_signal = {
+                "exit_level": "EARLY",
+                "exit_score": max(int(exit_signal.get("exit_score", 0)), 2),
+                "exit_flags": list(set(exit_signal.get("exit_flags", []) + ["liquidity_weak"])),
+                "suggested_action": "REDUCE_50",
             }
         persistence = exit_persistence_state(hist, min_points=3)
         if liq_health["action"] in ("EXIT_NOW", "EXIT"):
@@ -3947,7 +4057,7 @@ def page_portfolio():
             reco = "WATCH CLOSELY"
 
         if liq_health["level"] == "DEAD":
-            reco = "FORCE EXIT (if possible)"
+            reco = "FORCE EXIT / DEAD LIQUIDITY"
         elif liq_health["level"] == "CRITICAL":
             reco = "EXIT NOW"
         elif liq_health["level"] == "WEAK" and str(reco).startswith("HOLD"):
@@ -3961,9 +4071,11 @@ def page_portfolio():
 
         with c1:
             symbol = f"{base_sym}/{quote_sym}"
-            if level == "EXIT" and persistence.get("persistent_exit"):
+            if liq_health["level"] in ("DEAD", "CRITICAL"):
                 st.markdown("### 🔴 " + symbol)
-            elif level == "EARLY":
+            elif level == "EXIT":
+                st.markdown("### 🔴 " + symbol)
+            elif level == "EARLY" or liq_health["level"] == "WEAK":
                 st.markdown("### 🟡 " + symbol)
             else:
                 st.markdown("### " + symbol)
@@ -4004,12 +4116,15 @@ def page_portfolio():
             st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
             st.write(f"Exit signal: {level}")
             st.write(f"Recommended action: {action_plan['action_label']}")
+            st.write(f"Liquidity health: {liq_health['level']}")
             if liq_health["level"] == "DEAD":
-                st.error("☠️ LIQUIDITY DEAD – cannot exit")
+                st.error("☠ liquidity dead – pool practically unusable")
             elif liq_health["level"] == "CRITICAL":
-                st.error("🔴 LIQUIDITY CRITICAL – exit immediately")
+                st.error("🔴 liquidity critical – exit immediately")
             elif liq_health["level"] == "WEAK":
-                st.warning("⚠️ liquidity weak")
+                st.warning("⚠ liquidity weak – reduce risk")
+            for fl in liq_health.get("flags", []):
+                st.caption(f"– {fl}")
             if level in ("EXIT", "EARLY"):
                 if level == "EXIT":
                     st.error(f"{level} ({exit_signal.get('exit_score', 0)})")
@@ -4183,6 +4298,12 @@ def main():
             st.caption("Supabase/app_storage: ON")
         else:
             st.caption("Supabase/app_storage: OFF (local CSV)")
+
+        issues = core_safety_selfcheck()
+        if issues:
+            st.caption("Core safety check")
+            for msg in issues[:5]:
+                st.warning(msg)
 
     # rotating scanner – one slot every 5 minutes, runs at most once per slot
     scan_result = maybe_run_rotating_scanner(scanner_seeds_raw, max_items=int(scanner_max_items), use_birdeye_trending=bool(use_birdeye_trending), birdeye_limit=int(birdeye_limit))
