@@ -2325,6 +2325,21 @@ def exit_persistence_state(hist: Optional[List[Dict[str, Any]]], min_points: int
     }
 
 
+def liquidity_health(best: Dict[str, Any]) -> Dict[str, Any]:
+    liq = float(best.get("liquidity", {}).get("usd") or 0)
+
+    if liq < 100:
+        return {"level": "DEAD", "action": "EXIT_NOW"}
+
+    if liq < 1000:
+        return {"level": "CRITICAL", "action": "EXIT"}
+
+    if liq < 5000:
+        return {"level": "WEAK", "action": "REDUCE"}
+
+    return {"level": "OK", "action": "HOLD"}
+
+
 def action_from_exit_signal(exit_signal: Dict[str, Any], persistence: Dict[str, Any]) -> Dict[str, str]:
     level = str(exit_signal.get("exit_level", "WATCH"))
     base_action = str(exit_signal.get("suggested_action", "HOLD"))
@@ -3866,6 +3881,7 @@ def page_portfolio():
             entry_price = 0.0
 
         best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
+        liq_health = liquidity_health(best) if best else {"level": "OK", "action": "HOLD"}
 
         cur_price = parse_float(best.get("priceUsd"), 0.0) if best else 0.0
         pc1h = parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0) if best else 0.0
@@ -3890,7 +3906,16 @@ def page_portfolio():
         strength_cls = classify_position_strength(strength_score)
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
         exit_signal = exit_before_dump_detector(best, hist, entry_price)
+        if liq_health["action"] in ("EXIT_NOW", "EXIT"):
+            exit_signal = {
+                "exit_level": "EXIT",
+                "exit_flags": ["liquidity_collapse"],
+                "exit_score": exit_signal.get("exit_score", 0),
+                "suggested_action": "EXIT_100",
+            }
         persistence = exit_persistence_state(hist, min_points=3)
+        if liq_health["action"] in ("EXIT_NOW", "EXIT"):
+            persistence = {**persistence, "persistent_exit": True}
         action_plan = action_from_exit_signal(exit_signal, persistence)
         level = str(exit_signal.get("exit_level", "WATCH"))
 
@@ -3920,6 +3945,13 @@ def page_portfolio():
             reco = "REDUCE 30%"
         elif action_plan["action_code"] == "WATCH_TIGHT" and str(reco).startswith("HOLD"):
             reco = "WATCH CLOSELY"
+
+        if liq_health["level"] == "DEAD":
+            reco = "FORCE EXIT (if possible)"
+        elif liq_health["level"] == "CRITICAL":
+            reco = "EXIT NOW"
+        elif liq_health["level"] == "WEAK" and str(reco).startswith("HOLD"):
+            reco = "REDUCE / WATCH"
 
         pnl = 0.0
         if entry_price > 0 and cur_price > 0:
@@ -3972,6 +4004,12 @@ def page_portfolio():
             st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
             st.write(f"Exit signal: {level}")
             st.write(f"Recommended action: {action_plan['action_label']}")
+            if liq_health["level"] == "DEAD":
+                st.error("☠️ LIQUIDITY DEAD – cannot exit")
+            elif liq_health["level"] == "CRITICAL":
+                st.error("🔴 LIQUIDITY CRITICAL – exit immediately")
+            elif liq_health["level"] == "WEAK":
+                st.warning("⚠️ liquidity weak")
             if level in ("EXIT", "EARLY"):
                 if level == "EXIT":
                     st.error(f"{level} ({exit_signal.get('exit_score', 0)})")
