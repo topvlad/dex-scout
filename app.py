@@ -189,20 +189,30 @@ def sb_get_storage(key: str) -> Optional[str]:
         return None
 
 def sb_put_storage(key: str, content: str) -> bool:
-    """
-    Upsert (insert or update) content into public.app_storage.
-    """
-    if not USE_SUPABASE:
-        return False
     try:
-        url = _sb_table_url("app_storage")
-        payload = [{"key": key, "content": content}]
-        headers = _sb_headers().copy()
-        headers["Prefer"] = "resolution=merge-duplicates"
-        r = requests.post(url, headers=headers, data=safe_json(payload), timeout=15)
-        r.raise_for_status()
+        if not _sb_ok():
+            return False
+
+        url = f"{SUPABASE_URL}/rest/v1/app_storage"
+        headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates",
+        }
+        payload = {
+            "key": key,
+            "content": content,
+        }
+
+        res = requests.post(url, headers=headers, json=payload, timeout=10)
+        if res.status_code not in (200, 201):
+            st.sidebar.error(f"❌ Supabase write failed {key}: {res.text}")
+            return False
+
         return True
-    except Exception:
+    except Exception as e:
+        st.sidebar.error(f"❌ Supabase EXCEPTION {key}: {e}")
         return False
 
 def storage_key_for_path(path: str) -> str:
@@ -375,7 +385,13 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     if _sb_ok():
         key = storage_key_for_path(path)
         content = _csv_to_string(rows, fieldnames)
-        sb_put_storage(key, content)
+        ok = sb_put_storage(key, content)
+        if ok:
+            check = sb_get_storage(key)
+            if not check:
+                st.sidebar.error(f"❌ Write OK but read FAIL: {key}")
+            else:
+                st.sidebar.success(f"✅ Stored in Supabase: {key}")
 
 
 def append_csv(path: str, row: Dict[str, Any], fieldnames: List[str]):
@@ -2112,6 +2128,7 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
         }
     )
     save_portfolio(rows)
+    st.sidebar.success("📦 Portfolio saved (trigger)")
     return "OK"
 
 
