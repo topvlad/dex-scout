@@ -4492,6 +4492,21 @@ def main():
     birdeye_limit = 50
     ui_autorefresh_sec = 60
 
+    st.sidebar.markdown("## 🔍 Supabase debug")
+    
+    st.sidebar.write("USE_SUPABASE:", USE_SUPABASE)
+    st.sidebar.write("URL present:", bool(SUPABASE_URL))
+    st.sidebar.write("KEY present:", bool(SUPABASE_SERVICE_ROLE_KEY))
+    
+    if USE_SUPABASE:
+        test_keys = ["portfolio.csv", "monitoring.csv", "monitoring_history.csv"]
+        for k in test_keys:
+            content = sb_get_storage(k)
+            if content:
+                st.sidebar.success(f"{k}: FOUND ({len(content)} chars)")
+            else:
+                st.sidebar.error(f"{k}: EMPTY / NOT FOUND")
+
     with st.sidebar:
         st.markdown("### DEX Scout")
         st.caption(f"Version: v{VERSION}")
