@@ -344,28 +344,27 @@ def _csv_to_string(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
     return sio.getvalue()
 
 
-def load_csv(path: str) -> List[Dict[str, Any]]:
+def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     ensure_storage()
 
-    # Supabase source of truth
-    if _sb_ok():
-        key = storage_key_for_path(path)
-        content = sb_get_storage(key)
-        if content is not None:
-            try:
-                return _csv_from_string(content)
-            except Exception:
-                # fall back to local if content corrupt
-                pass
+    key = storage_key_for_path(path)
+    try:
+        if USE_SUPABASE:
+            content = sb_get_storage(key)
+            if content:
+                reader = csv.DictReader(io.StringIO(content))
+                return list(reader)
+            st.sidebar.warning(f"⚠️ Supabase empty: {key}")
+            return []
 
-    # Local fallback
-    if not os.path.exists(path):
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    except Exception as e:
+        st.sidebar.error(f"❌ load_csv failed {key}: {e}")
         return []
-    rows: List[Dict[str, Any]] = []
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            rows.append(row)
-    return rows
 
 
 def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
@@ -4502,6 +4501,15 @@ def main():
         st.rerun()
 
     ensure_storage()
+    portfolio_rows = load_csv(PORTFOLIO_CSV, PORTFOLIO_FIELDS)
+    monitoring_rows = load_csv(MONITORING_CSV, MON_FIELDS)
+    monitoring_history_rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
+    st.session_state["_preload_counts"] = {
+        "portfolio": len(portfolio_rows),
+        "monitoring": len(monitoring_rows),
+        "monitoring_history": len(monitoring_history_rows),
+    }
+    st.sidebar.info(f"📥 Loaded portfolio: {len(portfolio_rows)} rows")
 
     scanner_seeds_raw = str(DEFAULT_SEEDS)
     scanner_max_items = 100
