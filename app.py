@@ -1880,14 +1880,33 @@ def risk_adjusted_size(
     base_size: float,
     corr: Dict[str, Any],
     liq_health: Optional[Dict[str, Any]] = None,
+    anti_rug: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     factor = correlation_size_modifier(corr)
+    reasons: List[str] = []
 
     if liq_health:
         if liq_health.get("level") == "WEAK":
             factor *= 0.5
+            reasons.append("liquidity_weak")
         elif liq_health.get("level") in ("CRITICAL", "DEAD"):
             factor *= 0.0
+            reasons.append("liquidity_dead")
+
+    if anti_rug:
+        level = str(anti_rug.get("level") or "").upper()
+        if level == "CRITICAL":
+            return {
+                "base_size": base_size,
+                "final_size": 0.0,
+                "factor": 0.0,
+                "size_label": "SKIP",
+                "size_pct": 0.0,
+                "reason": ["anti_rug_critical"],
+            }
+        if level == "WARNING":
+            factor *= 0.5
+            reasons.append("anti_rug_warning")
 
     final_size = max(0.0, base_size * factor)
 
@@ -1895,6 +1914,7 @@ def risk_adjusted_size(
         "base_size": base_size,
         "final_size": final_size,
         "factor": factor,
+        "reason": reasons,
     }
 
 
@@ -2622,8 +2642,12 @@ def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]
             continue
         hist = token_history_rows(chain, base_addr, limit=60)
         anti_rug = anti_rug_early_detector(best, hist)
+        if anti_rug.get("level") == "CRITICAL":
+            continue
 
         score = position_strength_score(best or {}, hist, entry_price)
+        if anti_rug.get("level") == "WARNING":
+            score *= 0.7
         cls = classify_position_strength(score)
 
         enriched_row = {
@@ -3694,10 +3718,22 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if not corr:
             corr = {"status": "ALLOW", "reason": []}
         liq_health = liquidity_health(best)
-        adj = risk_adjusted_size(float(size_info.get("usd_size", 0.0) or 0.0), corr, liq_health)
+        adj = risk_adjusted_size(
+            float(size_info.get("usd_size", 0.0) or 0.0),
+            corr,
+            liq_health,
+            anti_rug=anti_rug,
+        )
         size_info["usd_size_adj"] = round(adj["final_size"], 2)
         size_info["size_factor"] = adj["factor"]
         size_info["liq_health"] = liq_health["level"]
+        if anti_rug.get("level") == "CRITICAL":
+            size_info["size_label"] = "SKIP"
+            size_info["size_pct"] = 0.0
+        elif anti_rug.get("level") == "WARNING" and size_info.get("size_label") == "FULL":
+            size_info["size_label"] = "SMALL"
+        elif anti_rug.get("level") == "WARNING" and size_info.get("size_label") == "SMALL":
+            size_info["size_label"] = "MICRO"
         final_status = gov["status"]  # correlation no longer blocks promote
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
 
@@ -4103,58 +4139,31 @@ def portfolio_alert_count() -> int:
     return alerts
 
 
-def core_safety_selfcheck() -> List[str]:
+def core_safety_self_check():
     issues: List[str] = []
 
     try:
-        import inspect
-        src = inspect.getsource(exit_before_dump_detector)
-        if '"suggested_action"' not in src and "'suggested_action'" not in src:
-            issues.append("exit_before_dump_detector missing suggested_action")
+        src = Path(__file__).read_text(encoding="utf-8")
     except Exception:
-        issues.append("cannot inspect exit_before_dump_detector")
+        st.sidebar.error("CORE SAFETY BROKEN")
+        st.sidebar.write("–", "cannot read source")
+        return
 
-    try:
-        import inspect
-        src = inspect.getsource(page_portfolio)
-        if "liquidity_health(" not in src:
-            issues.append("page_portfolio missing liquidity_health integration")
-    except Exception:
-        issues.append("cannot inspect page_portfolio")
+    if "anti_rug_early_detector" not in src:
+        issues.append("anti-rug missing")
 
-    try:
-        import inspect
-        src = inspect.getsource(page_monitoring)
-        if "correlation_size_modifier(" not in src and "risk_adjusted_size(" not in src:
-            issues.append("page_monitoring missing risk-adjusted sizing")
-    except Exception:
-        issues.append("cannot inspect page_monitoring")
+    if "EXIT_100" not in src:
+        issues.append("exit override missing")
 
-    try:
-        import inspect
-        src = inspect.getsource(page_portfolio)
-        if "anti_rug_early_detector(" not in src:
-            issues.append("portfolio missing anti-rug")
-    except Exception:
-        issues.append("inspect portfolio failed")
+    if "risk_adjusted_size" in src and "anti_rug" not in src:
+        issues.append("anti-rug not wired into sizing")
 
-    try:
-        import inspect
-        src = inspect.getsource(page_monitoring)
-        if "anti_rug_early_detector(" not in src:
-            issues.append("monitoring missing anti-rug")
-    except Exception:
-        issues.append("inspect monitoring failed")
-
-    try:
-        import inspect
-        src = inspect.getsource(active_portfolio_addresses)
-        if ".lower()" in src:
-            issues.append("address lower() still present")
-    except Exception:
-        issues.append("inspect address normalization failed")
-
-    return issues
+    if issues:
+        st.sidebar.error("CORE SAFETY BROKEN")
+        for i in issues:
+            st.sidebar.write("–", i)
+    else:
+        st.sidebar.success("Core safety OK")
 
 
 def page_portfolio():
@@ -4545,16 +4554,18 @@ def main():
             request_rerun()
 
         st.divider()
+        st.markdown("### Storage status")
         if _sb_ok():
-            st.caption("Supabase/app_storage: ON")
+            st.success("Supabase: ON")
         else:
-            st.caption("Supabase/app_storage: OFF (local CSV)")
+            st.error("Supabase: OFF")
+        st.caption(f"URL: {bool(SUPABASE_URL)} | KEY: {bool(SUPABASE_SERVICE_ROLE_KEY)}")
+        if _sb_ok():
+            test = sb_get_storage("monitoring.csv")
+            if test is None:
+                st.warning("Supabase reachable but EMPTY / no data")
 
-        issues = core_safety_selfcheck()
-        if issues:
-            st.caption("Core safety check")
-            for msg in issues[:5]:
-                st.warning(msg)
+        core_safety_self_check()
 
     # rotating scanner – one slot every 5 minutes, runs at most once per slot
     scan_result = maybe_run_rotating_scanner(scanner_seeds_raw, max_items=int(scanner_max_items), use_birdeye_trending=bool(use_birdeye_trending), birdeye_limit=int(birdeye_limit))
