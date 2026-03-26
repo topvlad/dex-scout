@@ -1477,6 +1477,74 @@ def entry_timing_signal(best: Optional[Dict[str, Any]], hist: Optional[List[Dict
         return {"timing": "NEUTRAL", "reason": ["error"]}
 
 
+def classify_entry_status(
+    best: Optional[Dict[str, Any]],
+    decision: str,
+    timing: Dict[str, Any],
+    liq_health: Dict[str, Any],
+    anti_rug: Dict[str, Any],
+    size_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not best:
+        return {
+            "status": "NO_ENTRY",
+            "reason": ["no_live_pair"],
+            "rank": 2,
+            "can_promote": False,
+        }
+
+    decision_u = str(decision or "").upper()
+    timing_state = str((timing or {}).get("timing", "SKIP") or "SKIP").upper()
+    liq_level = str((liq_health or {}).get("level", "UNKNOWN") or "UNKNOWN").upper()
+    anti_level = str((anti_rug or {}).get("level", "SAFE") or "SAFE").upper()
+    final_size = float(size_info.get("usd_size_adj", size_info.get("usd_size", 0.0)) or 0.0)
+
+    reasons: List[str] = []
+    if liq_level in ("DEAD", "CRITICAL"):
+        reasons.append(f"liq={liq_level}")
+    if anti_level == "CRITICAL":
+        reasons.append("anti_rug_critical")
+    if timing_state == "SKIP":
+        reasons.append("timing_skip")
+    if final_size <= 0:
+        reasons.append("size_zero")
+    if decision_u == "NO ENTRY":
+        reasons.append("decision_no_entry")
+
+    if reasons:
+        return {
+            "status": "NO_ENTRY",
+            "reason": reasons,
+            "rank": 2,
+            "can_promote": False,
+        }
+
+    if decision_u.startswith("ENTRY") and timing_state == "GOOD" and liq_level == "OK" and anti_level == "SAFE":
+        return {
+            "status": "READY",
+            "reason": ["entry_ok"],
+            "rank": 0,
+            "can_promote": True,
+        }
+
+    wait_reasons: List[str] = []
+    if not decision_u.startswith("ENTRY"):
+        wait_reasons.append("decision_wait")
+    if timing_state != "GOOD":
+        wait_reasons.append(f"timing={timing_state}")
+    if liq_level == "WEAK":
+        wait_reasons.append("liq_weak")
+    if anti_level == "WARNING":
+        wait_reasons.append("anti_rug_warning")
+
+    return {
+        "status": "WAIT",
+        "reason": wait_reasons or ["mixed_signals"],
+        "rank": 1,
+        "can_promote": True,
+    }
+
+
 def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
     if not p:
         return "NO DATA", []
@@ -3550,8 +3618,25 @@ def page_scout(cfg: Dict[str, Any]):
             s += 2
         s += pump_probability(p) * 0.5
         decision, tags = build_trade_hint(p)
+        timing = entry_timing_signal(p, None)
+        liq_health = liquidity_health(p)
+        anti_rug = anti_rug_early_detector(p, None)
+        size_info = position_sizing_engine(
+            p,
+            portfolio_value_usd=float(cfg.get("portfolio_value_usd", 1000.0)),
+            hist=None,
+        )
+        corr = correlation_governor(p)
+        adj = risk_adjusted_size(
+            float(size_info.get("usd_size", 0.0) or 0.0),
+            corr,
+            liq_health,
+            anti_rug=anti_rug,
+        )
+        size_info["usd_size_adj"] = round(adj["final_size"], 2)
+        entry_state = classify_entry_status(p, decision, timing, liq_health, anti_rug, size_info)
 
-        if decision.strip().upper() == "NO ENTRY":
+        if entry_state["status"] == "NO_ENTRY":
             continue
 
         row = normalize_pair_row(p)
@@ -3605,6 +3690,23 @@ def page_scout(cfg: Dict[str, Any]):
         pump_score = pump_probability(pobj)
         score += pump_score * 0.5
         decision, tag_list = build_trade_hint(pobj)
+        timing = entry_timing_signal(pobj, None)
+        liq_health = liquidity_health(pobj)
+        anti_rug = anti_rug_early_detector(pobj, None)
+        size_info = position_sizing_engine(
+            pobj,
+            portfolio_value_usd=float(cfg.get("portfolio_value_usd", 1000.0)),
+            hist=None,
+        )
+        corr = correlation_governor(pobj)
+        adj = risk_adjusted_size(
+            float(size_info.get("usd_size", 0.0) or 0.0),
+            corr,
+            liq_health,
+            anti_rug=anti_rug,
+        )
+        size_info["usd_size_adj"] = round(adj["final_size"], 2)
+        entry_state = classify_entry_status(pobj, decision, timing, liq_health, anti_rug, size_info)
         sniper_flag = detect_snipers(pobj)
         trap_signal, trap_level = liquidity_trap(pobj)
 
@@ -3785,9 +3887,6 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         pump_live = pump_probability(best)
         s_live += pump_live * 0.5
         decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
-        if decision == "NO ENTRY" and s_live < 200:
-            archive_monitoring(chain, base_addr, reason="weak_signal", last_score=s_live, last_decision=decision)
-            continue
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
         anti_rug = anti_rug_early_detector(best, hist)
         flow_collapse = flow_collapse_detector(hist)
@@ -3845,8 +3944,20 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             size_info["size_label"] = "MICRO"
         final_status = gov["status"]  # correlation no longer blocks promote
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
+        entry_state = classify_entry_status(
+            best,
+            decision,
+            timing,
+            liq_health,
+            anti_rug,
+            size_info,
+        )
 
         # smart auto-archive
+        if entry_state["status"] == "NO_ENTRY" and s_live < 200:
+            archive_monitoring(chain, base_addr, reason="weak_signal", last_score=s_live, last_decision=decision)
+            continue
+
         if best and auto_cfg.get("auto_archive_enabled"):
             min_score = float(auto_cfg.get("auto_archive_min_score", 150.0))
             persistent_no_entry = bool(auto_cfg.get("auto_archive_on_no_entry", False))
@@ -3902,13 +4013,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         stars = confidence_stars(best, hist)
         second_wave = second_wave_label(hist)
-        stage = "WATCHLIST"
-        if decision.upper().startswith("ENTRY"):
+        if entry_state["status"] == "READY":
             stage = "SIGNAL"
-        elif second_wave:
-            stage = "SIGNAL"
-        elif (r.get("risk") or "").upper() == "EARLY":
-            stage = "SIGNAL" if s_live >= 300 else "WATCHLIST"
+        elif entry_state["status"] == "WAIT":
+            stage = "WATCHLIST"
+        else:
+            stage = "WATCHLIST"
 
         trap_signal, trap_level = liquidity_trap(best)
         fresh = fresh_lp(best)
@@ -3916,7 +4026,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         whale = whale_accumulation(best)
         signal = classify_signal(best) if best else (r.get("signal") or "RED")
 
-        enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug))
+        enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug, entry_state))
 
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
@@ -3925,8 +4035,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     priority = {"GREEN": 0, "YELLOW": 1, "RED": 2}
     timing_priority = {"GOOD": 0, "NEUTRAL": 1, "SKIP": 2}
+    entry_priority = {"READY": 0, "WAIT": 1, "NO_ENTRY": 2}
     enriched.sort(
         key=lambda x: (
+            entry_priority.get(((x[34] or {}).get("status") or "NO_ENTRY"), 2),
             timing_priority.get(((x[7] or {}).get("timing") or "SKIP"), 2),
             priority.get(x[27], 2),
             -x[5],
@@ -3941,7 +4053,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption("Порожньо")
             return
 
-        for stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug in items:
+        for stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug, entry_state in items:
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
             exit_signal = apply_liquidity_exit_override(exit_signal, liq_health)
 
@@ -4013,6 +4125,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             with c3:
                 st.markdown("Plan")
                 st.write(f"Decision: {decision}")
+                st.write(f"Entry status: {entry_state['status']}")
+                for rr in entry_state.get("reason", [])[:4]:
+                    st.caption(f"– {rr}")
                 st.write(f"Entry timing: {timing['timing']}")
                 for reason in timing.get("reason", []):
                     st.caption(f"– {reason}")
@@ -4059,6 +4174,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 if second_wave and not str(decision).upper().startswith("ENTRY"):
                     label = f"ENTRY (2nd wave) {stars}".strip()
                 st.markdown(action_badge(label), unsafe_allow_html=True)
+                if entry_state["status"] == "READY":
+                    st.success("Entry status: READY")
+                elif entry_state["status"] == "WAIT":
+                    st.warning("Entry status: WAIT")
+                else:
+                    st.error("Entry status: NO_ENTRY")
+                for rr in entry_state.get("reason", [])[:4]:
+                    st.caption(f"– {rr}")
                 if signal == "GREEN":
                     st.success("ENTRY signal")
                 elif signal == "YELLOW":
@@ -4113,6 +4236,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     if not best:
                         st.error("No live pool found.")
                     else:
+                        if entry_state["status"] == "NO_ENTRY":
+                            st.error("Entry blocked by execution discipline.")
+                            for rr in entry_state.get("reason", [])[:4]:
+                                st.caption(f"– {rr}")
+                            return
+                        elif entry_state["status"] == "WAIT":
+                            st.warning("Entry is not ready yet – manual promote is cautious only.")
+                            for rr in entry_state.get("reason", [])[:4]:
+                                st.caption(f"– {rr}")
+
                         if level == "EXIT" and persistence.get("persistent_exit"):
                             st.warning("Persistent exit signal – manual promote is risky.")
                         elif level == "EARLY" and persistence.get("persistent_early"):
