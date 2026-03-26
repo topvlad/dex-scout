@@ -2564,20 +2564,135 @@ def momentum_positive(hist: List[Dict[str, Any]]) -> bool:
     return scores[-1] > scores[0]
 
 
-def evaluate_entry_state(decision: str, timing: Dict[str, Any], score: float, hist: List[Dict[str, Any]]) -> str:
+def anti_rug_check(best: Optional[Dict[str, Any]], hist: Optional[List[Dict[str, Any]]]) -> List[str]:
+    if not best:
+        return ["NO_DATA"]
+
+    flags: List[str] = []
+
+    liq = parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0)
+    vol = parse_float(safe_get(best, "volume", "h24", default=0), 0.0)
+
+    if liq > 0 and vol / liq > 5:
+        flags.append("VOL_LIQ_IMBALANCE")
+
+    if hist and len(hist) >= 2:
+        liqs = [
+            parse_float(x.get("liq_usd", x.get("liquidity_usd", 0)), 0.0)
+            for x in hist[-3:]
+        ]
+        if len(liqs) >= 2 and liqs[-1] < liqs[0] * 0.6:
+            flags.append("LIQ_DROP")
+
+    if hist and len(hist) >= 2:
+        prices = [
+            parse_float(x.get("price", x.get("price_usd", 0)), 0.0)
+            for x in hist[-3:]
+        ]
+        if len(prices) >= 2 and prices[-1] > prices[0] * 2.5:
+            flags.append("PARABOLIC")
+
+    buys = parse_float(safe_get(best, "txns", "m5", "buys", default=0), 0.0)
+    sells = parse_float(safe_get(best, "txns", "m5", "sells", default=0), 0.0)
+    if buys > 0 and sells == 0:
+        flags.append("NO_SELLS")
+
+    if vol < 500 and liq < 2000:
+        flags.append("DEAD")
+
+    return flags
+
+
+def dev_wallet_pattern(best: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not best:
+        return None
+
+    buys = parse_float(safe_get(best, "txns", "m5", "buys", default=0), 0.0)
+    sells = parse_float(safe_get(best, "txns", "m5", "sells", default=0), 0.0)
+
+    if buys > 20 and sells < 2:
+        return "DEV_ACCUMULATION"
+
+    if sells > buys * 2:
+        return "DEV_DUMP"
+
+    return None
+
+
+def smart_money_signal(hist: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    if not hist or len(hist) < 5:
+        return None
+
+    recent = hist[-5:]
+    volumes = [
+        parse_float(x.get("vol_5m", x.get("vol5_usd", x.get("volume_5m", 0))), 0.0)
+        for x in recent
+    ]
+    prices = [
+        parse_float(x.get("price", x.get("price_usd", 0)), 0.0)
+        for x in recent
+    ]
+
+    if volumes[-1] > volumes[0] * 2 and prices[-1] <= prices[0] * 1.1:
+        return "SMART_ACCUMULATION"
+
+    if volumes[-1] > volumes[0] * 2 and prices[-1] > prices[0] * 1.5:
+        return "SMART_BREAKOUT"
+
+    if volumes[-2] > volumes[-1] * 2:
+        return "SMART_EXIT"
+
+    return None
+
+
+def confidence_score(score: float, sm_signal: Optional[str], rug_flags: List[str]) -> float:
+    conf = parse_float(score, 0.0) / 500.0
+
+    if sm_signal:
+        conf += 0.2
+
+    if rug_flags:
+        conf -= 0.3
+
+    return max(0.0, min(conf, 1.0))
+
+
+def evaluate_entry_state(decision: str, timing: Dict[str, Any], score: float, hist: List[Dict[str, Any]], sm_signal: Optional[str]) -> str:
+    if sm_signal == "SMART_ACCUMULATION" and score > 250:
+        return "READY"
+
+    if sm_signal == "SMART_BREAKOUT":
+        return "READY"
+
+    if sm_signal == "SMART_EXIT":
+        return "NO_ENTRY"
+
     timing_state = str((timing or {}).get("timing", "SKIP") or "SKIP").upper()
     if str(decision or "").upper().startswith("ENTRY") and timing_state == "GOOD":
         return "READY"
     if score >= 400 and momentum_positive(hist):
         return "READY"
-    if timing_state == "NEUTRAL":
-        return "WAIT"
-    return "NO_ENTRY"
+    return "WAIT"
 
 
-def kill_logic(best: Optional[Dict[str, Any]], hist: List[Dict[str, Any]], decision: str, score: float) -> Optional[str]:
+def kill_logic(best: Optional[Dict[str, Any]], hist: List[Dict[str, Any]], decision: str, score: float, sm_signal: Optional[str]) -> Optional[str]:
     if not best:
         return "KILL_NO_DATA"
+
+    rug_flags = anti_rug_check(best, hist)
+    dev_flag = dev_wallet_pattern(best)
+    if dev_flag:
+        rug_flags.append(dev_flag)
+
+    if sm_signal == "SMART_EXIT":
+        return "KILL_SMART_EXIT"
+
+    if "DEV_DUMP" in rug_flags:
+        return "KILL_DEV_DUMP"
+
+    if rug_flags:
+        return f"KILL_RUG_{'_'.join(rug_flags[:2])}"
+
     if rug_like(best, hist):
         return "KILL_RUG"
     if str(liquidity_health(best).get("level", "")).upper() == "CRITICAL":
@@ -4228,6 +4343,28 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         s_live += pump_live * 0.5
         decision, tags = build_trade_hint(best) if best else (decision, [])
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
+
+        rug_flags = anti_rug_check(best, hist)
+        dev_flag = dev_wallet_pattern(best)
+        sm_signal = smart_money_signal(hist)
+
+        if sm_signal == "SMART_ACCUMULATION":
+            s_live *= 1.2
+        elif sm_signal == "SMART_BREAKOUT":
+            s_live *= 1.3
+        elif sm_signal == "SMART_EXIT":
+            s_live *= 0.7
+
+        if rug_flags:
+            tags = tags + rug_flags
+        if dev_flag:
+            tags.append(dev_flag)
+        if sm_signal:
+            tags.append(sm_signal)
+
+        seen_tags = set()
+        tags = [t for t in tags if not (t in seen_tags or seen_tags.add(t))]
+
         anti_rug = anti_rug_early_detector(best, hist)
         flow_collapse = flow_collapse_detector(hist)
         if flow_collapse["level"] == "WARNING" and anti_rug["level"] == "SAFE":
@@ -4292,7 +4429,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             size_info,
         )
 
-        kill_reason = kill_logic(best, hist, decision, s_live)
+        kill_reason = kill_logic(best, hist, decision, s_live, sm_signal)
         if kill_reason:
             archive_monitoring(chain, base_addr, reason=f"kill: {kill_reason}", last_score=s_live, last_decision=decision)
             continue
@@ -4363,7 +4500,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         stars = confidence_stars(best, hist)
         second_wave = second_wave_label(hist)
-        new_entry_state = evaluate_entry_state(decision, timing, s_live, hist)
+        new_entry_state = evaluate_entry_state(decision, timing, s_live, hist, sm_signal)
         if r.get("entry_state") != new_entry_state:
             r["entry_state"] = new_entry_state
             rows_dirty = True
@@ -4380,6 +4517,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         dev = dev_wallet_risk(best)
         whale = whale_accumulation(best)
         signal = classify_signal(best) if best else (r.get("signal") or "RED")
+
+        r["tags"] = tags
+        if sm_signal:
+            r["smart_money"] = sm_signal
+        r["confidence"] = f"{confidence_score(s_live, sm_signal, rug_flags):.2f}"
 
         enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug, entry_state))
 
