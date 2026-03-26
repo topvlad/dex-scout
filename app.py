@@ -307,6 +307,10 @@ def ensure_storage():
                     "archived_reason",
                     "last_score",
                     "last_decision",
+                    "priority_score",
+                    "last_decay_ts",
+                    "decay_hits",
+                    "entry_state",
                 ],
             )
             w.writeheader()
@@ -339,6 +343,21 @@ def ensure_storage():
 
 def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def parse_ts(ts: Any) -> Optional[datetime]:
+    raw = str(ts or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
 
 
 def _csv_from_string(content: str) -> List[Dict[str, Any]]:
@@ -2026,6 +2045,9 @@ MON_FIELDS = [
     "archived_reason",
     "last_score",
     "last_decision",
+    "priority_score",
+    "last_decay_ts",
+    "decay_hits",
     "source_window",
     "source_preset",
     "risk",
@@ -2037,6 +2059,7 @@ MON_FIELDS = [
     "entry_status",
     "entry_score",
     "risk_level",
+    "entry_state",
 ]
 
 HIST_FIELDS = [
@@ -2311,6 +2334,9 @@ def add_to_monitoring(
             "archived_reason": "",
             "last_score": str(score),
             "last_decision": decision,
+            "priority_score": str(score),
+            "last_decay_ts": now_utc_str(),
+            "decay_hits": "0",
             "source_window": window_name or "",
             "source_preset": preset_key or "",
             "risk": risk,
@@ -2322,6 +2348,7 @@ def add_to_monitoring(
             "entry_status": final_entry_status,
             "entry_score": str(final_entry_score),
             "risk_level": final_risk_level,
+            "entry_state": "WAIT",
         }
     )
     save_monitoring(rows)
@@ -2492,6 +2519,77 @@ def token_history_rows(chain: str, base_addr: str, limit: int = 180) -> List[Dic
 # =============================
 # Monitoring ranking helpers
 # =============================
+def apply_priority_decay(row: Dict[str, Any], now_ts: datetime, decay_rate: float = 0.98, step_minutes: int = 5) -> Dict[str, Any]:
+    last = parse_ts(row.get("last_decay_ts"))
+    if not last:
+        row["last_decay_ts"] = now_ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+        if not str(row.get("priority_score", "")).strip():
+            row["priority_score"] = str(parse_float(row.get("score_init", 0), 0.0))
+        if not str(row.get("decay_hits", "")).strip():
+            row["decay_hits"] = "0"
+        return row
+
+    delta_min = (now_ts - last).total_seconds() / 60.0
+    steps = int(delta_min // max(1, int(step_minutes)))
+    if steps <= 0:
+        return row
+
+    score = parse_float(row.get("priority_score", row.get("score_init", 0)), 0.0)
+    score *= decay_rate ** steps
+    row["priority_score"] = str(round(score, 4))
+    row["last_decay_ts"] = now_ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+    row["decay_hits"] = str(int(parse_float(row.get("decay_hits", 0), 0.0)) + steps)
+    return row
+
+
+def recheck_token(chain: str, base_addr: str, hist_limit: int = 30) -> Dict[str, Any]:
+    best = best_pair_for_token(chain, base_addr)
+    hist = token_history_rows(chain, base_addr, limit=hist_limit)
+    decision, _tags = build_trade_hint(best) if best else ("NO DATA", [])
+    timing = entry_timing_signal(best, hist)
+    score_live = score_pair(best) if best else 0.0
+    return {
+        "best": best,
+        "hist": hist,
+        "decision": decision,
+        "timing": timing,
+        "score": score_live,
+    }
+
+
+def momentum_positive(hist: List[Dict[str, Any]]) -> bool:
+    if len(hist) < 3:
+        return False
+    scores = [parse_float(x.get("score_live", 0), 0.0) for x in hist[-3:]]
+    return scores[-1] > scores[0]
+
+
+def evaluate_entry_state(decision: str, timing: Dict[str, Any], score: float, hist: List[Dict[str, Any]]) -> str:
+    timing_state = str((timing or {}).get("timing", "SKIP") or "SKIP").upper()
+    if str(decision or "").upper().startswith("ENTRY") and timing_state == "GOOD":
+        return "READY"
+    if score >= 400 and momentum_positive(hist):
+        return "READY"
+    if timing_state == "NEUTRAL":
+        return "WAIT"
+    return "NO_ENTRY"
+
+
+def kill_logic(best: Optional[Dict[str, Any]], hist: List[Dict[str, Any]], decision: str, score: float) -> Optional[str]:
+    if not best:
+        return "KILL_NO_DATA"
+    if rug_like(best, hist):
+        return "KILL_RUG"
+    if str(liquidity_health(best).get("level", "")).upper() == "CRITICAL":
+        return "KILL_LIQ"
+    if score < 120:
+        return "KILL_LOW_SCORE"
+    recent = hist[-3:] if hist else []
+    if recent and all(str(x.get("decision", "")).upper().startswith("NO ENTRY") for x in recent):
+        return "KILL_NO_FLOW"
+    return None
+
+
 def monitoring_priority(
     score_live: float,
     pc1h: float,
@@ -4084,6 +4182,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     if chain_filter != "all":
         active = [r for r in active if (r.get("chain") or "").strip().lower() == chain_filter]
 
+    now_ts = datetime.utcnow()
+    rows_dirty = False
+    for r in active:
+        before = (r.get("priority_score", ""), r.get("last_decay_ts", ""), r.get("decay_hits", ""))
+        apply_priority_decay(r, now_ts)
+        after = (r.get("priority_score", ""), r.get("last_decay_ts", ""), r.get("decay_hits", ""))
+        if before != after:
+            rows_dirty = True
+
     active_set = active_portfolio_addresses()
 
     enriched = []
@@ -4093,7 +4200,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
         if addr_key(chain, base_addr) in active_set:
             continue
-        best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
+        recheck = recheck_token(chain, base_addr, hist_limit=int(auto_cfg.get("stability_window_n", 30))) if (chain and base_addr) else {"best": None, "hist": [], "decision": "NO DATA", "timing": {"timing": "SKIP"}, "score": 0.0}
+        best = recheck["best"]
+        hist = recheck["hist"]
+        decision = recheck["decision"]
+        timing = recheck["timing"]
+        s_live = parse_float(recheck["score"], 0.0)
 
         live = {"price": 0.0, "liq": 0.0, "vol24": 0.0, "vol5": 0.0, "pc1h": 0.0, "pc5": 0.0, "dex": "", "pair_addr": "", "url": "", "quote": ""}
         if best:
@@ -4109,13 +4221,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             live["pc5"] = parse_float(safe_get(best, "priceChange", "m5", default=0), 0.0)
             snapshot_live_to_history(chain, base_sym, base_addr, best)
 
-        s_live = score_pair(best) if best else 0.0
         smart_money = detect_smart_money(best) if best else False
         if smart_money:
             s_live += 4
         pump_live = pump_probability(best)
         s_live += pump_live * 0.5
-        decision, tags = build_trade_hint(best) if best else ("NO DATA", [])
+        decision, tags = build_trade_hint(best) if best else (decision, [])
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
         anti_rug = anti_rug_early_detector(best, hist)
         flow_collapse = flow_collapse_detector(hist)
@@ -4126,7 +4237,6 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 "flags": list(set((anti_rug.get("flags", []) or []) + flow_collapse["flags"])),
                 "action": "REDUCE",
             }
-        timing = entry_timing_signal(best, hist)
         if timing["timing"] == "SKIP":
             decision = "NO ENTRY"
         elif timing["timing"] == "NEUTRAL" and decision == "ENTRY (scalp)":
@@ -4182,6 +4292,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             size_info,
         )
 
+        kill_reason = kill_logic(best, hist, decision, s_live)
+        if kill_reason:
+            archive_monitoring(chain, base_addr, reason=f"kill: {kill_reason}", last_score=s_live, last_decision=decision)
+            continue
+
         # smart auto-archive
         if entry_state["status"] == "NO_ENTRY" and s_live < 200:
             archive_monitoring(chain, base_addr, reason="weak_signal", last_score=s_live, last_decision=decision)
@@ -4225,7 +4340,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             migration_label = mig.get("migration_label", "")
             cex_prob = parse_float(best.get("cex_prob", 0), 0.0)
 
-        pr = source_priority(r) * 10000 + monitoring_priority(
+        base_pr = monitoring_priority(
             s_live,
             live["pc1h"],
             live["pc5"],
@@ -4235,6 +4350,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             migration_score=migration_score,
             cex_prob=cex_prob,
         )
+        if s_live > parse_float(r.get("score_init", 0), 0.0) * 1.5:
+            r["priority_score"] = str(round(s_live, 4))
+            r["decay_hits"] = "0"
+            rows_dirty = True
+        decay_pr = parse_float(r.get("priority_score", base_pr), base_pr)
+        pr = source_priority(r) * 10000 + decay_pr
         d_score = s_live - parse_float(r.get("score_init"), 0.0)
         d_liq = live["liq"] - parse_float(r.get("liq_init"), 0.0)
         d_v24 = live["vol24"] - parse_float(r.get("vol24_init"), 0.0)
@@ -4242,9 +4363,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         stars = confidence_stars(best, hist)
         second_wave = second_wave_label(hist)
-        if entry_state["status"] == "READY":
+        new_entry_state = evaluate_entry_state(decision, timing, s_live, hist)
+        if r.get("entry_state") != new_entry_state:
+            r["entry_state"] = new_entry_state
+            rows_dirty = True
+
+        if r.get("entry_state") == "READY":
             stage = "SIGNAL"
-        elif entry_state["status"] == "WAIT":
+        elif r.get("entry_state") == "WAIT":
             stage = "WATCHLIST"
         else:
             stage = "WATCHLIST"
@@ -4257,6 +4383,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug, entry_state))
 
+    if rows_dirty:
+        save_monitoring(rows)
+
     rows_now = load_monitoring()
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
         st.info("Archive/revisit changes applied. Refreshing list…")
@@ -4267,7 +4396,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     entry_priority = {"READY": 0, "WAIT": 1, "NO_ENTRY": 2}
     enriched.sort(
         key=lambda x: (
-            entry_priority.get(((x[34] or {}).get("status") or "NO_ENTRY"), 2),
+            entry_priority.get(str((x[3] or {}).get("entry_state", "NO_ENTRY")).upper(), 2),
             timing_priority.get(((x[7] or {}).get("timing") or "SKIP"), 2),
             priority.get(x[27], 2),
             -x[5],
