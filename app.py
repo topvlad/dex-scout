@@ -4264,13 +4264,26 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     scan_state = scanner_state_load()
     top = st.columns([2,2,3,3])
-    rows = load_monitoring()
-    active = [r for r in rows if r.get("active") == "1"]
-    archived = [r for r in rows if r.get("active") != "1"]
+
+    # Source of truth for Monitoring page UI: monitoring.csv only.
+    monitoring_rows = load_csv(MONITORING_CSV)
+    rows: List[Dict[str, Any]] = []
+    for raw in monitoring_rows:
+        row = dict(raw)
+        for k in MON_FIELDS:
+            if k not in row:
+                row[k] = ""
+        rows.append(row)
+
+    active = [r for r in rows if str(r.get("active", "1")).strip() == "1"]
+    archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
     top[0].metric("Active", len(active))
     top[1].metric("Archived", len(archived))
     top[2].caption(f"Last scan: {scan_state.get('last_run_ts','—')} • {scan_state.get('last_window','—')} • {scan_state.get('last_chain','—')}")
     top[3].caption(f"Last stats: {scan_state.get('last_stats', {})}")
+
+    st.caption(f"DEBUG monitoring rows: {len(monitoring_rows)}")
+    st.caption(f"DEBUG active items: {len(active)}")
 
     cbtn1, cbtn2, cbtn3 = st.columns([2,2,6])
     with cbtn1:
@@ -4870,6 +4883,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     with s5: st.line_chart(dfh[["vol5_usd"]], height=120, use_container_width=True)
         if rendered_count == 0:
             st.warning("No tokens to display (check filters)")
+
+    if not signals and not watchlist:
+        st.warning("Monitoring empty (UI layer)")
+        st.subheader("Monitoring (raw active rows)")
+        for r in active:
+            st.write(r.get("base_symbol", "n/a"), r.get("last_decision", "n/a"))
+        return
 
     render_items("Signals", signals)
     st.markdown("---")
