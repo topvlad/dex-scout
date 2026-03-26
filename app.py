@@ -101,6 +101,13 @@ def log_error(err: Exception):
         pass
 
 
+def debug_log(msg: str):
+    if "debug_log" not in st.session_state:
+        st.session_state["debug_log"] = []
+    st.session_state["debug_log"].append(f"{now_utc_str()} | {msg}")
+    st.session_state["debug_log"] = st.session_state["debug_log"][-50:]
+
+
 def load_smart_wallets() -> Dict[str, Any]:
     if os.path.exists(SMART_WALLET_FILE):
         try:
@@ -208,12 +215,13 @@ def sb_put_storage(key: str, content: str) -> bool:
 
         res = requests.post(url, headers=headers, json=payload, timeout=10)
         if res.status_code not in (200, 201):
-            st.sidebar.error(f"❌ Supabase write failed {key}: {res.text}")
+            debug_log(f"supabase_write_failed key={key} status={res.status_code}")
             return False
 
+        debug_log(f"supabase_write_ok key={key} bytes={len(content)}")
         return True
     except Exception as e:
-        st.sidebar.error(f"❌ Supabase EXCEPTION {key}: {e}")
+        debug_log(f"supabase_write_exception key={key} err={type(e).__name__}:{e}")
         return False
 
 def storage_key_for_path(path: str) -> str:
@@ -361,16 +369,16 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
             try:
                 return _csv_from_string(content)
             except Exception:
-                st.sidebar.error(f"❌ Corrupt Supabase CSV: {key}")
+                debug_log(f"corrupt_supabase_csv key={key}")
 
     fallback = local_fallback_path(path)
     if os.path.exists(fallback):
         try:
             with open(fallback, "r", newline="", encoding="utf-8") as f:
-                st.sidebar.warning(f"⚠️ Using local fallback: {key}")
+                debug_log(f"using_local_fallback key={key}")
                 return list(csv.DictReader(f))
         except Exception as e:
-            st.sidebar.error(f"❌ Local fallback read failed {key}: {e}")
+            debug_log(f"local_fallback_read_failed key={key} err={type(e).__name__}:{e}")
 
     return []
 
@@ -387,18 +395,19 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
             with open(fallback, "w", newline="", encoding="utf-8") as f:
                 f.write(content)
     except Exception as e:
-        st.sidebar.error(f"❌ Local fallback write failed {key}: {e}")
+        debug_log(f"local_fallback_write_failed key={key} err={type(e).__name__}:{e}")
 
     if _sb_ok():
         ok = sb_put_storage(key, content)
         if ok:
             check = sb_get_storage(key)
             if check:
-                st.sidebar.success(f"✅ Stored in Supabase: {key}")
+                debug_log(f"supabase_store_verified key={key}")
             else:
-                st.sidebar.error(f"❌ Write OK but read FAIL: {key}")
+                debug_log(f"supabase_store_unverified key={key}")
         else:
-            st.sidebar.warning(f"⚠️ Supabase write failed, local fallback kept: {key}")
+            debug_log(f"supabase_store_failed_local_kept key={key}")
+    st.session_state["_save_badge"] = "💾 saved"
 
 
 def backup_csv_snapshot(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
@@ -2158,7 +2167,7 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
         }
     )
     save_portfolio(rows)
-    st.sidebar.success("📦 Portfolio saved (trigger)")
+    debug_log("portfolio_saved_trigger")
     return "OK"
 
 
@@ -4251,8 +4260,8 @@ def core_safety_self_check():
     try:
         src = Path(__file__).read_text(encoding="utf-8")
     except Exception:
-        st.sidebar.error("CORE SAFETY BROKEN")
-        st.sidebar.write("– cannot read source")
+        st.error("CORE SAFETY BROKEN")
+        st.write("– cannot read source")
         return
 
     required = {
@@ -4272,11 +4281,52 @@ def core_safety_self_check():
         issues.append("address lower() regression in active_portfolio_addresses")
 
     if issues:
-        st.sidebar.error("CORE SAFETY BROKEN")
+        st.error("CORE SAFETY BROKEN")
         for i in issues[:8]:
-            st.sidebar.write(f"– {i}")
+            st.write(f"– {i}")
     else:
-        st.sidebar.success("Core safety OK")
+        st.success("Core safety OK")
+
+
+def render_debug_panel():
+    with st.sidebar.expander("🛠 Debug panel", expanded=False):
+        st.write("### Supabase")
+        st.write(f"USE_SUPABASE: {USE_SUPABASE}")
+        st.write(f"URL present: {bool(SUPABASE_URL)}")
+        st.write(f"KEY present: {bool(SUPABASE_SERVICE_ROLE_KEY)}")
+
+        for key in ["portfolio.csv", "monitoring.csv", "monitoring_history.csv"]:
+            try:
+                content = sb_get_storage(key) if _sb_ok() else None
+                if content:
+                    st.success(f"{key}: FOUND ({len(content)} chars)")
+                else:
+                    st.warning(f"{key}: EMPTY / NOT FOUND")
+            except Exception as e:
+                st.error(f"{key}: ERROR {e}")
+
+        st.write("---")
+        st.write("### Local fallback")
+        for key in ["portfolio.csv", "monitoring.csv", "monitoring_history.csv"]:
+            fpath = os.path.join(DATA_DIR, key)
+            if os.path.exists(fpath):
+                st.success(f"{key}: local OK")
+            else:
+                st.warning(f"{key}: no local file")
+
+        st.write("---")
+        st.write("### Runtime")
+        st.write(f"Session keys: {len(st.session_state.keys())}")
+        st.write(list(st.session_state.keys())[:10])
+
+        st.write("---")
+        st.write("### Core safety")
+        core_safety_self_check()
+
+        st.write("---")
+        st.write("### Events")
+        for line in st.session_state.get("debug_log", []):
+            st.caption(line)
 
 
 def explain_reco(
@@ -4637,33 +4687,13 @@ def main():
         "monitoring": len(monitoring_rows),
         "monitoring_history": len(monitoring_history_rows),
     }
-    st.sidebar.info(f"📥 Loaded portfolio: {len(portfolio_rows)} rows")
+    st.sidebar.caption(f"📥 portfolio: {len(portfolio_rows)}")
 
     scanner_seeds_raw = str(DEFAULT_SEEDS)
     scanner_max_items = 100
     use_birdeye_trending = True
     birdeye_limit = 50
     ui_autorefresh_sec = 60
-
-    st.sidebar.markdown("## 🔍 Supabase debug")
-    
-    st.sidebar.write("USE_SUPABASE:", USE_SUPABASE)
-    st.sidebar.write("URL present:", bool(SUPABASE_URL))
-    st.sidebar.write("KEY present:", bool(SUPABASE_SERVICE_ROLE_KEY))
-    
-    if USE_SUPABASE:
-        test_keys = ["portfolio.csv", "monitoring.csv", "monitoring_history.csv"]
-        for k in test_keys:
-            content = sb_get_storage(k)
-            if content:
-                st.sidebar.success(f"{k}: FOUND ({len(content)} chars)")
-            else:
-                st.sidebar.error(f"{k}: EMPTY / NOT FOUND")
-    if _sb_ok():
-        if sb_get_storage("portfolio.csv") is None and sb_get_storage("monitoring.csv") is None:
-            st.sidebar.warning("⚠️ Supabase connected but currently empty/unavailable")
-        else:
-            st.sidebar.success("Supabase data доступні")
 
     with st.sidebar:
         st.markdown("### DEX Scout")
@@ -4738,7 +4768,12 @@ def main():
             if test is None:
                 st.warning("Supabase reachable but EMPTY / no data")
 
-        core_safety_self_check()
+        if st.session_state.get("_save_badge"):
+            st.caption(str(st.session_state.get("_save_badge")))
+        DEBUG_MODE = st.checkbox("🛠 Debug mode", value=False)
+
+    if DEBUG_MODE:
+        render_debug_panel()
 
     # rotating scanner – one slot every 5 minutes, runs at most once per slot
     scan_result = maybe_run_rotating_scanner(scanner_seeds_raw, max_items=int(scanner_max_items), use_birdeye_trending=bool(use_birdeye_trending), birdeye_limit=int(birdeye_limit))
