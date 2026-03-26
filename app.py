@@ -28,6 +28,7 @@ import time
 import json
 import random
 import hashlib
+import inspect
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional, Set
@@ -221,6 +222,11 @@ def storage_key_for_path(path: str) -> str:
     return base or path
 
 
+def local_fallback_path(path: str) -> str:
+    ensure_storage()
+    return path
+
+
 # Storage + lock (CSV fallback)
 # =============================
 @contextmanager
@@ -346,51 +352,66 @@ def _csv_to_string(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
 
 def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     ensure_storage()
-
     key = storage_key_for_path(path)
-    try:
-        if USE_SUPABASE:
-            content = sb_get_storage(key)
-            if content:
-                reader = csv.DictReader(io.StringIO(content))
-                return list(reader)
-            st.sidebar.warning(f"⚠️ Supabase empty: {key}")
-            return []
+    del fields  # compatibility
 
-        if not os.path.exists(path):
-            return []
-        with open(path, "r", newline="", encoding="utf-8") as f:
-            return list(csv.DictReader(f))
+    if _sb_ok():
+        content = sb_get_storage(key)
+        if content:
+            try:
+                return _csv_from_string(content)
+            except Exception:
+                st.sidebar.error(f"❌ Corrupt Supabase CSV: {key}")
 
-    except Exception as e:
-        st.sidebar.error(f"❌ load_csv failed {key}: {e}")
-        return []
+    fallback = local_fallback_path(path)
+    if os.path.exists(fallback):
+        try:
+            with open(fallback, "r", newline="", encoding="utf-8") as f:
+                st.sidebar.warning(f"⚠️ Using local fallback: {key}")
+                return list(csv.DictReader(f))
+        except Exception as e:
+            st.sidebar.error(f"❌ Local fallback read failed {key}: {e}")
+
+    return []
 
 
 def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     ensure_storage()
+    key = storage_key_for_path(path)
+    content = _csv_to_string(rows, fieldnames)
 
-    # Always write local (helps debugging)
-    lockp = path + ".lock"
-    with file_lock(lockp):
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for r in rows:
-                out = {k: r.get(k, "") for k in fieldnames}
-                w.writerow(out)
+    fallback = local_fallback_path(path)
+    try:
+        lockp = fallback + ".lock"
+        with file_lock(lockp):
+            with open(fallback, "w", newline="", encoding="utf-8") as f:
+                f.write(content)
+    except Exception as e:
+        st.sidebar.error(f"❌ Local fallback write failed {key}: {e}")
 
-    # Supabase persistence
     if _sb_ok():
-        key = storage_key_for_path(path)
-        content = _csv_to_string(rows, fieldnames)
         ok = sb_put_storage(key, content)
         if ok:
             check = sb_get_storage(key)
-            if not check:
-                st.sidebar.error(f"❌ Write OK but read FAIL: {key}")
-            else:
+            if check:
                 st.sidebar.success(f"✅ Stored in Supabase: {key}")
+            else:
+                st.sidebar.error(f"❌ Write OK but read FAIL: {key}")
+        else:
+            st.sidebar.warning(f"⚠️ Supabase write failed, local fallback kept: {key}")
+
+
+def backup_csv_snapshot(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
+    if not _sb_ok():
+        return
+    try:
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        key = storage_key_for_path(path)
+        backup_key = f"backup/{ts}_{key}"
+        content = _csv_to_string(rows, fieldnames)
+        sb_put_storage(backup_key, content)
+    except Exception:
+        pass
 
 
 def append_csv(path: str, row: Dict[str, Any], fieldnames: List[str]):
@@ -1418,6 +1439,10 @@ def entry_timing_signal(best: Optional[Dict[str, Any]], hist: Optional[List[Dict
 
         if m5 > 20:
             return {"timing": "SKIP", "reason": ["overextended_m5"]}
+        if h1 > 100:
+            return {"timing": "SKIP", "reason": ["parabolic_h1"]}
+        if m5 > 12 and h1 > 25:
+            return {"timing": "SKIP", "reason": ["late_pump_entry"]}
         if h1 > 60:
             return {"timing": "SKIP", "reason": ["overextended_h1"]}
         if m5 < -12:
@@ -1806,6 +1831,7 @@ def load_portfolio() -> List[Dict[str, Any]]:
 
 def save_portfolio(rows: List[Dict[str, Any]]):
     save_csv(PORTFOLIO_CSV, rows, PORTFOLIO_FIELDS)
+    backup_csv_snapshot(PORTFOLIO_CSV, rows, PORTFOLIO_FIELDS)
 
 
 def active_portfolio_addresses() -> Set[str]:
@@ -1899,36 +1925,40 @@ def risk_adjusted_size(
 ) -> Dict[str, Any]:
     factor = correlation_size_modifier(corr)
     reasons: List[str] = []
+    liq_level = str((liq_health or {}).get("level", "") or "").upper()
+    anti_level = str((anti_rug or {}).get("level", "") or "").upper()
 
-    if liq_health:
-        if liq_health.get("level") == "WEAK":
-            factor *= 0.5
-            reasons.append("liquidity_weak")
-        elif liq_health.get("level") in ("CRITICAL", "DEAD"):
-            factor *= 0.0
-            reasons.append("liquidity_dead")
+    if liq_level == "WEAK":
+        factor *= 0.5
+        reasons.append("liquidity_weak")
+    elif liq_level in ("CRITICAL", "DEAD"):
+        factor = 0.0
+        reasons.append("liquidity_untradable")
 
-    if anti_rug:
-        level = str(anti_rug.get("level") or "").upper()
-        if level == "CRITICAL":
-            return {
-                "base_size": base_size,
-                "final_size": 0.0,
-                "factor": 0.0,
-                "size_label": "SKIP",
-                "size_pct": 0.0,
-                "reason": ["anti_rug_critical"],
-            }
-        if level == "WARNING":
-            factor *= 0.5
-            reasons.append("anti_rug_warning")
+    if anti_level == "CRITICAL":
+        factor = 0.0
+        reasons.append("anti_rug_critical")
+    elif anti_level == "WARNING":
+        factor *= 0.5
+        reasons.append("anti_rug_warning")
 
     final_size = max(0.0, base_size * factor)
+    if final_size <= 0:
+        size_label = "SKIP"
+    elif final_size < 10:
+        size_label = "MICRO"
+    elif final_size < 25:
+        size_label = "SMALL"
+    elif final_size < 60:
+        size_label = "MEDIUM"
+    else:
+        size_label = "LARGE"
 
     return {
         "base_size": base_size,
-        "final_size": final_size,
-        "factor": factor,
+        "final_size": round(final_size, 2),
+        "factor": round(factor, 4),
+        "size_label": size_label,
         "reason": reasons,
     }
 
@@ -1944,6 +1974,7 @@ def load_monitoring() -> List[Dict[str, Any]]:
 
 def save_monitoring(rows: List[Dict[str, Any]]):
     save_csv(MONITORING_CSV, rows, MON_FIELDS)
+    backup_csv_snapshot(MONITORING_CSV, rows, MON_FIELDS)
 
 
 def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
@@ -2322,6 +2353,18 @@ def anti_rug_early_detector(
     if liq < 15000:
         score += 1
         flags.append("thin_liquidity")
+    if liq < 5000:
+        score += 3
+        flags.append("liq_blackhole")
+    if liq < 1000:
+        score += 4
+        flags.append("near_dead_liquidity")
+    if vol24 > 1_000_000 and liq < 10_000:
+        score += 2
+        flags.append("fake_volume_profile")
+    if buys5 > 0 and sells5 > buys5 * 2.2:
+        score += 2
+        flags.append("aggressive_sell_imbalance")
 
     if hist and len(hist) >= 4:
         try:
@@ -2334,6 +2377,9 @@ def anti_rug_early_detector(
             if liqs[-1] < liqs[0] * 0.75:
                 score += 2
                 flags.append("liq_fading")
+            if len(liqs) >= 3 and liqs[-1] < max(liqs[:-1]) * 0.5:
+                score += 2
+                flags.append("liq_halfed")
 
             if vols[-1] < max(vols[:-1] or [0]) * 0.4:
                 score += 1
@@ -2343,17 +2389,42 @@ def anti_rug_early_detector(
             if peak > 0 and prices[-1] < peak * 0.85:
                 score += 1
                 flags.append("failed_reclaim")
+            if len(prices) >= 3:
+                recent_peak = max(prices[:-1])
+                if recent_peak > 0 and prices[-1] < recent_peak * 0.75:
+                    score += 2
+                    flags.append("deep_failed_reclaim")
 
         except Exception:
             flags.append("hist_error")
 
-    if score >= 5:
+    if score >= 6:
         return {"level": "CRITICAL", "score": score, "flags": flags, "action": "EXIT"}
 
     if score >= 3:
         return {"level": "WARNING", "score": score, "flags": flags, "action": "REDUCE"}
 
     return {"level": "SAFE", "score": score, "flags": flags, "action": "WATCH"}
+
+
+def flow_collapse_detector(hist: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not hist or len(hist) < 4:
+        return {"level": "SAFE", "flags": []}
+
+    vols = [parse_float(x.get("vol5_usd", 0), 0.0) for x in hist[-4:]]
+    liqs = [parse_float(x.get("liq_usd", 0), 0.0) for x in hist[-4:]]
+    flags: List[str] = []
+
+    if vols[-1] < max(vols[:-1] or [0]) * 0.3:
+        flags.append("flow_collapse")
+
+    if liqs[-1] < max(liqs[:-1] or [0]) * 0.6:
+        flags.append("liq_collapse")
+
+    if len(flags) >= 2:
+        return {"level": "WARNING", "flags": flags}
+
+    return {"level": "SAFE", "flags": flags}
 
 
 def exit_before_dump_detector(
@@ -2554,9 +2625,9 @@ def apply_liquidity_reco_override(reco: str, liq_health: Optional[Dict[str, Any]
     reco_text = str(reco or "")
 
     if liq_level == "DEAD":
-        return "FORCE EXIT"
+        return "FORCE EXIT / DEAD LIQUIDITY"
     if liq_level == "CRITICAL":
-        return "EXIT NOW"
+        return "EXIT NOW / CRITICAL LIQUIDITY"
     if liq_level == "WEAK" and "HOLD" in reco_text.upper():
         return "REDUCE / WATCH"
     return reco_text
@@ -2653,17 +2724,17 @@ def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]
         entry_price = parse_float(r.get("entry_price_usd") or r.get("entry_price") or 0, 0.0)
 
         best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
-        liq_health = liquidity_health(best)
-        if liq_health.get("level") == "DEAD":
-            continue
         hist = token_history_rows(chain, base_addr, limit=60)
+        liq_health = liquidity_health(best)
         anti_rug = anti_rug_early_detector(best, hist)
+        if liq_health.get("level") in ("DEAD", "CRITICAL"):
+            continue
         if anti_rug.get("level") == "CRITICAL":
             continue
 
         score = position_strength_score(best or {}, hist, entry_price)
         if anti_rug.get("level") == "WARNING":
-            score *= 0.7
+            score *= 0.6
         cls = classify_position_strength(score)
 
         enriched_row = {
@@ -2677,6 +2748,8 @@ def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]
         enriched.append(enriched_row)
 
         if cls == "STRONG":
+            if liquidity_health(best).get("level") != "OK":
+                continue
             strong.append(r)
         elif cls == "WEAK":
             weak.append(r)
@@ -3708,6 +3781,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             continue
         hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
         anti_rug = anti_rug_early_detector(best, hist)
+        flow_collapse = flow_collapse_detector(hist)
+        if flow_collapse["level"] == "WARNING" and anti_rug["level"] == "SAFE":
+            anti_rug = {
+                "level": "WARNING",
+                "score": max(int(anti_rug.get("score", 0)), 2),
+                "flags": list(set((anti_rug.get("flags", []) or []) + flow_collapse["flags"])),
+                "action": "REDUCE",
+            }
         timing = entry_timing_signal(best, hist)
         if timing["timing"] == "SKIP":
             decision = "NO ENTRY"
@@ -3734,6 +3815,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if not corr:
             corr = {"status": "ALLOW", "reason": []}
         liq_health = liquidity_health(best)
+        if liq_health["level"] in ("DEAD", "CRITICAL"):
+            decision = "NO ENTRY"
         adj = risk_adjusted_size(
             float(size_info.get("usd_size", 0.0) or 0.0),
             corr,
@@ -3742,6 +3825,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         )
         size_info["usd_size_adj"] = round(adj["final_size"], 2)
         size_info["size_factor"] = adj["factor"]
+        size_info["size_reason"] = adj.get("reason", [])
         size_info["liq_health"] = liq_health["level"]
         if anti_rug.get("level") == "CRITICAL":
             size_info["size_label"] = "SKIP"
@@ -3944,11 +4028,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.caption(f"– {rr}")
                 st.write(f"Liquidity health: {liq_health['level']}")
                 st.write(f"Anti-rug: {anti_rug['level']} ({anti_rug['score']})")
+                st.write(f"Can enter safely: {'YES' if liq_health['level']=='OK' and anti_rug['level']!='CRITICAL' else 'NO'}")
                 st.caption(f"size factor: {float(size_info.get('size_factor', 1.0) or 1.0):.2f}")
                 for fl in liq_health.get("flags", []):
                     st.caption(f"– {fl}")
                 for fl in anti_rug.get("flags", [])[:4]:
                     st.caption(f"– {fl}")
+                if size_info.get("size_reason"):
+                    st.caption("Size adjustments:")
+                    for rr in size_info["size_reason"]:
+                        st.caption(f"– {rr}")
                 if size_info["risk_flags"]:
                     st.caption("Risk flags:")
                     for rf in size_info["risk_flags"]:
@@ -4036,6 +4125,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
                         if liq_level in ("DEAD", "CRITICAL"):
                             st.error("Liquidity too low for entry")
+                            return
                         else:
                             if adj_size < 5:
                                 st.warning("Position too small after risk adjustment.")
@@ -4162,24 +4252,52 @@ def core_safety_self_check():
         src = Path(__file__).read_text(encoding="utf-8")
     except Exception:
         st.sidebar.error("CORE SAFETY BROKEN")
-        st.sidebar.write("–", "cannot read source")
+        st.sidebar.write("– cannot read source")
         return
 
-    if "anti_rug_early_detector" not in src:
-        issues.append("anti-rug missing")
+    required = {
+        "anti_rug_early_detector": "anti-rug missing",
+        "liquidity_health": "liquidity health missing",
+        "apply_liquidity_exit_override": "liquidity exit override missing",
+        "apply_liquidity_reco_override": "liquidity reco override missing",
+        "risk_adjusted_size": "risk-adjusted sizing missing",
+        "flow_collapse_detector": "flow collapse detector missing",
+    }
 
-    if "EXIT_100" not in src:
-        issues.append("exit override missing")
+    for needle, msg in required.items():
+        if needle not in src:
+            issues.append(msg)
 
-    if "risk_adjusted_size" in src and "anti_rug" not in src:
-        issues.append("anti-rug not wired into sizing")
+    if ".lower()" in inspect.getsource(active_portfolio_addresses):
+        issues.append("address lower() regression in active_portfolio_addresses")
 
     if issues:
         st.sidebar.error("CORE SAFETY BROKEN")
-        for i in issues:
-            st.sidebar.write("–", i)
+        for i in issues[:8]:
+            st.sidebar.write(f"– {i}")
     else:
         st.sidebar.success("Core safety OK")
+
+
+def explain_reco(
+    reco: str,
+    liq_health: Dict[str, Any],
+    anti_rug: Dict[str, Any],
+    exit_signal: Dict[str, Any],
+) -> List[str]:
+    reasons: List[str] = []
+    if liq_health.get("level") == "OK":
+        reasons.append("liquidity stable")
+    else:
+        reasons.append(f"liquidity={liq_health.get('level')}")
+
+    if anti_rug.get("level") == "SAFE":
+        reasons.append("no rug pattern")
+    else:
+        reasons.append(f"anti_rug={anti_rug.get('level')}")
+
+    reasons.extend([str(x) for x in exit_signal.get("exit_flags", [])[:3]])
+    return reasons[:4]
 
 
 def page_portfolio():
@@ -4264,6 +4382,14 @@ def page_portfolio():
 
         hist = token_history_rows(chain, base_addr, limit=60)
         anti_rug = anti_rug_early_detector(best, hist)
+        flow_collapse = flow_collapse_detector(hist)
+        if flow_collapse["level"] == "WARNING" and anti_rug["level"] == "SAFE":
+            anti_rug = {
+                "level": "WARNING",
+                "score": max(int(anti_rug.get("score", 0)), 2),
+                "flags": list(set((anti_rug.get("flags", []) or []) + flow_collapse["flags"])),
+                "action": "REDUCE",
+            }
         strength_score = position_strength_score(best or {}, hist, entry_price)
         strength_cls = classify_position_strength(strength_score)
         trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
@@ -4325,12 +4451,11 @@ def page_portfolio():
         elif action_plan["action_code"] == "WATCH_TIGHT" and str(reco).startswith("HOLD"):
             reco = "WATCH CLOSELY"
 
-        reco = apply_liquidity_reco_override(reco, liq_health)
-
         if anti_rug["level"] == "CRITICAL":
             reco = "EXIT NOW / EARLY RUG RISK"
         elif anti_rug["level"] == "WARNING" and "HOLD" in str(reco).upper():
             reco = "REDUCE / EARLY RUG RISK"
+        reco = apply_liquidity_reco_override(reco, liq_health)
 
         pnl = 0.0
         if entry_price > 0 and cur_price > 0:
@@ -4387,6 +4512,9 @@ def page_portfolio():
             st.write(f"Recommended action: {action_plan['action_label']}")
             st.write(f"Liquidity health: {liq_health['level']}")
             st.write(f"Anti-rug: {anti_rug['level']} ({anti_rug['score']})")
+            st.caption("Why:")
+            for rr in explain_reco(reco, liq_health, anti_rug, exit_signal):
+                st.caption(f"– {rr}")
             for f in anti_rug.get("flags", [])[:4]:
                 st.caption(f"– {f}")
             if anti_rug["level"] == "CRITICAL":
@@ -4531,6 +4659,11 @@ def main():
                 st.sidebar.success(f"{k}: FOUND ({len(content)} chars)")
             else:
                 st.sidebar.error(f"{k}: EMPTY / NOT FOUND")
+    if _sb_ok():
+        if sb_get_storage("portfolio.csv") is None and sb_get_storage("monitoring.csv") is None:
+            st.sidebar.warning("⚠️ Supabase connected but currently empty/unavailable")
+        else:
+            st.sidebar.success("Supabase data доступні")
 
     with st.sidebar:
         st.markdown("### DEX Scout")
