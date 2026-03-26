@@ -2733,6 +2733,15 @@ def monitoring_priority(
     return round(s, 2)
 
 
+def compute_priority(row: Dict[str, Any]) -> float:
+    score = float(parse_float(row.get("last_score", 0), 0.0))
+    momentum = float(parse_float(row.get("vol5_init", 0), 0.0))
+    age_factor = 1.0
+    if row.get("ts_added"):
+        age_factor = 0.8
+    return score + momentum * 0.05 * age_factor
+
+
 # =============================
 # Portfolio recommendation (fixed)
 # =============================
@@ -4055,6 +4064,8 @@ def page_scout(cfg: Dict[str, Any]):
         size_info["usd_size_adj"] = round(adj["final_size"], 2)
         if str(row.get("entry_status", "NO_ENTRY")) == "NO_ENTRY":
             continue
+        if str(row.get("entry_status", "")).upper() == "NO ENTRY":
+            continue
 
         ranked.append((s, decision, tags, row))
 
@@ -4504,6 +4515,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             r["priority_score"] = str(round(s_live, 4))
             r["decay_hits"] = "0"
             rows_dirty = True
+        computed_pr = compute_priority(r)
+        if parse_float(r.get("priority_score", 0), 0.0) != computed_pr:
+            r["priority_score"] = str(round(computed_pr, 4))
+            rows_dirty = True
         decay_pr = parse_float(r.get("priority_score", base_pr), base_pr)
         pr = source_priority(r) * 10000 + decay_pr
         d_score = s_live - parse_float(r.get("score_init"), 0.0)
@@ -4535,6 +4550,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if sm_signal:
             r["smart_money"] = sm_signal
         r["confidence"] = f"{confidence_score(s_live, sm_signal, rug_flags):.2f}"
+        r["last_score"] = str(round(s_live, 4))
+        r["priority_score"] = str(round(compute_priority(r), 4))
 
         enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug, entry_state))
 
@@ -4542,19 +4559,22 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         save_monitoring(rows)
 
     rows_now = load_monitoring()
+    rows_now.sort(
+        key=lambda r: (
+            -float(parse_float(r.get("priority_score", 0), 0.0)),
+            -float(parse_float(r.get("last_score", 0), 0.0)),
+            r.get("ts_added", ""),
+        )
+    )
     if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
         st.info("Archive/revisit changes applied. Refreshing list…")
         request_rerun()
 
-    priority = {"GREEN": 0, "YELLOW": 1, "RED": 2}
-    timing_priority = {"GOOD": 0, "NEUTRAL": 1, "SKIP": 2}
-    entry_priority = {"READY": 0, "WAIT": 1, "NO_ENTRY": 2}
     enriched.sort(
         key=lambda x: (
-            entry_priority.get(str((x[3] or {}).get("entry_state", "NO_ENTRY")).upper(), 2),
-            timing_priority.get(((x[7] or {}).get("timing") or "SKIP"), 2),
-            priority.get(x[27], 2),
-            -x[5],
+            -float(parse_float((x[3] or {}).get("priority_score", 0), 0.0)),
+            -float(parse_float((x[3] or {}).get("last_score", 0), 0.0)),
+            (x[3] or {}).get("ts_added", ""),
         )
     )
     signals = [x for x in enriched if x[0] == "SIGNAL"]
@@ -5397,6 +5417,8 @@ def page_portfolio():
 # App main
 # =============================
 def main():
+    _maybe_autorefresh(10000, "main_refresh")
+
     if st.session_state.get("_rerun_flag"):
         st.session_state["_rerun_flag"] = False
         st.rerun()
@@ -5522,12 +5544,21 @@ def main():
         portfolio_value_usd=portfolio_value_usd,
     )
 
-    if page == "Monitoring":
-        page_monitoring(auto_cfg)
-    elif page == "Archive":
-        page_archive()
-    else:
-        page_portfolio()
+    try:
+        if page == "Monitoring":
+            page_monitoring(auto_cfg)
+        elif page == "Archive":
+            page_archive()
+        else:
+            page_portfolio()
+    except Exception as e:
+        log_error(e)
+        st.error(f"Page render error: {e}")
+        debug_log(f"page_render_crash: {type(e).__name__}:{e}")
+
+    with st.expander("Debug log"):
+        for line in st.session_state.get("debug_log", []):
+            st.text(line)
 
 
 # =============================
@@ -5573,5 +5604,13 @@ def birdeye_trending_solana(limit: int = 50, offset: int = 0) -> list[str]:
     except Exception:
         return []
 
+def run_app():
+    try:
+        main()
+    except Exception as e:
+        st.error(f"App crash: {e}")
+        debug_log(f"app_crash: {type(e).__name__}:{e}")
+
+
 if __name__ == "__main__":
-    main()
+    run_app()
