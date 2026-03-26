@@ -4553,6 +4553,59 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption("Порожньо")
             return
 
+        def signal_color(entry_state_value: str, sm_signal_value: Optional[str]) -> str:
+            if entry_state_value == "READY":
+                return "#16a34a"
+            if sm_signal_value == "SMART_ACCUMULATION":
+                return "#22c55e"
+            if sm_signal_value == "SMART_EXIT":
+                return "#ef4444"
+            return "#f59e0b"
+
+        def action_label(entry_state_value: str, decision_value: str) -> str:
+            if entry_state_value == "READY":
+                return "ENTER"
+            if decision_value == "NO ENTRY":
+                return "SKIP"
+            return "WAIT"
+
+        def risk_color(risk_score_value: float) -> str:
+            if risk_score_value <= 1:
+                return "#16a34a"
+            if risk_score_value <= 2:
+                return "#f59e0b"
+            return "#ef4444"
+
+        def row_bg(entry_state_value: str, risk_score_value: float) -> str:
+            if entry_state_value == "READY" and risk_score_value <= 1:
+                return "#ecfdf5"
+            if risk_score_value >= 3:
+                return "#fef2f2"
+            return "#ffffff"
+
+        items = sorted(
+            items,
+            key=lambda x: (
+                str((x[35] or {}).get("status", "NO_ENTRY")).upper() != "READY",
+                float((x[29] or {}).get("risk_score", 3) or 3),
+                -float(x[5] or 0.0),
+            )
+        )
+
+        list_container = st.container(height=600)
+        with list_container:
+            header_cols = st.columns([2, 1.2, 1.2, 1.2, 1.2])
+            with header_cols[0]:
+                st.caption("TOKEN")
+            with header_cols[1]:
+                st.caption("SIGNAL")
+            with header_cols[2]:
+                st.caption("ACTION")
+            with header_cols[3]:
+                st.caption("SIZE")
+            with header_cols[4]:
+                st.caption("RISK")
+
         for stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug, entry_state in items:
             exit_signal = exit_before_dump_detector(best, hist, 0.0)
             exit_signal = apply_liquidity_exit_override(exit_signal, liq_health)
@@ -4590,90 +4643,103 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             chain = (r.get("chain") or "").strip().lower()
             base_sym = r.get("base_symbol") or "???"
             base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
-            st.markdown("---")
-            c1, c2, c3, c4 = st.columns([3,2,2,2])
-            with c1:
-                title_bits = [base_sym]
-                if stars:
-                    title_bits.append(stars)
-                if second_wave:
-                    title_bits.append(second_wave)
-                st.subheader(" ".join(title_bits))
-                st.caption(f"{chain} • src: {(r.get('source_window') or '—')} • preset: {(r.get('source_preset') or '—')} • last_seen: {(r.get('ts_last_seen') or '—')}")
-                st.code(base_addr, language="text")
-                if live["url"]:
-                    link_button("DexScreener", live["url"], use_container_width=True, key=f"m_ds_{idx}_{hkey(base_addr)}")
-                swap_url = build_swap_url(chain, base_addr)
-                if swap_url:
-                    label = "Swap (Jupiter)" if chain == "solana" else "Swap (PancakeSwap)"
-                    link_button(label, swap_url, use_container_width=True, key=f"m_sw_{idx}_{hkey(base_addr, chain)}")
-                if chain == "solana":
-                    st.caption("Solana extra stream: Birdeye trending + Jupiter swap link.")
-            with c2:
-                st.markdown("Live")
-                st.write(f"Score: {s_live:.2f}" if best else "Score: n/a")
-                st.write(f"Price: ${live['price']:.8f}" if live['price'] else "Price: n/a")
-                st.write(f"Liq: {fmt_usd(live['liq'])}")
-                st.write(f"Vol24: {fmt_usd(live['vol24'])}")
-                st.write(f"Vol5: {fmt_usd(live['vol5'])}")
-                st.caption(f"Δ1h {fmt_pct(live['pc1h'])} • Δ5m {fmt_pct(live['pc5'])}")
-                st.write(f"SNIPER: {'YES' if sniper_flag else 'NO'}")
-                st.write(f"PUMP: {pump_score}")
-                st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
-                if level == "EARLY":
-                    st.caption("⚠ early exit forming")
-            with c3:
-                st.markdown("Plan")
-                st.write(f"Decision: {decision}")
-                st.write(f"Entry status: {entry_state['status']}")
-                for rr in entry_state.get("reason", [])[:4]:
-                    st.caption(f"– {rr}")
-                st.write(f"Entry timing: {timing['timing']}")
-                for reason in timing.get("reason", []):
-                    st.caption(f"– {reason}")
-                st.write(f"Risk: {(r.get('risk') or 'standard')}")
-                st.write(f"Suggested entry: ${r.get('entry_suggest_usd') or '—'}")
-                st.write(f"TP target: {r.get('tp_target_pct') or '—'}%")
-                st.write(f"Δscore: {d_score:+.2f}")
-                st.write(f"Size: {size_info['size_label']}")
-                st.write(f"Suggested size: {size_info['size_pct']}%")
-                base_usd_size = float(size_info.get("usd_size", 0.0) or 0.0)
-                adjusted_usd_size = float(size_info.get("usd_size_adj", base_usd_size) or base_usd_size)
-                size_factor = float(size_info.get("size_factor", 1.0) or 1.0)
-                if size_factor < 1.0:
-                    st.write(f"USD size: ${adjusted_usd_size:.2f} (reduced from ${base_usd_size:.2f})")
+            row_state = str(entry_state.get("status", "NO_ENTRY")).upper()
+            risk_score_value = float(size_info.get("risk_score", 3) or 3)
+            row_background = row_bg(row_state, risk_score_value)
+            list_container.markdown(
+                f"<div style='background:{row_background};padding:6px 8px;border-radius:8px'>",
+                unsafe_allow_html=True,
+            )
+            cols = list_container.columns([2, 1.2, 1.2, 1.2, 1.2])
+            with cols[0]:
+                st.markdown(f"**{base_sym}**")
+                if live["price"]:
+                    st.caption(f"${live['price']:.6f}")
                 else:
-                    st.write(f"USD size: ${base_usd_size:.2f}")
-                st.write(f"Risk score: {size_info['risk_score']}")
-                corr_status = str(corr.get("status", "ALLOW"))
-                corr_reasons = corr.get("reason", []) or []
-                st.write(f"Correlation: {corr_status}")
-                for rr in corr_reasons:
-                    st.caption(f"– {rr}")
-                st.write(f"Liquidity health: {liq_health['level']}")
-                st.write(f"Anti-rug: {anti_rug['level']} ({anti_rug['score']})")
-                st.write(f"Can enter safely: {'YES' if liq_health['level']=='OK' and anti_rug['level']!='CRITICAL' else 'NO'}")
-                st.caption(f"size factor: {float(size_info.get('size_factor', 1.0) or 1.0):.2f}")
-                for fl in liq_health.get("flags", []):
-                    st.caption(f"– {fl}")
-                for fl in anti_rug.get("flags", [])[:4]:
-                    st.caption(f"– {fl}")
-                if size_info.get("size_reason"):
-                    st.caption("Size adjustments:")
-                    for rr in size_info["size_reason"]:
+                    st.caption("n/a")
+            with cols[1]:
+                sig_color = signal_color(row_state, smart_money)
+                st.markdown(
+                    f"<span style='color:{sig_color};font-weight:600'>{row_state}</span>",
+                    unsafe_allow_html=True,
+                )
+                tag_items: List[str] = []
+                if smart_money:
+                    tag_items.append(smart_money)
+                rug_flags = anti_rug.get("flags", []) or []
+                if rug_flags:
+                    tag_items.append("RISK")
+                if "DEV_DUMP" in tags:
+                    tag_items.append("DEV")
+                if tag_items:
+                    st.caption(" • ".join(tag_items[:3]))
+            with cols[2]:
+                action = action_label(row_state, decision)
+                st.markdown(f"**{action}**")
+            with cols[3]:
+                adjusted_usd_size = float(size_info.get("usd_size_adj", 0) or 0)
+                st.markdown(f"${int(adjusted_usd_size)}")
+            with cols[4]:
+                r_color = risk_color(risk_score_value)
+                st.markdown(
+                    f"<span style='color:{r_color}'>R{int(risk_score_value)}</span>",
+                    unsafe_allow_html=True,
+                )
+            list_container.markdown("</div>", unsafe_allow_html=True)
+
+            with list_container.expander(f"Details · {base_sym}", expanded=False):
+                c1, c2, c3 = st.columns([2, 2, 2])
+                with c1:
+                    st.caption(f"{chain} • src: {(r.get('source_window') or '—')} • preset: {(r.get('source_preset') or '—')} • last_seen: {(r.get('ts_last_seen') or '—')}")
+                    st.code(base_addr, language="text")
+                    if live["url"]:
+                        link_button("DexScreener", live["url"], use_container_width=True, key=f"m_ds_{idx}_{hkey(base_addr)}")
+                    swap_url = build_swap_url(chain, base_addr)
+                    if swap_url:
+                        label = "Swap (Jupiter)" if chain == "solana" else "Swap (PancakeSwap)"
+                        link_button(label, swap_url, use_container_width=True, key=f"m_sw_{idx}_{hkey(base_addr, chain)}")
+                    st.write(f"Score: {s_live:.2f}" if best else "Score: n/a")
+                    st.write(f"Liq: {fmt_usd(live['liq'])}")
+                    st.write(f"Vol24: {fmt_usd(live['vol24'])}")
+                    st.write(f"Vol5: {fmt_usd(live['vol5'])}")
+                    st.caption(f"Δ1h {fmt_pct(live['pc1h'])} • Δ5m {fmt_pct(live['pc5'])}")
+                    st.write(f"SNIPER: {'YES' if sniper_flag else 'NO'}")
+                    st.write(f"PUMP: {pump_score}")
+                    st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
+                    st.write(f"Entry timing: {timing['timing']}")
+                    for reason in timing.get("reason", []):
+                        st.caption(f"– {reason}")
+                with c2:
+                    st.write(f"Decision: {decision}")
+                    for rr in entry_state.get("reason", [])[:4]:
                         st.caption(f"– {rr}")
-                if size_info["risk_flags"]:
-                    st.caption("Risk flags:")
-                    for rf in size_info["risk_flags"]:
-                        st.caption(f"– {rf}")
-                if migration_label:
-                    st.info(f"MIGRATION: {migration_label}")
-            with c4:
-                st.markdown("Status")
-                label = f"{decision} {stars}".strip()
-                if second_wave and not str(decision).upper().startswith("ENTRY"):
-                    label = f"ENTRY (2nd wave) {stars}".strip()
-                st.markdown(action_badge(label), unsafe_allow_html=True)
+                    st.write(f"Risk: {(r.get('risk') or 'standard')}")
+                    st.write(f"Suggested entry: ${r.get('entry_suggest_usd') or '—'}")
+                    st.write(f"TP target: {r.get('tp_target_pct') or '—'}%")
+                    st.write(f"Δscore: {d_score:+.2f}")
+                    st.write(f"Size: {size_info['size_label']}")
+                    st.write(f"Suggested size: {size_info['size_pct']}%")
+                    base_usd_size = float(size_info.get("usd_size", 0.0) or 0.0)
+                    size_factor = float(size_info.get("size_factor", 1.0) or 1.0)
+                    if size_factor < 1.0:
+                        st.write(f"USD size: ${adjusted_usd_size:.2f} (reduced from ${base_usd_size:.2f})")
+                    else:
+                        st.write(f"USD size: ${base_usd_size:.2f}")
+                    st.caption(f"size factor: {size_factor:.2f}")
+                    st.write(f"Correlation: {str(corr.get('status', 'ALLOW'))}")
+                    for rr in (corr.get("reason", []) or []):
+                        st.caption(f"– {rr}")
+                    st.write(f"Liquidity health: {liq_health['level']}")
+                    for fl in liq_health.get("flags", []):
+                        st.caption(f"– {fl}")
+                    st.write(f"Anti-rug: {anti_rug['level']} ({anti_rug['score']})")
+                    for fl in anti_rug.get("flags", [])[:4]:
+                        st.caption(f"– {fl}")
+                with c3:
+                    label = f"{decision} {stars}".strip()
+                    if second_wave and not str(decision).upper().startswith("ENTRY"):
+                        label = f"ENTRY (2nd wave) {stars}".strip()
+                    st.markdown(action_badge(label), unsafe_allow_html=True)
                 if entry_state["status"] == "READY":
                     st.success("Entry status: READY")
                 elif entry_state["status"] == "WAIT":
@@ -4783,7 +4849,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     archive_monitoring(chain, base_addr, reason="manual", last_score=s_live, last_decision=decision)
                     st.success("Archived.")
                     request_rerun()
-            with st.expander("Dynamics / sparklines", expanded=False):
+            with list_container.expander(f"Dynamics / sparklines · {base_sym}", expanded=False):
                 if not hist:
                     st.info("No snapshots yet.")
                 else:
