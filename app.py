@@ -4593,6 +4593,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         )
 
         list_container = st.container(height=600)
+        rendered_count = 0
         with list_container:
             header_cols = st.columns([2, 1.2, 1.2, 1.2, 1.2])
             with header_cols[0]:
@@ -4639,9 +4640,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             action_plan = action_from_exit_signal(exit_signal, persistence)
             if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
                 continue
+            rendered_count += 1
 
             chain = (r.get("chain") or "").strip().lower()
-            base_sym = r.get("base_symbol") or "???"
+            base_sym = r.get("base_symbol") or r.get("symbol") or "NA"
             base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
             row_state = str(entry_state.get("status", "NO_ENTRY")).upper()
             risk_score_value = float(size_info.get("risk_score", 3) or 3)
@@ -4866,6 +4868,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     s4, s5 = st.columns(2)
                     with s4: st.line_chart(dfh[["vol24_usd"]], height=120, use_container_width=True)
                     with s5: st.line_chart(dfh[["vol5_usd"]], height=120, use_container_width=True)
+        if rendered_count == 0:
+            st.warning("No tokens to display (check filters)")
 
     render_items("Signals", signals)
     st.markdown("---")
