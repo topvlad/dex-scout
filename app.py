@@ -1147,6 +1147,13 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
     row = dict(pair)
     row["meme_score"] = meme_token_score(row)
     row["smart_money"] = detect_smart_wallet_activity(row)
+    age_minutes = pair_age_minutes(row)
+    row["price_change_5m"] = parse_float(safe_get(row, "priceChange", "m5", default=row.get("price_change_5m", 0)), 0.0)
+    row["price_change_15m"] = parse_float(safe_get(row, "priceChange", "m15", default=row.get("price_change_15m", 0)), 0.0)
+    row["volume_5m"] = parse_float(safe_get(row, "volume", "m5", default=row.get("volume_5m", 0)), 0.0)
+    row["liquidity"] = parse_float(safe_get(row, "liquidity", "usd", default=row.get("liquidity", 0)), 0.0)
+    row["fdv"] = parse_float(row.get("fdv", 0), 0.0)
+    row["age_minutes"] = parse_float(age_minutes if age_minutes is not None else row.get("age_minutes", 0), 0.0)
 
     mig = detect_liquidity_migration(row)
     row["migration"] = mig.get("migration", 0)
@@ -1165,6 +1172,10 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
     row["dev_risk"] = dev_wallet_risk(row)
     row["whale"] = whale_accumulation(row)
     row["signal"] = classify_signal(row)
+    entry_status, entry_score, entry_reasons = evaluate_entry(row)
+    row["entry_status"] = entry_status
+    row["entry_score"] = entry_score
+    row["entry_reasons"] = entry_reasons
     return row
 
 
@@ -1477,6 +1488,65 @@ def entry_timing_signal(best: Optional[Dict[str, Any]], hist: Optional[List[Dict
         return {"timing": "NEUTRAL", "reason": ["error"]}
 
 
+def evaluate_entry(token: Dict[str, Any]) -> Tuple[str, float, List[str]]:
+    """
+    Returns:
+        status: "READY" | "WAIT" | "NO_ENTRY"
+        score: float (0-100)
+        reasons: list[str]
+    """
+    price_change_5m = parse_float(token.get("price_change_5m", safe_get(token, "priceChange", "m5", default=0)), 0.0)
+    price_change_15m = parse_float(token.get("price_change_15m", safe_get(token, "priceChange", "m15", default=0)), 0.0)
+    volume_5m = parse_float(token.get("volume_5m", safe_get(token, "volume", "m5", default=0)), 0.0)
+    liquidity = parse_float(token.get("liquidity", safe_get(token, "liquidity", "usd", default=0)), 0.0)
+    fdv = parse_float(token.get("fdv", 0), 0.0)
+    age_minutes = parse_float(token.get("age_minutes", pair_age_minutes(token) or 0), 0.0)
+
+    score = 0.0
+    reasons: List[str] = []
+
+    if price_change_5m > 5:
+        score += 25
+        reasons.append("strong 5m momentum")
+    elif price_change_5m > 2:
+        score += 15
+        reasons.append("moderate 5m momentum")
+
+    if volume_5m > 50000:
+        score += 20
+        reasons.append("high volume")
+    elif volume_5m > 20000:
+        score += 10
+
+    if liquidity > 30000:
+        score += 15
+    else:
+        score -= 20
+        reasons.append("low liquidity risk")
+
+    if 50000 < fdv < 5000000:
+        score += 10
+    else:
+        score -= 10
+
+    if age_minutes < 10:
+        score += 10
+        reasons.append("early token")
+    elif age_minutes > 120:
+        score -= 10
+
+    # soft bonus: confirms short-term continuation when m15 is also green
+    if price_change_15m > 0 and price_change_5m > 0:
+        score += 5
+
+    score = max(0.0, min(100.0, round(score, 2)))
+    if score >= 60:
+        return "READY", score, reasons
+    if score >= 35:
+        return "WAIT", score, reasons
+    return "NO_ENTRY", score, reasons
+
+
 def classify_entry_status(
     best: Optional[Dict[str, Any]],
     decision: str,
@@ -1498,31 +1568,32 @@ def classify_entry_status(
     liq_level = str((liq_health or {}).get("level", "UNKNOWN") or "UNKNOWN").upper()
     anti_level = str((anti_rug or {}).get("level", "SAFE") or "SAFE").upper()
     final_size = float(size_info.get("usd_size_adj", size_info.get("usd_size", 0.0)) or 0.0)
+    entry_status, entry_score, entry_reasons = evaluate_entry(best)
 
-    reasons: List[str] = []
+    hard_blockers: List[str] = []
     if liq_level in ("DEAD", "CRITICAL"):
-        reasons.append(f"liq={liq_level}")
+        hard_blockers.append(f"liq={liq_level}")
     if anti_level == "CRITICAL":
-        reasons.append("anti_rug_critical")
+        hard_blockers.append("anti_rug_critical")
     if timing_state == "SKIP":
-        reasons.append("timing_skip")
+        hard_blockers.append("timing_skip")
     if final_size <= 0:
-        reasons.append("size_zero")
+        hard_blockers.append("size_zero")
     if decision_u == "NO ENTRY":
-        reasons.append("decision_no_entry")
+        hard_blockers.append("decision_no_entry")
 
-    if reasons:
+    if hard_blockers or entry_status == "NO_ENTRY":
         return {
             "status": "NO_ENTRY",
-            "reason": reasons,
+            "reason": hard_blockers + entry_reasons,
             "rank": 2,
             "can_promote": False,
         }
 
-    if decision_u.startswith("ENTRY") and timing_state == "GOOD" and liq_level == "OK" and anti_level == "SAFE":
+    if entry_status == "READY" and decision_u.startswith("ENTRY") and timing_state == "GOOD" and liq_level == "OK" and anti_level == "SAFE":
         return {
             "status": "READY",
-            "reason": ["entry_ok"],
+            "reason": ["entry_ok", f"entry_score={entry_score}"] + entry_reasons,
             "rank": 0,
             "can_promote": True,
         }
@@ -1539,7 +1610,7 @@ def classify_entry_status(
 
     return {
         "status": "WAIT",
-        "reason": wait_reasons or ["mixed_signals"],
+        "reason": (wait_reasons or ["mixed_signals"]) + [f"entry_score={entry_score}"] + entry_reasons,
         "rank": 1,
         "can_promote": True,
     }
@@ -1876,6 +1947,8 @@ MON_FIELDS = [
     "ts_last_seen",
     "signal",
     "smart_money",
+    "entry_status",
+    "entry_score",
 ]
 
 HIST_FIELDS = [
@@ -2078,7 +2151,14 @@ def token_exists(contract: str) -> bool:
     return False
 
 
-def add_to_monitoring(p: Dict[str, Any], score: float, window_name: str = "", preset_key: str = "") -> str:
+def add_to_monitoring(
+    p: Dict[str, Any],
+    score: float,
+    window_name: str = "",
+    preset_key: str = "",
+    entry_status: str = "",
+    entry_score: float = 0.0,
+) -> str:
     chain = (p.get("chainId") or "").lower().strip()
     base_addr_raw = (safe_get(p, "baseToken", "address", default="") or "").strip()
     if not base_addr_raw:
@@ -2096,6 +2176,9 @@ def add_to_monitoring(p: Dict[str, Any], score: float, window_name: str = "", pr
             # refresh lightweight fields
             r["last_score"] = str(score)
             r["ts_last_seen"] = now_utc_str()
+            if entry_status:
+                r["entry_status"] = entry_status
+                r["entry_score"] = str(entry_score)
             if window_name:
                 r["source_window"] = _merge_csv_values(r.get("source_window", ""), window_name)
             if preset_key:
@@ -2116,6 +2199,9 @@ def add_to_monitoring(p: Dict[str, Any], score: float, window_name: str = "", pr
     risk = "EARLY" if preset_key in {"ultra", "momentum"} else ""
     entry_s, tp_s = suggest_entry_and_tp_usd(p, risk=risk)
     decision, _tags = build_trade_hint(p)
+    computed_entry_status, computed_entry_score, _ = evaluate_entry(p)
+    final_entry_status = entry_status or computed_entry_status
+    final_entry_score = float(entry_score if entry_status else computed_entry_score)
 
     rows.insert(0,
         {
@@ -2141,6 +2227,8 @@ def add_to_monitoring(p: Dict[str, Any], score: float, window_name: str = "", pr
             "ts_last_seen": now_utc_str(),
             "signal": classify_signal(p),
             "smart_money": "1" if detect_smart_money(p) else "0",
+            "entry_status": final_entry_status,
+            "entry_score": str(final_entry_score),
         }
     )
     save_monitoring(rows)
@@ -3211,10 +3299,10 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
         if not base_addr:
             continue
-        decision, _tags = build_trade_hint(p)
-        if str(decision).upper() == "NO ENTRY":
+        row = normalize_pair_row(p)
+        if str(row.get("entry_status", "NO_ENTRY")) == "NO_ENTRY":
             continue
-        out.append(p)
+        out.append(row)
 
     SCAN_CACHE[cache_key] = {"ts": now_ts, "pairs": out}
     return out
@@ -3237,6 +3325,8 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     for s, p, smart, signal in ranked:
         counts["seen"] += 1
         row = normalize_pair_row(p)
+        entry_status = str(row.get("entry_status", "NO_ENTRY") or "NO_ENTRY")
+        entry_score = parse_float(row.get("entry_score", 0), 0.0)
         row["smart_money"] = smart
         row["signal"] = signal
         if row["signal"] == "RED":
@@ -3245,6 +3335,10 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 base_addr=safe_get(row, "baseToken", "address", default=""),
                 reason="auto_filter"
             )
+            continue
+
+        if entry_status == "NO_ENTRY":
+            counts["skipped_noise"] = counts.get("skipped_noise", 0) + 1
             continue
 
         allowed, _gate_reason = passes_monitoring_gate(row, float(s))
@@ -3271,7 +3365,16 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["skipped_active"] += 1
                 continue
 
-            res = add_to_monitoring(row, float(s), window_name=window_name, preset_key=preset_key)
+            if entry_status != "WAIT":
+                continue
+            res = add_to_monitoring(
+                row,
+                float(s),
+                window_name=window_name,
+                preset_key=preset_key,
+                entry_status=entry_status,
+                entry_score=entry_score,
+            )
 
             append_monitoring_history({
                 "ts_utc": now_utc_str(),
@@ -3297,8 +3400,15 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["skipped_active"] += 1
             elif res == "EXISTS_ARCHIVED":
                 counts["skipped_archived"] += 1
-            if detect_auto_signal(row):
-                add_to_monitoring(row, float(s), window_name="AUTO_SIGNAL", preset_key="AUTO_SIGNAL")
+            if entry_status == "WAIT" and detect_auto_signal(row):
+                add_to_monitoring(
+                    row,
+                    float(s),
+                    window_name="AUTO_SIGNAL",
+                    preset_key="AUTO_SIGNAL",
+                    entry_status=entry_status,
+                    entry_score=entry_score,
+                )
         except Exception as e:
             log_error(e)
             counts["errors"] += 1
@@ -3608,8 +3718,9 @@ def page_scout(cfg: Dict[str, Any]):
         if key in mon_set or key in port_set:
             continue
 
-        whale = whale_accumulation(p)
-        fresh = fresh_lp(p)
+        row = normalize_pair_row(p)
+        whale = whale_accumulation(row)
+        fresh = fresh_lp(row)
 
         s = score_pair(p)
         if whale:
@@ -3617,16 +3728,16 @@ def page_scout(cfg: Dict[str, Any]):
         if fresh == "VERY_NEW":
             s += 2
         s += pump_probability(p) * 0.5
-        decision, tags = build_trade_hint(p)
-        timing = entry_timing_signal(p, None)
-        liq_health = liquidity_health(p)
-        anti_rug = anti_rug_early_detector(p, None)
+        decision, tags = build_trade_hint(row)
+        timing = entry_timing_signal(row, None)
+        liq_health = liquidity_health(row)
+        anti_rug = anti_rug_early_detector(row, None)
         size_info = position_sizing_engine(
-            p,
+            row,
             portfolio_value_usd=float(cfg.get("portfolio_value_usd", 1000.0)),
             hist=None,
         )
-        corr = correlation_governor(p)
+        corr = correlation_governor(row)
         adj = risk_adjusted_size(
             float(size_info.get("usd_size", 0.0) or 0.0),
             corr,
@@ -3634,12 +3745,9 @@ def page_scout(cfg: Dict[str, Any]):
             anti_rug=anti_rug,
         )
         size_info["usd_size_adj"] = round(adj["final_size"], 2)
-        entry_state = classify_entry_status(p, decision, timing, liq_health, anti_rug, size_info)
-
-        if entry_state["status"] == "NO_ENTRY":
+        if str(row.get("entry_status", "NO_ENTRY")) == "NO_ENTRY":
             continue
 
-        row = normalize_pair_row(p)
         ranked.append((s, decision, tags, row))
 
     ranked.sort(key=lambda x: x[0], reverse=True)
@@ -3690,6 +3798,10 @@ def page_scout(cfg: Dict[str, Any]):
         pump_score = pump_probability(pobj)
         score += pump_score * 0.5
         decision, tag_list = build_trade_hint(pobj)
+        entry_status, entry_score, entry_reasons = evaluate_entry(pobj)
+        pobj["entry_status"] = entry_status
+        pobj["entry_score"] = entry_score
+        pobj["entry_reasons"] = entry_reasons
         timing = entry_timing_signal(pobj, None)
         liq_health = liquidity_health(pobj)
         anti_rug = anti_rug_early_detector(pobj, None)
@@ -3751,6 +3863,13 @@ def page_scout(cfg: Dict[str, Any]):
         sells = (pobj.get("txns") or {}).get("m5", {}).get("sells")
 
         st.write(f"Score: {score:,.2f}")
+        c_entry_1, c_entry_2 = st.columns(2)
+        with c_entry_1:
+            st.metric("Entry Status", entry_status)
+        with c_entry_2:
+            st.metric("Entry Score", f"{entry_score:.2f}")
+        if entry_reasons:
+            st.caption("Entry reasons: " + " • ".join(entry_reasons))
         st.write(f"Meme Score: {int(pobj.get('meme_score', 0) or 0)}")
         smart_money_label = "YES" if int(pobj.get("smart_money", 0) or 0) == 1 else "NO"
         st.write(f"Smart Money: {smart_money_label}")
