@@ -4966,14 +4966,41 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         else:
             st.info("Already in portfolio.")
 
+    def extract_name(row: Dict[str, Any]) -> str:
+        return (
+            row.get("symbol")
+            or row.get("name")
+            or row.get("token")
+            or (row.get("baseToken") or {}).get("symbol")
+            or ((row.get("pair") or {}).get("baseToken") or {}).get("symbol")
+            or "unknown"
+        )
+
+    def g(row: Dict[str, Any], key: str, default: str = "NA") -> Any:
+        value = row.get(key)
+        return value if value not in [None, ""] else default
+
+    def dex_url(addr: str) -> str:
+        return f"https://dexscreener.com/solana/{addr}"
+
+    def jup_url(addr: str) -> str:
+        return f"https://jup.ag/swap/SOL-{addr}"
+
     if not signals and not watchlist:
         st.warning("Monitoring empty (UI layer)")
         if rows:
             st.caption("Fallback: compact actionable cards")
             for r in active_rows:
-                name = r.get("symbol") or r.get("name") or "token"
+                name = extract_name(r)
                 score = round(parse_float(r.get("last_score", 0), 0.0), 2)
                 decision = r.get("decision", "WATCH")
+                addr = (r.get("address") or r.get("mint") or r.get("base_addr") or "").strip()
+
+                r.setdefault("entry_status", "WATCH")
+                r.setdefault("risk_level", "MED")
+                r.setdefault("anti_rug", "UNKNOWN")
+                r.setdefault("entry_timing", "EARLY")
+
                 header = f"{name} | {decision} | {score}"
 
                 with st.expander(header):
@@ -4981,45 +5008,48 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     col1, col2, col3 = st.columns(3)
 
                     with col1:
-                        dex_url = r.get("dex_url") or r.get("dexscreener_url") or ""
-                        if dex_url:
-                            link_button("Dex", dex_url, use_container_width=True, key=f"fallback_ds_{hkey(dex_url, name)}")
+                        if addr:
+                            st.link_button("Dex", dex_url(addr), use_container_width=True)
 
                     with col2:
-                        addr = (r.get("address") or r.get("base_addr") or "").strip()
                         if addr:
-                            st.code(addr[:10] + "...", language="text")
+                            st.link_button("Jupiter", jup_url(addr), use_container_width=True)
 
                     with col3:
-                        if st.button("➕ Portfolio", key=f"pf_{name}_{hkey(str(r))}", use_container_width=True):
+                        if st.button("➕ Portfolio", key=f"pf_{addr or hkey(str(r))}", use_container_width=True):
                             promote_to_portfolio(r)
+
+                    # --- ADDRESS ---
+                    if addr:
+                        st.code(addr, language="text")
+                        st.caption(f"{addr[:6]}...{addr[-4:]}")
 
                     # --- CORE ---
                     col1, col2, col3, col4 = st.columns(4)
 
                     with col1:
-                        st.metric("Entry", r.get("entry_status", "NA"))
+                        st.metric("Entry", g(r, "entry_status"))
 
                     with col2:
-                        st.metric("Timing", r.get("entry_timing") or r.get("timing") or "NA")
+                        st.metric("Timing", g(r, "entry_timing", g(r, "timing")))
 
                     with col3:
-                        st.metric("Risk", r.get("risk_level") or r.get("risk") or "NA")
+                        st.metric("Risk", g(r, "risk_level", g(r, "risk")))
 
                     with col4:
-                        st.metric("Safe", r.get("anti_rug") or r.get("rug_risk") or "NA")
+                        st.metric("Safe", g(r, "anti_rug", g(r, "rug_risk")))
 
                     # --- PLAN ---
                     col1, col2, col3 = st.columns(3)
 
                     with col1:
-                        st.write(f"Size: {r.get('size_label', 'NA')}")
+                        st.write(f"Size: {g(r, 'size_label')}")
 
                     with col2:
-                        st.write(f"USD: {r.get('usd_size', 'NA')}")
+                        st.write(f"USD: {g(r, 'usd_size')}")
 
                     with col3:
-                        st.write(f"TP: {r.get('tp_target', 'NA')}")
+                        st.write(f"TP: {g(r, 'tp_target')}")
 
                     # --- REASON ---
                     reason = r.get("entry_reason") or r.get("decision_reason")
