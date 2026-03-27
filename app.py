@@ -4970,9 +4970,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         return (
             row.get("symbol")
             or row.get("name")
-            or row.get("token")
+            or row.get("tokenSymbol")
+            or row.get("tokenName")
+            or (row.get("token") or {}).get("symbol")
+            or (row.get("token") or {}).get("name")
             or (row.get("baseToken") or {}).get("symbol")
+            or (row.get("baseToken") or {}).get("name")
             or ((row.get("pair") or {}).get("baseToken") or {}).get("symbol")
+            or ((row.get("pair") or {}).get("baseToken") or {}).get("name")
+            or (row.get("info") or {}).get("symbol")
+            or (row.get("info") or {}).get("name")
             or "unknown"
         )
 
@@ -4989,9 +4996,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     if not signals and not watchlist:
         st.warning("Monitoring empty (UI layer)")
         if rows:
+            debug_keys = st.checkbox("DEBUG KEYS", key="dbg_keys_compact_cards")
             st.caption("Fallback: compact actionable cards")
             for r in active_rows:
-                name = extract_name(r)
+                if debug_keys:
+                    st.write(r.keys())
+                    st.write(r)
+
+                name = extract_name(r).upper()
                 score = round(parse_float(r.get("last_score", 0), 0.0), 2)
                 decision = r.get("decision", "WATCH")
                 addr = (r.get("address") or r.get("mint") or r.get("base_addr") or "").strip()
