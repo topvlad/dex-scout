@@ -4937,37 +4937,101 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if rendered_count == 0:
             st.warning("No tokens to display (check filters)")
 
+    def promote_to_portfolio(row: Dict[str, Any]) -> None:
+        chain = (row.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, (row.get("base_addr") or row.get("address") or "").strip())
+        if not chain or not base_addr:
+            st.error("Missing chain/address for portfolio promote.")
+            return
+        best = best_pair_for_token(chain, base_addr)
+        if not best:
+            st.error("No live pool found.")
+            return
+        score_value = parse_float(row.get("last_score", row.get("score_init", 0)), 0.0)
+        decision_value = str(row.get("decision") or "WATCH")
+        tags_raw = str(row.get("tags") or "")
+        tags = [t.strip() for t in tags_raw.split("|") if t.strip()]
+        swap_url = build_swap_url(chain, base_addr)
+        res = log_to_portfolio(best, score_value, decision_value, tags, swap_url)
+        if res == "OK":
+            archive_monitoring(
+                chain,
+                base_addr,
+                reason="manual: promoted from compact card",
+                last_score=score_value,
+                last_decision=decision_value,
+            )
+            st.success("Promoted to Portfolio.")
+            request_rerun()
+        else:
+            st.info("Already in portfolio.")
+
     if not signals and not watchlist:
         st.warning("Monitoring empty (UI layer)")
         if rows:
-            st.caption("Fallback: showing raw rows")
+            st.caption("Fallback: compact actionable cards")
             for r in active_rows:
                 name = r.get("symbol") or r.get("name") or r.get("base_symbol") or "unknown"
-                status = r.get("entry_status", "?")
-                score = r.get("last_score", "-")
-                col1, col2, col3 = st.columns([3, 1, 1])
-                with col1:
-                    if st.button(name, key=f"name_{name}_{hkey(str(r))}"):
-                        st.session_state.selected_token = r
-                with col2:
-                    st.write(status)
-                with col3:
-                    st.write(score)
+                score = round(parse_float(r.get("last_score", r.get("score_init", 0)), 0.0), 2)
+                entry = r.get("entry_status") or r.get("entry_state") or "?"
+                decision = r.get("decision") or "WATCH"
+                header = f"{name} | {decision} | score {score}"
 
-                with st.expander(f"{name} | {status}"):
-                    st.write(r)
-            with st.expander("Debug raw rows"):
-                for r in active_rows[:20]:
-                    name = r.get("base_symbol", "n/a")
-                    status = r.get("entry_status", "?")
-                    if st.button(f"{name} | {status}", key=f"btn_{name}_{hkey(str(r))}"):
-                        st.session_state.selected_token = r
+                with st.expander(header):
+                    top1, top2, top3 = st.columns(3)
+                    with top1:
+                        dex_url = r.get("dex_url") or r.get("dexscreener_url") or ""
+                        if dex_url:
+                            link_button("DexScreener", dex_url, use_container_width=True, key=f"fallback_ds_{hkey(dex_url, name)}")
+                    with top2:
+                        addr = (r.get("address") or r.get("base_addr") or "").strip()
+                        if addr:
+                            st.code(f"{addr[:10]}...", language="text")
+                    with top3:
+                        if st.button("➕ Portfolio", key=f"pf_{name}_{hkey(str(r))}", use_container_width=True):
+                            promote_to_portfolio(r)
 
-            selected = st.session_state.get("selected_token")
-            if selected:
-                st.divider()
-                st.subheader(f"Token: {selected.get('symbol', selected.get('base_symbol', 'unknown'))}")
-                st.write(selected)
+                    core1, core2, core3, core4 = st.columns(4)
+                    with core1:
+                        st.metric("Entry", entry)
+                    with core2:
+                        st.metric("Timing", r.get("entry_timing") or r.get("timing") or "NA")
+                    with core3:
+                        st.metric("Risk", r.get("risk_level") or r.get("risk") or "NA")
+                    with core4:
+                        st.metric("Safe", r.get("anti_rug") or r.get("rug_risk") or "NA")
+
+                    st.caption("Plan")
+                    plan1, plan2, plan3 = st.columns(3)
+                    with plan1:
+                        st.metric("Size", r.get("size_label") or r.get("entry_suggest_usd") or "NA")
+                    with plan2:
+                        st.metric("USD", r.get("usd_size") or r.get("entry_suggest_usd") or "NA")
+                    with plan3:
+                        st.metric("TP", r.get("tp_target") or r.get("tp_target_pct") or "NA")
+
+                    reason = r.get("entry_reason") or r.get("decision_reason")
+                    if not reason:
+                        reasons = r.get("entry_reasons")
+                        if isinstance(reasons, list) and reasons:
+                            reason = " • ".join(str(x) for x in reasons[:3])
+                        elif isinstance(reasons, str) and reasons.strip():
+                            reason = reasons
+                    if reason:
+                        st.info(str(reason))
+
+                    prices = r.get("price_series")
+                    if isinstance(prices, list) and prices:
+                        st.line_chart(prices, height=100, use_container_width=True)
+                    else:
+                        hist_rows = token_history_rows((r.get("chain") or "").strip().lower(), (r.get("base_addr") or "").strip(), limit=60)
+                        if hist_rows:
+                            price_series = [parse_float(h.get("price_usd"), 0.0) for h in hist_rows if str(h.get("price_usd", "")).strip()]
+                            if price_series:
+                                st.line_chart(price_series, height=100, use_container_width=True)
+
+                    with st.expander("Debug"):
+                        st.write(r)
         return
 
     render_items("Signals", signals)
