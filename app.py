@@ -4286,15 +4286,20 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 row[k] = ""
         rows.append(row)
 
-    active = [r for r in rows if str(r.get("active", "1")).strip() == "1"]
+    active_rows = [
+        r for r in rows
+        if str(r.get("active", "1")).strip() == "1"
+        or str(r.get("status", "")).strip().lower() in ("active", "monitoring", "watch")
+    ]
+    active = list(active_rows)
     archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
     top[0].metric("Active", len(active))
     top[1].metric("Archived", len(archived))
     top[2].caption(f"Last scan: {scan_state.get('last_run_ts','—')} • {scan_state.get('last_window','—')} • {scan_state.get('last_chain','—')}")
     top[3].caption(f"Last stats: {scan_state.get('last_stats', {})}")
 
-    st.caption(f"DEBUG monitoring rows: {len(monitoring_rows)}")
-    st.caption(f"DEBUG active items: {len(active)}")
+    st.caption(f"DEBUG total_rows: {len(rows)}")
+    st.caption(f"DEBUG active_rows: {len(active_rows)}")
 
     cbtn1, cbtn2, cbtn3 = st.columns([2,2,6])
     with cbtn1:
@@ -4313,13 +4318,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     with cbtn3:
         st.caption("The app checks scanner slot on every load. One slot = 5 minutes, rotating across 4 presets × 2 chains.")
 
-    if not active:
+    if not active_rows:
         st.info("Monitoring is empty. Wait for scanner or run it now.")
         return
 
     chain_filter = st.selectbox("Chain filter", ["all", "bsc", "solana"], index=0)
     if chain_filter != "all":
-        active = [r for r in active if (r.get("chain") or "").strip().lower() == chain_filter]
+        active = [r for r in active_rows if (r.get("chain") or "").strip().lower() == chain_filter]
+    else:
+        active = list(active_rows)
 
     now_ts = datetime.utcnow()
     rows_dirty = False
@@ -4906,9 +4913,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     if not signals and not watchlist:
         st.warning("Monitoring empty (UI layer)")
-        st.subheader("Monitoring (raw active rows)")
-        for r in active:
-            st.write(r.get("base_symbol", "n/a"), r.get("last_decision", "n/a"))
+        if rows:
+            st.caption("Fallback: showing raw rows")
+            for r in rows[:20]:
+                name = r.get("symbol") or r.get("name") or r.get("base_symbol") or "unknown"
+                status = r.get("entry_status", "?")
+                score = r.get("last_score", "-")
+                st.markdown(f"**{name}** | {status} | score: {score}")
+            with st.expander("Debug raw rows"):
+                for r in active_rows[:20]:
+                    st.text(f"{r.get('base_symbol', 'n/a')} [{r.get('entry_status', '?')}]")
         return
 
     render_items("Signals", signals)
