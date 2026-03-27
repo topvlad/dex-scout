@@ -4967,11 +4967,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.info("Already in portfolio.")
 
     def extract_name(row: Dict[str, Any]) -> str:
-        return (
-            row.get("symbol")
+        name = (
+            row.get("base_symbol")
+            or row.get("symbol")
             or row.get("name")
             or row.get("tokenSymbol")
             or row.get("tokenName")
+            or row.get("base_name")
             or (row.get("token") or {}).get("symbol")
             or (row.get("token") or {}).get("name")
             or (row.get("baseToken") or {}).get("symbol")
@@ -4980,18 +4982,31 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             or ((row.get("pair") or {}).get("baseToken") or {}).get("name")
             or (row.get("info") or {}).get("symbol")
             or (row.get("info") or {}).get("name")
-            or "unknown"
         )
+        if name:
+            return str(name).strip()
+
+        addr = (row.get("base_addr") or row.get("address") or row.get("mint") or "").strip()
+        if addr:
+            return f"{addr[:6]}...{addr[-4:]}"
+        return "UNKNOWN"
 
     def g(row: Dict[str, Any], key: str, default: str = "NA") -> Any:
         value = row.get(key)
         return value if value not in [None, ""] else default
 
-    def dex_url(addr: str) -> str:
-        return f"https://dexscreener.com/solana/{addr}"
+    def dex_url(chain: str, addr: str) -> str:
+        chain = (chain or "").strip().lower()
+        if not chain or not addr:
+            return ""
+        return f"https://dexscreener.com/{chain}/{addr}"
 
-    def jup_url(addr: str) -> str:
-        return f"https://jup.ag/swap/SOL-{addr}"
+    def swap_url_for_row(row: Dict[str, Any]) -> str:
+        chain = (row.get("chain") or "").strip().lower()
+        addr = (row.get("base_addr") or row.get("address") or row.get("mint") or "").strip()
+        if not chain or not addr:
+            return ""
+        return build_swap_url(chain, addr)
 
     if not signals and not watchlist:
         st.warning("Monitoring empty (UI layer)")
@@ -5005,7 +5020,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
                 name = extract_name(r).upper()
                 score = round(parse_float(r.get("last_score", 0), 0.0), 2)
-                decision = r.get("decision", "WATCH")
+                decision = r.get("last_decision") or r.get("decision") or r.get("entry_status") or "WATCH"
                 addr = (r.get("address") or r.get("mint") or r.get("base_addr") or "").strip()
 
                 r.setdefault("entry_status", "WATCH")
@@ -5016,16 +5031,26 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 header = f"{name} | {decision} | {score}"
 
                 with st.expander(header):
+                    st.caption(
+                        f"{(r.get('chain') or '—').upper()} • "
+                        f"{(r.get('entry_status') or 'WATCH')} • "
+                        f"risk {(r.get('risk_level') or r.get('risk') or '—')}"
+                    )
                     # --- ACTIONS ---
                     col1, col2, col3 = st.columns(3)
 
                     with col1:
+                        chain = (r.get("chain") or "").strip().lower()
                         if addr:
-                            st.link_button("Dex", dex_url(addr), use_container_width=True)
+                            url = dex_url(chain, addr)
+                            if url:
+                                st.link_button("Dex", url, use_container_width=True)
 
                     with col2:
-                        if addr:
-                            st.link_button("Jupiter", jup_url(addr), use_container_width=True)
+                        swap_url = swap_url_for_row(r)
+                        if swap_url:
+                            label = "Jupiter" if (r.get("chain") or "").strip().lower() == "solana" else "Swap"
+                            st.link_button(label, swap_url, use_container_width=True)
 
                     with col3:
                         if st.button("➕ Portfolio", key=f"pf_{addr or hkey(str(r))}", use_container_width=True):
