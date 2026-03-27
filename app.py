@@ -58,6 +58,26 @@ def _maybe_autorefresh(interval_ms: int, key: str):
         pass
 
 
+def maybe_safe_auto_refresh(enabled: bool, interval_sec: int = 60) -> None:
+    """
+    Session-safe auto-refresh.
+    Only reruns if user enabled refresh and interval elapsed.
+    """
+    if not enabled:
+        return
+
+    now = time.time()
+    interval_sec = max(60, int(interval_sec))
+    last_refresh = st.session_state.get("last_refresh_ts")
+    if last_refresh is None:
+        st.session_state["last_refresh_ts"] = now
+        return
+
+    if (now - float(last_refresh)) >= interval_sec:
+        st.session_state["last_refresh_ts"] = now
+        st.rerun()
+
+
 VERSION = "0.5.5"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
@@ -403,6 +423,11 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
     return []
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_monitoring_rows_cached() -> List[Dict[str, Any]]:
+    return load_csv(MONITORING_CSV, MON_FIELDS)
+
+
 def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     ensure_storage()
     key = storage_key_for_path(path)
@@ -428,6 +453,7 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
         else:
             debug_log(f"supabase_store_failed_local_kept key={key}")
     st.session_state["_save_badge"] = "💾 saved"
+    load_monitoring_rows_cached.clear()
 
 
 def backup_csv_snapshot(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
@@ -4262,8 +4288,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     st.title("Monitoring")
     st.caption("Автоматичний pipeline: rotating scans → Monitoring → Signals / Watchlist → Archive.")
 
-    if bool(auto_cfg.get("ui_autorefresh_sec", 0)):
-        _maybe_autorefresh(int(auto_cfg.get("ui_autorefresh_sec", 0)) * 1000, key="monitoring_refresh")
+    if "selected_token" not in st.session_state:
+        st.session_state.selected_token = None
 
     if bool(auto_cfg.get("auto_revisit_enabled", False)):
         try:
@@ -4277,7 +4303,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     top = st.columns([2,2,3,3])
 
     # Source of truth for Monitoring page UI: monitoring.csv only.
-    monitoring_rows = load_csv(MONITORING_CSV)
+    monitoring_rows = load_monitoring_rows_cached()
     rows: List[Dict[str, Any]] = []
     for raw in monitoring_rows:
         row = dict(raw)
@@ -4915,14 +4941,33 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         st.warning("Monitoring empty (UI layer)")
         if rows:
             st.caption("Fallback: showing raw rows")
-            for r in rows[:20]:
+            for r in active_rows:
                 name = r.get("symbol") or r.get("name") or r.get("base_symbol") or "unknown"
                 status = r.get("entry_status", "?")
                 score = r.get("last_score", "-")
-                st.markdown(f"**{name}** | {status} | score: {score}")
+                col1, col2, col3 = st.columns([3, 1, 1])
+                with col1:
+                    if st.button(name, key=f"name_{name}_{hkey(str(r))}"):
+                        st.session_state.selected_token = r
+                with col2:
+                    st.write(status)
+                with col3:
+                    st.write(score)
+
+                with st.expander(f"{name} | {status}"):
+                    st.write(r)
             with st.expander("Debug raw rows"):
                 for r in active_rows[:20]:
-                    st.text(f"{r.get('base_symbol', 'n/a')} [{r.get('entry_status', '?')}]")
+                    name = r.get("base_symbol", "n/a")
+                    status = r.get("entry_status", "?")
+                    if st.button(f"{name} | {status}", key=f"btn_{name}_{hkey(str(r))}"):
+                        st.session_state.selected_token = r
+
+            selected = st.session_state.get("selected_token")
+            if selected:
+                st.divider()
+                st.subheader(f"Token: {selected.get('symbol', selected.get('base_symbol', 'unknown'))}")
+                st.write(selected)
         return
 
     render_items("Signals", signals)
@@ -5431,8 +5476,6 @@ def page_portfolio():
 # App main
 # =============================
 def main():
-    _maybe_autorefresh(10000, "main_refresh")
-
     if st.session_state.get("_rerun_flag"):
         st.session_state["_rerun_flag"] = False
         st.rerun()
@@ -5452,6 +5495,7 @@ def main():
     scanner_max_items = 100
     use_birdeye_trending = True
     birdeye_limit = 50
+    auto_refresh_enabled = False
     ui_autorefresh_sec = 60
 
     with st.sidebar:
@@ -5481,7 +5525,8 @@ def main():
         st.divider()
         st.caption("Scanner")
         scanner_max_items = st.slider("Max tokens per slot", 10, 100, 100, step=10)
-        ui_autorefresh_sec = st.slider("UI auto-refresh (sec)", 0, 300, 20, step=10)
+        auto_refresh_enabled = st.checkbox("Auto refresh", value=False)
+        ui_autorefresh_sec = st.slider("Auto-refresh interval (sec)", 60, 300, 60, step=30, disabled=(not auto_refresh_enabled))
         use_birdeye_trending = st.checkbox("Use Solana extra stream (Birdeye)", value=True, disabled=(not BIRDEYE_ENABLED))
         if not BIRDEYE_ENABLED:
             st.caption("Birdeye key missing: add BIRDEYE_API_KEY to secrets to enable extra Solana stream.")
@@ -5554,6 +5599,7 @@ def main():
         use_birdeye_trending=use_birdeye_trending,
         birdeye_limit=birdeye_limit,
         ui_autorefresh_sec=ui_autorefresh_sec,
+        auto_refresh_enabled=auto_refresh_enabled,
         hide_red=hide_red,
         portfolio_value_usd=portfolio_value_usd,
     )
@@ -5573,6 +5619,11 @@ def main():
     with st.expander("Debug log"):
         for line in st.session_state.get("debug_log", []):
             st.text(line)
+
+    maybe_safe_auto_refresh(
+        enabled=bool(auto_cfg.get("auto_refresh_enabled", False)),
+        interval_sec=int(auto_cfg.get("ui_autorefresh_sec", 60)),
+    )
 
 
 # =============================
