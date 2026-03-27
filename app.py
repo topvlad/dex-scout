@@ -4971,45 +4971,57 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if rows:
             st.caption("Fallback: compact actionable cards")
             for r in active_rows:
-                name = r.get("symbol") or r.get("name") or r.get("base_symbol") or "unknown"
-                score = round(parse_float(r.get("last_score", r.get("score_init", 0)), 0.0), 2)
-                entry = r.get("entry_status") or r.get("entry_state") or "?"
-                decision = r.get("decision") or "WATCH"
-                header = f"{name} | {decision} | score {score}"
+                name = r.get("symbol") or r.get("name") or "token"
+                score = round(parse_float(r.get("last_score", 0), 0.0), 2)
+                decision = r.get("decision", "WATCH")
+                header = f"{name} | {decision} | {score}"
 
                 with st.expander(header):
-                    top1, top2, top3 = st.columns(3)
-                    with top1:
+                    # --- ACTIONS ---
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
                         dex_url = r.get("dex_url") or r.get("dexscreener_url") or ""
                         if dex_url:
-                            link_button("DexScreener", dex_url, use_container_width=True, key=f"fallback_ds_{hkey(dex_url, name)}")
-                    with top2:
+                            link_button("Dex", dex_url, use_container_width=True, key=f"fallback_ds_{hkey(dex_url, name)}")
+
+                    with col2:
                         addr = (r.get("address") or r.get("base_addr") or "").strip()
                         if addr:
-                            st.code(f"{addr[:10]}...", language="text")
-                    with top3:
+                            st.code(addr[:10] + "...", language="text")
+
+                    with col3:
                         if st.button("➕ Portfolio", key=f"pf_{name}_{hkey(str(r))}", use_container_width=True):
                             promote_to_portfolio(r)
 
-                    core1, core2, core3, core4 = st.columns(4)
-                    with core1:
-                        st.metric("Entry", entry)
-                    with core2:
+                    # --- CORE ---
+                    col1, col2, col3, col4 = st.columns(4)
+
+                    with col1:
+                        st.metric("Entry", r.get("entry_status", "NA"))
+
+                    with col2:
                         st.metric("Timing", r.get("entry_timing") or r.get("timing") or "NA")
-                    with core3:
+
+                    with col3:
                         st.metric("Risk", r.get("risk_level") or r.get("risk") or "NA")
-                    with core4:
+
+                    with col4:
                         st.metric("Safe", r.get("anti_rug") or r.get("rug_risk") or "NA")
 
-                    st.caption("Plan")
-                    plan1, plan2, plan3 = st.columns(3)
-                    with plan1:
-                        st.metric("Size", r.get("size_label") or r.get("entry_suggest_usd") or "NA")
-                    with plan2:
-                        st.metric("USD", r.get("usd_size") or r.get("entry_suggest_usd") or "NA")
-                    with plan3:
-                        st.metric("TP", r.get("tp_target") or r.get("tp_target_pct") or "NA")
+                    # --- PLAN ---
+                    col1, col2, col3 = st.columns(3)
 
+                    with col1:
+                        st.write(f"Size: {r.get('size_label', 'NA')}")
+
+                    with col2:
+                        st.write(f"USD: {r.get('usd_size', 'NA')}")
+
+                    with col3:
+                        st.write(f"TP: {r.get('tp_target', 'NA')}")
+
+                    # --- REASON ---
                     reason = r.get("entry_reason") or r.get("decision_reason")
                     if not reason:
                         reasons = r.get("entry_reasons")
@@ -5030,7 +5042,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                             if price_series:
                                 st.line_chart(price_series, height=100, use_container_width=True)
 
-                    with st.expander("Debug"):
+                    # --- DEBUG (without nested expander) ---
+                    if st.checkbox("Debug", key=f"dbg_{name}_{hkey(str(r))}"):
                         st.write(r)
         return
 
