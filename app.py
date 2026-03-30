@@ -4232,6 +4232,43 @@ def rug_like(best: Optional[Dict[str, Any]], hist: List[Dict[str, Any]]) -> bool
         return False
 
 
+def is_token_dead(pair: Optional[Dict[str, Any]]) -> bool:
+    if not pair:
+        return True
+
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)
+    vol5 = parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)
+    vol24 = parse_float(safe_get(pair, "volume", "h24", default=0), 0.0)
+    buys = int(safe_get(pair, "txns", "m5", "buys", default=0) or 0)
+    sells = int(safe_get(pair, "txns", "m5", "sells", default=0) or 0)
+
+    if liq < 1_000:
+        return True
+    if vol24 < 100 and vol5 < 10:
+        return True
+    if buys == 0 and sells == 0:
+        return True
+    return False
+
+
+def is_post_rug(pair: Optional[Dict[str, Any]], hist: List[Dict[str, Any]]) -> bool:
+    if not pair or not hist:
+        return False
+    try:
+        prices = [
+            parse_float(x.get("price_usd", x.get("price", 0)), 0.0)
+            for x in hist
+            if parse_float(x.get("price_usd", x.get("price", 0)), 0.0) > 0
+        ]
+        if len(prices) < 5:
+            return False
+        peak = max(prices)
+        cur = prices[-1]
+        return peak > 0 and cur < peak * 0.2
+    except Exception:
+        return False
+
+
 def extract_name(row: Dict[str, Any]) -> str:
     name = (
         row.get("base_symbol")
@@ -4298,6 +4335,21 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "entry_reasons": entry_reasons,
         "risk_level": risk_level,
     }
+
+    dead = is_token_dead(best)
+    post_rug = is_post_rug(best, hist)
+    item["is_dead"] = dead
+    item["is_post_rug"] = post_rug
+    if dead:
+        item["live_score"] = 0.0
+        item["decision"] = "DEAD"
+        item["entry_status"] = "NO_ENTRY"
+        item["risk_level"] = "EXTREME"
+    elif post_rug:
+        item["live_score"] = round(float(item["live_score"]) * 0.1, 2)
+        item["decision"] = "POST-RUG"
+        item["risk_level"] = "EXTREME"
+
     item["row"] = hydrate_monitoring_row_defaults(row, item)
     return item
 
@@ -4685,7 +4737,33 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     else:
         active = list(active_rows)
 
-    cards = [monitoring_row_to_card(r) for r in active]
+    cards_raw = [monitoring_row_to_card(r) for r in active]
+
+    auto_archived = 0
+    for item in cards_raw:
+        if item.get("is_dead"):
+            row = item.get("row", {}) or {}
+            chain = (row.get("chain") or "").strip().lower()
+            base_addr = addr_store(chain, (row.get("base_addr") or "").strip())
+            if chain and base_addr:
+                archived = archive_monitoring(
+                    chain,
+                    base_addr,
+                    reason="auto: DEAD",
+                    last_score=float(item.get("live_score", 0.0) or 0.0),
+                    last_decision="DEAD",
+                    revisit_days=0,
+                )
+                if archived:
+                    auto_archived += 1
+    if auto_archived:
+        st.warning(f"Auto-archived dead tokens: {auto_archived}")
+        load_monitoring_rows_cached.clear()
+
+    cards = [
+        c for c in cards_raw
+        if float(c.get("live_score", 0.0) or 0.0) > 50 and c.get("decision") not in ("DEAD", "POST-RUG")
+    ]
     cards.sort(key=lambda x: float(x["live_score"]), reverse=True)
 
     st.subheader("Signals / Watchlist")
