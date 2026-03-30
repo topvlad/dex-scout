@@ -30,7 +30,7 @@ import random
 import hashlib
 import inspect
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional, Set
 from collections import Counter
 from contextlib import contextmanager
@@ -66,7 +66,7 @@ def maybe_safe_auto_refresh(enabled: bool, interval_sec: int = 60) -> None:
     if not enabled:
         return
 
-    interval_sec = max(20, int(interval_sec))
+    interval_sec = max(60, int(interval_sec))
     _maybe_autorefresh(interval_ms=interval_sec * 1000, key="dex_scout_autorefresh")
 
     now = time.time()
@@ -85,7 +85,7 @@ DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
 ENTRY_MODE = "aggressive"
-TEMP_DISABLE_BEST_PAIR = True  # TEMP: disable best_pair_for_token lookups to stabilize UI rendering
+TEMP_DISABLE_BEST_PAIR = False
 
 SCAN_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 300
@@ -334,6 +334,9 @@ def ensure_storage():
                     "last_decay_ts",
                     "decay_hits",
                     "entry_state",
+                    "revisit_count",
+                    "revisit_after_ts",
+                    "last_revisit_ts",
                 ],
             )
             w.writeheader()
@@ -775,66 +778,94 @@ def fetch_dexscreener_latest(chain: str, limit: int = 40):
     except Exception:
         return []
 
-def fetch_tokens_unified(limit: int = 50) -> List[Dict[str, Any]]:
-    # --- TRY BIRDEYE ---
-    try:
-        url = "https://public-api.birdeye.so/defi/tokenlist"
-        params = {
-            "sort_by": "v24hUSD",
-            "sort_type": "desc",
-            "offset": 0,
-            "limit": limit,
-        }
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code == 200:
-            data = r.json() or {}
-            raw = safe_get(data, "data", "tokens", default=[]) or []
-            if raw:
-                tokens = []
+def fetch_tokens_unified(chain: str, limit: int = 50) -> List[Dict[str, Any]]:
+    chain = (chain or "").strip().lower()
+
+    if chain == "solana":
+        try:
+            url = "https://public-api.birdeye.so/defi/tokenlist"
+            params = {
+                "sort_by": "v24hUSD",
+                "sort_type": "desc",
+                "offset": 0,
+                "limit": limit,
+            }
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                data = r.json() or {}
+                raw = safe_get(data, "data", "tokens", default=[]) or []
+                out: List[Dict[str, Any]] = []
                 for t in raw:
-                    tokens.append(
+                    addr = str(t.get("address") or "").strip()
+                    sym = str(t.get("symbol") or "NA").strip()
+                    if not addr:
+                        continue
+                    out.append(
                         {
-                            "symbol": t.get("symbol", "NA"),
-                            "address": t.get("address", ""),
+                            "symbol": sym,
+                            "address": addr,
                             "price": parse_float(t.get("price", 0), 0.0),
                             "volume": parse_float(t.get("v24hUSD", 0), 0.0),
                             "liquidity": parse_float(t.get("liquidity", 0), 0.0),
                             "source": "birdeye",
+                            "chain": "solana",
                         }
                     )
-                return tokens
-    except Exception as e:
-        print("BIRDEYE FAIL:", e)
+                if out:
+                    return out
+        except Exception:
+            pass
 
-    # --- FALLBACK: DEXSCREENER ---
-    try:
-        url = "https://api.dexscreener.com/latest/dex/search?q=solana"
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            data = r.json() or {}
-            pairs = data.get("pairs", [])[:limit]
-            tokens = []
+        try:
+            pairs = fetch_dexscreener_trending("solana", limit=limit)
+            out = []
             for p in pairs:
                 base = p.get("baseToken", {}) or {}
-                tokens.append(
+                addr = str(base.get("address") or "").strip()
+                sym = str(base.get("symbol") or "NA").strip()
+                if not addr:
+                    continue
+                out.append(
                     {
-                        "symbol": base.get("symbol", "NA"),
-                        "address": base.get("address", ""),
-                        "price": parse_float(p.get("priceUsd") or 0, 0.0),
+                        "symbol": sym,
+                        "address": addr,
+                        "price": parse_float(p.get("priceUsd"), 0.0),
                         "volume": parse_float(safe_get(p, "volume", "h24", default=0), 0.0),
                         "liquidity": parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0),
                         "source": "dexscreener",
+                        "chain": "solana",
                     }
                 )
-            return tokens
-    except Exception as e:
-        print("DEXSCREENER FAIL:", e)
+            return out
+        except Exception:
+            return []
 
-    # --- HARD FALLBACK (ЩОБ UI НЕ БУВ ПУСТИЙ) ---
-    return [
-        {"symbol": "TEST1", "address": "0x1", "price": 0.0, "volume": 0.0, "liquidity": 0.0, "source": "fallback"},
-        {"symbol": "TEST2", "address": "0x2", "price": 0.0, "volume": 0.0, "liquidity": 0.0, "source": "fallback"},
-    ]
+    if chain == "bsc":
+        try:
+            pairs = fetch_dexscreener_trending("bsc", limit=limit)
+            out = []
+            for p in pairs:
+                base = p.get("baseToken", {}) or {}
+                addr = str(base.get("address") or "").strip()
+                sym = str(base.get("symbol") or "NA").strip()
+                if not addr:
+                    continue
+                out.append(
+                    {
+                        "symbol": sym,
+                        "address": addr,
+                        "price": parse_float(p.get("priceUsd"), 0.0),
+                        "volume": parse_float(safe_get(p, "volume", "h24", default=0), 0.0),
+                        "liquidity": parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0),
+                        "source": "dexscreener",
+                        "chain": "bsc",
+                    }
+                )
+            return out
+        except Exception:
+            return []
+
+    return []
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_dexscreener_trending(chain: str, limit: int = 40) -> List[Dict[str, Any]]:
@@ -888,6 +919,11 @@ def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, An
 
     pools.sort(key=key, reverse=True)
     return pools[0]
+
+
+@st.cache_data(ttl=45, max_entries=1000, show_spinner=False)
+def best_pair_for_token_cached(chain: str, token_address: str) -> Optional[Dict[str, Any]]:
+    return best_pair_for_token(chain, token_address)
 
 
 def detect_narrative(pair: Dict[str, Any]) -> str:
@@ -2152,6 +2188,9 @@ MON_FIELDS = [
     "entry_score",
     "risk_level",
     "entry_state",
+    "revisit_count",
+    "revisit_after_ts",
+    "last_revisit_ts",
 ]
 
 HIST_FIELDS = [
@@ -2215,7 +2254,7 @@ def build_live_portfolio_pairs() -> List[Dict[str, Any]]:
         base_addr = addr_store(chain, (r.get("base_token_address") or "").strip())
         if not chain or not base_addr:
             continue
-        best = best_pair_for_token(chain, base_addr)
+        best = best_pair_for_token_cached(chain, base_addr)
         if best:
             pairs.append(best)
     return pairs
@@ -2441,13 +2480,23 @@ def add_to_monitoring(
             "entry_score": str(final_entry_score),
             "risk_level": final_risk_level,
             "entry_state": "WAIT",
+            "revisit_count": "0",
+            "revisit_after_ts": "",
+            "last_revisit_ts": "",
         }
     )
     save_monitoring(rows)
     return "OK"
 
 
-def archive_monitoring(chain: str, base_addr: str, reason: str, last_score: float = 0.0, last_decision: str = "") -> bool:
+def archive_monitoring(
+    chain: str,
+    base_addr: str,
+    reason: str,
+    last_score: float = 0.0,
+    last_decision: str = "",
+    revisit_days: int = 0,
+) -> bool:
     if not base_addr:
         return False
     key = addr_key(chain, base_addr)
@@ -2460,6 +2509,11 @@ def archive_monitoring(chain: str, base_addr: str, reason: str, last_score: floa
             r["archived_reason"] = reason
             r["last_score"] = f"{last_score:.2f}" if last_score else str(last_score)
             r["last_decision"] = last_decision or ""
+            if revisit_days > 0:
+                future_dt = datetime.utcnow() + timedelta(days=int(revisit_days))
+                r["revisit_after_ts"] = future_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            else:
+                r["revisit_after_ts"] = ""
             changed = True
     if changed:
         save_monitoring(rows)
@@ -2635,7 +2689,7 @@ def apply_priority_decay(row: Dict[str, Any], now_ts: datetime, decay_rate: floa
 
 
 def recheck_token(chain: str, base_addr: str, hist_limit: int = 30) -> Dict[str, Any]:
-    best = best_pair_for_token(chain, base_addr)
+    best = best_pair_for_token_cached(chain, base_addr)
     hist = token_history_rows(chain, base_addr, limit=hist_limit)
     decision, _tags = build_trade_hint(best) if best else ("NO DATA", [])
     timing = entry_timing_signal(best, hist)
@@ -3295,7 +3349,7 @@ def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]
         base_addr = addr_store(chain, (r.get("base_token_address") or "").strip())
         entry_price = parse_float(r.get("entry_price_usd") or r.get("entry_price") or 0, 0.0)
 
-        best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
+        best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
         hist = token_history_rows(chain, base_addr, limit=60)
         liq_health = liquidity_health(best)
         anti_rug = anti_rug_early_detector(best, hist)
@@ -3639,9 +3693,7 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     tokens: List[Dict[str, Any]] = []
 
     if chain == "solana":
-        unified_tokens = fetch_tokens_unified(limit=50)
-        st.write("TOKENS:", len(unified_tokens))
-        st.write("SOURCE:", unified_tokens[0]["source"] if unified_tokens else "none")
+        unified_tokens = fetch_tokens_unified(chain=chain, limit=50)
         for t in unified_tokens:
             symbol = t.get("symbol", "NA")
             address = t.get("address", "")
@@ -3679,11 +3731,8 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         tokens = []
 
     if not tokens:
-        st.write("NO TOKENS – FORCE FALLBACK")
         tokens = [{"symbol": "FORCE", "address": "0x0"}]
 
-    st.write("CHAIN:", chain)
-    st.write("TOKENS:", len(tokens))
     all_pairs.extend(tokens)
 
     for q in sampled:
@@ -3790,7 +3839,6 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 "score_live": str(float(s)),
                 "decision": decision,
             })
-            st.write("WRITE DONE")
 
             if res == "OK":
                 counts["added"] += 1
@@ -3814,28 +3862,50 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     save_smart_wallets(smart_wallets)
     return counts
 
-def auto_reactivate_archived(days: int = 7) -> int:
+def auto_reactivate_archived(days: int = 7, max_revisits: int = 3) -> int:
     days = max(1, int(days))
     rows = load_monitoring()
     changed = 0
     now_dt = datetime.utcnow()
+
     for r in rows:
         if r.get("active") == "1":
             continue
+
         reason = (r.get("archived_reason") or "").strip().lower()
-        if not reason.startswith("auto:"):
+        if not reason:
             continue
-        ts = _safe_dt_parse(r.get("ts_archived", ""))
-        if not ts:
+
+        revisit_count = int(parse_float(r.get("revisit_count", 0), 0))
+        if revisit_count >= max_revisits:
             continue
-        age_days = (now_dt - ts).total_seconds() / 86400.0
-        if age_days >= float(days):
-            r["active"] = "1"
-            r["ts_added"] = now_utc_str()
-            r["ts_archived"] = ""
-            r["archived_reason"] = ""
-            r["ts_last_seen"] = now_utc_str()
-            changed += 1
+
+        ts_archived = _safe_dt_parse(r.get("ts_archived", ""))
+        revisit_after = _safe_dt_parse(r.get("revisit_after_ts", ""))
+
+        eligible = False
+        if revisit_after:
+            eligible = now_dt >= revisit_after
+        elif ts_archived:
+            eligible = ((now_dt - ts_archived).total_seconds() / 86400.0) >= float(days)
+
+        if not eligible:
+            continue
+
+        reason_upper = reason.upper()
+        if "RUG" in reason_upper or "DEAD" in reason_upper:
+            continue
+
+        r["active"] = "1"
+        r["ts_added"] = now_utc_str()
+        r["ts_archived"] = ""
+        r["archived_reason"] = ""
+        r["ts_last_seen"] = now_utc_str()
+        r["last_revisit_ts"] = now_utc_str()
+        r["revisit_count"] = str(revisit_count + 1)
+        r["revisit_after_ts"] = ""
+        changed += 1
+
     if changed:
         save_monitoring(rows)
     return changed
@@ -3925,9 +3995,6 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
 def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
     window_name, preset_key, chain, slot = current_scan_slot()
     chain = st.session_state.get("chain", chain)
-    st.write("SCANNER STARTED")
-    tokens = fetch_tokens_unified(50)
-    st.write("TOKENS FETCHED:", len(tokens))
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     except Exception as e:
@@ -3946,52 +4013,99 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
 
 
+def scan_source_window_name() -> str:
+    state = scanner_state_load() or {}
+    return str(state.get("last_window") or "manual")
+
+
+def scan_source_preset_key() -> str:
+    state = scanner_state_load() or {}
+    return str(state.get("last_preset") or "manual")
+
+
 def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
-    """
-    Single-pass scanner for Streamlit execution flow:
-    click -> fetch once -> persist once -> render.
-    """
     chain = str(st.session_state.get("chain", "solana")).strip().lower() or "solana"
-    tokens = fetch_tokens_unified(limit)
+    tokens = fetch_tokens_unified(chain=chain, limit=limit)
     ts_now = now_utc_str()
     rows: List[Dict[str, Any]] = []
 
-    def normalize_token(t: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "symbol": str(t.get("symbol", "NA") or "NA"),
-            "address": str(t.get("address", "") or "").strip(),
-            "price": float(parse_float(t.get("price", 0), 0.0)),
-            "volume": float(parse_float(t.get("volume", 0), 0.0)),
-            "liquidity": float(parse_float(t.get("liquidity", 0), 0.0)),
-            "score": float(parse_float(t.get("score", 1), 1.0)),
-            "status": str(t.get("status", "watch") or "watch"),
-            "chain": str(st.session_state.get("chain", chain) or chain),
-            "ts": time.time(),
-        }
-
     for t in tokens:
-        normalized = normalize_token(t)
-        symbol = normalized.get("symbol", "NA")
-        address = normalized.get("address", "")
+        symbol = str(t.get("symbol") or "NA").strip()
+        address = str(t.get("address") or "").strip()
         if not address:
             continue
-        rows.append(
-            {
-                "ts_added": ts_now,
-                "chain": str(normalized.get("chain", chain)).strip().lower() or chain,
-                "base_symbol": symbol,
-                "base_addr": address,
-                "pair_addr": "",
-                "score_init": str(normalized.get("score", 1)),
-                "liq_init": str(normalized.get("liquidity", 0.0)),
-                "vol24_init": str(normalized.get("volume", 0.0)),
-                "vol5_init": "0",
-                "active": "1",
-                "entry_status": "WATCH",
-                "signal": str(normalized.get("status", "watch")),
-                "ts_last_seen": ts_now,
-            }
-        )
+
+        best = best_pair_for_token_cached(chain, address)
+        pair = best if best else {
+            "chainId": chain,
+            "dexId": t.get("source", ""),
+            "pairAddress": "",
+            "baseToken": {"symbol": symbol, "address": address},
+            "quoteToken": {"symbol": "USDC" if chain == "solana" else "USDT"},
+            "priceUsd": t.get("price", 0),
+            "volume": {"h24": t.get("volume", 0), "m5": 0, "h1": 0},
+            "liquidity": {"usd": t.get("liquidity", 0)},
+            "txns": {"m5": {"buys": 0, "sells": 0}},
+            "priceChange": {"m5": 0, "h1": 0},
+            "url": "",
+        }
+
+        score_live = score_pair(pair)
+        decision, _tags = build_trade_hint(pair)
+        entry_status, entry_score, _entry_reasons, risk_level = evaluate_entry(pair, mode=ENTRY_MODE)
+
+        rows.append({
+            "ts_added": ts_now,
+            "chain": chain,
+            "base_symbol": symbol,
+            "base_addr": address,
+            "pair_addr": pair.get("pairAddress", "") or "",
+            "score_init": str(score_live),
+            "liq_init": str(parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)),
+            "vol24_init": str(parse_float(safe_get(pair, "volume", "h24", default=0), 0.0)),
+            "vol5_init": str(parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)),
+            "active": "1",
+            "ts_archived": "",
+            "archived_reason": "",
+            "last_score": str(score_live),
+            "last_decision": decision,
+            "priority_score": str(score_live),
+            "last_decay_ts": ts_now,
+            "decay_hits": "0",
+            "source_window": scan_source_window_name(),
+            "source_preset": scan_source_preset_key(),
+            "risk": risk_level,
+            "tp_target_pct": "25",
+            "entry_suggest_usd": "10",
+            "ts_last_seen": ts_now,
+            "signal": classify_signal(pair),
+            "smart_money": "1" if detect_smart_money(pair) else "0",
+            "entry_status": entry_status,
+            "entry_score": str(entry_score),
+            "risk_level": risk_level,
+            "entry_state": "READY" if entry_status == "READY" else "WAIT",
+            "revisit_count": "0",
+            "revisit_after_ts": "",
+            "last_revisit_ts": "",
+        })
+
+        append_monitoring_history({
+            "ts_utc": ts_now,
+            "chain": chain,
+            "base_symbol": symbol,
+            "base_addr": address,
+            "pair_addr": pair.get("pairAddress", "") or "",
+            "dex": pair.get("dexId", "") or "",
+            "quote_symbol": safe_get(pair, "quoteToken", "symbol", default="") or "",
+            "price_usd": str(parse_float(pair.get("priceUsd"), 0.0)),
+            "liq_usd": str(parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)),
+            "vol24_usd": str(parse_float(safe_get(pair, "volume", "h24", default=0), 0.0)),
+            "vol5_usd": str(parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)),
+            "pc1h": str(parse_float(safe_get(pair, "priceChange", "h1", default=0), 0.0)),
+            "pc5": str(parse_float(safe_get(pair, "priceChange", "m5", default=0), 0.0)),
+            "score_live": str(score_live),
+            "decision": decision,
+        })
 
     return rows
 
@@ -4002,35 +4116,39 @@ def persist_scanner_result(scanner_rows: List[Dict[str, Any]]) -> Dict[str, int]
 
     for row in existing:
         chain = str(row.get("chain") or "").strip().lower()
-        base_addr = str(row.get("base_addr") or "").strip()
+        base_addr = addr_store(chain, str(row.get("base_addr") or "").strip())
         if not chain or not base_addr:
             continue
-        by_key[f"{chain}:{base_addr}"] = row
+        for k in MON_FIELDS:
+            row.setdefault(k, "")
+        by_key[addr_key(chain, base_addr)] = row
 
     inserted = 0
     updated = 0
     for row in scanner_rows:
-        if "base_symbol" not in row and "symbol" in row:
-            row["base_symbol"] = row.get("symbol", "NA")
-        if "base_addr" not in row and "address" in row:
-            row["base_addr"] = row.get("address", "")
-        if "entry_status" not in row and "status" in row:
-            row["entry_status"] = row.get("status", "WATCH")
-
         chain = str(row.get("chain") or "").strip().lower()
-        base_addr = str(row.get("base_addr") or "").strip()
+        base_addr = addr_store(chain, str(row.get("base_addr") or "").strip())
         if not chain or not base_addr:
             continue
-        key = f"{chain}:{base_addr}"
+        key = addr_key(chain, base_addr)
+
         if key in by_key:
-            by_key[key].update(row)
+            old = by_key[key]
+            for k in MON_FIELDS:
+                if row.get(k, "") not in ("", None):
+                    old[k] = row.get(k, "")
+            old["active"] = "1"
+            old["ts_last_seen"] = now_utc_str()
             updated += 1
         else:
-            by_key[key] = row
+            normalized = {k: row.get(k, "") for k in MON_FIELDS}
+            normalized["active"] = "1"
+            by_key[key] = normalized
             inserted += 1
 
-    save_monitoring(list(by_key.values()))
-    return {"inserted": inserted, "updated": updated, "total": len(by_key)}
+    out = list(by_key.values())
+    save_monitoring(out)
+    return {"inserted": inserted, "updated": updated, "total": len(out)}
 
 def source_priority(row: Dict[str, Any]) -> int:
     presets = [x.strip() for x in str(row.get("source_preset", "")).split(",") if x.strip()]
@@ -4113,6 +4231,76 @@ def rug_like(best: Optional[Dict[str, Any]], hist: List[Dict[str, Any]]) -> bool
     except Exception:
         return False
 
+
+def extract_name(row: Dict[str, Any]) -> str:
+    name = (
+        row.get("base_symbol")
+        or row.get("symbol")
+        or row.get("name")
+        or row.get("tokenSymbol")
+        or row.get("tokenName")
+        or row.get("base_name")
+        or (row.get("token") or {}).get("symbol")
+        or (row.get("token") or {}).get("name")
+        or (row.get("baseToken") or {}).get("symbol")
+        or (row.get("baseToken") or {}).get("name")
+    )
+    if name:
+        return str(name).strip()
+    addr = (row.get("base_addr") or row.get("address") or row.get("mint") or "").strip()
+    return f"{addr[:6]}...{addr[-4:]}" if addr else "UNKNOWN"
+
+
+def hydrate_monitoring_row_defaults(row: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
+    if not row.get("entry_status"):
+        row["entry_status"] = item.get("entry_status") or "WAIT"
+    if not row.get("risk_level"):
+        row["risk_level"] = item.get("risk_level") or "MEDIUM"
+    if not row.get("tp_target_pct"):
+        row["tp_target_pct"] = "25"
+    if not row.get("entry_suggest_usd"):
+        row["entry_suggest_usd"] = "10"
+    return row
+
+
+def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
+    chain = (row.get("chain") or "").strip().lower()
+    base_addr = addr_store(chain, (row.get("base_addr") or "").strip())
+    best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
+    hist = token_history_rows(chain, base_addr, limit=30)
+    live_score = score_pair(best) if best else parse_float(row.get("last_score"), 0.0)
+    decision, tags = build_trade_hint(best) if best else (str(row.get("last_decision") or "NO DATA"), [])
+    timing = entry_timing_signal(best, hist)
+    liq_health = liquidity_health(best)
+    anti_rug = anti_rug_early_detector(best, hist)
+    size_info = position_sizing_engine(best, portfolio_value_usd=1000.0, hist=hist) if best else {
+        "size_pct": 0.0, "size_label": "NA", "usd_size": 0.0, "risk_score": 0.0, "risk_flags": []
+    }
+    entry_status, entry_score, entry_reasons, risk_level = evaluate_entry(best if best else {}, mode=ENTRY_MODE) if best else (
+        str(row.get("entry_status") or "NO DATA"),
+        parse_float(row.get("entry_score"), 0.0),
+        [],
+        str(row.get("risk_level") or "UNKNOWN"),
+    )
+    item = {
+        "row": row,
+        "best": best,
+        "hist": hist,
+        "live_score": live_score,
+        "decision": decision,
+        "tags": tags,
+        "timing": timing,
+        "liq_health": liq_health,
+        "anti_rug": anti_rug,
+        "size_info": size_info,
+        "entry_status": entry_status,
+        "entry_score": entry_score,
+        "entry_reasons": entry_reasons,
+        "risk_level": risk_level,
+    }
+    item["row"] = hydrate_monitoring_row_defaults(row, item)
+    return item
+
 # =============================
 # Pages
 # =============================
@@ -4164,7 +4352,7 @@ def page_scout(cfg: Dict[str, Any]):
             st.caption(f"Birdeye trending added: {len(mints)} mints")
             for mint in mints:
                 try:
-                    bp = best_pair_for_token("solana", mint)
+                    bp = best_pair_for_token_cached("solana", mint)
                     if bp:
                         all_pairs.append(bp)
                 except Exception:
@@ -4473,15 +4661,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     top[2].caption(f"Last scan: {scan_state.get('last_run_ts','—')} • {scan_state.get('last_window','—')} • {scan_state.get('last_chain','—')}")
     top[3].caption(f"Last stats: {scan_state.get('last_stats', {})}")
 
-    st.caption(f"DEBUG total_rows: {len(rows)}")
-    st.caption(f"DEBUG active_rows: {len(active_rows)}")
-
     cbtn1, cbtn2, cbtn3 = st.columns([2,2,6])
     with cbtn1:
         if st.button("Run scanner now", use_container_width=True, key="run_scanner_now"):
-            st.session_state["scanner_result"] = run_scanner_once(
-                limit=int(auto_cfg.get("scanner_max_items", 50))
-            )
+            scanner_rows = run_scanner_once(limit=int(auto_cfg.get("scanner_max_items", 50)))
+            stats = persist_scanner_result(scanner_rows)
+            st.success(f"Scanner ran: {stats}")
+            load_monitoring_rows_cached.clear()
             request_rerun()
     with cbtn2:
         if st.button("Refresh live data", use_container_width=True):
@@ -4499,881 +4685,76 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     else:
         active = list(active_rows)
 
-    now_ts = datetime.utcnow()
-    rows_dirty = False
-    for r in active:
-        before = (r.get("priority_score", ""), r.get("last_decay_ts", ""), r.get("decay_hits", ""))
-        apply_priority_decay(r, now_ts)
-        after = (r.get("priority_score", ""), r.get("last_decay_ts", ""), r.get("decay_hits", ""))
-        if before != after:
-            rows_dirty = True
-
-    def enrich_fallback(row: Dict[str, Any]) -> Dict[str, Any]:
-        score = parse_float(row.get("live_score"), parse_float(row.get("last_score"), 0.0))
-        if not row.get("entry_status") or str(row.get("entry_status")) == "NA":
-            if score > 300:
-                row["entry_status"] = "NO ENTRY"
-            elif score > 200:
-                row["entry_status"] = "WAIT"
-            else:
-                row["entry_status"] = "ENTRY"
-        if not row.get("risk_level"):
-            if score > 300:
-                row["risk_level"] = "HIGH"
-            elif score > 200:
-                row["risk_level"] = "MED"
-            else:
-                row["risk_level"] = "LOW"
-        if not row.get("size_label"):
-            row["size_label"] = {"LOW": "FULL", "MED": "HALF", "HIGH": "SMALL"}.get(str(row.get("risk_level", "")), "NA")
-        if not row.get("anti_rug"):
-            row["anti_rug"] = "UNKNOWN"
-        return row
-
-    live_recheck: Dict[str, Dict[str, Any]] = {}
-    enriched_rows: List[Dict[str, Any]] = []
-    for r in active:
-        chain = (r.get("chain") or "").strip().lower()
-        base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
-        if not chain or not base_addr:
-            continue
-        rk = addr_key(chain, base_addr)
-        recheck = recheck_token(chain, base_addr, hist_limit=int(auto_cfg.get("stability_window_n", 30)))
-        live_recheck[rk] = recheck
-        r["live_score"] = parse_float(recheck.get("score"), 0.0)
-        r["entry_status"] = recheck.get("decision", "NA")
-        r["entry_timing"] = safe_get(recheck.get("timing", {}), "timing", default="NA")
-        enriched_rows.append(enrich_fallback(r))
-
-    active = sorted(
-        enriched_rows,
-        key=lambda row: parse_float(row.get("live_score"), parse_float(row.get("last_score"), 0.0)),
-        reverse=True,
-    )
-
-    enriched = []
-    for idx, r in enumerate(active, start=1):
-        chain = (r.get("chain") or "").strip().lower()
-        base_sym = r.get("base_symbol") or "???"
-        base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
-        rk = addr_key(chain, base_addr)
-        # Temporarily disabled: keep showing all monitoring tokens even if they are already in portfolio.
-        # if rk in active_set:
-        #     continue
-        recheck = live_recheck.get(rk) if (chain and base_addr) else None
-        if recheck is None:
-            recheck = recheck_token(chain, base_addr, hist_limit=int(auto_cfg.get("stability_window_n", 30))) if (chain and base_addr) else {"best": None, "hist": [], "decision": "NO DATA", "timing": {"timing": "SKIP"}, "score": 0.0}
-        best = recheck["best"]
-        hist = recheck["hist"]
-        decision = recheck["decision"]
-        timing = recheck["timing"]
-        s_live = parse_float(recheck["score"], 0.0)
-
-        live = {"price": 0.0, "liq": 0.0, "vol24": 0.0, "vol5": 0.0, "pc1h": 0.0, "pc5": 0.0, "dex": "", "pair_addr": "", "url": "", "quote": ""}
-        if best:
-            live["dex"] = best.get("dexId", "") or ""
-            live["pair_addr"] = best.get("pairAddress", "") or ""
-            live["url"] = best.get("url", "") or ""
-            live["quote"] = safe_get(best, "quoteToken", "symbol", default="") or ""
-            live["price"] = parse_float(best.get("priceUsd"), 0.0)
-            live["liq"] = parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0)
-            live["vol24"] = parse_float(safe_get(best, "volume", "h24", default=0), 0.0)
-            live["vol5"] = parse_float(safe_get(best, "volume", "m5", default=0), 0.0)
-            live["pc1h"] = parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0)
-            live["pc5"] = parse_float(safe_get(best, "priceChange", "m5", default=0), 0.0)
-            snapshot_live_to_history(chain, base_sym, base_addr, best)
-
-        smart_money = detect_smart_money(best) if best else False
-        if smart_money:
-            s_live += 4
-        pump_live = pump_probability(best)
-        s_live += pump_live * 0.5
-        decision, tags = build_trade_hint(best) if best else (decision, [])
-        hist = token_history_rows(chain, base_addr, limit=int(auto_cfg.get("stability_window_n", 30)))
-
-        rug_flags = anti_rug_check(best, hist)
-        dev_flag = dev_wallet_pattern(best)
-        sm_signal = smart_money_signal(hist)
-
-        if sm_signal == "SMART_ACCUMULATION":
-            s_live *= 1.2
-        elif sm_signal == "SMART_BREAKOUT":
-            s_live *= 1.3
-        elif sm_signal == "SMART_EXIT":
-            s_live *= 0.7
-
-        if rug_flags:
-            tags = tags + rug_flags
-        if dev_flag:
-            tags.append(dev_flag)
-        if sm_signal:
-            tags.append(sm_signal)
-
-        seen_tags = set()
-        tags = [t for t in tags if not (t in seen_tags or seen_tags.add(t))]
-
-        anti_rug = anti_rug_early_detector(best, hist)
-        flow_collapse = flow_collapse_detector(hist)
-        if flow_collapse["level"] == "WARNING" and anti_rug["level"] == "SAFE":
-            anti_rug = {
-                "level": "WARNING",
-                "score": max(int(anti_rug.get("score", 0)), 2),
-                "flags": list(set((anti_rug.get("flags", []) or []) + flow_collapse["flags"])),
-                "action": "REDUCE",
-            }
-        if timing["timing"] == "SKIP":
-            decision = "NO ENTRY"
-        elif timing["timing"] == "NEUTRAL" and decision == "ENTRY (scalp)":
-            decision = "WATCH / WAIT"
-
-        if anti_rug["level"] == "CRITICAL":
-            decision = "NO ENTRY"
-        elif anti_rug["level"] == "WARNING" and decision == "ENTRY (scalp)":
-            decision = "WATCH / WAIT"
-        size_info = position_sizing_engine(
-            best,
-            portfolio_value_usd=float(auto_cfg.get("portfolio_value_usd", 1000.0)),
-            hist=hist,
-        ) if best else {
-            "size_pct": 0.0,
-            "size_label": "SKIP",
-            "usd_size": 0.0,
-            "risk_score": 10,
-            "risk_flags": ["no_data"],
-        }
-        gov = portfolio_allocation_governor(size_info)
-        corr = correlation_governor(best) if best else {"status": "BLOCK", "reason": ["no_data"]}
-        if not corr:
-            corr = {"status": "ALLOW", "reason": []}
-        liq_health = liquidity_health(best)
-        if liq_health["level"] in ("DEAD", "CRITICAL"):
-            decision = "NO ENTRY"
-        adj = risk_adjusted_size(
-            float(size_info.get("usd_size", 0.0) or 0.0),
-            corr,
-            liq_health,
-            anti_rug=anti_rug,
-        )
-        size_info["usd_size_adj"] = round(adj["final_size"], 2)
-        size_info["size_factor"] = adj["factor"]
-        size_info["size_reason"] = adj.get("reason", [])
-        size_info["liq_health"] = liq_health["level"]
-        if anti_rug.get("level") == "CRITICAL":
-            size_info["size_label"] = "SKIP"
-            size_info["size_pct"] = 0.0
-        elif anti_rug.get("level") == "WARNING" and size_info.get("size_label") == "FULL":
-            size_info["size_label"] = "SMALL"
-        elif anti_rug.get("level") == "WARNING" and size_info.get("size_label") == "SMALL":
-            size_info["size_label"] = "MICRO"
-        final_status = gov["status"]  # correlation no longer blocks promote
-        trap = liquidity_trap_detector(best, hist) if best else {"trap_score": 0, "trap_level": "SAFE", "trap_flags": []}
-        entry_state = classify_entry_status(
-            best,
-            decision,
-            timing,
-            liq_health,
-            anti_rug,
-            size_info,
-        )
-
-        kill_reason = kill_logic(best, hist, decision, s_live, sm_signal)
-        if kill_reason:
-            archive_monitoring(chain, base_addr, reason=f"kill: {kill_reason}", last_score=s_live, last_decision=decision)
-            continue
-
-        # smart auto-archive
-        if entry_state["status"] == "NO_ENTRY" and s_live < 200:
-            archive_monitoring(chain, base_addr, reason="weak_signal", last_score=s_live, last_decision=decision)
-            continue
-
-        if best and auto_cfg.get("auto_archive_enabled"):
-            min_score = float(auto_cfg.get("auto_archive_min_score", 150.0))
-            persistent_no_entry = bool(auto_cfg.get("auto_archive_on_no_entry", False))
-            avg_score = 0.0
-            if hist:
-                scores = [parse_float(x.get("score_live", 0), 0.0) for x in hist[-6:]]
-                if scores:
-                    avg_score = sum(scores)/len(scores)
-            target_score = avg_score if avg_score > 0 else s_live
-            if anti_rug["level"] == "CRITICAL":
-                archive_monitoring(chain, base_addr, reason="auto: EARLY_RUG", last_score=s_live, last_decision=decision)
-                continue
-            if rug_like(best, hist):
-                archive_monitoring(chain, base_addr, reason="auto: RUG", last_score=s_live, last_decision=decision)
-                continue
-            if trap["trap_level"] == "CRITICAL":
-                archive_monitoring(chain, base_addr, reason="auto: TRAP", last_score=s_live, last_decision=decision)
-                continue
-            if persistent_no_entry and hist:
-                last_decisions = [str(x.get("decision", "")).upper() for x in hist[-4:]]
-                if last_decisions and all(d == "NO ENTRY" for d in last_decisions):
-                    archive_monitoring(chain, base_addr, reason="auto: NO FLOW", last_score=s_live, last_decision=decision)
-                    continue
-            if target_score > 0 and target_score < min_score:
-                archive_monitoring(chain, base_addr, reason=f"auto: LOW SCORE<{int(min_score)}", last_score=s_live, last_decision=decision)
-                continue
-
-        meme_score = meme_token_score(best) if best else 0.0
-        migration_score = 0.0
-        migration_label = ""
-        cex_prob = 0.0
-
-        if best:
-            mig = detect_liquidity_migration(best)
-            migration_score = parse_float(mig.get("migration_score", 0), 0.0)
-            migration_label = mig.get("migration_label", "")
-            cex_prob = parse_float(best.get("cex_prob", 0), 0.0)
-
-        base_pr = monitoring_priority(
-            s_live,
-            live["pc1h"],
-            live["pc5"],
-            live["vol5"],
-            live["liq"],
-            meme_score=meme_score,
-            migration_score=migration_score,
-            cex_prob=cex_prob,
-        )
-        if s_live > parse_float(r.get("score_init", 0), 0.0) * 1.5:
-            r["priority_score"] = str(round(s_live, 4))
-            r["decay_hits"] = "0"
-            rows_dirty = True
-        computed_pr = compute_priority(r)
-        if parse_float(r.get("priority_score", 0), 0.0) != computed_pr:
-            r["priority_score"] = str(round(computed_pr, 4))
-            rows_dirty = True
-        decay_pr = parse_float(r.get("priority_score", base_pr), base_pr)
-        pr = source_priority(r) * 10000 + decay_pr
-        d_score = s_live - parse_float(r.get("score_init"), 0.0)
-        d_liq = live["liq"] - parse_float(r.get("liq_init"), 0.0)
-        d_v24 = live["vol24"] - parse_float(r.get("vol24_init"), 0.0)
-        d_v5 = live["vol5"] - parse_float(r.get("vol5_init"), 0.0)
-
-        stars = confidence_stars(best, hist)
-        second_wave = second_wave_label(hist)
-        new_entry_state = evaluate_entry_state(decision, timing, s_live, hist, sm_signal)
-        if r.get("entry_state") != new_entry_state:
-            r["entry_state"] = new_entry_state
-            rows_dirty = True
-
-        if r.get("entry_state") == "READY":
-            stage = "SIGNAL"
-        elif r.get("entry_state") == "WAIT":
-            stage = "WATCHLIST"
-        else:
-            stage = "WATCHLIST"
-
-        trap_signal, trap_level = liquidity_trap(best)
-        fresh = fresh_lp(best)
-        dev = dev_wallet_risk(best)
-        whale = whale_accumulation(best)
-        signal = classify_signal(best) if best else (r.get("signal") or "RED")
-
-        r["tags"] = tags
-        if sm_signal:
-            r["smart_money"] = sm_signal
-        r["confidence"] = f"{confidence_score(s_live, sm_signal, rug_flags):.2f}"
-        r["last_score"] = str(round(s_live, 4))
-        r["priority_score"] = str(round(compute_priority(r), 4))
-
-        enriched.append((stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, detect_snipers(best), pump_live, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug, entry_state))
-
-    if rows_dirty:
-        save_monitoring(rows)
-
-    rows_now = load_monitoring()
-    rows_now.sort(
-        key=lambda r: (
-            -float(parse_float(r.get("priority_score", 0), 0.0)),
-            -float(parse_float(r.get("last_score", 0), 0.0)),
-            r.get("ts_added", ""),
-        )
-    )
-    if len([r for r in rows_now if r.get("active") == "1"]) != len(active):
-        st.info("Archive/revisit changes applied. Refreshing list…")
-        request_rerun()
-
-    def _row_dict(item: Any) -> Dict[str, Any]:
-        if isinstance(item, (list, tuple)) and len(item) >= 4 and isinstance(item[3], dict):
-            return item[3]
-        return {}
-
-    def _stage(item: Any) -> str:
-        if isinstance(item, (list, tuple)) and len(item) >= 1:
-            return str(item[0] or "")
-        return ""
-
-    enriched.sort(
-        key=lambda x: (
-            -float(parse_float(_row_dict(x).get("priority_score", 0), 0.0)),
-            -float(parse_float(_row_dict(x).get("last_score", 0), 0.0)),
-            _row_dict(x).get("ts_added", ""),
-        )
-    )
-    signals = [x for x in enriched if _stage(x) == "SIGNAL"]
-    watchlist = [x for x in enriched if _stage(x) != "SIGNAL"]
-
-    def render_items(title: str, items: List[tuple]):
-        st.subheader(title)
-        if not items:
-            st.caption("Порожньо")
-            return
-
-        def signal_color(entry_state_value: str, sm_signal_value: Optional[str]) -> str:
-            if entry_state_value == "READY":
-                return "#16a34a"
-            if sm_signal_value == "SMART_ACCUMULATION":
-                return "#22c55e"
-            if sm_signal_value == "SMART_EXIT":
-                return "#ef4444"
-            return "#f59e0b"
-
-        def action_label(entry_state_value: str, decision_value: str) -> str:
-            if entry_state_value == "READY":
-                return "ENTER"
-            if decision_value == "NO ENTRY":
-                return "SKIP"
-            return "WAIT"
-
-        def risk_color(risk_score_value: float) -> str:
-            if risk_score_value <= 1:
-                return "#16a34a"
-            if risk_score_value <= 2:
-                return "#f59e0b"
-            return "#ef4444"
-
-        def row_bg(entry_state_value: str, risk_score_value: float) -> str:
-            if entry_state_value == "READY" and risk_score_value <= 1:
-                return "#ecfdf5"
-            if risk_score_value >= 3:
-                return "#fef2f2"
-            return "#ffffff"
-
-        def _safe_get_item(x: Any, idx: int, default: Any = None) -> Any:
-            if isinstance(x, (list, tuple)) and len(x) > idx:
-                return x[idx]
-            return default
-
-        items = sorted(
-            items,
-            key=lambda x: (
-                str((_safe_get_item(x, 34, {}) or {}).get("status", "NO_ENTRY")).upper() != "READY",
-                float((_safe_get_item(x, 29, {}) or {}).get("risk_score", 3) or 3),
-                -float(_safe_get_item(x, 5, 0.0) or 0.0),
-            )
-        )
-
-        list_container = st.container(height=600)
-        rendered_count = 0
-        with list_container:
-            header_cols = st.columns([2, 1.2, 1.2, 1.2, 1.2])
-            with header_cols[0]:
-                st.caption("TOKEN")
-            with header_cols[1]:
-                st.caption("SIGNAL")
-            with header_cols[2]:
-                st.caption("ACTION")
-            with header_cols[3]:
-                st.caption("SIZE")
-            with header_cols[4]:
-                st.caption("RISK")
-
-        for item in items:
-            try:
-                if not isinstance(item, (list, tuple)) or len(item) < 35:
-                    st.write("Render error: malformed monitoring tuple")
-                    st.write(item)
-                    continue
-                stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug, entry_state = item
-
-                exit_signal = exit_before_dump_detector(best, hist, 0.0)
-                exit_signal = apply_liquidity_exit_override(exit_signal, liq_health)
-
-                if anti_rug["level"] == "CRITICAL":
-                    flags = list(exit_signal.get("exit_flags", []) or [])
-                    for f in anti_rug.get("flags", []):
-                        if f not in flags:
-                            flags.append(f)
-                    exit_signal.update({
-                        "exit_level": "EXIT",
-                        "exit_score": max(int(exit_signal.get("exit_score", 0)), 4),
-                        "exit_flags": flags,
-                        "suggested_action": "EXIT_100",
-                    })
-                elif anti_rug["level"] == "WARNING" and str(exit_signal.get("exit_level", "WATCH")).upper() == "WATCH":
-                    flags = list(exit_signal.get("exit_flags", []) or [])
-                    for f in anti_rug.get("flags", []):
-                        if f not in flags:
-                            flags.append(f)
-                    exit_signal.update({
-                        "exit_level": "EARLY",
-                        "exit_score": max(int(exit_signal.get("exit_score", 0)), 2),
-                        "exit_flags": flags,
-                        "suggested_action": "REDUCE_50",
-                    })
-                persistence = exit_persistence_state(hist, min_points=3)
-                if liq_health["action"] in ("EXIT_NOW", "EXIT"):
-                    persistence = {**persistence, "persistent_exit": True}
-                level = str(exit_signal.get("exit_level", "WATCH"))
-                action_plan = action_from_exit_signal(exit_signal, persistence)
-                if bool(auto_cfg.get("hide_red", False)) and signal == "RED":
-                    continue
-                rendered_count += 1
-
-                chain = (r.get("chain") or "").strip().lower()
-                base_sym = r.get("base_symbol") or r.get("symbol") or "NA"
-                base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
-                row_state = str(entry_state.get("status", "NO_ENTRY")).upper()
-                risk_score_value = float(size_info.get("risk_score", 3) or 3)
-                row_background = row_bg(row_state, risk_score_value)
-                list_container.markdown(
-                    f"<div style='background:{row_background};padding:6px 8px;border-radius:8px'>",
-                    unsafe_allow_html=True,
-                )
-                cols = list_container.columns([2, 1.2, 1.2, 1.2, 1.2])
-                with cols[0]:
-                    st.markdown(f"**{base_sym}**")
-                    if live["price"]:
-                        st.caption(f"${live['price']:.6f}")
-                    else:
-                        st.caption("n/a")
-                with cols[1]:
-                    sig_color = signal_color(row_state, smart_money)
-                    st.markdown(
-                        f"<span style='color:{sig_color};font-weight:600'>{row_state}</span>",
-                        unsafe_allow_html=True,
-                    )
-                    tag_items: List[str] = []
-                    if smart_money:
-                        tag_items.append(smart_money)
-                    rug_flags = anti_rug.get("flags", []) or []
-                    if rug_flags:
-                        tag_items.append("RISK")
-                    if "DEV_DUMP" in tags:
-                        tag_items.append("DEV")
-                    if tag_items:
-                        st.caption(" • ".join(tag_items[:3]))
-                with cols[2]:
-                    action = action_label(row_state, decision)
-                    st.markdown(f"**{action}**")
-                with cols[3]:
-                    adjusted_usd_size = float(size_info.get("usd_size_adj", 0) or 0)
-                    st.markdown(f"${int(adjusted_usd_size)}")
-                with cols[4]:
-                    r_color = risk_color(risk_score_value)
-                    st.markdown(
-                        f"<span style='color:{r_color}'>R{int(risk_score_value)}</span>",
-                        unsafe_allow_html=True,
-                    )
-                list_container.markdown("</div>", unsafe_allow_html=True)
-            except Exception as e:
-                st.write("Render error:", e)
-                st.write(item)
-                continue
-
-            with list_container.expander(f"Details · {base_sym}", expanded=False):
-                c1, c2, c3 = st.columns([2, 2, 2])
-                with c1:
-                    st.caption(f"{chain} • src: {(r.get('source_window') or '—')} • preset: {(r.get('source_preset') or '—')} • last_seen: {(r.get('ts_last_seen') or '—')}")
-                    st.code(base_addr, language="text")
-                    if live["url"]:
-                        link_button("DexScreener", live["url"], use_container_width=True, key=f"m_ds_{idx}_{hkey(base_addr)}")
-                    swap_url = build_swap_url(chain, base_addr)
-                    if swap_url:
-                        label = "Swap (Jupiter)" if chain == "solana" else "Swap (PancakeSwap)"
-                        link_button(label, swap_url, use_container_width=True, key=f"m_sw_{idx}_{hkey(base_addr, chain)}")
-                    st.write(f"Score: {s_live:.2f}" if best else "Score: n/a")
-                    st.write(f"Liq: {fmt_usd(live['liq'])}")
-                    st.write(f"Vol24: {fmt_usd(live['vol24'])}")
-                    st.write(f"Vol5: {fmt_usd(live['vol5'])}")
-                    st.caption(f"Δ1h {fmt_pct(live['pc1h'])} • Δ5m {fmt_pct(live['pc5'])}")
-                    st.write(f"SNIPER: {'YES' if sniper_flag else 'NO'}")
-                    st.write(f"PUMP: {pump_score}")
-                    st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
-                    st.write(f"Entry timing: {timing['timing']}")
-                    for reason in timing.get("reason", []):
-                        st.caption(f"– {reason}")
-                with c2:
-                    st.write(f"Decision: {decision}")
-                    for rr in entry_state.get("reason", [])[:4]:
-                        st.caption(f"– {rr}")
-                    st.write(f"Risk: {(r.get('risk') or 'standard')}")
-                    st.write(f"Suggested entry: ${r.get('entry_suggest_usd') or '—'}")
-                    st.write(f"TP target: {r.get('tp_target_pct') or '—'}%")
-                    st.write(f"Δscore: {d_score:+.2f}")
-                    st.write(f"Size: {size_info['size_label']}")
-                    st.write(f"Suggested size: {size_info['size_pct']}%")
-                    base_usd_size = float(size_info.get("usd_size", 0.0) or 0.0)
-                    size_factor = float(size_info.get("size_factor", 1.0) or 1.0)
-                    if size_factor < 1.0:
-                        st.write(f"USD size: ${adjusted_usd_size:.2f} (reduced from ${base_usd_size:.2f})")
-                    else:
-                        st.write(f"USD size: ${base_usd_size:.2f}")
-                    st.caption(f"size factor: {size_factor:.2f}")
-                    st.write(f"Correlation: {str(corr.get('status', 'ALLOW'))}")
-                    for rr in (corr.get("reason", []) or []):
-                        st.caption(f"– {rr}")
-                    st.write(f"Liquidity health: {liq_health['level']}")
-                    for fl in liq_health.get("flags", []):
-                        st.caption(f"– {fl}")
-                    st.write(f"Anti-rug: {anti_rug['level']} ({anti_rug['score']})")
-                    for fl in anti_rug.get("flags", [])[:4]:
-                        st.caption(f"– {fl}")
-                with c3:
-                    label = f"{decision} {stars}".strip()
-                    if second_wave and not str(decision).upper().startswith("ENTRY"):
-                        label = f"ENTRY (2nd wave) {stars}".strip()
-                    st.markdown(action_badge(label), unsafe_allow_html=True)
-                if entry_state["status"] == "READY":
-                    st.success("Entry status: READY")
-                elif entry_state["status"] == "WAIT":
-                    st.warning("Entry status: WAIT")
-                else:
-                    st.error("Entry status: NO_ENTRY")
-                for rr in entry_state.get("reason", [])[:4]:
-                    st.caption(f"– {rr}")
-                if signal == "GREEN":
-                    st.success("ENTRY signal")
-                elif signal == "YELLOW":
-                    st.warning("WATCH")
-                else:
-                    st.error("NO ENTRY")
-                if sniper_flag:
-                    st.markdown("🧠 sniper activity")
-                if pump_score >= 6:
-                    st.markdown("🚀 pump probability HIGH")
-                cex_label = (best or {}).get("cex_label") or r.get("cex_label")
-                if cex_label == "HIGH":
-                    st.success("Possible CEX listing")
-                elif cex_label == "MEDIUM":
-                    st.caption("CEX watch")
-                if trap_signal:
-                    st.markdown(f"⚠️ {trap_label(trap_signal)}")
-                if liq_health["level"] == "DEAD":
-                    st.error("☠ liquidity dead – manual promote disabled")
-                elif liq_health["level"] == "CRITICAL":
-                    st.error("🔴 liquidity critical – avoid entry")
-                elif liq_health["level"] == "WEAK":
-                    st.warning("⚠ liquidity weak – size reduced")
-
-                if anti_rug["level"] == "CRITICAL":
-                    st.error("early rug risk – exit")
-                elif anti_rug["level"] == "WARNING":
-                    st.warning("rug risk building – reduce/watch")
-                if trap.get("trap_flags"):
-                    for fl in trap["trap_flags"][:3]:
-                        st.caption(f"– {fl}")
-                if fresh == "VERY_NEW":
-                    st.markdown("🆕 fresh LP")
-                elif fresh == "NEW":
-                    st.markdown("🌱 new token")
-                if whale:
-                    st.markdown("🐋 whale accumulation")
-                if smart_money:
-                    st.markdown("🐋 smart money entry")
-                if dev:
-                    st.markdown("⚠ dev risk")
-                st.write(f"Window: {r.get('source_window') or '—'}")
-                st.write(f"Preset tags: {r.get('source_preset') or '—'}")
-                st.write(f"Exit action: {action_plan['action_label']}")
-                if level == "EXIT":
-                    st.warning(f"EXIT ({exit_signal['exit_score']})")
-                elif level == "EARLY":
-                    st.caption(f"EARLY ({exit_signal['exit_score']})")
-                if st.button("Promote → Portfolio", key=f"prom_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
-                    adj_size = float(size_info.get("usd_size_adj", size_info.get("usd_size", 0.0)) or 0.0)
-                    liq_level = liq_health.get("level", "UNKNOWN")
-                    if not best:
-                        st.error("No live pool found.")
-                    else:
-                        if entry_state["status"] == "NO_ENTRY":
-                            st.error("Entry blocked by execution discipline.")
-                            for rr in entry_state.get("reason", [])[:4]:
-                                st.caption(f"– {rr}")
-                            return
-                        elif entry_state["status"] == "WAIT":
-                            st.warning("Entry is not ready yet – manual promote is cautious only.")
-                            for rr in entry_state.get("reason", [])[:4]:
-                                st.caption(f"– {rr}")
-
-                        if level == "EXIT" and persistence.get("persistent_exit"):
-                            st.warning("Persistent exit signal – manual promote is risky.")
-                        elif level == "EARLY" and persistence.get("persistent_early"):
-                            st.warning("Early warning – use caution / smaller size.")
-
-                        if corr.get("status", "ALLOW") == "BLOCK":
-                            st.warning("High correlation risk – size will be reduced")
-                        elif corr.get("status", "ALLOW") == "ALLOW_SMALL_ONLY":
-                            st.warning("Correlation elevated – use smaller size")
-
-                        if timing["timing"] == "SKIP":
-                            st.warning("Bad entry timing – manual promote only.")
-
-                        if anti_rug["level"] == "CRITICAL":
-                            st.error("Early rug risk – entry blocked.")
-                            return
-                        elif anti_rug["level"] == "WARNING":
-                            st.warning("Rug risk building – manual entry risky.")
-
-                        if liq_level in ("DEAD", "CRITICAL"):
-                            st.error("Liquidity too low for entry")
-                            return
-                        else:
-                            if adj_size < 5:
-                                st.warning("Position too small after risk adjustment.")
-                            swap_url = build_swap_url(chain, base_addr)
-                            res = log_to_portfolio(best, s_live, decision, tags, swap_url)
-                            if res == "OK":
-                                archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=s_live, last_decision=decision)
-                                st.success("Promoted.")
-                                request_rerun()
-                            else:
-                                st.info("Already in portfolio.")
-                if st.button("Archive (manual)", key=f"drop_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
-                    archive_monitoring(chain, base_addr, reason="manual", last_score=s_live, last_decision=decision)
-                    st.success("Archived.")
-                    request_rerun()
-            with list_container.expander(f"Dynamics / sparklines · {base_sym}", expanded=False):
-                if not hist:
-                    st.info("No snapshots yet.")
-                else:
-                    dfh = pd.DataFrame(hist).copy()
-                    dfh["ts_utc"] = pd.to_datetime(dfh.get("ts_utc", ""), errors="coerce")
-                    dfh = dfh.sort_values("ts_utc")
-                    for col in ["price_usd","score_live","liq_usd","vol24_usd","vol5_usd"]:
-                        dfh[col] = pd.to_numeric(dfh.get(col, 0), errors="coerce")
-                    dfh = dfh.set_index("ts_utc")
-                    s1, s2, s3 = st.columns(3)
-                    with s1: st.line_chart(dfh[["price_usd"]], height=120, use_container_width=True)
-                    with s2: st.line_chart(dfh[["score_live"]], height=120, use_container_width=True)
-                    with s3: st.line_chart(dfh[["liq_usd"]], height=120, use_container_width=True)
-                    s4, s5 = st.columns(2)
-                    with s4: st.line_chart(dfh[["vol24_usd"]], height=120, use_container_width=True)
-                    with s5: st.line_chart(dfh[["vol5_usd"]], height=120, use_container_width=True)
-        if rendered_count == 0:
-            st.warning("No tokens to display (check filters)")
-
-    def promote_to_portfolio(row: Dict[str, Any]) -> None:
-        chain = (row.get("chain") or "").strip().lower()
-        base_addr = addr_store(chain, (row.get("base_addr") or row.get("address") or "").strip())
-        if not chain or not base_addr:
-            st.error("Missing chain/address for portfolio promote.")
-            return
-        best = best_pair_for_token(chain, base_addr)
-        if not best:
-            st.error("No live pool found.")
-            return
-        score_value = parse_float(row.get("last_score", row.get("score_init", 0)), 0.0)
-        decision_value = str(row.get("decision") or "WATCH")
-        tags_raw = str(row.get("tags") or "")
-        tags = [t.strip() for t in tags_raw.split("|") if t.strip()]
-        swap_url = build_swap_url(chain, base_addr)
-        res = log_to_portfolio(best, score_value, decision_value, tags, swap_url)
-        if res == "OK":
-            archive_monitoring(
-                chain,
-                base_addr,
-                reason="manual: promoted from compact card",
-                last_score=score_value,
-                last_decision=decision_value,
-            )
-            st.success("Promoted to Portfolio.")
-            request_rerun()
-        else:
-            st.info("Already in portfolio.")
-
-    def extract_name(row: Dict[str, Any]) -> str:
-        name = (
-            row.get("base_symbol")
-            or row.get("symbol")
-            or row.get("name")
-            or row.get("tokenSymbol")
-            or row.get("tokenName")
-            or row.get("base_name")
-            or (row.get("token") or {}).get("symbol")
-            or (row.get("token") or {}).get("name")
-            or (row.get("baseToken") or {}).get("symbol")
-            or (row.get("baseToken") or {}).get("name")
-            or ((row.get("pair") or {}).get("baseToken") or {}).get("symbol")
-            or ((row.get("pair") or {}).get("baseToken") or {}).get("name")
-            or (row.get("info") or {}).get("symbol")
-            or (row.get("info") or {}).get("name")
-        )
-        if name:
-            return str(name).strip()
-
-        addr = (row.get("base_addr") or row.get("address") or row.get("mint") or "").strip()
-        if addr:
-            return f"{addr[:6]}...{addr[-4:]}"
-        return "UNKNOWN"
-
-    def g(row: Dict[str, Any], key: str, default: str = "NA") -> Any:
-        value = row.get(key)
-        return value if value not in [None, ""] else default
-
-    def dex_url(chain: str, addr: str) -> str:
-        chain = (chain or "").strip().lower()
-        if not chain or not addr:
-            return ""
-        return f"https://dexscreener.com/{chain}/{addr}"
-
-    def swap_url_for_row(row: Dict[str, Any]) -> str:
-        chain = (row.get("chain") or "").strip().lower()
-        addr = (row.get("base_addr") or row.get("address") or row.get("mint") or "").strip()
-        if not chain or not addr:
-            return ""
-        return build_swap_url(chain, addr)
-
-    if not signals and not watchlist:
-        st.warning("Monitoring empty (UI layer)")
-        if rows:
-            debug_keys = st.checkbox("DEBUG KEYS", key="dbg_keys_compact_cards")
-            debug_pipeline = st.checkbox("DEBUG PIPELINE", key="dbg_pipeline_compact_cards")
-            st.caption("Fallback: compact actionable cards")
-            new_active_rows: List[Dict[str, Any]] = []
-            for r in active_rows:
-                row = dict(r)
-                chain = (row.get("chain") or "").strip().lower()
-                base_addr = (row.get("base_addr") or row.get("address") or row.get("mint") or "").strip()
-
-                if debug_pipeline:
-                    st.write("DEBUG RECHECK:", chain, base_addr)
-
-                try:
-                    recheck = (
-                        recheck_token(chain, base_addr, hist_limit=int(auto_cfg.get("stability_window_n", 30)))
-                        if (chain and base_addr)
-                        else {"score": row.get("last_score", 0), "decision": "NO DATA", "timing": {"timing": "NA"}}
-                    )
-                    row["live_score"] = recheck.get("score", row.get("last_score", 0))
-                    row["entry_status"] = recheck.get("decision", row.get("entry_status", "NA"))
-                    row["entry_timing"] = (recheck.get("timing") or {}).get("timing", row.get("entry_timing", "NA"))
-                except Exception:
-                    row["live_score"] = row.get("last_score", 0)
-                    row["entry_status"] = row.get("entry_status", "NA")
-                    row["entry_timing"] = row.get("entry_timing", "NA")
-
-                new_active_rows.append(row)
-
-            active_rows = new_active_rows
-            if debug_pipeline:
-                st.write("==== DEBUG PIPELINE ====")
-                st.write("DEBUG ACTIVE COUNT:", len(active_rows))
-                st.write(active_rows[:1])
-                for row in active_rows[:3]:
-                    st.write(
-                        {
-                            "symbol": row.get("base_symbol"),
-                            "score": row.get("last_score"),
-                            "live_score": row.get("live_score"),
-                            "entry": row.get("entry_status"),
-                        }
-                    )
-
-            for r in active_rows:
-                if debug_keys:
-                    st.write(r.keys())
-                    st.write(r)
-
-                name = extract_name(r).upper()
-                score = round(parse_float(r.get("last_score", 0), 0.0), 2)
-                decision = r.get("last_decision") or r.get("decision") or r.get("entry_status") or "WATCH"
-                addr = (r.get("address") or r.get("mint") or r.get("base_addr") or "").strip()
-
-                r.setdefault("entry_status", "WATCH")
-                r.setdefault("risk_level", "MED")
-                r.setdefault("anti_rug", "UNKNOWN")
-                r.setdefault("entry_timing", "EARLY")
-
-                header = f"{name} | {decision} | {score}"
-
-                with st.expander(header):
-                    st.caption(
-                        f"{(r.get('chain') or '—').upper()} • "
-                        f"{(r.get('entry_status') or 'WATCH')} • "
-                        f"risk {(r.get('risk_level') or r.get('risk') or '—')}"
-                    )
-                    # --- ACTIONS ---
-                    col1, col2, col3 = st.columns(3)
-
-                    with col1:
-                        chain = (r.get("chain") or "").strip().lower()
-                        if addr:
-                            url = dex_url(chain, addr)
-                            if url:
-                                st.link_button("Dex", url, use_container_width=True)
-
-                    with col2:
-                        swap_url = swap_url_for_row(r)
-                        if swap_url:
-                            label = "Jupiter" if (r.get("chain") or "").strip().lower() == "solana" else "Swap"
-                            st.link_button(label, swap_url, use_container_width=True)
-
-                    with col3:
-                        if st.button("➕ Portfolio", key=f"pf_{addr or hkey(str(r))}", use_container_width=True):
-                            promote_to_portfolio(r)
-
-                    # --- ADDRESS ---
-                    if addr:
-                        st.code(addr, language="text")
-                        st.caption(f"{addr[:6]}...{addr[-4:]}")
-
-                    # --- CORE ---
-                    col1, col2, col3, col4 = st.columns(4)
-
-                    with col1:
-                        st.metric("Entry", g(r, "entry_status"))
-
-                    with col2:
-                        st.metric("Timing", g(r, "entry_timing", g(r, "timing")))
-
-                    with col3:
-                        st.metric("Risk", g(r, "risk_level", g(r, "risk")))
-
-                    with col4:
-                        st.metric("Safe", g(r, "anti_rug", g(r, "rug_risk")))
-
-                    # --- PLAN ---
-                    col1, col2, col3 = st.columns(3)
-
-                    with col1:
-                        st.write(f"Size: {g(r, 'size_label')}")
-
-                    with col2:
-                        st.write(f"USD: {g(r, 'usd_size')}")
-
-                    with col3:
-                        st.write(f"TP: {g(r, 'tp_target')}")
-
-                    # --- REASON ---
-                    reason = r.get("entry_reason") or r.get("decision_reason")
-                    if not reason:
-                        reasons = r.get("entry_reasons")
-                        if isinstance(reasons, list) and reasons:
-                            reason = " • ".join(str(x) for x in reasons[:3])
-                        elif isinstance(reasons, str) and reasons.strip():
-                            reason = reasons
-                    if reason:
-                        st.info(str(reason))
-
-                    prices = r.get("price_series")
-                    if isinstance(prices, list) and prices:
-                        st.line_chart(prices, height=100, use_container_width=True)
-                    else:
-                        hist_rows = token_history_rows((r.get("chain") or "").strip().lower(), (r.get("base_addr") or "").strip(), limit=60)
-                        if hist_rows:
-                            price_series = [parse_float(h.get("price_usd"), 0.0) for h in hist_rows if str(h.get("price_usd", "")).strip()]
-                            if price_series:
-                                st.line_chart(price_series, height=100, use_container_width=True)
-
-                    # --- DEBUG (without nested expander) ---
-                    if st.checkbox("Debug", key=f"dbg_{name}_{hkey(str(r))}"):
-                        st.write(r)
+    cards = [monitoring_row_to_card(r) for r in active]
+    cards.sort(key=lambda x: float(x["live_score"]), reverse=True)
+
+    st.subheader("Signals / Watchlist")
+    if not cards:
+        st.info("Monitoring empty after filter.")
         return
 
-    render_items("Signals", signals)
-    st.markdown("---")
-    render_items("Watchlist", watchlist)
+    for item in cards:
+        r = item["row"]
+        best = item["best"]
+        hist = item["hist"]
+        chain = (r.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
+        name = extract_name(r).upper()
+        score = round(float(item["live_score"]), 2)
+        decision = item["decision"]
+        header = f"{name} | {decision} | {score}"
+
+        with st.expander(header, expanded=False):
+            st.caption(f"{chain.upper()} • {item['entry_status']} • risk {item['risk_level']}")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if best and best.get("url"):
+                    link_button("Dex", best.get("url"), use_container_width=True)
+            with c2:
+                swap_url = build_swap_url(chain, base_addr)
+                if swap_url:
+                    link_button("Swap", swap_url, use_container_width=True)
+            with c3:
+                if st.button("Promote → Portfolio", key=f"promote_{chain}_{base_addr}", use_container_width=True):
+                    if best:
+                        res = log_to_portfolio(best, item["live_score"], decision, item["tags"], build_swap_url(chain, base_addr))
+                        if res == "OK":
+                            archive_monitoring(chain, base_addr, reason="manual: promoted", last_score=item["live_score"], last_decision=decision)
+                            st.success("Promoted.")
+                            request_rerun()
+                        else:
+                            st.info("Already in portfolio.")
+                    else:
+                        st.error("No live pool found.")
+
+            st.code(base_addr)
+
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("Entry", item["entry_status"])
+            with m2:
+                st.metric("Timing", item["timing"].get("timing", "NA"))
+            with m3:
+                st.metric("Risk", item["risk_level"])
+            with m4:
+                st.metric("Safe", item["anti_rug"].get("level", "UNKNOWN"))
+
+            p1, p2, p3 = st.columns(3)
+            with p1:
+                st.write(f"Size: {item['size_info'].get('size_label', 'NA')}")
+            with p2:
+                st.write(f"USD: ${float(item['size_info'].get('usd_size', 0) or 0):.2f}")
+            with p3:
+                st.write(f"TP: {r.get('tp_target_pct') or '25'}%")
+
+            if item["entry_reasons"]:
+                st.info(" • ".join(item["entry_reasons"][:3]))
+
+            if hist:
+                price_series = [parse_float(h.get("price_usd"), 0.0) for h in hist if str(h.get("price_usd", "")).strip()]
+                if price_series:
+                    st.line_chart(price_series, height=100, use_container_width=True)
 
 def page_archive():
     st.title("Archive")
@@ -5433,7 +4814,7 @@ def portfolio_alert_count() -> int:
         chain = (r.get("chain") or "").lower()
         base_addr = r.get("base_token_address")
 
-        best = best_pair_for_token(chain, base_addr)
+        best = best_pair_for_token_cached(chain, base_addr)
         if not best:
             continue
 
@@ -5580,7 +4961,7 @@ def page_portfolio():
     rotation_rows = [
         r for r in active_rows
         if liquidity_health(
-            best_pair_for_token(
+            best_pair_for_token_cached(
                 (r.get("chain") or "").strip().lower(),
                 addr_store((r.get("chain") or "").strip().lower(), (r.get("base_token_address") or "").strip()),
             )
@@ -5612,7 +4993,7 @@ def page_portfolio():
         except Exception:
             entry_price = 0.0
 
-        best = best_pair_for_token(chain, base_addr) if (chain and base_addr) else None
+        best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
         liq_health = liquidity_health(best)
 
         cur_price = parse_float(best.get("priceUsd"), 0.0) if best else 0.0
@@ -5934,7 +5315,7 @@ def main():
         st.caption("Scanner")
         scanner_max_items = st.slider("Max tokens per slot", 10, 100, 100, step=10)
         auto_refresh_enabled = st.checkbox("Auto refresh", value=False)
-        ui_autorefresh_sec = st.slider("Auto-refresh interval (sec)", 20, 300, 20, step=10, disabled=(not auto_refresh_enabled))
+        ui_autorefresh_sec = st.slider("Auto-refresh interval (sec)", 60, 300, 60, step=10, disabled=(not auto_refresh_enabled))
         use_birdeye_trending = st.checkbox("Use Solana extra stream (Birdeye)", value=True, disabled=(not BIRDEYE_ENABLED))
         if not BIRDEYE_ENABLED:
             st.caption("Birdeye key missing: add BIRDEYE_API_KEY to secrets to enable extra Solana stream.")
@@ -5960,7 +5341,9 @@ def main():
 
         st.divider()
         if st.button("Run scanner now", use_container_width=True):
-            st.session_state["scanner_result"] = run_scanner_once(limit=int(scanner_max_items))
+            scanner_rows = run_scanner_once(limit=int(scanner_max_items))
+            stats = persist_scanner_result(scanner_rows)
+            st.session_state["_scan_feedback"] = f"Scanner saved: +{stats['inserted']} new, ~{stats['updated']} updated, total {stats['total']}"
             request_rerun()
 
         if st.button("Clear cache", use_container_width=True):
@@ -5985,14 +5368,6 @@ def main():
 
     if DEBUG_MODE:
         render_debug_panel()
-
-    if "scanner_result" in st.session_state:
-        result_rows = st.session_state.get("scanner_result") or []
-        summary = persist_scanner_result(result_rows)
-        st.session_state.pop("scanner_result", None)
-        st.session_state["_scan_feedback"] = (
-            f"Scanner saved: +{summary['inserted']} new, ~{summary['updated']} updated, total {summary['total']}"
-        )
 
     if st.session_state.get("_scan_feedback"):
         st.info(st.session_state.pop("_scan_feedback"))
