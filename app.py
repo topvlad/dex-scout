@@ -3517,13 +3517,9 @@ SCOUT_WINDOWS = [
 ]
 
 SCAN_ROTATION = [
-    ("Ultra Early (safer)", "ultra", "bsc"),
     ("Ultra Early (safer)", "ultra", "solana"),
-    ("Balanced (default)", "balanced", "bsc"),
     ("Balanced (default)", "balanced", "solana"),
-    ("Wide Net (explore)", "wide", "bsc"),
     ("Wide Net (explore)", "wide", "solana"),
-    ("Momentum (hot)", "momentum", "bsc"),
     ("Momentum (hot)", "momentum", "solana"),
 ]
 
@@ -3554,6 +3550,7 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
     return (f"{entry:.0f}", f"{tp:.0f}")
 
 def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any], seeds_raw: str, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> List[Dict[str, Any]]:
+    chain = "solana"
     cache_key = safe_json({
         "chain": chain,
         "window_name": window_name,
@@ -3598,18 +3595,21 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         except Exception:
             pass
             
-    # Optional Solana extra stream via Birdeye trending
-    if chain == "solana" and use_birdeye_trending and BIRDEYE_ENABLED:
+    # Debug: always try Birdeye stream
+    mints = birdeye_trending_solana(limit=int(birdeye_limit))
+    st.write("TOKENS FROM API:", len(mints))
+    try:
+        r = requests.get("https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc", timeout=15)
+        st.write("BIRDEYE STATUS:", r.status_code)
+    except Exception as e:
+        st.write("BIRDEYE STATUS:", f"error: {e}")
+    for mint in mints:
         try:
-            for mint in birdeye_trending_solana(limit=int(birdeye_limit)):
-                try:
-                    pools = fetch_token_pairs("solana", mint)
-                    if pools:
-                        all_pairs.extend(pools)
-                except Exception:
-                    continue
+            pools = fetch_token_pairs("solana", mint)
+            if pools:
+                all_pairs.extend(pools)
         except Exception:
-            pass
+            continue
 
     pairs = dedupe_mode(all_pairs, by_base_token=False)
     pairs = sorted(
@@ -3619,23 +3619,8 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     )
     pairs = dedupe_mode(pairs, by_base_token=bool(preset.get("dedupe_by_base", True)))
 
-    filtered, _fstats, _freasons = filter_pairs_with_debug(
-        pairs=pairs,
-        chain=chain,
-        any_dex=True,
-        allowed_dexes=set(),
-        min_liq=float(preset.get("min_liq", 1000)),
-        min_vol24=float(preset.get("min_vol24", 5000)),
-        min_trades_m5=int(preset.get("min_trades_m5", 0)),
-        min_sells_m5=int(preset.get("min_sells_m5", 0)),
-        max_buy_sell_imbalance=int(preset.get("max_imbalance", 30)),
-        block_suspicious_names=bool(preset.get("block_suspicious_names", True)),
-        block_majors=bool(preset.get("block_majors", True)),
-        min_age_min=int(preset.get("min_age_min", 0)),
-        max_age_min=int(preset.get("max_age_min", 999999)),
-        enforce_age=bool(preset.get("enforce_age", True)),
-        hide_solana_unverified=bool(preset.get("hide_solana_unverified", True)),
-    )
+    # Debug: disable filters
+    filtered = pairs
 
     out = []
     for p in filtered:
@@ -3643,14 +3628,14 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         if not base_addr:
             continue
         row = normalize_pair_row(p)
-        if str(row.get("entry_status", "NO_ENTRY")) == "NO_ENTRY":
-            continue
+        # Debug: keep all rows (no entry filter)
         out.append(row)
 
     SCAN_CACHE[cache_key] = {"ts": now_ts, "pairs": out}
     return out
 
 def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, int]:
+    chain = "solana"
     preset = PRESETS.get(window_name, {})
     counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
@@ -3672,22 +3657,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         entry_score = parse_float(row.get("entry_score", 0), 0.0)
         row["smart_money"] = smart
         row["signal"] = signal
-        if row["signal"] == "RED":
-            add_to_archive(
-                chain=row.get("chainId"),
-                base_addr=safe_get(row, "baseToken", "address", default=""),
-                reason="auto_filter"
-            )
-            continue
-
-        if entry_status == "NO_ENTRY":
-            counts["skipped_noise"] = counts.get("skipped_noise", 0) + 1
-            continue
-
-        allowed, _gate_reason = passes_monitoring_gate(row, float(s))
-        if not allowed:
-            counts["skipped_noise"] = counts.get("skipped_noise", 0) + 1
-            continue
+        # Debug mode: disable red/no-entry/gate filtering
 
         if smart:
             chain = (row.get("chainId") or "").lower()
@@ -3697,10 +3667,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 "last_seen": now_utc_str(),
                 "symbol": row.get("base_symbol", "")
             }
-        priority = scout_priority(row)
-        if priority < 3:
-            counts["skipped_noise"] = counts.get("skipped_noise", 0) + 1
-            continue
+        # Debug mode: disable priority filter
 
         try:
             contract = addr_store(row.get("chainId", ""), safe_get(row, "baseToken", "address", default=""))
@@ -3708,8 +3675,9 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["skipped_active"] += 1
                 continue
 
-            if entry_status != "WAIT":
-                continue
+            # Debug mode – add all
+            pass
+            st.write("ADDING TOKEN:", row.get("base_symbol", ""), safe_get(row, "baseToken", "address", default=""))
             res = add_to_monitoring(
                 row,
                 float(s),
