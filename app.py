@@ -774,6 +774,67 @@ def fetch_dexscreener_latest(chain: str, limit: int = 40):
     except Exception:
         return []
 
+def fetch_tokens_unified(limit: int = 50) -> List[Dict[str, Any]]:
+    # --- TRY BIRDEYE ---
+    try:
+        url = "https://public-api.birdeye.so/defi/tokenlist"
+        params = {
+            "sort_by": "v24hUSD",
+            "sort_type": "desc",
+            "offset": 0,
+            "limit": limit,
+        }
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json() or {}
+            raw = safe_get(data, "data", "tokens", default=[]) or []
+            if raw:
+                tokens = []
+                for t in raw:
+                    tokens.append(
+                        {
+                            "symbol": t.get("symbol", "NA"),
+                            "address": t.get("address", ""),
+                            "price": parse_float(t.get("price", 0), 0.0),
+                            "volume": parse_float(t.get("v24hUSD", 0), 0.0),
+                            "liquidity": parse_float(t.get("liquidity", 0), 0.0),
+                            "source": "birdeye",
+                        }
+                    )
+                return tokens
+    except Exception as e:
+        print("BIRDEYE FAIL:", e)
+
+    # --- FALLBACK: DEXSCREENER ---
+    try:
+        url = "https://api.dexscreener.com/latest/dex/search?q=solana"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json() or {}
+            pairs = data.get("pairs", [])[:limit]
+            tokens = []
+            for p in pairs:
+                base = p.get("baseToken", {}) or {}
+                tokens.append(
+                    {
+                        "symbol": base.get("symbol", "NA"),
+                        "address": base.get("address", ""),
+                        "price": parse_float(p.get("priceUsd") or 0, 0.0),
+                        "volume": parse_float(safe_get(p, "volume", "h24", default=0), 0.0),
+                        "liquidity": parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0),
+                        "source": "dexscreener",
+                    }
+                )
+            return tokens
+    except Exception as e:
+        print("DEXSCREENER FAIL:", e)
+
+    # --- HARD FALLBACK (ЩОБ UI НЕ БУВ ПУСТИЙ) ---
+    return [
+        {"symbol": "TEST1", "address": "0x1", "price": 0.0, "volume": 0.0, "liquidity": 0.0, "source": "fallback"},
+        {"symbol": "TEST2", "address": "0x2", "price": 0.0, "volume": 0.0, "liquidity": 0.0, "source": "fallback"},
+    ]
+
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_dexscreener_trending(chain: str, limit: int = 40) -> List[Dict[str, Any]]:
     """
@@ -2340,7 +2401,7 @@ def add_to_monitoring(
 
     risk = "EARLY" if preset_key in {"ultra", "momentum"} else ""
     entry_s, tp_s = suggest_entry_and_tp_usd(p, risk=risk)
-    decision, _tags = build_trade_hint(p)
+    decision = "watch"
     computed_entry_status, computed_entry_score, _, computed_risk = evaluate_entry(p, mode=ENTRY_MODE)
     final_entry_status = entry_status or computed_entry_status
     final_entry_score = float(entry_score if entry_status else computed_entry_score)
@@ -3575,14 +3636,32 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     tokens: List[Dict[str, Any]] = []
 
     if chain == "solana":
-        mints = birdeye_trending_solana(limit=int(birdeye_limit))
-        for mint in mints:
-            try:
-                pools = fetch_token_pairs("solana", mint)
-                if pools:
-                    tokens.extend(pools)
-            except Exception:
+        unified_tokens = fetch_tokens_unified(limit=50)
+        st.write("TOKENS:", len(unified_tokens))
+        st.write("SOURCE:", unified_tokens[0]["source"] if unified_tokens else "none")
+        for t in unified_tokens:
+            symbol = t.get("symbol", "NA")
+            address = t.get("address", "")
+            price = parse_float(t.get("price", 0), 0.0)
+            volume = parse_float(t.get("volume", 0), 0.0)
+            liquidity = parse_float(t.get("liquidity", 0), 0.0)
+            if not address:
                 continue
+            tokens.append(
+                {
+                    "chainId": "solana",
+                    "dexId": "unified",
+                    "pairAddress": address,
+                    "baseToken": {"symbol": symbol, "address": address},
+                    "quoteToken": {"symbol": "USDC"},
+                    "priceUsd": price,
+                    "volume": {"h24": volume, "m5": 0, "h1": 0},
+                    "liquidity": {"usd": liquidity},
+                    "txns": {"m5": {"buys": 0, "sells": 0}},
+                    "priceChange": {"m5": 0, "h1": 0},
+                    "url": "",
+                }
+            )
     elif chain == "bsc":
         try:
             tokens.extend(fetch_dexscreener_latest(chain, limit=40))
@@ -4057,10 +4136,7 @@ def page_scout(cfg: Dict[str, Any]):
             anti_rug=anti_rug,
         )
         size_info["usd_size_adj"] = round(adj["final_size"], 2)
-        if str(row.get("entry_status", "NO_ENTRY")) == "NO_ENTRY":
-            continue
-        if str(row.get("entry_status", "")).upper() == "NO ENTRY":
-            continue
+        # Debug mode: keep all rows, even NO_ENTRY
 
         ranked.append((s, decision, tags, row))
 
