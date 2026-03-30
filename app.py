@@ -3942,6 +3942,72 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
     scanner_state_save(state)
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
 
+
+def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Single-pass scanner for Streamlit execution flow:
+    click -> fetch once -> persist once -> render.
+    """
+    chain = str(st.session_state.get("chain", "solana")).strip().lower() or "solana"
+    tokens = fetch_tokens_unified(limit)
+    ts_now = now_utc_str()
+    rows: List[Dict[str, Any]] = []
+
+    for t in tokens:
+        symbol = str(t.get("symbol") or "").strip() or "NA"
+        address = str(t.get("address") or "").strip()
+        if not address:
+            continue
+        rows.append(
+            {
+                "ts_added": ts_now,
+                "chain": chain,
+                "base_symbol": symbol,
+                "base_addr": address,
+                "pair_addr": "",
+                "score_init": "1",
+                "liq_init": str(parse_float(t.get("liquidity", 0), 0.0)),
+                "vol24_init": str(parse_float(t.get("volume", 0), 0.0)),
+                "vol5_init": "0",
+                "active": "1",
+                "entry_status": "WATCH",
+                "signal": "watch",
+                "ts_last_seen": ts_now,
+            }
+        )
+
+    return rows
+
+
+def persist_scanner_result(scanner_rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    existing = load_monitoring()
+    by_key: Dict[str, Dict[str, Any]] = {}
+
+    for row in existing:
+        chain = str(row.get("chain") or "").strip().lower()
+        base_addr = str(row.get("base_addr") or "").strip()
+        if not chain or not base_addr:
+            continue
+        by_key[f"{chain}:{base_addr}"] = row
+
+    inserted = 0
+    updated = 0
+    for row in scanner_rows:
+        chain = str(row.get("chain") or "").strip().lower()
+        base_addr = str(row.get("base_addr") or "").strip()
+        if not chain or not base_addr:
+            continue
+        key = f"{chain}:{base_addr}"
+        if key in by_key:
+            by_key[key].update(row)
+            updated += 1
+        else:
+            by_key[key] = row
+            inserted += 1
+
+    save_monitoring(list(by_key.values()))
+    return {"inserted": inserted, "updated": updated, "total": len(by_key)}
+
 def source_priority(row: Dict[str, Any]) -> int:
     presets = [x.strip() for x in str(row.get("source_preset", "")).split(",") if x.strip()]
     if "momentum" in presets:
@@ -4337,7 +4403,7 @@ def page_scout(cfg: Dict[str, Any]):
 
 def page_monitoring(auto_cfg: Dict[str, Any]):
     st.title("Monitoring")
-    st.caption("Автоматичний pipeline: rotating scans → Monitoring → Signals / Watchlist → Archive.")
+    st.caption("Manual pipeline: click scanner → save snapshot → render Monitoring.")
 
     if "selected_token" not in st.session_state:
         st.session_state.selected_token = None
@@ -4381,26 +4447,18 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     cbtn1, cbtn2, cbtn3 = st.columns([2,2,6])
     with cbtn1:
         if st.button("Run scanner now", use_container_width=True, key="run_scanner_now"):
-            st.session_state["force_run"] = True
-        force_run = st.session_state.get("force_run", False)
-        if force_run:
-            res = run_scanner_now(
-                seeds_raw=str(auto_cfg.get("scanner_seeds_raw", DEFAULT_SEEDS)),
-                max_items=int(auto_cfg.get("scanner_max_items", 100)),
-                use_birdeye_trending=bool(auto_cfg.get("use_birdeye_trending", True)),
-                birdeye_limit=int(auto_cfg.get("birdeye_limit", 50)),
+            st.session_state["scanner_result"] = run_scanner_once(
+                limit=int(auto_cfg.get("scanner_max_items", 50))
             )
-            st.session_state["force_run"] = False
-            st.success(f"Scanner ran: {res['window']} / {res['chain']} / {res['stats']}")
             request_rerun()
     with cbtn2:
         if st.button("Refresh live data", use_container_width=True):
             request_rerun()
     with cbtn3:
-        st.caption("The app checks scanner slot on every load. One slot = 5 minutes, rotating across 4 presets × 2 chains.")
+        st.caption("Scanner is manual: one click runs one pass and saves results.")
 
     if not active_rows:
-        st.info("Monitoring is empty. Wait for scanner or run it now.")
+        st.info("Monitoring is empty. Run scanner now to fetch and save tokens.")
         return
 
     chain_filter = st.selectbox("Chain filter", ["all", "bsc", "solana"], index=0)
@@ -5844,12 +5902,7 @@ def main():
 
         st.divider()
         if st.button("Run scanner now", use_container_width=True):
-            st.session_state["force_run"] = True
-        force_run = st.session_state.get("force_run", False)
-        if force_run:
-            res = run_scanner_now(scanner_seeds_raw, max_items=int(scanner_max_items), use_birdeye_trending=bool(use_birdeye_trending), birdeye_limit=int(birdeye_limit))
-            st.session_state["force_run"] = False
-            st.session_state["_scan_feedback"] = f"Scanner ran: {res['window']} / {res['chain']} / {res['stats']}"
+            st.session_state["scanner_result"] = run_scanner_once(limit=int(scanner_max_items))
             request_rerun()
 
         if st.button("Clear cache", use_container_width=True):
@@ -5875,10 +5928,13 @@ def main():
     if DEBUG_MODE:
         render_debug_panel()
 
-    # rotating scanner – one slot every 5 minutes, runs at most once per slot
-    scan_result = maybe_run_rotating_scanner(scanner_seeds_raw, max_items=int(scanner_max_items), use_birdeye_trending=bool(use_birdeye_trending), birdeye_limit=int(birdeye_limit))
-    if scan_result.get("ran"):
-        st.toast(f"Scanner: {scan_result['window']} / {scan_result['chain']} / {scan_result['stats']}")
+    if "scanner_result" in st.session_state:
+        result_rows = st.session_state.get("scanner_result") or []
+        summary = persist_scanner_result(result_rows)
+        st.session_state.pop("scanner_result", None)
+        st.session_state["_scan_feedback"] = (
+            f"Scanner saved: +{summary['inserted']} new, ~{summary['updated']} updated, total {summary['total']}"
+        )
 
     if st.session_state.get("_scan_feedback"):
         st.info(st.session_state.pop("_scan_feedback"))
