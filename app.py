@@ -85,6 +85,7 @@ DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
 ENTRY_MODE = "aggressive"
+TEMP_DISABLE_BEST_PAIR = True  # TEMP: disable best_pair_for_token lookups to stabilize UI rendering
 
 SCAN_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 300
@@ -871,6 +872,8 @@ def fetch_token_pairs(chain: str, token_address: str) -> List[Dict[str, Any]]:
 
 @st.cache_data(ttl=60, max_entries=500)
 def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, Any]]:
+    if TEMP_DISABLE_BEST_PAIR:
+        return None
     try:
         pools = fetch_token_pairs(chain, token_address)
     except Exception:
@@ -3953,25 +3956,39 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
     ts_now = now_utc_str()
     rows: List[Dict[str, Any]] = []
 
+    def normalize_token(t: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "symbol": str(t.get("symbol", "NA") or "NA"),
+            "address": str(t.get("address", "") or "").strip(),
+            "price": float(parse_float(t.get("price", 0), 0.0)),
+            "volume": float(parse_float(t.get("volume", 0), 0.0)),
+            "liquidity": float(parse_float(t.get("liquidity", 0), 0.0)),
+            "score": float(parse_float(t.get("score", 1), 1.0)),
+            "status": str(t.get("status", "watch") or "watch"),
+            "chain": str(st.session_state.get("chain", chain) or chain),
+            "ts": time.time(),
+        }
+
     for t in tokens:
-        symbol = str(t.get("symbol") or "").strip() or "NA"
-        address = str(t.get("address") or "").strip()
+        normalized = normalize_token(t)
+        symbol = normalized.get("symbol", "NA")
+        address = normalized.get("address", "")
         if not address:
             continue
         rows.append(
             {
                 "ts_added": ts_now,
-                "chain": chain,
+                "chain": str(normalized.get("chain", chain)).strip().lower() or chain,
                 "base_symbol": symbol,
                 "base_addr": address,
                 "pair_addr": "",
-                "score_init": "1",
-                "liq_init": str(parse_float(t.get("liquidity", 0), 0.0)),
-                "vol24_init": str(parse_float(t.get("volume", 0), 0.0)),
+                "score_init": str(normalized.get("score", 1)),
+                "liq_init": str(normalized.get("liquidity", 0.0)),
+                "vol24_init": str(normalized.get("volume", 0.0)),
                 "vol5_init": "0",
                 "active": "1",
                 "entry_status": "WATCH",
-                "signal": "watch",
+                "signal": str(normalized.get("status", "watch")),
                 "ts_last_seen": ts_now,
             }
         )
@@ -3993,6 +4010,13 @@ def persist_scanner_result(scanner_rows: List[Dict[str, Any]]) -> Dict[str, int]
     inserted = 0
     updated = 0
     for row in scanner_rows:
+        if "base_symbol" not in row and "symbol" in row:
+            row["base_symbol"] = row.get("symbol", "NA")
+        if "base_addr" not in row and "address" in row:
+            row["base_addr"] = row.get("address", "")
+        if "entry_status" not in row and "status" in row:
+            row["entry_status"] = row.get("status", "WATCH")
+
         chain = str(row.get("chain") or "").strip().lower()
         base_addr = str(row.get("base_addr") or "").strip()
         if not chain or not base_addr:
@@ -4427,6 +4451,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         for k in MON_FIELDS:
             if k not in row:
                 row[k] = ""
+        if "symbol" not in row:
+            row["symbol"] = row.get("base_symbol", "NA")
+        if "address" not in row:
+            row["address"] = row.get("base_addr", "")
+        if "price" not in row:
+            row["price"] = ""
+        if "status" not in row:
+            row["status"] = row.get("entry_status", "watch")
         rows.append(row)
 
     active_rows = [
@@ -4761,15 +4793,25 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         st.info("Archive/revisit changes applied. Refreshing list…")
         request_rerun()
 
+    def _row_dict(item: Any) -> Dict[str, Any]:
+        if isinstance(item, (list, tuple)) and len(item) >= 4 and isinstance(item[3], dict):
+            return item[3]
+        return {}
+
+    def _stage(item: Any) -> str:
+        if isinstance(item, (list, tuple)) and len(item) >= 1:
+            return str(item[0] or "")
+        return ""
+
     enriched.sort(
         key=lambda x: (
-            -float(parse_float((x[3] or {}).get("priority_score", 0), 0.0)),
-            -float(parse_float((x[3] or {}).get("last_score", 0), 0.0)),
-            (x[3] or {}).get("ts_added", ""),
+            -float(parse_float(_row_dict(x).get("priority_score", 0), 0.0)),
+            -float(parse_float(_row_dict(x).get("last_score", 0), 0.0)),
+            _row_dict(x).get("ts_added", ""),
         )
     )
-    signals = [x for x in enriched if x[0] == "SIGNAL"]
-    watchlist = [x for x in enriched if x[0] != "SIGNAL"]
+    signals = [x for x in enriched if _stage(x) == "SIGNAL"]
+    watchlist = [x for x in enriched if _stage(x) != "SIGNAL"]
 
     def render_items(title: str, items: List[tuple]):
         st.subheader(title)
@@ -4807,12 +4849,17 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 return "#fef2f2"
             return "#ffffff"
 
+        def _safe_get_item(x: Any, idx: int, default: Any = None) -> Any:
+            if isinstance(x, (list, tuple)) and len(x) > idx:
+                return x[idx]
+            return default
+
         items = sorted(
             items,
             key=lambda x: (
-                str((x[35] or {}).get("status", "NO_ENTRY")).upper() != "READY",
-                float((x[29] or {}).get("risk_score", 3) or 3),
-                -float(x[5] or 0.0),
+                str((_safe_get_item(x, 34, {}) or {}).get("status", "NO_ENTRY")).upper() != "READY",
+                float((_safe_get_item(x, 29, {}) or {}).get("risk_score", 3) or 3),
+                -float(_safe_get_item(x, 5, 0.0) or 0.0),
             )
         )
 
@@ -4831,87 +4878,98 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             with header_cols[4]:
                 st.caption("RISK")
 
-        for stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug, entry_state in items:
-            exit_signal = exit_before_dump_detector(best, hist, 0.0)
-            exit_signal = apply_liquidity_exit_override(exit_signal, liq_health)
+        for item in items:
+            try:
+                if not isinstance(item, (list, tuple)) or len(item) < 35:
+                    st.write("Render error: malformed monitoring tuple")
+                    st.write(item)
+                    continue
+                stage, pr, idx, r, best, s_live, decision, timing, tags, hist, live, d_score, d_liq, d_v24, d_v5, stars, second_wave, trap, migration_label, migration_score, sniper_flag, pump_score, trap_signal, trap_level, fresh, dev, whale, signal, smart_money, size_info, corr, final_status, liq_health, anti_rug, entry_state = item
 
-            if anti_rug["level"] == "CRITICAL":
-                flags = list(exit_signal.get("exit_flags", []) or [])
-                for f in anti_rug.get("flags", []):
-                    if f not in flags:
-                        flags.append(f)
-                exit_signal.update({
-                    "exit_level": "EXIT",
-                    "exit_score": max(int(exit_signal.get("exit_score", 0)), 4),
-                    "exit_flags": flags,
-                    "suggested_action": "EXIT_100",
-                })
-            elif anti_rug["level"] == "WARNING" and str(exit_signal.get("exit_level", "WATCH")).upper() == "WATCH":
-                flags = list(exit_signal.get("exit_flags", []) or [])
-                for f in anti_rug.get("flags", []):
-                    if f not in flags:
-                        flags.append(f)
-                exit_signal.update({
-                    "exit_level": "EARLY",
-                    "exit_score": max(int(exit_signal.get("exit_score", 0)), 2),
-                    "exit_flags": flags,
-                    "suggested_action": "REDUCE_50",
-                })
-            persistence = exit_persistence_state(hist, min_points=3)
-            if liq_health["action"] in ("EXIT_NOW", "EXIT"):
-                persistence = {**persistence, "persistent_exit": True}
-            level = str(exit_signal.get("exit_level", "WATCH"))
-            action_plan = action_from_exit_signal(exit_signal, persistence)
-            if bool(auto_cfg.get("hide_red", False)) and signal == "RED":
+                exit_signal = exit_before_dump_detector(best, hist, 0.0)
+                exit_signal = apply_liquidity_exit_override(exit_signal, liq_health)
+
+                if anti_rug["level"] == "CRITICAL":
+                    flags = list(exit_signal.get("exit_flags", []) or [])
+                    for f in anti_rug.get("flags", []):
+                        if f not in flags:
+                            flags.append(f)
+                    exit_signal.update({
+                        "exit_level": "EXIT",
+                        "exit_score": max(int(exit_signal.get("exit_score", 0)), 4),
+                        "exit_flags": flags,
+                        "suggested_action": "EXIT_100",
+                    })
+                elif anti_rug["level"] == "WARNING" and str(exit_signal.get("exit_level", "WATCH")).upper() == "WATCH":
+                    flags = list(exit_signal.get("exit_flags", []) or [])
+                    for f in anti_rug.get("flags", []):
+                        if f not in flags:
+                            flags.append(f)
+                    exit_signal.update({
+                        "exit_level": "EARLY",
+                        "exit_score": max(int(exit_signal.get("exit_score", 0)), 2),
+                        "exit_flags": flags,
+                        "suggested_action": "REDUCE_50",
+                    })
+                persistence = exit_persistence_state(hist, min_points=3)
+                if liq_health["action"] in ("EXIT_NOW", "EXIT"):
+                    persistence = {**persistence, "persistent_exit": True}
+                level = str(exit_signal.get("exit_level", "WATCH"))
+                action_plan = action_from_exit_signal(exit_signal, persistence)
+                if bool(auto_cfg.get("hide_red", False)) and signal == "RED":
+                    continue
+                rendered_count += 1
+
+                chain = (r.get("chain") or "").strip().lower()
+                base_sym = r.get("base_symbol") or r.get("symbol") or "NA"
+                base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
+                row_state = str(entry_state.get("status", "NO_ENTRY")).upper()
+                risk_score_value = float(size_info.get("risk_score", 3) or 3)
+                row_background = row_bg(row_state, risk_score_value)
+                list_container.markdown(
+                    f"<div style='background:{row_background};padding:6px 8px;border-radius:8px'>",
+                    unsafe_allow_html=True,
+                )
+                cols = list_container.columns([2, 1.2, 1.2, 1.2, 1.2])
+                with cols[0]:
+                    st.markdown(f"**{base_sym}**")
+                    if live["price"]:
+                        st.caption(f"${live['price']:.6f}")
+                    else:
+                        st.caption("n/a")
+                with cols[1]:
+                    sig_color = signal_color(row_state, smart_money)
+                    st.markdown(
+                        f"<span style='color:{sig_color};font-weight:600'>{row_state}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    tag_items: List[str] = []
+                    if smart_money:
+                        tag_items.append(smart_money)
+                    rug_flags = anti_rug.get("flags", []) or []
+                    if rug_flags:
+                        tag_items.append("RISK")
+                    if "DEV_DUMP" in tags:
+                        tag_items.append("DEV")
+                    if tag_items:
+                        st.caption(" • ".join(tag_items[:3]))
+                with cols[2]:
+                    action = action_label(row_state, decision)
+                    st.markdown(f"**{action}**")
+                with cols[3]:
+                    adjusted_usd_size = float(size_info.get("usd_size_adj", 0) or 0)
+                    st.markdown(f"${int(adjusted_usd_size)}")
+                with cols[4]:
+                    r_color = risk_color(risk_score_value)
+                    st.markdown(
+                        f"<span style='color:{r_color}'>R{int(risk_score_value)}</span>",
+                        unsafe_allow_html=True,
+                    )
+                list_container.markdown("</div>", unsafe_allow_html=True)
+            except Exception as e:
+                st.write("Render error:", e)
+                st.write(item)
                 continue
-            rendered_count += 1
-
-            chain = (r.get("chain") or "").strip().lower()
-            base_sym = r.get("base_symbol") or r.get("symbol") or "NA"
-            base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
-            row_state = str(entry_state.get("status", "NO_ENTRY")).upper()
-            risk_score_value = float(size_info.get("risk_score", 3) or 3)
-            row_background = row_bg(row_state, risk_score_value)
-            list_container.markdown(
-                f"<div style='background:{row_background};padding:6px 8px;border-radius:8px'>",
-                unsafe_allow_html=True,
-            )
-            cols = list_container.columns([2, 1.2, 1.2, 1.2, 1.2])
-            with cols[0]:
-                st.markdown(f"**{base_sym}**")
-                if live["price"]:
-                    st.caption(f"${live['price']:.6f}")
-                else:
-                    st.caption("n/a")
-            with cols[1]:
-                sig_color = signal_color(row_state, smart_money)
-                st.markdown(
-                    f"<span style='color:{sig_color};font-weight:600'>{row_state}</span>",
-                    unsafe_allow_html=True,
-                )
-                tag_items: List[str] = []
-                if smart_money:
-                    tag_items.append(smart_money)
-                rug_flags = anti_rug.get("flags", []) or []
-                if rug_flags:
-                    tag_items.append("RISK")
-                if "DEV_DUMP" in tags:
-                    tag_items.append("DEV")
-                if tag_items:
-                    st.caption(" • ".join(tag_items[:3]))
-            with cols[2]:
-                action = action_label(row_state, decision)
-                st.markdown(f"**{action}**")
-            with cols[3]:
-                adjusted_usd_size = float(size_info.get("usd_size_adj", 0) or 0)
-                st.markdown(f"${int(adjusted_usd_size)}")
-            with cols[4]:
-                r_color = risk_color(risk_score_value)
-                st.markdown(
-                    f"<span style='color:{r_color}'>R{int(risk_score_value)}</span>",
-                    unsafe_allow_html=True,
-                )
-            list_container.markdown("</div>", unsafe_allow_html=True)
 
             with list_container.expander(f"Details · {base_sym}", expanded=False):
                 c1, c2, c3 = st.columns([2, 2, 2])
