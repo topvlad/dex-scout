@@ -66,8 +66,10 @@ def maybe_safe_auto_refresh(enabled: bool, interval_sec: int = 60) -> None:
     if not enabled:
         return
 
+    interval_sec = max(20, int(interval_sec))
+    _maybe_autorefresh(interval_ms=interval_sec * 1000, key="dex_scout_autorefresh")
+
     now = time.time()
-    interval_sec = max(60, int(interval_sec))
     last_refresh = st.session_state.get("last_refresh_ts")
     if last_refresh is None:
         st.session_state["last_refresh_ts"] = now
@@ -4363,16 +4365,61 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if before != after:
             rows_dirty = True
 
-    active_set = active_portfolio_addresses()
+    def enrich_fallback(row: Dict[str, Any]) -> Dict[str, Any]:
+        score = parse_float(row.get("live_score"), parse_float(row.get("last_score"), 0.0))
+        if not row.get("entry_status") or str(row.get("entry_status")) == "NA":
+            if score > 300:
+                row["entry_status"] = "NO ENTRY"
+            elif score > 200:
+                row["entry_status"] = "WAIT"
+            else:
+                row["entry_status"] = "ENTRY"
+        if not row.get("risk_level"):
+            if score > 300:
+                row["risk_level"] = "HIGH"
+            elif score > 200:
+                row["risk_level"] = "MED"
+            else:
+                row["risk_level"] = "LOW"
+        if not row.get("size_label"):
+            row["size_label"] = {"LOW": "FULL", "MED": "HALF", "HIGH": "SMALL"}.get(str(row.get("risk_level", "")), "NA")
+        if not row.get("anti_rug"):
+            row["anti_rug"] = "UNKNOWN"
+        return row
+
+    live_recheck: Dict[str, Dict[str, Any]] = {}
+    enriched_rows: List[Dict[str, Any]] = []
+    for r in active:
+        chain = (r.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
+        if not chain or not base_addr:
+            continue
+        rk = addr_key(chain, base_addr)
+        recheck = recheck_token(chain, base_addr, hist_limit=int(auto_cfg.get("stability_window_n", 30)))
+        live_recheck[rk] = recheck
+        r["live_score"] = parse_float(recheck.get("score"), 0.0)
+        r["entry_status"] = recheck.get("decision", "NA")
+        r["entry_timing"] = safe_get(recheck.get("timing", {}), "timing", default="NA")
+        enriched_rows.append(enrich_fallback(r))
+
+    active = sorted(
+        enriched_rows,
+        key=lambda row: parse_float(row.get("live_score"), parse_float(row.get("last_score"), 0.0)),
+        reverse=True,
+    )
 
     enriched = []
     for idx, r in enumerate(active, start=1):
         chain = (r.get("chain") or "").strip().lower()
         base_sym = r.get("base_symbol") or "???"
         base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
-        if addr_key(chain, base_addr) in active_set:
-            continue
-        recheck = recheck_token(chain, base_addr, hist_limit=int(auto_cfg.get("stability_window_n", 30))) if (chain and base_addr) else {"best": None, "hist": [], "decision": "NO DATA", "timing": {"timing": "SKIP"}, "score": 0.0}
+        rk = addr_key(chain, base_addr)
+        # Temporarily disabled: keep showing all monitoring tokens even if they are already in portfolio.
+        # if rk in active_set:
+        #     continue
+        recheck = live_recheck.get(rk) if (chain and base_addr) else None
+        if recheck is None:
+            recheck = recheck_token(chain, base_addr, hist_limit=int(auto_cfg.get("stability_window_n", 30))) if (chain and base_addr) else {"best": None, "hist": [], "decision": "NO DATA", "timing": {"timing": "SKIP"}, "score": 0.0}
         best = recheck["best"]
         hist = recheck["hist"]
         decision = recheck["decision"]
@@ -4704,7 +4751,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 persistence = {**persistence, "persistent_exit": True}
             level = str(exit_signal.get("exit_level", "WATCH"))
             action_plan = action_from_exit_signal(exit_signal, persistence)
-            if bool(auto_cfg.get("hide_red", True)) and signal == "RED":
+            if bool(auto_cfg.get("hide_red", False)) and signal == "RED":
                 continue
             rendered_count += 1
 
@@ -5670,7 +5717,7 @@ def main():
         st.caption("Scanner")
         scanner_max_items = st.slider("Max tokens per slot", 10, 100, 100, step=10)
         auto_refresh_enabled = st.checkbox("Auto refresh", value=False)
-        ui_autorefresh_sec = st.slider("Auto-refresh interval (sec)", 60, 300, 60, step=30, disabled=(not auto_refresh_enabled))
+        ui_autorefresh_sec = st.slider("Auto-refresh interval (sec)", 20, 300, 20, step=10, disabled=(not auto_refresh_enabled))
         use_birdeye_trending = st.checkbox("Use Solana extra stream (Birdeye)", value=True, disabled=(not BIRDEYE_ENABLED))
         if not BIRDEYE_ENABLED:
             st.caption("Birdeye key missing: add BIRDEYE_API_KEY to secrets to enable extra Solana stream.")
@@ -5685,7 +5732,7 @@ def main():
         auto_revisit_enabled = st.checkbox("Auto-revisit auto-archived", value=True)
         auto_revisit_days = st.slider("Auto-revisit after (days)", 1, 30, 7, step=1)
         stability_window_n = st.slider("Stability window (snapshots)", 10, 120, 30, step=5)
-        hide_red = st.checkbox("Hide red signals", value=True)
+        hide_red = st.checkbox("Hide red signals", value=False)
         portfolio_value_usd = st.number_input(
             "Portfolio size (USD)",
             min_value=100.0,
