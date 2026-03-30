@@ -3646,7 +3646,8 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
             volume = parse_float(t.get("volume", 0), 0.0)
             liquidity = parse_float(t.get("liquidity", 0), 0.0)
             if not address:
-                continue
+                # continue
+                address = "0x0"
             tokens.append(
                 {
                     "chainId": "solana",
@@ -3673,6 +3674,10 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
             pass
     else:
         tokens = []
+
+    if not tokens:
+        st.write("NO TOKENS – FORCE FALLBACK")
+        tokens = [{"symbol": "FORCE", "address": "0x0"}]
 
     st.write("CHAIN:", chain)
     st.write("TOKENS:", len(tokens))
@@ -3731,6 +3736,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         row = normalize_pair_row(p)
         entry_status = str(row.get("entry_status", "NO_ENTRY") or "NO_ENTRY")
         entry_score = parse_float(row.get("entry_score", 0), 0.0)
+        decision = "watch"
         row["smart_money"] = smart
         row["signal"] = signal
         # Debug mode: disable red/no-entry/gate filtering
@@ -3753,7 +3759,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
 
             # Debug mode – add all
             pass
-            st.write("ADDING TOKEN:", row.get("base_symbol", ""), safe_get(row, "baseToken", "address", default=""))
+            st.write("ADDING:", row.get("base_symbol", ""), safe_get(row, "baseToken", "address", default=""))
             res = add_to_monitoring(
                 row,
                 float(s),
@@ -3779,8 +3785,9 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 "pc1h": str(parse_float(safe_get(row, "priceChange", "h1", default=0), 0.0)),
                 "pc5": str(parse_float(safe_get(row, "priceChange", "m5", default=0), 0.0)),
                 "score_live": str(float(s)),
-                "decision": "SCOUT_SCAN",
+                "decision": decision,
             })
+            st.write("WRITE DONE")
 
             if res == "OK":
                 counts["added"] += 1
@@ -3894,12 +3901,8 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
     chain = st.session_state.get("chain", chain)
     last_slot = int(state.get("last_slot", -1) or -1)
 
-    # distributed lock (prevents multi-tab race)
-    if not scanner_acquire_lock(slot):
-        return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {})}
-    
-    if last_slot == slot:
-        return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {})}
+    # DEBUG: always run scanner
+    pass
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     except Exception as e:
@@ -3919,6 +3922,9 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
 def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
     window_name, preset_key, chain, slot = current_scan_slot()
     chain = st.session_state.get("chain", chain)
+    st.write("SCANNER STARTED")
+    tokens = fetch_tokens_unified(50)
+    st.write("TOKENS FETCHED:", len(tokens))
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     except Exception as e:
@@ -4375,12 +4381,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     cbtn1, cbtn2, cbtn3 = st.columns([2,2,6])
     with cbtn1:
         if st.button("Run scanner now", use_container_width=True, key="run_scanner_now"):
+            st.session_state["force_run"] = True
+        force_run = st.session_state.get("force_run", False)
+        if force_run:
             res = run_scanner_now(
                 seeds_raw=str(auto_cfg.get("scanner_seeds_raw", DEFAULT_SEEDS)),
                 max_items=int(auto_cfg.get("scanner_max_items", 100)),
                 use_birdeye_trending=bool(auto_cfg.get("use_birdeye_trending", True)),
                 birdeye_limit=int(auto_cfg.get("birdeye_limit", 50)),
             )
+            st.session_state["force_run"] = False
             st.success(f"Scanner ran: {res['window']} / {res['chain']} / {res['stats']}")
             request_rerun()
     with cbtn2:
@@ -5834,7 +5844,11 @@ def main():
 
         st.divider()
         if st.button("Run scanner now", use_container_width=True):
+            st.session_state["force_run"] = True
+        force_run = st.session_state.get("force_run", False)
+        if force_run:
             res = run_scanner_now(scanner_seeds_raw, max_items=int(scanner_max_items), use_birdeye_trending=bool(use_birdeye_trending), birdeye_limit=int(birdeye_limit))
+            st.session_state["force_run"] = False
             st.session_state["_scan_feedback"] = f"Scanner ran: {res['window']} / {res['chain']} / {res['stats']}"
             request_rerun()
 
