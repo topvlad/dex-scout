@@ -5059,7 +5059,48 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         st.warning("Monitoring empty (UI layer)")
         if rows:
             debug_keys = st.checkbox("DEBUG KEYS", key="dbg_keys_compact_cards")
+            debug_pipeline = st.checkbox("DEBUG PIPELINE", key="dbg_pipeline_compact_cards")
             st.caption("Fallback: compact actionable cards")
+            new_active_rows: List[Dict[str, Any]] = []
+            for r in active_rows:
+                row = dict(r)
+                chain = (row.get("chain") or "").strip().lower()
+                base_addr = (row.get("base_addr") or row.get("address") or row.get("mint") or "").strip()
+
+                if debug_pipeline:
+                    st.write("DEBUG RECHECK:", chain, base_addr)
+
+                try:
+                    recheck = (
+                        recheck_token(chain, base_addr, hist_limit=int(auto_cfg.get("stability_window_n", 30)))
+                        if (chain and base_addr)
+                        else {"score": row.get("last_score", 0), "decision": "NO DATA", "timing": {"timing": "NA"}}
+                    )
+                    row["live_score"] = recheck.get("score", row.get("last_score", 0))
+                    row["entry_status"] = recheck.get("decision", row.get("entry_status", "NA"))
+                    row["entry_timing"] = (recheck.get("timing") or {}).get("timing", row.get("entry_timing", "NA"))
+                except Exception:
+                    row["live_score"] = row.get("last_score", 0)
+                    row["entry_status"] = row.get("entry_status", "NA")
+                    row["entry_timing"] = row.get("entry_timing", "NA")
+
+                new_active_rows.append(row)
+
+            active_rows = new_active_rows
+            if debug_pipeline:
+                st.write("==== DEBUG PIPELINE ====")
+                st.write("DEBUG ACTIVE COUNT:", len(active_rows))
+                st.write(active_rows[:1])
+                for row in active_rows[:3]:
+                    st.write(
+                        {
+                            "symbol": row.get("base_symbol"),
+                            "score": row.get("last_score"),
+                            "live_score": row.get("live_score"),
+                            "entry": row.get("entry_status"),
+                        }
+                    )
+
             for r in active_rows:
                 if debug_keys:
                     st.write(r.keys())
