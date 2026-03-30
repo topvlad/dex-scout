@@ -3550,7 +3550,7 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
     return (f"{entry:.0f}", f"{tp:.0f}")
 
 def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any], seeds_raw: str, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> List[Dict[str, Any]]:
-    chain = "solana"
+    chain = st.session_state.get("chain", "solana")
     cache_key = safe_json({
         "chain": chain,
         "window_name": window_name,
@@ -3572,42 +3572,39 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
 
     sampled = sample_seeds(seeds, int(preset.get("seed_k", 12)), refresh=False)
     all_pairs: List[Dict[str, Any]] = []
-    for q in sampled:
-        # Ultra early pairs
+    tokens: List[Dict[str, Any]] = []
+
+    if chain == "solana":
+        mints = birdeye_trending_solana(limit=int(birdeye_limit))
+        for mint in mints:
+            try:
+                pools = fetch_token_pairs("solana", mint)
+                if pools:
+                    tokens.extend(pools)
+            except Exception:
+                continue
+    elif chain == "bsc":
         try:
-            latest = fetch_dexscreener_latest(chain, limit=40)
-            if latest:
-                all_pairs.extend(latest)
+            tokens.extend(fetch_dexscreener_latest(chain, limit=40))
         except Exception:
             pass
+        try:
+            tokens.extend(fetch_dexscreener_trending(chain, limit=40))
+        except Exception:
+            pass
+    else:
+        tokens = []
+
+    st.write("CHAIN:", chain)
+    st.write("TOKENS:", len(tokens))
+    all_pairs.extend(tokens)
+
+    for q in sampled:
         if len(q.strip()) < 2:
             continue
         try:
             all_pairs.extend(fetch_latest_pairs_for_query(q))
             time.sleep(0.06)
-        except Exception:
-            continue
-        # Dexscreener trending pairs
-        try:
-            trending = fetch_dexscreener_trending(chain, limit=40)
-            if trending:
-                all_pairs.extend(trending)
-        except Exception:
-            pass
-            
-    # Debug: always try Birdeye stream
-    mints = birdeye_trending_solana(limit=int(birdeye_limit))
-    st.write("TOKENS FROM API:", len(mints))
-    try:
-        r = requests.get("https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc", timeout=15)
-        st.write("BIRDEYE STATUS:", r.status_code)
-    except Exception as e:
-        st.write("BIRDEYE STATUS:", f"error: {e}")
-    for mint in mints:
-        try:
-            pools = fetch_token_pairs("solana", mint)
-            if pools:
-                all_pairs.extend(pools)
         except Exception:
             continue
 
@@ -3635,7 +3632,7 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     return out
 
 def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, int]:
-    chain = "solana"
+    chain = st.session_state.get("chain", "solana")
     preset = PRESETS.get(window_name, {})
     counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
@@ -3815,6 +3812,7 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
     if not isinstance(state, dict):
         state = {}
     window_name, preset_key, chain, slot = current_scan_slot()
+    chain = st.session_state.get("chain", chain)
     last_slot = int(state.get("last_slot", -1) or -1)
 
     # distributed lock (prevents multi-tab race)
@@ -3841,6 +3839,7 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
 
 def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
     window_name, preset_key, chain, slot = current_scan_slot()
+    chain = st.session_state.get("chain", chain)
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     except Exception as e:
@@ -5701,6 +5700,13 @@ def main():
     with st.sidebar:
         st.markdown("### DEX Scout")
         st.caption(f"Version: v{VERSION}")
+        chain = st.selectbox(
+            "Chain",
+            ["solana", "bsc"],
+            index=0,
+            key="chain_select",
+        )
+        st.session_state["chain"] = chain
 
         if "page" not in st.session_state:
             st.session_state["page"] = "Monitoring"
