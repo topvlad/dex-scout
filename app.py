@@ -653,7 +653,8 @@ PRESETS = {
     },
 }
 
-MONITORING_MIN_VIABILITY_SCORE = 120.0
+MONITORING_SORT_PENALTY_FLOOR = 120.0
+MONITORING_REVIEW_THRESHOLD = 80.0
 
 
 # =============================
@@ -3641,6 +3642,10 @@ SCAN_ROTATION = [
     ("Balanced (default)", "balanced", "solana"),
     ("Wide Net (explore)", "wide", "solana"),
     ("Momentum (hot)", "momentum", "solana"),
+    ("Ultra Early (safer)", "ultra", "bsc"),
+    ("Balanced (default)", "balanced", "bsc"),
+    ("Wide Net (explore)", "wide", "bsc"),
+    ("Momentum (hot)", "momentum", "bsc"),
 ]
 
 def _safe_dt_parse(s: str) -> Optional[datetime]:
@@ -3670,7 +3675,7 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
     return (f"{entry:.0f}", f"{tp:.0f}")
 
 def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any], seeds_raw: str, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> List[Dict[str, Any]]:
-    chain = st.session_state.get("chain", "solana")
+    chain = (chain or "solana").strip().lower()
     cache_key = safe_json({
         "chain": chain,
         "window_name": window_name,
@@ -3754,8 +3759,23 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     )
     pairs = dedupe_mode(pairs, by_base_token=bool(preset.get("dedupe_by_base", True)))
 
-    # Debug: disable filters
-    filtered = pairs
+    filtered, _fstats, _freasons = filter_pairs_with_debug(
+        pairs=pairs,
+        chain=chain,
+        any_dex=True,
+        allowed_dexes=set(),
+        min_liq=float(preset.get("min_liq", 0)),
+        min_vol24=float(preset.get("min_vol24", 0)),
+        min_trades_m5=int(preset.get("min_trades_m5", 0)),
+        min_sells_m5=int(preset.get("min_sells_m5", 0)),
+        max_buy_sell_imbalance=int(preset.get("max_imbalance", 9999)),
+        block_suspicious_names=bool(preset.get("block_suspicious_names", False)),
+        block_majors=bool(preset.get("block_majors", True)),
+        min_age_min=int(preset.get("min_age_min", 0)),
+        max_age_min=int(preset.get("max_age_min", 86400)),
+        enforce_age=bool(preset.get("enforce_age", True)),
+        hide_solana_unverified=bool(preset.get("hide_solana_unverified", True)),
+    )
 
     out = []
     for p in filtered:
@@ -3763,14 +3783,13 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         if not base_addr:
             continue
         row = normalize_pair_row(p)
-        # Debug: keep all rows (no entry filter)
         out.append(row)
 
     SCAN_CACHE[cache_key] = {"ts": now_ts, "pairs": out}
     return out
 
 def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, int]:
-    chain = st.session_state.get("chain", "solana")
+    chain = (chain or "solana").strip().lower()
     preset = PRESETS.get(window_name, {})
     counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
@@ -3793,7 +3812,10 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         decision = "watch"
         row["smart_money"] = smart
         row["signal"] = signal
-        # Debug mode: disable red/no-entry/gate filtering
+        gate_ok, gate_reason = passes_monitoring_gate(row, float(s))
+        if not gate_ok:
+            counts["skipped_noise"] += 1
+            continue
 
         if smart:
             chain = (row.get("chainId") or "").lower()
@@ -3803,17 +3825,11 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 "last_seen": now_utc_str(),
                 "symbol": row.get("base_symbol", "")
             }
-        # Debug mode: disable priority filter
-
         try:
             contract = addr_store(row.get("chainId", ""), safe_get(row, "baseToken", "address", default=""))
             if token_exists(contract):
                 counts["skipped_active"] += 1
                 continue
-
-            # Debug mode – add all
-            pass
-            st.write("ADDING:", row.get("base_symbol", ""), safe_get(row, "baseToken", "address", default=""))
             res = add_to_monitoring(
                 row,
                 float(s),
@@ -3839,7 +3855,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 "pc1h": str(parse_float(safe_get(row, "priceChange", "h1", default=0), 0.0)),
                 "pc5": str(parse_float(safe_get(row, "priceChange", "m5", default=0), 0.0)),
                 "score_live": str(float(s)),
-                "decision": decision,
+                "decision": gate_reason if decision == "watch" else decision,
             })
 
             if res == "OK":
@@ -3973,11 +3989,17 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
     if not isinstance(state, dict):
         state = {}
     window_name, preset_key, chain, slot = current_scan_slot()
-    chain = st.session_state.get("chain", chain)
     last_slot = int(state.get("last_slot", -1) or -1)
 
-    # DEBUG: always run scanner
-    pass
+    if last_slot == slot:
+        return {
+            "ran": False,
+            "slot": slot,
+            "window": state.get("last_window", window_name),
+            "chain": state.get("last_chain", chain),
+            "stats": state.get("last_stats", {}),
+        }
+
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     except Exception as e:
@@ -3996,7 +4018,6 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
 
 def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
     window_name, preset_key, chain, slot = current_scan_slot()
-    chain = st.session_state.get("chain", chain)
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     except Exception as e:
@@ -4328,6 +4349,8 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
             "row": row,
             "best": best,
             "hist": hist,
+            "raw_live_score": 0.0,
+            "adjusted_live_score": 0.0,
             "live_score": 0.0,
             "decision": "DEAD",
             "tags": [],
@@ -4347,7 +4370,8 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         item["row"] = hydrate_monitoring_row_defaults(row, item)
         return item
 
-    live_score = score_pair(best) if best else parse_float(row.get("last_score"), 0.0)
+    raw_live_score = score_pair(best) if best else parse_float(row.get("last_score"), 0.0)
+    adjusted_live_score = raw_live_score
     decision, tags = build_trade_hint(best) if best else (str(row.get("last_decision") or "NO DATA"), [])
     timing = entry_timing_signal(best, hist)
     liq_health = liquidity_health(best)
@@ -4365,7 +4389,9 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "row": row,
         "best": best,
         "hist": hist,
-        "live_score": live_score,
+        "raw_live_score": raw_live_score,
+        "adjusted_live_score": adjusted_live_score,
+        "live_score": adjusted_live_score,
         "decision": decision,
         "tags": tags,
         "timing": timing,
@@ -4383,16 +4409,84 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     item["is_alive"] = alive
 
     if post_rug:
-        item["live_score"] = round(float(item["live_score"]) * 0.1, 2)
+        item["adjusted_live_score"] = round(float(item["adjusted_live_score"]) * 0.1, 2)
+        item["live_score"] = item["adjusted_live_score"]
         item["decision"] = "POST-RUG"
         item["risk_level"] = "EXTREME"
     elif not alive:
-        item["live_score"] = round(float(item["live_score"]) * 0.3, 2)
+        item["adjusted_live_score"] = round(float(item["adjusted_live_score"]) * 0.3, 2)
+        item["live_score"] = item["adjusted_live_score"]
         item["decision"] = "DYING"
         item["risk_level"] = "HIGH"
 
     item["row"] = hydrate_monitoring_row_defaults(row, item)
     return item
+
+
+def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
+    decision = str(item.get("decision", "") or "").upper()
+    timing = str((item.get("timing") or {}).get("timing", "") or "").upper()
+    anti_level = str((item.get("anti_rug") or {}).get("level", "") or "").upper()
+    liq_level = str((item.get("liq_health") or {}).get("level", "") or "").upper()
+    is_alive = bool(item.get("is_alive", False))
+    is_dead = bool(item.get("is_dead", False))
+    is_post_rug = bool(item.get("is_post_rug", False))
+
+    penalty = 0.0
+    flags: List[str] = []
+
+    if decision in ("NO ENTRY", "NO_ENTRY"):
+        penalty += 35.0
+        flags.append("no_entry")
+    if timing == "SKIP":
+        penalty += 25.0
+        flags.append("timing_skip")
+    if anti_level == "WARNING":
+        penalty += 30.0
+        flags.append("anti_rug_warning")
+    elif anti_level == "CRITICAL":
+        penalty += 80.0
+        flags.append("anti_rug_critical")
+    if liq_level == "WEAK":
+        penalty += 20.0
+        flags.append("liq_weak")
+    elif liq_level == "CRITICAL":
+        penalty += 60.0
+        flags.append("liq_critical")
+    if not is_alive:
+        penalty += 40.0
+        flags.append("not_alive")
+    if is_post_rug:
+        penalty += 120.0
+        flags.append("post_rug")
+
+    live_score = float(item.get("live_score", 0.0) or 0.0)
+    visible_score = max(0.0, round(live_score - penalty, 2))
+
+    if is_dead:
+        bucket = "dead"
+        badge = "DEAD"
+    elif is_post_rug or anti_level == "CRITICAL" or liq_level == "CRITICAL":
+        bucket = "review"
+        badge = "REVIEW"
+    elif flags or visible_score < MONITORING_REVIEW_THRESHOLD:
+        bucket = "caution"
+        badge = "CAUTION"
+    else:
+        bucket = "tradable"
+        badge = "TRADEABLE"
+
+    if visible_score < MONITORING_SORT_PENALTY_FLOOR and bucket == "tradable":
+        bucket = "caution"
+        badge = "CAUTION"
+
+    return {
+        "bucket": bucket,
+        "visible_score": visible_score,
+        "penalty": penalty,
+        "flags": flags,
+        "badge": badge,
+    }
 
 # =============================
 # Pages
@@ -4756,17 +4850,21 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     cbtn1, cbtn2, cbtn3 = st.columns([2,2,6])
     with cbtn1:
-        if st.button("Run scanner now", use_container_width=True, key="run_scanner_now"):
-            scanner_rows = run_scanner_once(limit=int(auto_cfg.get("scanner_max_items", 50)))
-            stats = persist_scanner_result(scanner_rows)
-            st.success(f"Scanner ran: {stats}")
+        if st.button("Run full scout ingestion", use_container_width=True, key="run_scanner_now"):
+            stats = run_scanner_now(
+                seeds_raw=str(auto_cfg.get("seeds_raw", "")),
+                max_items=int(auto_cfg.get("scanner_max_items", 50)),
+                use_birdeye_trending=bool(auto_cfg.get("use_birdeye_trending", True)),
+                birdeye_limit=int(auto_cfg.get("birdeye_limit", 50)),
+            )
+            st.success(f"Scanner ran: {stats.get('stats', {})}")
             load_monitoring_rows_cached.clear()
             request_rerun()
     with cbtn2:
         if st.button("Refresh live data", use_container_width=True):
             request_rerun()
     with cbtn3:
-        st.caption("Scanner is manual: one click runs one pass and saves results.")
+        st.caption("Scanner is manual: one click runs one full ingestion pass and saves results.")
 
     if not active_rows:
         st.info("Monitoring is empty. Run scanner now to fetch and save tokens.")
@@ -4779,62 +4877,47 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         active = list(active_rows)
 
     cards_raw = [monitoring_row_to_card(r) for r in active]
-
-    auto_archived = 0
-    for item in cards_raw:
-        if item.get("is_dead"):
-            row = item.get("row", {}) or {}
-            chain = (row.get("chain") or "").strip().lower()
-            base_addr = addr_store(chain, (row.get("base_addr") or "").strip())
-            if chain and base_addr:
-                archived = archive_monitoring(
-                    chain,
-                    base_addr,
-                    reason="auto: DEAD",
-                    last_score=float(item.get("live_score", 0.0) or 0.0),
-                    last_decision="DEAD",
-                    revisit_days=0,
-                )
-                if archived:
-                    auto_archived += 1
-    if auto_archived:
-        st.warning(f"Auto-archived dead tokens: {auto_archived}")
-        load_monitoring_rows_cached.clear()
-
-    cards = []
+    cards_all = []
     for c in cards_raw:
-        live_score = float(c.get("live_score", 0.0) or 0.0)
-        decision = str(c.get("decision", "") or "").upper()
-        timing_state = str((c.get("timing") or {}).get("timing", "") or "").upper()
+        ui = monitoring_ui_state(c)
+        c["ui_bucket"] = ui["bucket"]
+        c["ui_visible_score"] = float(ui["visible_score"])
+        c["ui_penalty"] = float(ui["penalty"])
+        c["ui_flags"] = list(ui["flags"])
+        c["ui_badge"] = ui["badge"]
+        cards_all.append(c)
 
-        if decision in ("DEAD", "POST-RUG", "NO ENTRY", "NO_ENTRY"):
-            continue
-        if timing_state == "SKIP":
-            continue
-        if live_score < MONITORING_MIN_VIABILITY_SCORE:
-            continue
+    signals_cards = [c for c in cards_all if c["ui_bucket"] in ("tradable", "caution")]
+    review_cards = [c for c in cards_all if c["ui_bucket"] == "review"]
+    dead_cards = [c for c in cards_all if c["ui_bucket"] == "dead"]
 
-        cards.append(c)
-    cards.sort(key=lambda x: float(x["live_score"]), reverse=True)
+    signals_cards.sort(key=lambda x: x.get("ui_visible_score", 0.0), reverse=True)
+    review_cards.sort(key=lambda x: x.get("ui_visible_score", 0.0), reverse=True)
+    dead_cards.sort(key=lambda x: x.get("ui_visible_score", 0.0), reverse=True)
 
     st.subheader("Signals / Watchlist")
-    if not cards:
-        st.info("Monitoring empty after filter.")
-        return
+    if not signals_cards:
+        st.info("No items in Signals / Watchlist yet.")
 
-    for item in cards:
+    for item in signals_cards:
         r = item["row"]
         best = item["best"]
-        hist = item["hist"]
         chain = (r.get("chain") or "").strip().lower()
         base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
         name = extract_name(r).upper()
-        score = round(float(item["live_score"]), 2)
+        score = round(float(item.get("ui_visible_score", 0.0)), 2)
         decision = item["decision"]
-        header = f"{name} | {decision} | {score}"
+        header = f"{name} | {item.get('ui_badge', 'NA')} | {decision} | {score}"
 
         with st.expander(header, expanded=False):
             st.caption(f"{chain.upper()} • {item['entry_status']} • risk {item['risk_level']}")
+            flags = item.get("ui_flags") or []
+            st.caption("UI flags: " + (" • ".join(flags) if flags else "none"))
+            st.caption(
+                f"Raw score: {float(item.get('raw_live_score', 0.0)):.2f} • "
+                f"Penalty: -{float(item.get('ui_penalty', 0.0)):.2f} • "
+                f"Visible: {float(item.get('ui_visible_score', 0.0)):.2f}"
+            )
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -4880,10 +4963,41 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             if item["entry_reasons"]:
                 st.info(" • ".join(item["entry_reasons"][:3]))
 
+            hist = item.get("hist", [])
             if hist:
                 price_series = [parse_float(h.get("price_usd"), 0.0) for h in hist if str(h.get("price_usd", "")).strip()]
                 if price_series:
                     st.line_chart(price_series, height=100, use_container_width=True)
+
+    st.subheader("Needs review")
+    if not review_cards:
+        st.caption("No review candidates.")
+    for item in review_cards:
+        r = item["row"]
+        chain = (r.get("chain") or "").strip().lower()
+        name = extract_name(r).upper()
+        decision = item["decision"]
+        score = round(float(item.get("ui_visible_score", 0.0)), 2)
+        with st.expander(f"{name} | {item.get('ui_badge', 'REVIEW')} | {decision} | {score}", expanded=False):
+            st.caption(f"{chain.upper()} • {item['entry_status']} • risk {item['risk_level']}")
+            flags = item.get("ui_flags") or []
+            st.caption("UI flags: " + (" • ".join(flags) if flags else "none"))
+            st.caption(
+                f"Raw score: {float(item.get('raw_live_score', 0.0)):.2f} • "
+                f"Penalty: -{float(item.get('ui_penalty', 0.0)):.2f} • "
+                f"Visible: {float(item.get('ui_visible_score', 0.0)):.2f}"
+            )
+
+    with st.expander("Auto-archived / Dead candidates", expanded=False):
+        if not dead_cards:
+            st.caption("No dead candidates.")
+        for item in dead_cards:
+            r = item["row"]
+            name = extract_name(r).upper()
+            chain = (r.get("chain") or "").strip().lower()
+            flags = item.get("ui_flags") or []
+            st.write(f"{name} ({chain}) • {item.get('decision', 'DEAD')}")
+            st.caption("Flags: " + (" • ".join(flags) if flags else "none"))
 
 def page_archive():
     st.title("Archive")
