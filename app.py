@@ -654,7 +654,8 @@ PRESETS = {
 }
 
 MONITORING_SORT_PENALTY_FLOOR = 120.0
-MONITORING_REVIEW_THRESHOLD = 80.0
+MONITORING_REVIEW_THRESHOLD = 120.0
+MONITORING_DEAD_THRESHOLD = 50.0
 
 
 # =============================
@@ -1858,42 +1859,93 @@ def classify_entry_status(
 
 
 def build_final_decision(
-    decision: str,
+    base_decision: str,
     entry_status: str,
     timing: Dict[str, Any],
     anti_rug: Dict[str, Any],
 ) -> str:
-    decision_u = str(decision or "").upper()
-    entry_status_u = str(entry_status or "").upper()
     timing_state = str((timing or {}).get("timing", "UNKNOWN") or "UNKNOWN").upper()
     anti_level = str((anti_rug or {}).get("level", "SAFE") or "SAFE").upper()
+    entry_status_u = str(entry_status or "UNKNOWN").upper()
+    base_decision_u = str(base_decision or "").upper()
 
-    if entry_status_u in ("NO_ENTRY", "NO ENTRY"):
-        return "NO ENTRY"
     if anti_level == "CRITICAL":
         return "NO ENTRY"
     if timing_state == "SKIP":
         return "NO ENTRY"
+    if entry_status_u in ("NO_ENTRY", "NO ENTRY"):
+        return "NO ENTRY"
 
     if timing_state == "NEUTRAL":
         return "WATCH / WAIT"
-    if anti_level == "WARNING" and decision_u.startswith("ENTRY"):
-        return "WATCH / WAIT"
-
-    if entry_status_u == "READY":
-        return "TRADEABLE"
     if entry_status_u == "WAIT":
         return "WATCH / WAIT"
-
-    if decision_u in ("NO DATA", "DEAD", "POST-RUG", "DYING"):
-        return decision_u
-    if decision_u.startswith("ENTRY"):
+    if entry_status_u in ("ENTER", "READY"):
         return "TRADEABLE"
-    if "WATCH" in decision_u:
+
+    if "ENTRY" in base_decision_u:
+        return "TRADEABLE"
+    if "WATCH" in base_decision_u:
         return "WATCH / WAIT"
-    if decision_u in ("NO ENTRY", "NO_ENTRY"):
-        return "NO ENTRY"
-    return "NO DATA"
+    return "NO ENTRY"
+
+
+def detect_breakout(item: Dict[str, Any]) -> bool:
+    pc5 = parse_float(item.get("pc5"), 0.0)
+    pc1h = parse_float(item.get("pc1h"), 0.0)
+    vol5 = parse_float(item.get("vol5_usd"), 0.0)
+    return pc5 > 6 and pc1h < 15 and vol5 > 10000
+
+
+def is_fake_pump(item: Dict[str, Any]) -> bool:
+    buys = int(parse_float(item.get("buys5"), 0))
+    sells = int(parse_float(item.get("sells5"), 0))
+    vol5 = parse_float(item.get("vol5_usd"), 0.0)
+    liq = parse_float(item.get("liq_usd"), 0.0)
+    if vol5 < 3000:
+        return True
+    if liq < 2000:
+        return True
+    if sells > buys * 1.5:
+        return True
+    return False
+
+
+def is_liquidity_trap(item: Dict[str, Any]) -> bool:
+    liq = parse_float(item.get("liq_usd"), 0.0)
+    vol5 = parse_float(item.get("vol5_usd"), 0.0)
+    return liq < 3000 and vol5 > 15000
+
+
+def rug_probability(item: Dict[str, Any]) -> int:
+    liq = parse_float(item.get("liq_usd"), 0.0)
+    pc1h = parse_float(item.get("pc1h"), 0.0)
+    buys = int(parse_float(item.get("buys5"), 0))
+    sells = int(parse_float(item.get("sells5"), 0))
+    score = 0
+    if liq < 2000:
+        score += 2
+    if sells > buys * 2 and buys > 0:
+        score += 1
+    if pc1h < -40:
+        score += 1
+    return score
+
+
+def entry_engine_v2(item: Dict[str, Any]) -> Tuple[str, str, str]:
+    if is_liquidity_trap(item):
+        return "NO_ENTRY", "LIQ_TRAP", "EXTREME"
+    if is_fake_pump(item):
+        return "NO_ENTRY", "FAKE_PUMP", "HIGH"
+    rug = rug_probability(item)
+    if rug >= 3:
+        return "NO_ENTRY", "RUG_RISK", "EXTREME"
+    if detect_breakout(item):
+        return "ENTER", "BREAKOUT", "MEDIUM"
+    vol5 = parse_float(item.get("vol5_usd"), 0.0)
+    if vol5 > 10000:
+        return "WATCH", "MOMENTUM", "MEDIUM"
+    return "WAIT", "NO_SIGNAL", "HIGH"
 
 
 def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
@@ -2660,6 +2712,24 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
     return "OK"
 
 
+def mark_monitoring_portfolio_linked(chain: str, base_addr: str, reason: str = "promoted_to_portfolio") -> bool:
+    rows = load_monitoring()
+    changed = False
+    for r in rows:
+        c = (r.get("chain") or "").strip().lower()
+        a = addr_store(c, (r.get("base_addr") or "").strip())
+        if addr_key(c, a) == addr_key(chain, base_addr):
+            r["active"] = "0"
+            r["ts_archived"] = now_utc_str()
+            r["archived_reason"] = reason
+            r["portfolio_linked"] = "1"
+            changed = True
+            break
+    if changed:
+        save_monitoring(rows)
+    return changed
+
+
 def promote_to_portfolio(item: Dict[str, Any]) -> str:
     best = item.get("best")
     row = item.get("row") or {}
@@ -2670,18 +2740,13 @@ def promote_to_portfolio(item: Dict[str, Any]) -> str:
     base_addr = addr_store(chain, (row.get("base_addr") or "").strip())
     decision = str(item.get("decision") or "WATCH / WAIT")
     res = log_to_portfolio(best, float(item.get("live_score", 0.0) or 0.0), decision, item.get("tags") or [], build_swap_url(chain, base_addr))
+    if res == "ALREADY_EXISTS":
+        mark_monitoring_portfolio_linked(chain, base_addr, "duplicate_portfolio")
+        return res
     if res != "OK":
         return res
 
-    archive_monitoring(
-        chain=chain,
-        base_addr=base_addr,
-        reason="manual: promoted",
-        last_score=float(item.get("live_score", 0.0) or 0.0),
-        last_decision=decision,
-        portfolio_linked=True,
-        note="IN PORTFOLIO",
-    )
+    mark_monitoring_portfolio_linked(chain, base_addr, "promoted_to_portfolio")
     return "OK"
 
 
@@ -3798,8 +3863,7 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
             volume = parse_float(t.get("volume", 0), 0.0)
             liquidity = parse_float(t.get("liquidity", 0), 0.0)
             if not address:
-                # continue
-                address = "0x0"
+                continue
             tokens.append(
                 {
                     "chainId": "solana",
@@ -3826,9 +3890,6 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
             pass
     else:
         tokens = []
-
-    if not tokens:
-        tokens = [{"symbol": "FORCE", "address": "0x0"}]
 
     all_pairs.extend(tokens)
 
@@ -3908,6 +3969,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         if not gate_ok:
             counts["skipped_noise"] += 1
             row["note"] = gate_reason
+            continue
 
         if smart:
             chain = (row.get("chainId") or "").lower()
@@ -4126,6 +4188,27 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
     })
     scanner_state_save(state)
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
+
+def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
+    state = scanner_state_load() or {}
+    window_name = "Manual"
+    preset_key = "balanced"
+    stats = ingest_window_to_monitoring(
+        chain=(chain or "solana").strip().lower(),
+        window_name=window_name,
+        preset_key=preset_key,
+        seeds_raw=seeds_raw,
+        max_items=max_items,
+        use_birdeye_trending=use_birdeye_trending,
+        birdeye_limit=birdeye_limit,
+    )
+    state["last_window"] = window_name
+    state["last_preset"] = preset_key
+    state["last_chain"] = (chain or "solana").strip().lower()
+    state["last_stats"] = stats
+    state["last_run_ts"] = now_utc_str()
+    scanner_state_save(state)
+    return stats
 
 
 def scan_source_window_name() -> str:
@@ -4507,14 +4590,25 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     size_info = position_sizing_engine(best, portfolio_value_usd=1000.0, hist=hist) if best else {
         "size_pct": 0.0, "size_label": "NA", "usd_size": 0.0, "risk_score": 0.0, "risk_flags": []
     }
-    entry_status, entry_score, entry_reasons, risk_level = evaluate_entry(best if best else {}, mode=ENTRY_MODE) if best else (
-        str(row.get("entry_status") or "NO DATA"),
-        parse_float(row.get("entry_score"), 0.0),
-        [],
-        str(row.get("risk_level") or "UNKNOWN"),
+    entry_item = {
+        "liq_usd": parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0) if best else 0.0,
+        "vol5_usd": parse_float(safe_get(best, "volume", "m5", default=0), 0.0) if best else 0.0,
+        "vol24_usd": parse_float(safe_get(best, "volume", "h24", default=0), 0.0) if best else 0.0,
+        "pc5": parse_float(safe_get(best, "priceChange", "m5", default=0), 0.0) if best else 0.0,
+        "pc1h": parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0) if best else 0.0,
+        "buys5": parse_float(safe_get(best, "txns", "m5", "buys", default=0), 0.0) if best else 0.0,
+        "sells5": parse_float(safe_get(best, "txns", "m5", "sells", default=0), 0.0) if best else 0.0,
+    }
+    entry_status, entry_reason, risk_level = entry_engine_v2(entry_item)
+    entry_score = parse_float(row.get("entry_score"), 0.0)
+    entry_reasons = [entry_reason] if entry_reason else []
+    entry = entry_status
+    final_decision = build_final_decision(
+        base_decision=decision,
+        entry_status=entry_status,
+        timing=timing,
+        anti_rug=anti_rug,
     )
-    entry, entry_reason = compute_entry_signal(best if best else row)
-    final_decision = build_final_decision(decision, entry_status, timing, anti_rug)
     item = {
         "row": row,
         "best": best,
@@ -4522,6 +4616,7 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "raw_live_score": raw_live_score,
         "adjusted_live_score": adjusted_live_score,
         "live_score": adjusted_live_score,
+        "base_decision": decision,
         "decision": final_decision,
         "tags": tags,
         "timing": timing,
@@ -4534,7 +4629,7 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "entry_score": entry_score,
         "entry_reasons": entry_reasons,
         "risk_level": risk_level,
-        "timing_label": row.get("timing_label") or timing_label,
+        "timing_label": row.get("timing_label") or str((timing or {}).get("timing", "UNKNOWN") or "UNKNOWN"),
     }
     item["is_dead"] = dead
     item["is_post_rug"] = post_rug
@@ -4544,12 +4639,12 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     if post_rug:
         item["adjusted_live_score"] = round(float(item["adjusted_live_score"]) * 0.1, 2)
         item["live_score"] = item["adjusted_live_score"]
-        item["decision"] = "POST-RUG"
+        item["decision"] = "NO ENTRY"
         item["risk_level"] = "EXTREME"
     elif not alive:
         item["adjusted_live_score"] = round(float(item["adjusted_live_score"]) * 0.3, 2)
         item["live_score"] = item["adjusted_live_score"]
-        item["decision"] = "DYING"
+        item["decision"] = build_final_decision(item.get("base_decision", "WATCH / WAIT"), item.get("entry_status", "WAIT"), timing, anti_rug)
         item["risk_level"] = "HIGH"
 
     item["row"] = hydrate_monitoring_row_defaults(row, item)
@@ -4557,58 +4652,67 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
-    decision = str(item.get("decision", "") or "").upper()
-    timing = str((item.get("timing") or {}).get("timing", "") or "").upper()
-    anti_level = str((item.get("anti_rug") or {}).get("level", "") or "").upper()
-    liq_level = str((item.get("liq_health") or {}).get("level", "") or "").upper()
-    is_alive = bool(item.get("is_alive", False))
-    is_dead = bool(item.get("is_dead", False))
-    is_post_rug = bool(item.get("is_post_rug", False))
-
+    raw_score = float(item.get("raw_live_score", item.get("live_score", 0.0)) or 0.0)
+    visible_score = raw_score
     penalty = 0.0
     flags: List[str] = []
+    decision = str(item.get("decision", "")).upper()
+    entry_status = str(item.get("entry_status", "")).upper()
+    timing_state = str(item.get("timing", {}).get("timing", "UNKNOWN") or "UNKNOWN").upper()
+    anti_level = str(item.get("anti_rug", {}).get("level", "SAFE") or "SAFE").upper()
+    liq_level = str(item.get("liq_health", {}).get("level", "UNKNOWN") or "UNKNOWN").upper()
+    is_dead = bool(item.get("is_dead"))
+    is_rug = bool(item.get("is_rug"))
 
     if decision in ("NO ENTRY", "NO_ENTRY"):
-        penalty += 35.0
+        penalty += 35
         flags.append("no_entry")
-    if timing == "SKIP":
-        penalty += 25.0
+    if entry_status == "WAIT":
+        penalty += 10
+        flags.append("wait")
+    if timing_state == "SKIP":
+        penalty += 25
         flags.append("timing_skip")
+    elif timing_state == "NEUTRAL":
+        penalty += 10
+        flags.append("timing_neutral")
     if anti_level == "WARNING":
-        penalty += 30.0
+        penalty += 30
         flags.append("anti_rug_warning")
     elif anti_level == "CRITICAL":
-        penalty += 80.0
+        penalty += 80
         flags.append("anti_rug_critical")
     if liq_level == "WEAK":
-        penalty += 20.0
+        penalty += 20
         flags.append("liq_weak")
     elif liq_level == "CRITICAL":
-        penalty += 60.0
+        penalty += 60
         flags.append("liq_critical")
-    if not is_alive:
-        penalty += 40.0
-        flags.append("not_alive")
-    if is_post_rug:
-        penalty += 120.0
+    if is_rug:
+        penalty += 120
         flags.append("post_rug")
+    if is_dead:
+        penalty += 200
+        flags.append("dead")
 
-    live_score = float(item.get("live_score", 0.0) or 0.0)
-    visible_score = max(0.0, round(live_score - penalty, 2))
+    visible_score = max(0.0, raw_score - penalty)
 
     if is_dead:
         bucket = "dead"
         badge = "DEAD"
-    elif is_post_rug:
-        bucket = "noise"
-        badge = "NOISE"
+    elif is_rug or anti_level == "CRITICAL" or liq_level == "CRITICAL":
+        bucket = "review"
+        badge = "REVIEW"
+    elif decision in ("NO ENTRY", "NO_ENTRY") or timing_state in ("SKIP", "NEUTRAL") or anti_level == "WARNING":
+        bucket = "caution"
+        badge = "CAUTION"
     else:
-        bucket = classify_bucket(visible_score, item)
-        badge = bucket.upper()
+        bucket = "tradable"
+        badge = "TRADEABLE"
 
     return {
         "bucket": bucket,
-        "visible_score": visible_score,
+        "visible_score": round(visible_score, 2),
         "penalty": penalty,
         "flags": flags,
         "badge": badge,
@@ -4962,11 +5066,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             row["status"] = row.get("entry_status", "watch")
         rows.append(row)
 
-    active_rows = [
-        r for r in rows
-        if str(r.get("active", "1")).strip() == "1"
-        or str(r.get("status", "")).strip().lower() in ("active", "monitoring", "watch")
-    ]
+    active_rows = []
+    for r in rows:
+        if str(r.get("active", "1")).strip() != "1":
+            continue
+        if str(r.get("archived_reason", "")).strip().lower() in ("promoted_to_portfolio", "duplicate_portfolio"):
+            continue
+        active_rows.append(r)
     active = list(active_rows)
     archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
     top[0].metric("Active", len(active))
@@ -4977,13 +5083,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     cbtn1, cbtn2, cbtn3 = st.columns([2,2,6])
     with cbtn1:
         if st.button("Run full scout ingestion", use_container_width=True, key="run_scanner_now"):
-            stats = run_scanner_now(
-                seeds_raw=str(auto_cfg.get("seeds_raw", "")),
+            stats = run_full_ingestion_now(
+                chain=str(st.session_state.get("chain", "solana")),
+                seeds_raw=str(auto_cfg.get("scanner_seeds_raw", "")),
                 max_items=int(auto_cfg.get("scanner_max_items", 50)),
                 use_birdeye_trending=bool(auto_cfg.get("use_birdeye_trending", True)),
                 birdeye_limit=int(auto_cfg.get("birdeye_limit", 50)),
             )
-            st.success(f"Scanner ran: {stats.get('stats', {})}")
+            st.success(f"Scanner ran: {stats}")
             load_monitoring_rows_cached.clear()
             request_rerun()
     with cbtn2:
@@ -5013,13 +5120,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         c["ui_badge"] = ui["badge"]
         cards_all.append(c)
 
-    MIN_VISIBLE = 10
-    visible_cards = sorted(cards_all, key=lambda x: x.get("ui_visible_score", 0.0), reverse=True)
-    signals_cards = [c for c in visible_cards if c["ui_bucket"] in ("tradable", "watch")]
-    noise_cards = [c for c in visible_cards if c["ui_bucket"] == "noise"]
-    dead_cards = [c for c in visible_cards if c["ui_bucket"] == "dead"]
-    if len(signals_cards) < MIN_VISIBLE:
-        signals_cards = visible_cards[:MIN_VISIBLE]
+    signals_cards = [c for c in cards_all if c["ui_bucket"] in ("tradable", "caution")]
+    review_cards = [c for c in cards_all if c["ui_bucket"] == "review"]
+    dead_cards = [c for c in cards_all if c["ui_bucket"] == "dead"]
+    signals_cards.sort(key=lambda x: x["ui_visible_score"], reverse=True)
+    review_cards.sort(key=lambda x: x["ui_visible_score"], reverse=True)
 
     st.subheader("Signals / Watchlist")
     if not signals_cards:
@@ -5033,11 +5138,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         name = extract_name(r).upper()
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
         decision = item["decision"]
-        header = f"{name} | {item.get('ui_badge', 'NA')} | {decision} | {score}"
+        header = f"{name} | {item.get('ui_badge', 'NA')} | {decision} | {score:.2f}"
 
         with st.expander(header, expanded=False):
-            st.caption(f"{chain.upper()} • {item['entry']} • risk {item['risk_level']}")
-            st.caption(f"{item['entry']} • {item['entry_reason']}")
+            st.caption(f"{chain.upper()} • entry {item.get('entry_status', 'UNKNOWN')} • risk {item.get('risk_level', 'UNKNOWN')}")
             if str(r.get("portfolio_linked", "0")) == "1":
                 st.caption(r.get("note") or "IN PORTFOLIO")
             flags = item.get("ui_flags") or []
@@ -5047,6 +5151,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 f"Penalty: -{float(item.get('ui_penalty', 0.0)):.2f} • "
                 f"Visible: {float(item.get('ui_visible_score', 0.0)):.2f}"
             )
+            st.caption(f"Entry reason: {item.get('entry_reason', 'NO_SIGNAL')}")
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -5066,6 +5171,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                         st.error("No live pool found.")
                     else:
                         st.info("Already in portfolio.")
+                        request_rerun()
 
             st.code(base_addr)
 
@@ -5096,18 +5202,17 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 if price_series:
                     st.line_chart(price_series, height=100, use_container_width=True)
 
-    st.subheader("Noise / low priority")
-    if not noise_cards:
-        st.caption("No noise candidates.")
-    for item in noise_cards:
+    st.subheader("Needs review")
+    if not review_cards:
+        st.caption("No review candidates.")
+    for item in review_cards:
         r = item["row"]
         chain = (r.get("chain") or "").strip().lower()
         name = extract_name(r).upper()
         decision = item["decision"]
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
-        with st.expander(f"{name} | {item.get('ui_badge', 'NOISE')} | {decision} | {score}", expanded=False):
-            st.caption(f"{chain.upper()} • {item['entry']} • risk {item['risk_level']}")
-            st.caption(f"{item['entry']} • {item['entry_reason']}")
+        with st.expander(f"{name} | {item.get('ui_badge', 'REVIEW')} | {decision} | {score:.2f}", expanded=False):
+            st.caption(f"{chain.upper()} • entry {item.get('entry_status', 'UNKNOWN')} • risk {item.get('risk_level', 'UNKNOWN')}")
             flags = item.get("ui_flags") or []
             st.caption("UI flags: " + (" • ".join(flags) if flags else "none"))
             st.caption(
@@ -5115,6 +5220,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 f"Penalty: -{float(item.get('ui_penalty', 0.0)):.2f} • "
                 f"Visible: {float(item.get('ui_visible_score', 0.0)):.2f}"
             )
+            st.caption(f"Entry reason: {item.get('entry_reason', 'NO_SIGNAL')}")
 
     with st.expander("Auto-archived / Dead candidates", expanded=False):
         if not dead_cards:
@@ -5712,9 +5818,14 @@ def main():
 
         st.divider()
         if st.button("Run scanner now", use_container_width=True):
-            scanner_rows = run_scanner_once(limit=int(scanner_max_items))
-            stats = persist_scanner_result(scanner_rows)
-            st.session_state["_scan_feedback"] = f"Scanner saved: +{stats['inserted']} new, ~{stats['updated']} updated, total {stats['total']}"
+            stats = run_full_ingestion_now(
+                chain=str(st.session_state.get("chain", "solana")),
+                seeds_raw=str(scanner_seeds_raw or ""),
+                max_items=int(scanner_max_items),
+                use_birdeye_trending=bool(use_birdeye_trending),
+                birdeye_limit=int(birdeye_limit),
+            )
+            st.session_state["_scan_feedback"] = f"Scanner saved: {stats}"
             request_rerun()
 
         if st.button("Clear cache", use_container_width=True):
