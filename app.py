@@ -4269,6 +4269,17 @@ def is_post_rug(pair: Optional[Dict[str, Any]], hist: List[Dict[str, Any]]) -> b
         return False
 
 
+def is_alive(pair: Optional[Dict[str, Any]]) -> bool:
+    if not pair:
+        return False
+    liq = parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)
+    vol24 = parse_float(safe_get(pair, "volume", "h24", default=0), 0.0)
+    buys = int(safe_get(pair, "txns", "m5", "buys", default=0) or 0)
+    sells = int(safe_get(pair, "txns", "m5", "sells", default=0) or 0)
+    txns5 = buys + sells
+    return liq > 2_000 and (vol24 > 1_000 or txns5 > 5)
+
+
 def extract_name(row: Dict[str, Any]) -> str:
     name = (
         row.get("base_symbol")
@@ -4305,6 +4316,35 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     base_addr = addr_store(chain, (row.get("base_addr") or "").strip())
     best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
     hist = token_history_rows(chain, base_addr, limit=30)
+
+    dead = is_token_dead(best)
+    post_rug = is_post_rug(best, hist)
+    alive = is_alive(best)
+
+    if dead:
+        item = {
+            "row": row,
+            "best": best,
+            "hist": hist,
+            "live_score": 0.0,
+            "decision": "DEAD",
+            "tags": [],
+            "timing": {},
+            "liq_health": {},
+            "anti_rug": {},
+            "size_info": {"size_pct": 0.0, "size_label": "NA", "usd_size": 0.0, "risk_score": 0.0, "risk_flags": []},
+            "entry_status": "NO_ENTRY",
+            "entry_score": 0.0,
+            "entry_reasons": ["token_dead"],
+            "risk_level": "EXTREME",
+            "is_dead": True,
+            "is_post_rug": False,
+            "is_rug": False,
+            "is_alive": False,
+        }
+        item["row"] = hydrate_monitoring_row_defaults(row, item)
+        return item
+
     live_score = score_pair(best) if best else parse_float(row.get("last_score"), 0.0)
     decision, tags = build_trade_hint(best) if best else (str(row.get("last_decision") or "NO DATA"), [])
     timing = entry_timing_signal(best, hist)
@@ -4335,20 +4375,19 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "entry_reasons": entry_reasons,
         "risk_level": risk_level,
     }
-
-    dead = is_token_dead(best)
-    post_rug = is_post_rug(best, hist)
     item["is_dead"] = dead
     item["is_post_rug"] = post_rug
-    if dead:
-        item["live_score"] = 0.0
-        item["decision"] = "DEAD"
-        item["entry_status"] = "NO_ENTRY"
-        item["risk_level"] = "EXTREME"
-    elif post_rug:
+    item["is_rug"] = post_rug
+    item["is_alive"] = alive
+
+    if post_rug:
         item["live_score"] = round(float(item["live_score"]) * 0.1, 2)
         item["decision"] = "POST-RUG"
         item["risk_level"] = "EXTREME"
+    elif not alive:
+        item["live_score"] = round(float(item["live_score"]) * 0.3, 2)
+        item["decision"] = "DYING"
+        item["risk_level"] = "HIGH"
 
     item["row"] = hydrate_monitoring_row_defaults(row, item)
     return item
