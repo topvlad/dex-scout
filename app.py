@@ -653,6 +653,8 @@ PRESETS = {
     },
 }
 
+MONITORING_MIN_VIABILITY_SCORE = 120.0
+
 
 # =============================
 # Address helpers
@@ -4799,10 +4801,20 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         st.warning(f"Auto-archived dead tokens: {auto_archived}")
         load_monitoring_rows_cached.clear()
 
-    cards = [
-        c for c in cards_raw
-        if float(c.get("live_score", 0.0) or 0.0) > 50 and c.get("decision") not in ("DEAD", "POST-RUG")
-    ]
+    cards = []
+    for c in cards_raw:
+        live_score = float(c.get("live_score", 0.0) or 0.0)
+        decision = str(c.get("decision", "") or "").upper()
+        timing_state = str((c.get("timing") or {}).get("timing", "") or "").upper()
+
+        if decision in ("DEAD", "POST-RUG", "NO ENTRY", "NO_ENTRY"):
+            continue
+        if timing_state == "SKIP":
+            continue
+        if live_score < MONITORING_MIN_VIABILITY_SCORE:
+            continue
+
+        cards.append(c)
     cards.sort(key=lambda x: float(x["live_score"]), reverse=True)
 
     st.subheader("Signals / Watchlist")
