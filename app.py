@@ -1853,6 +1853,45 @@ def classify_entry_status(
     }
 
 
+def build_final_decision(
+    decision: str,
+    entry_status: str,
+    timing: Dict[str, Any],
+    anti_rug: Dict[str, Any],
+) -> str:
+    decision_u = str(decision or "").upper()
+    entry_status_u = str(entry_status or "").upper()
+    timing_state = str((timing or {}).get("timing", "UNKNOWN") or "UNKNOWN").upper()
+    anti_level = str((anti_rug or {}).get("level", "SAFE") or "SAFE").upper()
+
+    if entry_status_u in ("NO_ENTRY", "NO ENTRY"):
+        return "NO ENTRY"
+    if anti_level == "CRITICAL":
+        return "NO ENTRY"
+    if timing_state == "SKIP":
+        return "NO ENTRY"
+
+    if timing_state == "NEUTRAL":
+        return "WATCH / WAIT"
+    if anti_level == "WARNING" and decision_u.startswith("ENTRY"):
+        return "WATCH / WAIT"
+
+    if entry_status_u == "READY":
+        return "TRADEABLE"
+    if entry_status_u == "WAIT":
+        return "WATCH / WAIT"
+
+    if decision_u in ("NO DATA", "DEAD", "POST-RUG", "DYING"):
+        return decision_u
+    if decision_u.startswith("ENTRY"):
+        return "TRADEABLE"
+    if "WATCH" in decision_u:
+        return "WATCH / WAIT"
+    if decision_u in ("NO ENTRY", "NO_ENTRY"):
+        return "NO ENTRY"
+    return "NO DATA"
+
+
 def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
     if not p:
         return "NO DATA", []
@@ -4324,7 +4363,7 @@ def extract_name(row: Dict[str, Any]) -> str:
 
 def hydrate_monitoring_row_defaults(row: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
     if not row.get("entry_status"):
-        row["entry_status"] = item.get("entry_status") or "WAIT"
+        row["entry_status"] = item.get("entry_status") or "UNKNOWN"
     if not row.get("risk_level"):
         row["risk_level"] = item.get("risk_level") or "MEDIUM"
     if not row.get("tp_target_pct"):
@@ -4385,6 +4424,7 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         [],
         str(row.get("risk_level") or "UNKNOWN"),
     )
+    final_decision = build_final_decision(decision, entry_status, timing, anti_rug)
     item = {
         "row": row,
         "best": best,
@@ -4392,7 +4432,7 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "raw_live_score": raw_live_score,
         "adjusted_live_score": adjusted_live_score,
         "live_score": adjusted_live_score,
-        "decision": decision,
+        "decision": final_decision,
         "tags": tags,
         "timing": timing,
         "liq_health": liq_health,
