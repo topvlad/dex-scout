@@ -2530,6 +2530,10 @@ MON_FIELDS = [
     "in_portfolio",
     "toxic_flags",
     "alert_sent",
+    "status",
+    "risk_score",
+    "risk_flags",
+    "why",
 ]
 
 HIST_FIELDS = [
@@ -4331,7 +4335,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     if ranked:
         best = ranked[0][1]
         best_row = normalize_pair_row(best)
-        if best_row.get("entry_status") in ["TRADEABLE", "EARLY"]:
+        if best_row.get("entry_status") in ["READY", "WATCH"]:
             last_ts = parse_float(st.session_state.get("last_alert_ts", 0), 0)
             now_ts = time.time()
             if now_ts - last_ts >= 60:
@@ -4400,24 +4404,18 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["skipped_symbol_duplicate"] += 1
                 continue
             seen_token_keys.add(dedupe_key)
-        momentum_flag = (
-            parse_float(safe_get(row, "volume", "m5", default=0), 0.0) > 20_000
-            and parse_float(safe_get(row, "priceChange", "m5", default=0), 0.0) > 5
-        )
-        if float(s) > 240 and momentum_flag:
-            entry_status = "TRADEABLE"
+        if float(s) > 500:
+            entry_status = "READY"
             signal_reason = "breakout"
-        elif float(s) > 200:
-            entry_status = "EARLY"
-            signal_reason = "early_momentum"
-        elif float(s) > 150:
+        elif float(s) > 300:
             entry_status = "WATCH"
-            signal_reason = None
+            signal_reason = "trend_building"
         else:
-            entry_status = "NO_ENTRY"
-            signal_reason = None
+            entry_status = "WAIT"
+            signal_reason = "early"
         row["entry_status"] = entry_status
-        row["status"] = "ACTIVE" if entry_status in {"TRADEABLE", "EARLY", "WATCH"} else "ARCHIVED"
+        row["entry"] = entry_status
+        row["status"] = "ACTIVE"
         row["signal_reason"] = signal_reason or row.get("signal_reason") or ""
         entry_score = parse_float(row.get("entry_score", 0), 0.0)
         decision = "watch"
@@ -4427,8 +4425,6 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         row["visible_score"] = float(s)
         row["bucket"] = classify_bucket(float(s), row)
         weak_reasons: List[str] = []
-        if entry_status == "NO_ENTRY":
-            weak_reasons.append("no_entry")
         st.write(f"entry={entry_status} score={float(s):.2f}")
         if not gate_ok:
             counts["skipped_noise"] += 1
@@ -4494,7 +4490,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["added"] += 1
                 if base_sym:
                     active_symbols.add(base_sym)
-                if row.get("entry_status") in ["TRADEABLE", "EARLY"]:
+                if row.get("entry_status") in ["READY", "WATCH"]:
                     if row.get("alert_sent") != "1":
                         msg = format_signal_msg(row)
                         last_ts = parse_float(st.session_state.get("last_alert_ts", 0), 0)
@@ -4531,7 +4527,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             counts["errors"] += 1
     if counts["added"] == 0 and ranked:
         fallback = normalize_pair_row(ranked[0][1])
-        fallback["entry_status"] = "EARLY"
+        fallback["entry_status"] = "WATCH"
         fallback["status"] = "ACTIVE"
         fallback["signal_reason"] = "fallback_signal"
         add_to_monitoring(
@@ -4539,7 +4535,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             float(ranked[0][0]),
             window_name=window_name,
             preset_key=preset_key,
-            entry_status="EARLY",
+            entry_status="WATCH",
             entry_score=parse_float(fallback.get("entry_score", ranked[0][0]), 0.0),
             risk_level=str(fallback.get("risk_level", "MEDIUM")),
         )
@@ -4940,9 +4936,63 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
             "url": "",
         }
 
-        score_live = score_pair(pair)
+        liquidity = parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)
+        volume_5m = parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)
+        txns_raw = (pair.get("txns") or {}).get("m5", {}) or {}
+        txns = int(parse_float(txns_raw.get("buys", 0), 0.0) + parse_float(txns_raw.get("sells", 0), 0.0))
+        age_minutes = parse_float(pair_age_minutes(pair) or token.get("age_minutes", 0), 0.0)
+        price_change_5m = parse_float(safe_get(pair, "priceChange", "m5", default=0), 0.0)
+
+        score_live = 300.0
+        if liquidity < 5000:
+            score_live -= 30
+        if volume_5m < 1000:
+            score_live -= 20
+        if txns < 20:
+            score_live -= 20
+        if age_minutes < 60:
+            score_live += 50
+        if price_change_5m > 5:
+            score_live += 40
+        score_live = max(score_live, 50.0)
+
+        if score_live > 500:
+            entry = "READY"
+        elif score_live > 300:
+            entry = "WATCH"
+        else:
+            entry = "WAIT"
+
         decision, _tags = build_trade_hint(pair)
-        entry_status, entry_score, _entry_reasons, risk_level = evaluate_entry(pair, mode=ENTRY_MODE)
+        entry_status = entry
+        entry_score = score_live
+
+        liquidity_locked = parse_float(token.get("liquidity_locked_pct", token.get("liquidity_locked", 100)), 100.0)
+        top_holder_pct = parse_float(token.get("top_holder_pct", token.get("top_holder_percent", 0)), 0.0)
+        buys = parse_float(txns_raw.get("buys", 0), 0.0)
+        sells = parse_float(txns_raw.get("sells", 0), 0.0)
+        buy_sell_ratio = buys / max(sells, 1.0)
+        risk_score = 0
+        risk_flags: List[str] = []
+        if liquidity_locked < 50:
+            risk_score += 2
+            risk_flags.append("LP_UNLOCKED")
+        if top_holder_pct > 20:
+            risk_score += 2
+            risk_flags.append("WHALE_DOMINANCE")
+        if buy_sell_ratio < 0.5:
+            risk_score += 1
+            risk_flags.append("SELL_PRESSURE")
+        if age_minutes < 10 and volume_5m > 10000:
+            risk_score += 2
+            risk_flags.append("PUMP_SPIKE")
+
+        if risk_score >= 5:
+            risk_level = "HIGH"
+        elif risk_score >= 3:
+            risk_level = "MEDIUM"
+        else:
+            risk_level = "LOW"
 
         append_monitoring_history({
             "ts_utc": ts_now,
@@ -4996,6 +5046,10 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
             "revisit_after_ts": "",
             "last_revisit_ts": "",
             "status": "ACTIVE",
+            "entry": entry,
+            "risk_score": str(risk_score),
+            "risk_flags": ",".join(risk_flags),
+            "why": f"{entry} | score={int(score_live)} | risk={risk_level}",
         }
         return row
 
@@ -5004,6 +5058,7 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
         if not row:
             continue
         row["status"] = "ACTIVE"
+        row["entry"] = row.get("entry", "WAIT")
         new_rows.append(row)
 
     return new_rows
@@ -5029,6 +5084,7 @@ def persist_scanner_result(scanner_rows: List[Dict[str, Any]]) -> Dict[str, int]
         normalized = {k: row.get(k, "") for k in MON_FIELDS}
         normalized["active"] = "1"
         normalized["status"] = "ACTIVE"
+        normalized["entry"] = normalized.get("entry") or "WAIT"
         normalized["chain"] = chain
         normalized["base_addr"] = base_addr
         new_rows.append(normalized)
@@ -5040,7 +5096,7 @@ def persist_scanner_result(scanner_rows: List[Dict[str, Any]]) -> Dict[str, int]
     combined = existing + new_rows
     seen: Set[Tuple[str, str]] = set()
     deduped: List[Dict[str, Any]] = []
-    for r in reversed(combined):
+    for r in combined:
         chain = str(r.get("chain") or "").strip().lower()
         base_addr = addr_store(chain, str(r.get("base_addr") or r.get("address") or "").strip())
         key = (base_addr, chain)
@@ -5050,7 +5106,6 @@ def persist_scanner_result(scanner_rows: List[Dict[str, Any]]) -> Dict[str, int]
             continue
         seen.add(key)
         deduped.append(r)
-    deduped.reverse()
 
     save_monitoring(deduped)
     st.write("DEBUG AFTER SAVE:", len(load_monitoring()))
@@ -5827,16 +5882,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         chain = (r.get("chain") or "").strip().lower()
         base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
         r["in_portfolio"] = "1" if addr_key(chain, base_addr) in active_set else "0"
-        if str(r.get("active", "1")).strip() != "1":
-            continue
-        status_u = str(r.get("status") or r.get("entry_status") or "").strip().upper()
-        if status_u and status_u not in {"ACTIVE", "WATCH", "EARLY"}:
-            continue
-        if str(r.get("archived_reason", "")).strip().lower() in ("promoted_to_portfolio", "duplicate_portfolio", "promoted"):
-            continue
-        active_rows.append(r)
+        if str(r.get("status", "")).strip().upper() == "ACTIVE":
+            active_rows.append(r)
     active_rows = sorted(active_rows, key=lambda row: parse_float(row.get("priority_score", 0), 0.0), reverse=True)[:20]
     active = list(active_rows)
+    st.write("DEBUG TOKENS:", len(load_monitoring()))
+    st.write("DEBUG ACTIVE:", len(active))
     archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
     top[0].metric("Active", len(active))
     top[1].metric("Archived", len(archived))
