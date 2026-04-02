@@ -4417,6 +4417,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             entry_status = "NO_ENTRY"
             signal_reason = None
         row["entry_status"] = entry_status
+        row["status"] = "ACTIVE" if entry_status in {"TRADEABLE", "EARLY", "WATCH"} else "ARCHIVED"
         row["signal_reason"] = signal_reason or row.get("signal_reason") or ""
         entry_score = parse_float(row.get("entry_score", 0), 0.0)
         decision = "watch"
@@ -4531,6 +4532,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     if counts["added"] == 0 and ranked:
         fallback = normalize_pair_row(ranked[0][1])
         fallback["entry_status"] = "EARLY"
+        fallback["status"] = "ACTIVE"
         fallback["signal_reason"] = "fallback_signal"
         add_to_monitoring(
             fallback,
