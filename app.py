@@ -658,6 +658,15 @@ PRESETS = {
 MONITORING_SORT_PENALTY_FLOOR = 120.0
 MONITORING_REVIEW_THRESHOLD = 120.0
 MONITORING_DEAD_THRESHOLD = 50.0
+REASON_LABELS = {
+    "fake_pump": "Suspicious pump",
+    "freezable": "Token can be frozen",
+    "fake_activity": "Fake trading activity",
+    "no_momentum": "No momentum",
+    "low_liquidity": "Low liquidity",
+    "early_momentum": "Early momentum",
+    "breakout": "Breakout",
+}
 
 
 # =============================
@@ -725,17 +734,15 @@ def is_flat_chart(p: Dict[str, Any]) -> bool:
     return False
 
 
-def is_toxic_token(p: Dict[str, Any]) -> Tuple[bool, str]:
+def is_toxic_token(p: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    reasons: List[str] = []
     if is_freezable(p):
-        return True, "freezable"
-
+        reasons.append("freezable")
     if is_fake_activity(p):
-        return True, "fake_activity"
-
+        reasons.append("fake_activity")
     if is_flat_chart(p):
-        return True, "no_movement"
-
-    return False, ""
+        reasons.append("no_momentum")
+    return (len(reasons) > 0), reasons
 
 
 def is_symbol_major_like(symbol: str) -> bool:
@@ -1465,20 +1472,26 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
     row["whale"] = whale_accumulation(row)
     row["signal"] = classify_signal(row)
     entry_status, entry_score, entry_reasons, risk_level = evaluate_entry(row, mode=ENTRY_MODE)
-    entry, entry_reason = compute_entry_signal(row)
+    entry, signal_reason = compute_entry_signal(row)
     row["entry_status"] = entry_status
     row["entry_score"] = entry_score
     row["entry_reasons"] = entry_reasons
     row["risk_level"] = risk_level
     row["entry"] = entry
-    row["entry_reason"] = entry_reason
+    row["signal_reason"] = signal_reason
+    if entry in {"TRADEABLE", "EARLY"}:
+        row["entry_status"] = entry
+    elif signal_reason == "low_liquidity":
+        row["decision_reason"] = "low_liquidity"
+        row["entry_status"] = "NO_ENTRY"
     row["timing_label"] = compute_timing(row)
     row["priority"] = entry_score
-    toxic, reason = is_toxic_token(pair)
+    toxic, reasons = is_toxic_token(pair)
     if toxic:
         row["risk"] = "HIGH"
         row["entry_status"] = "NO_ENTRY"
-        row["toxic_flag"] = reason
+        row["decision_reason"] = reasons[0]
+        row["toxic_flags"] = ",".join(reasons)
     return row
 
 
@@ -1533,7 +1546,7 @@ def score_pair(p: Optional[Dict[str, Any]]) -> float:
     elif cex_prob >= 3:
         s += 10
 
-    toxic, _reason = is_toxic_token(p)
+    toxic, _reasons = is_toxic_token(p)
     if toxic:
         s -= 200
 
@@ -2497,11 +2510,12 @@ MON_FIELDS = [
     "portfolio_linked",
     "note",
     "entry",
-    "entry_reason",
+    "decision_reason",
+    "signal_reason",
     "timing_label",
     "weak_reason",
     "in_portfolio",
-    "toxic_flag",
+    "toxic_flags",
     "alert_sent",
 ]
 
@@ -2681,6 +2695,19 @@ def save_monitoring(rows: List[Dict[str, Any]]):
     backup_csv_snapshot(MONITORING_CSV, rows, MON_FIELDS)
 
 
+def migrate_reason_fields() -> int:
+    rows = load_monitoring()
+    changed = 0
+    for r in rows:
+        legacy = str(r.get("entry_reason") or "").strip()
+        if legacy and not str(r.get("decision_reason") or "").strip():
+            r["decision_reason"] = legacy
+            changed += 1
+    if changed:
+        save_monitoring(rows)
+    return changed
+
+
 def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
     # Source of truth: load_csv (Supabase app_storage if enabled, else local)
     rows = load_csv(MON_HISTORY_CSV)
@@ -2738,13 +2765,18 @@ def add_to_monitoring(
                 r["risk_level"] = str(risk_level).upper()
             if p.get("weak_reason") is not None:
                 r["weak_reason"] = str(p.get("weak_reason") or "")
-            if p.get("toxic_flag") is not None:
-                r["toxic_flag"] = str(p.get("toxic_flag") or "")
+            if p.get("decision_reason") is not None:
+                r["decision_reason"] = str(p.get("decision_reason") or "")
+            if p.get("signal_reason") is not None:
+                r["signal_reason"] = str(p.get("signal_reason") or "")
+            if p.get("toxic_flags") is not None:
+                r["toxic_flags"] = str(p.get("toxic_flags") or "")
             if p.get("alert_sent") is not None:
                 r["alert_sent"] = str(p.get("alert_sent") or "0")
-            entry, entry_reason = compute_entry_signal(p)
+            entry, signal_reason = compute_entry_signal(p)
             r["entry"] = entry
-            r["entry_reason"] = entry_reason
+            if not r.get("signal_reason"):
+                r["signal_reason"] = signal_reason
             r["timing_label"] = compute_timing(p)
             if window_name:
                 r["source_window"] = _merge_csv_values(r.get("source_window", ""), window_name)
@@ -2767,7 +2799,7 @@ def add_to_monitoring(
     entry_s, tp_s = suggest_entry_and_tp_usd(p, risk=risk)
     decision = "watch"
     computed_entry_status, computed_entry_score, _, computed_risk = evaluate_entry(p, mode=ENTRY_MODE)
-    computed_entry, computed_entry_reason = compute_entry_signal(p)
+    computed_entry, computed_signal_reason = compute_entry_signal(p)
     final_entry_status = entry_status or computed_entry_status
     final_entry_score = float(entry_score if entry_status else computed_entry_score)
     final_risk_level = str((risk_level or p.get("risk_level") or computed_risk or "MEDIUM")).upper()
@@ -2809,11 +2841,12 @@ def add_to_monitoring(
             "portfolio_linked": "0",
             "note": str(p.get("note", "") or ""),
             "entry": computed_entry,
-            "entry_reason": computed_entry_reason,
+            "decision_reason": str(p.get("decision_reason") or ""),
+            "signal_reason": str(p.get("signal_reason") or computed_signal_reason or ""),
             "timing_label": compute_timing(p),
             "weak_reason": str(p.get("weak_reason") or ""),
             "in_portfolio": "0",
-            "toxic_flag": str(p.get("toxic_flag") or ""),
+            "toxic_flags": str(p.get("toxic_flags") or ""),
             "alert_sent": str(p.get("alert_sent") or "0"),
         }
     )
@@ -4102,15 +4135,13 @@ def format_signal_msg(row: Dict[str, Any]) -> str:
     score = parse_float(row.get("priority_score", row.get("score_init", 0)), 0)
     risk = row.get("risk", row.get("risk_level", ""))
     entry = row.get("entry_status", "")
-    vol5 = parse_float(row.get("vol_5m", safe_get(row, "volume", "m5", default=row.get("vol5_init", 0))), 0)
-    pc1h = parse_float(row.get("price_change_1h", safe_get(row, "priceChange", "h1", default=0)), 0)
+    reason = row.get("signal_reason") or row.get("decision_reason") or ""
+    label = REASON_LABELS.get(str(reason), str(reason))
     return (
         f"<b>{sym}</b>\n"
-        f"Entry: {entry}\n"
+        f"{entry} • {label}\n\n"
         f"Score: {score:.0f}\n"
-        f"Risk: {risk}\n\n"
-        f"Vol5m: {vol5:.0f}\n"
-        f"1h: {pc1h:.1f}%"
+        f"Risk: {risk}"
     )
 
 def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any], seeds_raw: str, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> List[Dict[str, Any]]:
@@ -4247,7 +4278,7 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     filtered = dedupe_by_symbol_family(filtered, per_symbol_limit=1)
     clean: List[Dict[str, Any]] = []
     for p in filtered:
-        toxic, _reason = is_toxic_token(p)
+        toxic, _reasons = is_toxic_token(p)
         if toxic:
             continue
         clean.append(p)
@@ -4299,11 +4330,15 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     }
     for s, p, smart, signal in ranked:
         counts["seen"] += 1
-        toxic, reason = is_toxic_token(p)
+        row = normalize_pair_row(p)
+        toxic, reasons = is_toxic_token(p)
         if toxic:
+            row["risk"] = "HIGH"
+            row["entry_status"] = "NO_ENTRY"
+            row["decision_reason"] = reasons[0]
+            row["toxic_flags"] = ",".join(reasons)
             counts["skipped_noise"] += 1
             continue
-        row = normalize_pair_row(p)
         base_sym = str(safe_get(row, "baseToken", "symbol", default="") or row.get("base_symbol") or "").strip().upper()
         row_chain = str(row.get("chainId") or row.get("chain") or "").strip().lower()
 
@@ -4644,12 +4679,13 @@ def purge_toxic() -> int:
     for r in rows:
         if str(r.get("active", "1")) != "1":
             continue
-        toxic, reason = is_toxic_token(r)
+        toxic, reasons = is_toxic_token(r)
         if toxic:
             r["active"] = "0"
-            r["archived_reason"] = f"toxic_{reason}"
+            r["archived_reason"] = f"toxic_{reasons[0]}"
             r["ts_archived"] = now_utc_str()
-            r["toxic_flag"] = reason
+            r["decision_reason"] = reasons[0]
+            r["toxic_flags"] = ",".join(reasons)
             changed += 1
 
     if changed:
@@ -5053,14 +5089,16 @@ def compute_entry_signal(item: Dict[str, Any]) -> Tuple[str, str]:
     liq = parse_float(item.get("liquidity", safe_get(item, "liquidity", "usd", default=0)), 0.0)
     vol = parse_float(item.get("volume_5m", safe_get(item, "volume", "m5", default=0)), 0.0)
     price_change = parse_float(item.get("price_change_5m", safe_get(item, "priceChange", "m5", default=0)), 0.0)
+    score = parse_float(item.get("priority_score", item.get("score_init", item.get("score", 0))), 0.0)
+    momentum_flag = vol > 20_000 and price_change > 5
 
     if liq < 2000:
-        return "SKIP", "LOW_LIQ"
-    if vol > 20000 and price_change > 5:
-        return "ENTER", "MOMENTUM"
-    if vol > 10000:
-        return "WATCH", "EARLY"
-    return "WAIT", "NO_SIGNAL"
+        return "SKIP", "low_liquidity"
+    if momentum_flag and score > 220:
+        return "TRADEABLE", "breakout"
+    if score > 200:
+        return "EARLY", "early_momentum"
+    return "WAIT", ""
 
 
 def compute_timing(item: Dict[str, Any]) -> str:
@@ -5148,8 +5186,10 @@ def hydrate_monitoring_row_defaults(row: Dict[str, Any], item: Dict[str, Any]) -
         row["entry_suggest_usd"] = "10"
     if not row.get("entry"):
         row["entry"] = item.get("entry") or "UNKNOWN"
-    if not row.get("entry_reason"):
-        row["entry_reason"] = item.get("entry_reason") or "NO_SIGNAL"
+    if not row.get("decision_reason"):
+        row["decision_reason"] = item.get("decision_reason") or ""
+    if not row.get("signal_reason"):
+        row["signal_reason"] = item.get("signal_reason") or ""
     if not row.get("timing_label"):
         row["timing_label"] = item.get("timing_label") or "NEUTRAL"
     if row.get("portfolio_linked") == "1" and not row.get("note"):
@@ -5183,7 +5223,8 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
             "size_info": {"size_pct": 0.0, "size_label": "NA", "usd_size": 0.0, "risk_score": 0.0, "risk_flags": []},
             "entry_status": "NO_ENTRY",
             "entry": "SKIP",
-            "entry_reason": "LOW_LIQ",
+            "decision_reason": "low_liquidity",
+            "signal_reason": "",
             "entry_score": 0.0,
             "entry_reasons": ["token_dead"],
             "risk_level": "EXTREME",
@@ -5214,9 +5255,9 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "buys5": parse_float(safe_get(best, "txns", "m5", "buys", default=0), 0.0) if best else 0.0,
         "sells5": parse_float(safe_get(best, "txns", "m5", "sells", default=0), 0.0) if best else 0.0,
     }
-    entry_status, entry_reason, risk_level = entry_engine_v2(entry_item)
+    entry_status, decision_reason, risk_level = entry_engine_v2(entry_item)
     entry_score = parse_float(row.get("entry_score"), 0.0)
-    entry_reasons = [entry_reason] if entry_reason else []
+    entry_reasons = [decision_reason] if decision_reason else []
     entry = entry_status
     final_decision = build_final_decision(
         base_decision=decision,
@@ -5242,7 +5283,8 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "size_info": size_info,
         "entry_status": entry_status,
         "entry": row.get("entry") or entry or "UNKNOWN",
-        "entry_reason": row.get("entry_reason") or entry_reason,
+        "decision_reason": row.get("decision_reason") or decision_reason,
+        "signal_reason": row.get("signal_reason") or "",
         "entry_score": entry_score,
         "entry_reasons": entry_reasons,
         "risk_level": risk_level,
@@ -5831,14 +5873,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         with st.expander(header, expanded=False):
             st.caption(f"{chain.upper()} • decision {decision} • risk {item.get('risk_level', 'UNKNOWN')}")
+            st.caption(f"score={score} risk={item.get('risk_level', 'UNKNOWN')}")
             if str(r.get("in_portfolio", "0")) == "1":
                 st.caption("🧺 Already in portfolio")
             if str(r.get("portfolio_linked", "0")) == "1":
                 st.caption(r.get("note") or "IN PORTFOLIO")
             if r.get("weak_reason"):
                 st.caption(f"Weak: {r.get('weak_reason')}")
-            if r.get("toxic_flag"):
-                st.caption(f"Toxic: {r.get('toxic_flag')}")
+            if r.get("toxic_flags"):
+                st.caption(f"Toxic: {r.get('toxic_flags')}")
             flags = item.get("ui_flags") or []
             st.caption("UI flags: " + (" • ".join(flags) if flags else "none"))
             st.caption(
@@ -5846,7 +5889,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 f"Penalty: -{float(item.get('ui_penalty', 0.0)):.2f} • "
                 f"Visible: {float(item.get('ui_visible_score', 0.0)):.2f}"
             )
-            st.caption(f"Entry reason: {item.get('entry_reason', 'NO_SIGNAL')}")
+            reason = r.get("decision_reason") or r.get("signal_reason") or ""
+            label = REASON_LABELS.get(str(reason), str(reason))
+            st.caption(f"Why: {label}")
+            if r.get("signal_reason"):
+                st.caption(f"Signal: {REASON_LABELS.get(str(r.get('signal_reason')), str(r.get('signal_reason')))}")
+            if r.get("decision_reason"):
+                st.caption(f"Blocked: {REASON_LABELS.get(str(r.get('decision_reason')), str(r.get('decision_reason')))}")
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -5908,8 +5957,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
         with st.expander(f"{name} | {item.get('ui_badge', 'REVIEW')} | {decision} | {score:.2f}", expanded=False):
             st.caption(f"{chain.upper()} • entry {item.get('entry_status', 'UNKNOWN')} • risk {item.get('risk_level', 'UNKNOWN')}")
-            if r.get("toxic_flag"):
-                st.caption(f"Toxic: {r.get('toxic_flag')}")
+            st.caption(f"score={score} risk={item.get('risk_level', 'UNKNOWN')}")
+            if r.get("toxic_flags"):
+                st.caption(f"Toxic: {r.get('toxic_flags')}")
             flags = item.get("ui_flags") or []
             st.caption("UI flags: " + (" • ".join(flags) if flags else "none"))
             st.caption(
@@ -5917,7 +5967,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 f"Penalty: -{float(item.get('ui_penalty', 0.0)):.2f} • "
                 f"Visible: {float(item.get('ui_visible_score', 0.0)):.2f}"
             )
-            st.caption(f"Entry reason: {item.get('entry_reason', 'NO_SIGNAL')}")
+            reason = r.get("decision_reason") or r.get("signal_reason") or ""
+            label = REASON_LABELS.get(str(reason), str(reason))
+            st.caption(f"Why: {label}")
+            if r.get("signal_reason"):
+                st.caption(f"Signal: {REASON_LABELS.get(str(r.get('signal_reason')), str(r.get('signal_reason')))}")
+            if r.get("decision_reason"):
+                st.caption(f"Blocked: {REASON_LABELS.get(str(r.get('decision_reason')), str(r.get('decision_reason')))}")
 
     with st.expander("Auto-archived / Dead candidates", expanded=False):
         if not dead_cards:
@@ -6437,6 +6493,9 @@ def main():
         st.rerun()
 
     ensure_storage()
+    if "_migrated_reason_fields" not in st.session_state:
+        migrate_reason_fields()
+        st.session_state["_migrated_reason_fields"] = True
     portfolio_rows = load_csv(PORTFOLIO_CSV, PORTFOLIO_FIELDS)
     monitoring_rows = load_csv(MONITORING_CSV, MON_FIELDS)
     monitoring_history_rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
