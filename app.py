@@ -213,13 +213,18 @@ def sb_get_storage(key: str) -> Optional[str]:
         params = {"select": "content", "key": f"eq.{key}"}
         r = requests.get(url, headers=_sb_headers(), params=params, timeout=12)
         if r.status_code == 404:
+            debug_log(f"supabase_read_404 key={key}")
             return None
         r.raise_for_status()
         data = r.json() or []
         if not data:
+            debug_log(f"supabase_read_empty key={key}")
             return None
-        return (data[0].get("content") or "")
-    except Exception:
+        content = (data[0].get("content") or "")
+        debug_log(f"supabase_read_ok key={key} bytes={len(content)}")
+        return content
+    except Exception as e:
+        debug_log(f"supabase_read_exception key={key} err={type(e).__name__}:{e}")
         return None
 
 def sb_put_storage(key: str, content: str) -> bool:
@@ -241,7 +246,8 @@ def sb_put_storage(key: str, content: str) -> bool:
 
         res = requests.post(url, headers=headers, json=payload, timeout=10)
         if res.status_code not in (200, 201):
-            debug_log(f"supabase_write_failed key={key} status={res.status_code}")
+            err_preview = (res.text or "").strip().replace("\n", " ")[:200]
+            debug_log(f"supabase_write_failed key={key} status={res.status_code} body={err_preview}")
             return False
 
         debug_log(f"supabase_write_ok key={key} bytes={len(content)}")
@@ -415,6 +421,7 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
         content = sb_get_storage(key)
         if content:
             try:
+                st.session_state[f"_storage_source_{key}"] = "supabase"
                 return _csv_from_string(content)
             except Exception:
                 debug_log(f"corrupt_supabase_csv key={key}")
@@ -424,10 +431,12 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
         try:
             with open(fallback, "r", newline="", encoding="utf-8") as f:
                 debug_log(f"using_local_fallback key={key}")
+                st.session_state[f"_storage_source_{key}"] = "local_fallback"
                 return list(csv.DictReader(f))
         except Exception as e:
             debug_log(f"local_fallback_read_failed key={key} err={type(e).__name__}:{e}")
 
+    st.session_state[f"_storage_source_{key}"] = "empty"
     return []
 
 
@@ -456,11 +465,15 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
             check = sb_get_storage(key)
             if check:
                 debug_log(f"supabase_store_verified key={key}")
+                st.session_state["_save_badge"] = "💾 saved (supabase verified)"
             else:
                 debug_log(f"supabase_store_unverified key={key}")
+                st.session_state["_save_badge"] = "⚠️ saved local, supabase unverified"
         else:
             debug_log(f"supabase_store_failed_local_kept key={key}")
-    st.session_state["_save_badge"] = "💾 saved"
+            st.session_state["_save_badge"] = "⚠️ saved local, supabase write failed"
+    else:
+        st.session_state["_save_badge"] = "💾 saved (local)"
     load_monitoring_rows_cached.clear()
 
 
@@ -5772,6 +5785,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     # Source of truth for Monitoring page UI: monitoring.csv only.
     monitoring_rows = load_monitoring_rows_cached()
+    mon_source = st.session_state.get("_storage_source_monitoring.csv", "unknown")
+    st.caption(f"MONITORING FROM DB: {len(monitoring_rows)} (source: {mon_source})")
     rows: List[Dict[str, Any]] = []
     for raw in monitoring_rows:
         row = dict(raw)
