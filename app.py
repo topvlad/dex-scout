@@ -666,6 +666,7 @@ REASON_LABELS = {
     "low_liquidity": "Low liquidity",
     "early_momentum": "Early momentum",
     "breakout": "Breakout",
+    "fallback_signal": "Weak signal",
 }
 
 
@@ -1490,6 +1491,9 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
         row["risk"] = "HIGH"
         row["decision_reason"] = reasons[0]
         row["toxic_flags"] = ",".join(reasons)
+        row["entry_score"] = parse_float(row.get("entry_score", 0), 0.0) - 200.0
+        row["priority"] = parse_float(row.get("priority", 0), 0.0) - 200.0
+        row["priority_score"] = parse_float(row.get("priority_score", row.get("entry_score", 0)), 0.0) - 200.0
     return row
 
 
@@ -2103,12 +2107,12 @@ def rug_probability(item: Dict[str, Any]) -> int:
 
 def entry_engine_v2(item: Dict[str, Any]) -> Tuple[str, str, str]:
     if is_liquidity_trap(item):
-        return "NO_ENTRY", "LIQ_TRAP", "EXTREME"
+        return "NO_ENTRY", "low_liquidity", "EXTREME"
     if is_fake_pump(item):
-        return "NO_ENTRY", "FAKE_PUMP", "HIGH"
+        return "NO_ENTRY", "fake_pump", "HIGH"
     rug = rug_probability(item)
     if rug >= 3:
-        return "NO_ENTRY", "RUG_RISK", "EXTREME"
+        return "NO_ENTRY", "fake_activity", "EXTREME"
 
     pc1h = parse_float(item.get("pc1h"), 0.0)
     pc5m = parse_float(item.get("pc5"), 0.0)
@@ -2149,19 +2153,17 @@ def entry_engine_v2(item: Dict[str, Any]) -> Tuple[str, str, str]:
     if liq > 15000:
         score += 30
 
-    momentum_flag = bool(pc1h > 2 or pc5m > 1)
-    if detect_breakout(item) or (momentum_flag and score > 200):
-        return "TRADEABLE", "MOMENTUM_LIGHT", "MEDIUM"
-    if score > 220 and vol5 > 800:
-        return "EARLY", "EARLY_ENTRY", "HIGH"
+    momentum_flag = bool((pc1h > 2 or pc5m > 1) and vol5 > 800)
+    if detect_breakout(item):
+        momentum_flag = True
 
-    risk = "HIGH" if liq < 12000 else "MEDIUM"
-    if risk == "HIGH" and score < 300:
-        return "NO_ENTRY", "RISK_HIGH_LOW_SCORE", "HIGH"
-
-    if vol5 > 10000:
-        return "WAIT", "MOMENTUM_BUILDING", risk
-    return "WAIT", "NO_SIGNAL", risk
+    if score > 240 and momentum_flag:
+        return "TRADEABLE", "breakout", "MEDIUM"
+    if score > 200:
+        return "EARLY", "early_momentum", "MEDIUM"
+    if score > 150:
+        return "WATCH", "", "MEDIUM"
+    return "NO_ENTRY", "no_momentum", "HIGH"
 
 
 def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
@@ -4273,6 +4275,8 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         for p in filtered
         if not is_symbol_major_like(str(safe_get(p, "baseToken", "symbol", default="") or ""))
     ]
+    if len(filtered) == 0 and pairs:
+        filtered = pairs[:5]
     filtered = dedupe_by_symbol_family(filtered, per_symbol_limit=1)
     # toxic candidates are marked later, not hard-skipped at collection stage
 
@@ -4335,7 +4339,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             row["risk"] = "HIGH"
             row["decision_reason"] = reasons[0]
             row["toxic_flags"] = ",".join(reasons)
-            counts["skipped_noise"] += 1
+            s -= 200.0
         base_sym = str(safe_get(row, "baseToken", "symbol", default="") or row.get("base_symbol") or "").strip().upper()
         row_chain = str(row.get("chainId") or row.get("chain") or "").strip().lower()
 
@@ -4383,7 +4387,24 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["skipped_symbol_duplicate"] += 1
                 continue
             seen_token_keys.add(dedupe_key)
-        entry_status = str(row.get("entry_status", "NO_ENTRY") or "NO_ENTRY")
+        momentum_flag = (
+            parse_float(safe_get(row, "volume", "m5", default=0), 0.0) > 20_000
+            and parse_float(safe_get(row, "priceChange", "m5", default=0), 0.0) > 5
+        )
+        if float(s) > 240 and momentum_flag:
+            entry_status = "TRADEABLE"
+            signal_reason = "breakout"
+        elif float(s) > 200:
+            entry_status = "EARLY"
+            signal_reason = "early_momentum"
+        elif float(s) > 150:
+            entry_status = "WATCH"
+            signal_reason = None
+        else:
+            entry_status = "NO_ENTRY"
+            signal_reason = None
+        row["entry_status"] = entry_status
+        row["signal_reason"] = signal_reason or row.get("signal_reason") or ""
         entry_score = parse_float(row.get("entry_score", 0), 0.0)
         decision = "watch"
         row["smart_money"] = smart
@@ -4394,6 +4415,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         weak_reasons: List[str] = []
         if entry_status == "NO_ENTRY":
             weak_reasons.append("no_entry")
+        st.write(f"entry={entry_status} score={float(s):.2f}")
         if not gate_ok:
             counts["skipped_noise"] += 1
             row["note"] = gate_reason
@@ -4480,7 +4502,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["skipped_active"] += 1
             elif res == "EXISTS_ARCHIVED":
                 counts["skipped_archived"] += 1
-            if entry_status == "WAIT" and detect_auto_signal(row):
+            if entry_status in {"WATCH", "WAIT"} and detect_auto_signal(row):
                 add_to_monitoring(
                     row,
                     float(s),
@@ -5104,12 +5126,14 @@ def compute_entry_signal(item: Dict[str, Any]) -> Tuple[str, str]:
     momentum_flag = vol > 20_000 and price_change > 5
 
     if liq < 2000:
-        return "SKIP", "low_liquidity"
-    if momentum_flag and score > 220:
+        return "NO_ENTRY", "low_liquidity"
+    if score > 240 and momentum_flag:
         return "TRADEABLE", "breakout"
     if score > 200:
         return "EARLY", "early_momentum"
-    return "WAIT", ""
+    if score > 150:
+        return "WATCH", ""
+    return "NO_ENTRY", "no_momentum"
 
 
 def compute_timing(item: Dict[str, Any]) -> str:
