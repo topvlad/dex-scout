@@ -718,7 +718,7 @@ def is_fake_activity(p: Dict[str, Any]) -> bool:
     sells = parse_float(safe_get(p, "txns", "h24", "sells", default=p.get("sells_h24", 0)), 0)
     makers = parse_float(safe_get(p, "txns", "h24", "makers", default=p.get("makers_h24", 0)), 0)
 
-    if buys <= 2 and sells <= 2:
+    if buys <= 1 and sells <= 1:
         return True
     if makers <= 2:
         return True
@@ -740,8 +740,7 @@ def is_toxic_token(p: Dict[str, Any]) -> Tuple[bool, List[str]]:
         reasons.append("freezable")
     if is_fake_activity(p):
         reasons.append("fake_activity")
-    if is_flat_chart(p):
-        reasons.append("no_momentum")
+    # flat chart is a soft penalty in scoring, not a toxic hard-flag
     return (len(reasons) > 0), reasons
 
 
@@ -1489,7 +1488,6 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
     toxic, reasons = is_toxic_token(pair)
     if toxic:
         row["risk"] = "HIGH"
-        row["entry_status"] = "NO_ENTRY"
         row["decision_reason"] = reasons[0]
         row["toxic_flags"] = ",".join(reasons)
     return row
@@ -4276,13 +4274,7 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         if not is_symbol_major_like(str(safe_get(p, "baseToken", "symbol", default="") or ""))
     ]
     filtered = dedupe_by_symbol_family(filtered, per_symbol_limit=1)
-    clean: List[Dict[str, Any]] = []
-    for p in filtered:
-        toxic, _reasons = is_toxic_token(p)
-        if toxic:
-            continue
-        clean.append(p)
-    filtered = clean
+    # toxic candidates are marked later, not hard-skipped at collection stage
 
     out = []
     for p in filtered:
@@ -4312,6 +4304,13 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         ranked.append((score, p, smart, signal))
     ranked.sort(key=lambda x: x[0], reverse=True)
     ranked = ranked[: max(1, int(max_items))]
+    if len(ranked) == 0 and pairs:
+        fallback_ranked = []
+        for p in pairs[:5]:
+            s = score_pair(p)
+            fallback_ranked.append((s, p, detect_smart_money(p), classify_signal(p)))
+        ranked = fallback_ranked
+    st.write(f"pairs={len(pairs)} filtered={len(pairs)} ranked={len(ranked)}")
     if ranked:
         best = ranked[0][1]
         best_row = normalize_pair_row(best)
@@ -4334,11 +4333,9 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         toxic, reasons = is_toxic_token(p)
         if toxic:
             row["risk"] = "HIGH"
-            row["entry_status"] = "NO_ENTRY"
             row["decision_reason"] = reasons[0]
             row["toxic_flags"] = ",".join(reasons)
             counts["skipped_noise"] += 1
-            continue
         base_sym = str(safe_get(row, "baseToken", "symbol", default="") or row.get("base_symbol") or "").strip().upper()
         row_chain = str(row.get("chainId") or row.get("chain") or "").strip().lower()
 
@@ -4496,6 +4493,20 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         except Exception as e:
             log_error(e)
             counts["errors"] += 1
+    if counts["added"] == 0 and ranked:
+        fallback = normalize_pair_row(ranked[0][1])
+        fallback["entry_status"] = "EARLY"
+        fallback["signal_reason"] = "fallback_signal"
+        add_to_monitoring(
+            fallback,
+            float(ranked[0][0]),
+            window_name=window_name,
+            preset_key=preset_key,
+            entry_status="EARLY",
+            entry_score=parse_float(fallback.get("entry_score", ranked[0][0]), 0.0),
+            risk_level=str(fallback.get("risk_level", "MEDIUM")),
+        )
+        counts["added"] += 1
     save_smart_wallets(smart_wallets)
     return counts
 
