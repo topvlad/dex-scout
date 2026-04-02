@@ -955,11 +955,18 @@ def fetch_tokens_unified(chain: str, limit: int = 50) -> List[Dict[str, Any]]:
             return []
 
     if chain == "solana":
-        merged = _from_birdeye_solana() + _from_dexscreener("solana")
-        return dedupe_unified_tokens(merged)
+        sources = ["birdeye", "dexscreener"]
+    else:
+        sources = ["dexscreener"]
 
-    if chain == "bsc":
-        return dedupe_unified_tokens(_from_dexscreener("bsc"))
+    merged: List[Dict[str, Any]] = []
+    for source in sources:
+        if source == "birdeye" and chain == "solana":
+            merged.extend(_from_birdeye_solana())
+        if source == "dexscreener":
+            merged.extend(_from_dexscreener(chain))
+    if merged:
+        return dedupe_unified_tokens(merged)
 
     return []
 
@@ -4039,6 +4046,32 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         except Exception:
             continue
 
+    target_chain = str(chain or "").lower().strip()
+
+    def match_chain(p: Dict[str, Any]) -> bool:
+        ch = str(p.get("chainId") or p.get("chain") or "").lower().strip()
+        return ch == target_chain
+
+    all_pairs = [p for p in all_pairs if match_chain(p)]
+
+    def is_not_solana_address(addr: str) -> bool:
+        if not addr:
+            return True
+        addr = str(addr).strip()
+        # solana addresses ~32-44 chars, no 0x
+        if addr.startswith("0x"):
+            return True
+        if len(addr) < 30:
+            return True
+        return False
+
+    def is_wrong_network(p: Dict[str, Any]) -> bool:
+        addr = safe_get(p, "baseToken", "address", default="")
+        return is_not_solana_address(addr)
+
+    if target_chain == "solana":
+        all_pairs = [p for p in all_pairs if not is_wrong_network(p)]
+
     pairs = dedupe_mode(all_pairs, by_base_token=False)
     pairs = sorted(
         pairs,
@@ -4088,7 +4121,7 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
 def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, int]:
     chain = (chain or "solana").strip().lower()
     preset = PRESETS.get(window_name, {})
-    counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "errors": 0, "seen": 0}
+    counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "skipped_wrong_chain": 0, "skipped_major": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     ranked = []
     smart_wallets = load_smart_wallets()
@@ -4112,6 +4145,22 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         counts["seen"] += 1
         row = normalize_pair_row(p)
         base_sym = str(safe_get(row, "baseToken", "symbol", default="") or row.get("base_symbol") or "").strip().upper()
+        row_chain = str(row.get("chainId") or row.get("chain") or "").strip().lower()
+
+        if row_chain != chain:
+            counts["skipped_noise"] += 1
+            counts["skipped_wrong_chain"] += 1
+            continue
+
+        if base_sym in MAJORS_STABLES:
+            counts["skipped_noise"] += 1
+            counts["skipped_major"] += 1
+            continue
+
+        if base_sym in {"ETH", "USDT", "USDC", "BTC", "BNB", "SOL"}:
+            counts["skipped_noise"] += 1
+            counts["skipped_major"] += 1
+            continue
 
         if is_symbol_major_like(base_sym):
             counts["skipped_noise"] += 1
@@ -4407,6 +4456,29 @@ def cleanup_monitoring_noise() -> int:
             changed += 1
     if changed:
         save_monitoring(rows)
+    return changed
+
+
+def purge_non_solana_and_majors() -> int:
+    rows = load_monitoring()
+    changed = 0
+
+    for r in rows:
+        if str(r.get("active", "1")) != "1":
+            continue
+
+        sym = str(r.get("base_symbol") or "").upper().strip()
+        addr = str(r.get("base_addr") or "")
+
+        if sym in {"ETH", "USDT", "USDC", "BTC", "BNB", "SOL"} or addr.startswith("0x"):
+            r["active"] = "0"
+            r["archived_reason"] = "purged_non_solana_or_major"
+            r["ts_archived"] = now_utc_str()
+            changed += 1
+
+    if changed:
+        save_monitoring(rows)
+
     return changed
 
 def scanner_state_load() -> Dict[str, Any]:
@@ -5408,6 +5480,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption(f"Revisited high-score candidates: {revisited_now}")
     except Exception:
         pass
+    if not st.session_state.get("_purged_non_solana_once", False):
+        try:
+            purged = purge_non_solana_and_majors()
+            if purged:
+                st.caption(f"Purged non-Solana/majors from Monitoring: {purged}")
+            load_monitoring_rows_cached.clear()
+        except Exception:
+            pass
+        st.session_state["_purged_non_solana_once"] = True
 
     scan_state = scanner_state_load()
     top = st.columns([2,2,3,3])
@@ -5454,6 +5535,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         f"Skipped active: {stats.get('skipped_active', 0)} • "
         f"Skipped archived: {stats.get('skipped_archived', 0)} • "
         f"Skipped noise: {stats.get('skipped_noise', 0)} • "
+        f"Skipped wrong chain: {stats.get('skipped_wrong_chain', 0)} • "
+        f"Skipped major: {stats.get('skipped_major', 0)} • "
         f"Revisited: {stats.get('revisited', 0)} • "
         f"Trimmed: {stats.get('trimmed', 0)} • "
         f"Stale removed: {stats.get('stale_removed', 0)}"
@@ -5534,7 +5617,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if sym in {"", "UNKNOWN", short_addr_label.upper()}:
             name = short_addr_label
         else:
-            name = f"{sym} ({short_addr_label})"
+            name = sym
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
         decision = item["decision"]
         entry_status = str(item.get("entry_status", "UNKNOWN")).upper()
