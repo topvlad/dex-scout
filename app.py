@@ -570,8 +570,8 @@ MAJORS_STABLES = {
 }
 
 DEFAULT_SEEDS = (
-    "WBNB, USDT, meme, memecoin, ai, ai agent, agentic, launch, new, listing, trending, hot, hype, pump, "
-    "sol, eth, usdc, pepe, trump, inu, dog, cat, frog, shiba, "
+    "meme, memecoin, ai, ai agent, agentic, launch, new, listing, trending, hot, hype, pump, "
+    "pepe, trump, inu, dog, cat, frog, shiba, "
     "community, cto, community takeover, takeover, revival, "
     "fairlaunch, stealth, presale, airdrop, claim, points, quest, rewards, wl, whitelist, "
     "v2, v3, v4, relaunch, rebrand, migration, upgrade, "
@@ -695,6 +695,60 @@ def parse_float(x, default=0.0) -> float:
         return float(x)
     except Exception:
         return float(default)
+
+
+def is_symbol_major_like(symbol: str) -> bool:
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return False
+    if s in MAJORS_STABLES:
+        return True
+    if s.startswith("W") and s[1:] in MAJORS_STABLES:
+        return True
+    if s in {"SOL", "ETH", "BTC", "BNB", "USDT", "USDC", "BUSD", "DAI"}:
+        return True
+    return False
+
+
+def looks_like_quote_or_lp(p: Dict[str, Any]) -> bool:
+    base_sym = str(safe_get(p, "baseToken", "symbol", default="") or "").strip().upper()
+    quote_sym = str(safe_get(p, "quoteToken", "symbol", default="") or "").strip().upper()
+    base_name = str(safe_get(p, "baseToken", "name", default="") or "").strip().lower()
+
+    if is_symbol_major_like(base_sym):
+        return True
+
+    if "lp" in base_name or "liquidity" in base_name:
+        return True
+
+    if base_sym == quote_sym and base_sym:
+        return True
+
+    return False
+
+
+def dedupe_by_symbol_family(rows: List[Dict[str, Any]], per_symbol_limit: int = 1) -> List[Dict[str, Any]]:
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+
+    for r in rows:
+        sym = str(safe_get(r, "baseToken", "symbol", default="") or r.get("base_symbol") or "").strip().upper()
+        if not sym:
+            continue
+        buckets.setdefault(sym, []).append(r)
+
+    out: List[Dict[str, Any]] = []
+    for _sym, items in buckets.items():
+        items.sort(
+            key=lambda p: (
+                parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0),
+                parse_float(safe_get(p, "volume", "h24", default=0), 0.0),
+                score_pair(p),
+            ),
+            reverse=True,
+        )
+        out.extend(items[:per_symbol_limit])
+
+    return out
 
 
 def norm_addr(chain: str, addr: str) -> str:
@@ -1311,10 +1365,10 @@ def passes_monitoring_gate(row: Dict[str, Any], score: float) -> Tuple[bool, str
         if score < 260 and strength_flags < 2:
             return False, "gate: no_entry_weak"
 
-    if score < 180 and strength_flags < 2:
+    if score < 140 and strength_flags < 2:
         return False, "gate: weak_score"
 
-    if score < 230 and vol5 < 2500 and pc1h < 5 and strength_flags < 3:
+    if score < 190 and vol5 < 1800 and pc1h < 4 and strength_flags < 3:
         return False, "gate: low_conviction"
 
     if sells5 > buys5 * 1.5 and strength_flags < 3:
@@ -4011,6 +4065,14 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         hide_solana_unverified=bool(preset.get("hide_solana_unverified", True)),
     )
 
+    filtered = [p for p in filtered if not looks_like_quote_or_lp(p)]
+    filtered = [
+        p
+        for p in filtered
+        if not is_symbol_major_like(str(safe_get(p, "baseToken", "symbol", default="") or ""))
+    ]
+    filtered = dedupe_by_symbol_family(filtered, per_symbol_limit=1)
+
     out = []
     for p in filtered:
         base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
@@ -4026,7 +4088,7 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
 def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, int]:
     chain = (chain or "solana").strip().lower()
     preset = PRESETS.get(window_name, {})
-    counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "errors": 0, "seen": 0}
+    counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     ranked = []
     smart_wallets = load_smart_wallets()
@@ -4040,12 +4102,35 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     ranked.sort(key=lambda x: x[0], reverse=True)
     ranked = ranked[: max(1, int(max_items))]
     seen_token_keys: Set[str] = set()
+    existing_rows = load_monitoring()
+    active_symbols = {
+        str(r.get("base_symbol") or "").strip().upper()
+        for r in existing_rows
+        if str(r.get("active", "1")).strip() == "1"
+    }
     for s, p, smart, signal in ranked:
         counts["seen"] += 1
         row = normalize_pair_row(p)
+        base_sym = str(safe_get(row, "baseToken", "symbol", default="") or row.get("base_symbol") or "").strip().upper()
+
+        if is_symbol_major_like(base_sym):
+            counts["skipped_noise"] += 1
+            counts["skipped_major_like"] += 1
+            continue
+
+        if looks_like_quote_or_lp(row):
+            counts["skipped_noise"] += 1
+            counts["skipped_quote_like"] += 1
+            continue
 
         if is_major_or_stable(row):
             counts["skipped_noise"] += 1
+            counts["skipped_major_like"] += 1
+            continue
+
+        if base_sym in active_symbols:
+            counts["skipped_noise"] += 1
+            counts["skipped_symbol_duplicate"] += 1
             continue
 
         chain_id = (row.get("chainId") or row.get("chain") or "").strip().lower()
@@ -4054,6 +4139,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         if dedupe_key:
             if dedupe_key in seen_token_keys:
                 counts["skipped_noise"] += 1
+                counts["skipped_symbol_duplicate"] += 1
                 continue
             seen_token_keys.add(dedupe_key)
         entry_status = str(row.get("entry_status", "NO_ENTRY") or "NO_ENTRY")
@@ -4129,6 +4215,8 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
 
             if res == "OK":
                 counts["added"] += 1
+                if base_sym:
+                    active_symbols.add(base_sym)
             elif res == "EXISTS_ACTIVE":
                 counts["skipped_active"] += 1
             elif res == "EXISTS_ARCHIVED":
@@ -4205,6 +4293,9 @@ def revisit_archived(min_days: int = 1, score_threshold: float = 400.0, max_revi
     for r in rows:
         if r.get("active") == "1":
             continue
+        reason = str(r.get("archived_reason", "") or "").lower()
+        if any(x in reason for x in ["promoted", "duplicate_portfolio", "dead", "rug", "critical"]):
+            continue
         revisit_count = int(parse_float(r.get("revisit_count", 0), 0))
         if revisit_count >= max_revisits:
             continue
@@ -4233,6 +4324,8 @@ def revisit_archived(min_days: int = 1, score_threshold: float = 400.0, max_revi
         r["revisit_count"] = str(revisit_count + 1)
         r["revisit_after_ts"] = ""
         r["weak_reason"] = ""
+        r["portfolio_linked"] = "0"
+        r["in_portfolio"] = "0"
         changed += 1
 
     if changed:
@@ -4262,12 +4355,19 @@ def remove_stale_tokens(ttl_hours: int = 6) -> int:
     return changed
 
 
+def monitoring_rank_for_trim(r: Dict[str, Any]) -> Tuple[float, float]:
+    score = parse_float(r.get("priority_score", 0), 0.0)
+    last_seen_dt = _safe_dt_parse(r.get("ts_last_seen", "")) or _safe_dt_parse(r.get("ts_added", ""))
+    freshness = last_seen_dt.timestamp() if last_seen_dt else 0.0
+    return (score, freshness)
+
+
 def trim_active_monitoring(max_active: int = 20) -> int:
     rows = load_monitoring()
     active_rows = [r for r in rows if str(r.get("active", "1")).strip() == "1"]
     if len(active_rows) <= max_active:
         return 0
-    active_sorted = sorted(active_rows, key=lambda r: parse_float(r.get("priority_score", 0), 0.0), reverse=True)
+    active_sorted = sorted(active_rows, key=monitoring_rank_for_trim, reverse=True)
     keep_keys = {
         addr_key((r.get("chain") or "").strip().lower(), addr_store((r.get("chain") or "").strip().lower(), r.get("base_addr", "")))
         for r in active_sorted[:max_active]
@@ -4290,7 +4390,24 @@ def trim_active_monitoring(max_active: int = 20) -> int:
 
 
 def add_new_candidates() -> int:
-    return revisit_archived(min_days=1, score_threshold=400.0)
+    return revisit_archived(min_days=1, score_threshold=260.0, max_revisits=3)
+
+
+def cleanup_monitoring_noise() -> int:
+    rows = load_monitoring()
+    changed = 0
+    for r in rows:
+        if str(r.get("active", "1")).strip() != "1":
+            continue
+        base_sym = str(r.get("base_symbol") or "").strip().upper()
+        if is_symbol_major_like(base_sym):
+            r["active"] = "0"
+            r["ts_archived"] = now_utc_str()
+            r["archived_reason"] = "noise_major_like"
+            changed += 1
+    if changed:
+        save_monitoring(rows)
+    return changed
 
 def scanner_state_load() -> Dict[str, Any]:
     path = os.path.join(DATA_DIR, "scanner_state.json")
@@ -4421,6 +4538,7 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
     stats["stale_removed"] = remove_stale_tokens()
     stats["revisited"] = add_new_candidates()
     stats["trimmed"] = trim_active_monitoring(max_active=20)
+    stats["cleanup_noise"] = cleanup_monitoring_noise()
     state["last_window"] = window_name
     state["last_preset"] = preset_key
     state["last_chain"] = (chain or "solana").strip().lower()
@@ -4898,6 +5016,8 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
     liq_level = str(item.get("liq_health", {}).get("level", "UNKNOWN") or "UNKNOWN").upper()
     is_dead = bool(item.get("is_dead"))
     is_rug = bool(item.get("is_rug"))
+    row = item.get("row", {}) or {}
+    base_sym = str(row.get("base_symbol") or "").strip().upper()
 
     if decision in ("NO ENTRY", "NO_ENTRY"):
         penalty += 35
@@ -4926,6 +5046,9 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
     if is_rug:
         penalty += 120
         flags.append("post_rug")
+    if is_symbol_major_like(base_sym):
+        penalty += 120
+        flags.append("major_like_symbol")
     if is_dead:
         penalty += 200
         flags.append("dead")
@@ -5280,7 +5403,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         except Exception:
             pass
     try:
-        revisited_now = revisit_archived(min_days=1, score_threshold=400.0)
+        revisited_now = revisit_archived(min_days=1, score_threshold=260.0, max_revisits=3)
         if revisited_now:
             st.caption(f"Revisited high-score candidates: {revisited_now}")
     except Exception:
@@ -5315,7 +5438,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         r["in_portfolio"] = "1" if addr_key(chain, base_addr) in active_set else "0"
         if str(r.get("active", "1")).strip() != "1":
             continue
-        if str(r.get("archived_reason", "")).strip().lower() in ("promoted_to_portfolio", "duplicate_portfolio"):
+        if str(r.get("archived_reason", "")).strip().lower() in ("promoted_to_portfolio", "duplicate_portfolio", "promoted"):
             continue
         active_rows.append(r)
     active_rows = sorted(active_rows, key=lambda row: parse_float(row.get("priority_score", 0), 0.0), reverse=True)[:20]
@@ -5325,6 +5448,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     top[1].metric("Archived", len(archived))
     top[2].caption(f"Last scan: {scan_state.get('last_run_ts','—')} • {scan_state.get('last_window','—')} • {scan_state.get('last_chain','—')}")
     top[3].caption(f"Last stats: {scan_state.get('last_stats', {})}")
+    stats = scan_state.get("last_stats", {}) or {}
+    st.caption(
+        f"Added: {stats.get('added', 0)} • "
+        f"Skipped active: {stats.get('skipped_active', 0)} • "
+        f"Skipped archived: {stats.get('skipped_archived', 0)} • "
+        f"Skipped noise: {stats.get('skipped_noise', 0)} • "
+        f"Revisited: {stats.get('revisited', 0)} • "
+        f"Trimmed: {stats.get('trimmed', 0)} • "
+        f"Stale removed: {stats.get('stale_removed', 0)}"
+    )
 
     cbtn1, cbtn2, cbtn3 = st.columns([2,2,6])
     with cbtn1:
@@ -5369,6 +5502,21 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     signals_cards = [c for c in cards_all if c["ui_bucket"] in ("tradable", "caution")]
     review_cards = [c for c in cards_all if c["ui_bucket"] == "review"]
     dead_cards = [c for c in cards_all if c["ui_bucket"] == "dead"]
+
+    def render_dedupe(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        best_by_symbol: Dict[str, Dict[str, Any]] = {}
+        for c in cards:
+            r = c.get("row", {})
+            sym = str(r.get("base_symbol") or extract_name(r) or "").strip().upper()
+            if not sym:
+                continue
+            prev = best_by_symbol.get(sym)
+            if prev is None or float(c.get("ui_visible_score", 0)) > float(prev.get("ui_visible_score", 0)):
+                best_by_symbol[sym] = c
+        return list(best_by_symbol.values())
+
+    signals_cards = render_dedupe(signals_cards)
+    review_cards = render_dedupe(review_cards)
     signals_cards.sort(key=lambda x: x["ui_visible_score"], reverse=True)
     review_cards.sort(key=lambda x: x["ui_visible_score"], reverse=True)
 
@@ -5381,13 +5529,19 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         best = item["best"]
         chain = (r.get("chain") or "").strip().lower()
         base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
-        name = extract_name(r).upper()
+        sym = extract_name(r).upper()
+        short_addr_label = f"{base_addr[:4]}...{base_addr[-4:]}" if base_addr else "?"
+        if sym in {"", "UNKNOWN", short_addr_label.upper()}:
+            name = short_addr_label
+        else:
+            name = f"{sym} ({short_addr_label})"
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
         decision = item["decision"]
-        header = f"{name} ({short_addr(base_addr)}) | {item.get('ui_badge', 'NA')} | {decision} | {score:.2f}"
+        entry_status = str(item.get("entry_status", "UNKNOWN")).upper()
+        header = f"{name} | {item.get('ui_badge', 'NA')} | {entry_status} | {score:.2f}"
 
         with st.expander(header, expanded=False):
-            st.caption(f"{chain.upper()} • entry {item.get('entry_status', 'UNKNOWN')} • risk {item.get('risk_level', 'UNKNOWN')}")
+            st.caption(f"{chain.upper()} • decision {decision} • risk {item.get('risk_level', 'UNKNOWN')}")
             if str(r.get("in_portfolio", "0")) == "1":
                 st.caption("🧺 Already in portfolio")
             if str(r.get("portfolio_linked", "0")) == "1":
