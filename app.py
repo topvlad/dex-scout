@@ -713,6 +713,61 @@ def token_key(chain: str, addr: str) -> str:
     return f"{c}|{a}" if (c and a) else ""
 
 
+
+
+def dedupe_tokens_by_address(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep the highest-priority row per (chain, base address)."""
+    best: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        chain = (row.get("chainId") or row.get("chain") or "").strip().lower()
+        base_addr = (
+            safe_get(row, "baseToken", "address", default="")
+            or row.get("base_addr")
+            or row.get("address")
+            or ""
+        )
+        key = token_key(chain, str(base_addr).strip())
+        if not key:
+            continue
+
+        score = parse_float(row.get("priority_score", row.get("visible_score", 0.0)), 0.0)
+        prev = best.get(key)
+        if prev is None:
+            best[key] = row
+            continue
+
+        prev_score = parse_float(prev.get("priority_score", prev.get("visible_score", 0.0)), 0.0)
+        if score > prev_score:
+            best[key] = row
+    return list(best.values())
+
+
+def dedupe_unified_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate unified token feed by normalized address key."""
+    if not tokens:
+        return []
+
+    best: Dict[str, Dict[str, Any]] = {}
+    for token in tokens:
+        chain = (token.get("chain") or "").strip().lower()
+        address = (token.get("address") or "").strip()
+        key = token_key(chain, address)
+        if not key:
+            continue
+
+        current = best.get(key)
+        if current is None:
+            best[key] = token
+            continue
+
+        liq = parse_float(token.get("liquidity", 0.0), 0.0)
+        vol = parse_float(token.get("volume", 0.0), 0.0)
+        cur_liq = parse_float(current.get("liquidity", 0.0), 0.0)
+        cur_vol = parse_float(current.get("volume", 0.0), 0.0)
+        if (liq, vol) > (cur_liq, cur_vol):
+            best[key] = token
+
+    return list(best.values())
 def fmt_usd(x: float) -> str:
     try:
         return f"${x:,.0f}"
@@ -785,7 +840,7 @@ def fetch_dexscreener_latest(chain: str, limit: int = 40):
 def fetch_tokens_unified(chain: str, limit: int = 50) -> List[Dict[str, Any]]:
     chain = (chain or "").strip().lower()
 
-    if chain == "solana":
+    def _from_birdeye_solana() -> List[Dict[str, Any]]:
         try:
             url = "https://public-api.birdeye.so/defi/tokenlist"
             params = {
@@ -795,48 +850,24 @@ def fetch_tokens_unified(chain: str, limit: int = 50) -> List[Dict[str, Any]]:
                 "limit": limit,
             }
             r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                data = r.json() or {}
-                raw = safe_get(data, "data", "tokens", default=[]) or []
-                out: List[Dict[str, Any]] = []
-                for t in raw:
-                    addr = str(t.get("address") or "").strip()
-                    sym = str(t.get("symbol") or "NA").strip()
-                    if not addr:
-                        continue
-                    out.append(
-                        {
-                            "symbol": sym,
-                            "address": addr,
-                            "price": parse_float(t.get("price", 0), 0.0),
-                            "volume": parse_float(t.get("v24hUSD", 0), 0.0),
-                            "liquidity": parse_float(t.get("liquidity", 0), 0.0),
-                            "source": "birdeye",
-                            "chain": "solana",
-                        }
-                    )
-                if out:
-                    return out
-        except Exception:
-            pass
-
-        try:
-            pairs = fetch_dexscreener_trending("solana", limit=limit)
-            out = []
-            for p in pairs:
-                base = p.get("baseToken", {}) or {}
-                addr = str(base.get("address") or "").strip()
-                sym = str(base.get("symbol") or "NA").strip()
+            if r.status_code != 200:
+                return []
+            data = r.json() or {}
+            raw = safe_get(data, "data", "tokens", default=[]) or []
+            out: List[Dict[str, Any]] = []
+            for t in raw:
+                addr = str(t.get("address") or "").strip()
+                sym = str(t.get("symbol") or "NA").strip()
                 if not addr:
                     continue
                 out.append(
                     {
                         "symbol": sym,
                         "address": addr,
-                        "price": parse_float(p.get("priceUsd"), 0.0),
-                        "volume": parse_float(safe_get(p, "volume", "h24", default=0), 0.0),
-                        "liquidity": parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0),
-                        "source": "dexscreener",
+                        "price": parse_float(t.get("price", 0), 0.0),
+                        "volume": parse_float(t.get("v24hUSD", 0), 0.0),
+                        "liquidity": parse_float(t.get("liquidity", 0), 0.0),
+                        "source": "birdeye",
                         "chain": "solana",
                     }
                 )
@@ -844,10 +875,10 @@ def fetch_tokens_unified(chain: str, limit: int = 50) -> List[Dict[str, Any]]:
         except Exception:
             return []
 
-    if chain == "bsc":
+    def _from_dexscreener(chain_id: str) -> List[Dict[str, Any]]:
         try:
-            pairs = fetch_dexscreener_trending("bsc", limit=limit)
-            out = []
+            pairs = fetch_dexscreener_trending(chain_id, limit=limit)
+            out: List[Dict[str, Any]] = []
             for p in pairs:
                 base = p.get("baseToken", {}) or {}
                 addr = str(base.get("address") or "").strip()
@@ -862,12 +893,19 @@ def fetch_tokens_unified(chain: str, limit: int = 50) -> List[Dict[str, Any]]:
                         "volume": parse_float(safe_get(p, "volume", "h24", default=0), 0.0),
                         "liquidity": parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0),
                         "source": "dexscreener",
-                        "chain": "bsc",
+                        "chain": chain_id,
                     }
                 )
             return out
         except Exception:
             return []
+
+    if chain == "solana":
+        merged = _from_birdeye_solana() + _from_dexscreener("solana")
+        return dedupe_unified_tokens(merged)
+
+    if chain == "bsc":
+        return dedupe_unified_tokens(_from_dexscreener("bsc"))
 
     return []
 
@@ -3981,6 +4019,7 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         row = normalize_pair_row(p)
         out.append(row)
 
+    out = dedupe_tokens_by_address(out)
     SCAN_CACHE[cache_key] = {"ts": now_ts, "pairs": out}
     return out
 
@@ -4000,9 +4039,23 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         ranked.append((score, p, smart, signal))
     ranked.sort(key=lambda x: x[0], reverse=True)
     ranked = ranked[: max(1, int(max_items))]
+    seen_token_keys: Set[str] = set()
     for s, p, smart, signal in ranked:
         counts["seen"] += 1
         row = normalize_pair_row(p)
+
+        if is_major_or_stable(row):
+            counts["skipped_noise"] += 1
+            continue
+
+        chain_id = (row.get("chainId") or row.get("chain") or "").strip().lower()
+        base_addr = (safe_get(row, "baseToken", "address", default="") or row.get("base_addr") or "").strip()
+        dedupe_key = token_key(chain_id, base_addr)
+        if dedupe_key:
+            if dedupe_key in seen_token_keys:
+                counts["skipped_noise"] += 1
+                continue
+            seen_token_keys.add(dedupe_key)
         entry_status = str(row.get("entry_status", "NO_ENTRY") or "NO_ENTRY")
         entry_score = parse_float(row.get("entry_score", 0), 0.0)
         decision = "watch"
@@ -4669,6 +4722,13 @@ def is_alive(pair: Optional[Dict[str, Any]]) -> bool:
     return liq > 2_000 and (vol24 > 1_000 or txns5 > 5)
 
 
+def short_addr(addr: str) -> str:
+    addr = (addr or "").strip()
+    if len(addr) < 10:
+        return addr
+    return f"{addr[:4]}...{addr[-4:]}"
+
+
 def extract_name(row: Dict[str, Any]) -> str:
     name = (
         row.get("base_symbol")
@@ -5091,7 +5151,7 @@ def page_scout(cfg: Dict[str, Any]):
         trap_signal, trap_level = liquidity_trap(pobj)
 
         st.markdown("---")
-        st.subheader(f"{base}/{quote}")
+        st.subheader(f"{base} ({short_addr(base_addr)}) / {quote}")
         st.caption(f"{chain_id or '?'} • {pobj.get('dexId','?')}")
 
         btn1, btn2 = st.columns(2)
@@ -5324,7 +5384,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         name = extract_name(r).upper()
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
         decision = item["decision"]
-        header = f"{name} | {item.get('ui_badge', 'NA')} | {decision} | {score:.2f}"
+        header = f"{name} ({short_addr(base_addr)}) | {item.get('ui_badge', 'NA')} | {decision} | {score:.2f}"
 
         with st.expander(header, expanded=False):
             st.caption(f"{chain.upper()} • entry {item.get('entry_status', 'UNKNOWN')} • risk {item.get('risk_level', 'UNKNOWN')}")
