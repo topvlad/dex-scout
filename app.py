@@ -1863,6 +1863,8 @@ def build_final_decision(
     entry_status: str,
     timing: Dict[str, Any],
     anti_rug: Dict[str, Any],
+    live_score: float = 0.0,
+    risk_flags: Optional[List[str]] = None,
 ) -> str:
     timing_state = str((timing or {}).get("timing", "UNKNOWN") or "UNKNOWN").upper()
     anti_level = str((anti_rug or {}).get("level", "SAFE") or "SAFE").upper()
@@ -1874,6 +1876,11 @@ def build_final_decision(
     if timing_state == "SKIP":
         return "NO ENTRY"
     if entry_status_u in ("NO_ENTRY", "NO ENTRY"):
+        return "NO ENTRY"
+    if float(live_score or 0.0) >= 400 and entry_status_u not in ("NO_ENTRY", "NO ENTRY"):
+        return "TRADEABLE"
+    flags_u = {str(x).upper() for x in (risk_flags or [])}
+    if "CRITICAL_TRAP" in flags_u or "DEAD_LIQ" in flags_u:
         return "NO ENTRY"
 
     if timing_state == "NEUTRAL":
@@ -2294,6 +2301,8 @@ MON_FIELDS = [
     "entry",
     "entry_reason",
     "timing_label",
+    "weak_reason",
+    "in_portfolio",
 ]
 
 HIST_FIELDS = [
@@ -2527,6 +2536,8 @@ def add_to_monitoring(
                 r["entry_score"] = str(entry_score)
             if risk_level:
                 r["risk_level"] = str(risk_level).upper()
+            if p.get("weak_reason") is not None:
+                r["weak_reason"] = str(p.get("weak_reason") or "")
             entry, entry_reason = compute_entry_signal(p)
             r["entry"] = entry
             r["entry_reason"] = entry_reason
@@ -2596,6 +2607,8 @@ def add_to_monitoring(
             "entry": computed_entry,
             "entry_reason": computed_entry_reason,
             "timing_label": compute_timing(p),
+            "weak_reason": str(p.get("weak_reason") or ""),
+            "in_portfolio": "0",
         }
     )
     save_monitoring(rows)
@@ -2637,6 +2650,34 @@ def archive_monitoring(
     if changed:
         save_monitoring(rows)
     return changed
+
+
+def update_monitoring_status(
+    contract: str,
+    chain: str,
+    status: str,
+    reason: str = "",
+    last_score: float = 0.0,
+    last_decision: str = "",
+    revisit_days: int = 0,
+    portfolio_linked: bool = False,
+    note: str = "",
+) -> bool:
+    status_u = str(status or "").strip().lower()
+    if status_u == "archived":
+        return archive_monitoring(
+            chain=chain,
+            base_addr=contract,
+            reason=reason or "manual",
+            last_score=last_score,
+            last_decision=last_decision,
+            revisit_days=revisit_days,
+            portfolio_linked=portfolio_linked,
+            note=note,
+        )
+    if status_u == "active":
+        return reactivate_monitoring(chain=chain, base_addr=contract)
+    return False
 
 
 
@@ -2713,21 +2754,13 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
 
 
 def mark_monitoring_portfolio_linked(chain: str, base_addr: str, reason: str = "promoted_to_portfolio") -> bool:
-    rows = load_monitoring()
-    changed = False
-    for r in rows:
-        c = (r.get("chain") or "").strip().lower()
-        a = addr_store(c, (r.get("base_addr") or "").strip())
-        if addr_key(c, a) == addr_key(chain, base_addr):
-            r["active"] = "0"
-            r["ts_archived"] = now_utc_str()
-            r["archived_reason"] = reason
-            r["portfolio_linked"] = "1"
-            changed = True
-            break
-    if changed:
-        save_monitoring(rows)
-    return changed
+    return update_monitoring_status(
+        contract=base_addr,
+        chain=chain,
+        status="archived",
+        reason=reason,
+        portfolio_linked=True,
+    )
 
 
 def promote_to_portfolio(item: Dict[str, Any]) -> str:
@@ -2741,12 +2774,24 @@ def promote_to_portfolio(item: Dict[str, Any]) -> str:
     decision = str(item.get("decision") or "WATCH / WAIT")
     res = log_to_portfolio(best, float(item.get("live_score", 0.0) or 0.0), decision, item.get("tags") or [], build_swap_url(chain, base_addr))
     if res == "ALREADY_EXISTS":
-        mark_monitoring_portfolio_linked(chain, base_addr, "duplicate_portfolio")
+        update_monitoring_status(
+            contract=base_addr,
+            chain=chain,
+            status="archived",
+            reason="duplicate_portfolio",
+            portfolio_linked=True,
+        )
         return res
     if res != "OK":
         return res
 
-    mark_monitoring_portfolio_linked(chain, base_addr, "promoted_to_portfolio")
+    update_monitoring_status(
+        contract=base_addr,
+        chain=chain,
+        status="archived",
+        reason="promoted",
+        portfolio_linked=True,
+    )
     return "OK"
 
 
@@ -3711,7 +3756,7 @@ def position_sizing_engine(
 
     total = strength - risk
 
-    if signal == "RED" or trap_level == "CRITICAL":
+    if (signal == "RED" and score < 200) or trap_level == "CRITICAL":
         size_pct = 0.0
         label = "SKIP"
     elif total >= 6:
@@ -3966,10 +4011,27 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         gate_ok, gate_reason = passes_monitoring_gate(row, float(s))
         row["visible_score"] = float(s)
         row["bucket"] = classify_bucket(float(s), row)
+        weak_reasons: List[str] = []
+        if entry_status == "NO_ENTRY":
+            weak_reasons.append("no_entry")
         if not gate_ok:
             counts["skipped_noise"] += 1
             row["note"] = gate_reason
-            continue
+            weak_reasons.append(gate_reason.replace("gate:", "").strip() or "gate_blocked")
+        priority = monitoring_priority(
+            score_live=float(s),
+            pc1h=parse_float(safe_get(row, "priceChange", "h1", default=0), 0.0),
+            pc5=parse_float(safe_get(row, "priceChange", "m5", default=0), 0.0),
+            vol5=parse_float(safe_get(row, "volume", "m5", default=0), 0.0),
+            liq=parse_float(safe_get(row, "liquidity", "usd", default=0), 0.0),
+            meme_score=parse_float(row.get("meme_score", 0), 0.0),
+            migration_score=parse_float(row.get("migration_score", 0), 0.0),
+            cex_prob=parse_float(row.get("cex_prob", 0), 0.0),
+        )
+        if priority < 3:
+            weak_reasons.append("low_priority")
+        if weak_reasons:
+            row["weak_reason"] = "|".join(sorted(set(weak_reasons)))
 
         if smart:
             chain = (row.get("chainId") or "").lower()
@@ -4082,6 +4144,101 @@ def auto_reactivate_archived(days: int = 7, max_revisits: int = 3) -> int:
         save_monitoring(rows)
     return changed
 
+
+def revisit_archived(min_days: int = 1, score_threshold: float = 400.0, max_revisits: int = 3) -> int:
+    rows = load_monitoring()
+    now_dt = datetime.utcnow()
+    changed = 0
+    for r in rows:
+        if r.get("active") == "1":
+            continue
+        revisit_count = int(parse_float(r.get("revisit_count", 0), 0))
+        if revisit_count >= max_revisits:
+            continue
+        ts_archived = _safe_dt_parse(r.get("ts_archived", ""))
+        if not ts_archived:
+            continue
+        age_days = (now_dt - ts_archived).total_seconds() / 86400.0
+        if age_days < float(min_days):
+            continue
+
+        chain = (r.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, r.get("base_addr", ""))
+        if not chain or not base_addr:
+            continue
+        best = best_pair_for_token_cached(chain, base_addr)
+        live_score = score_pair(best) if best else 0.0
+        if live_score <= score_threshold:
+            continue
+
+        r["active"] = "1"
+        r["ts_added"] = now_utc_str()
+        r["ts_archived"] = ""
+        r["archived_reason"] = ""
+        r["last_score"] = str(round(live_score, 2))
+        r["last_revisit_ts"] = now_utc_str()
+        r["revisit_count"] = str(revisit_count + 1)
+        r["revisit_after_ts"] = ""
+        r["weak_reason"] = ""
+        changed += 1
+
+    if changed:
+        save_monitoring(rows)
+    return changed
+
+
+def remove_stale_tokens(ttl_hours: int = 6) -> int:
+    rows = load_monitoring()
+    now_dt = datetime.utcnow()
+    changed = 0
+    for r in rows:
+        if str(r.get("active", "1")).strip() != "1":
+            continue
+        ts_added = _safe_dt_parse(r.get("ts_added", "")) or _safe_dt_parse(r.get("ts_last_seen", ""))
+        if not ts_added:
+            continue
+        age_hours = (now_dt - ts_added).total_seconds() / 3600.0
+        if age_hours <= float(ttl_hours):
+            continue
+        r["active"] = "0"
+        r["ts_archived"] = now_utc_str()
+        r["archived_reason"] = "ttl_expired"
+        changed += 1
+    if changed:
+        save_monitoring(rows)
+    return changed
+
+
+def trim_active_monitoring(max_active: int = 20) -> int:
+    rows = load_monitoring()
+    active_rows = [r for r in rows if str(r.get("active", "1")).strip() == "1"]
+    if len(active_rows) <= max_active:
+        return 0
+    active_sorted = sorted(active_rows, key=lambda r: parse_float(r.get("priority_score", 0), 0.0), reverse=True)
+    keep_keys = {
+        addr_key((r.get("chain") or "").strip().lower(), addr_store((r.get("chain") or "").strip().lower(), r.get("base_addr", "")))
+        for r in active_sorted[:max_active]
+    }
+    changed = 0
+    for r in rows:
+        if str(r.get("active", "1")).strip() != "1":
+            continue
+        chain = (r.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, r.get("base_addr", ""))
+        if addr_key(chain, base_addr) in keep_keys:
+            continue
+        r["active"] = "0"
+        r["ts_archived"] = now_utc_str()
+        r["archived_reason"] = "rotation_trim"
+        changed += 1
+    if changed:
+        save_monitoring(rows)
+    return changed
+
+
+def add_new_candidates() -> int:
+    return revisit_archived(min_days=1, score_threshold=400.0)
+
 def scanner_state_load() -> Dict[str, Any]:
     path = os.path.join(DATA_DIR, "scanner_state.json")
     ensure_storage()
@@ -4156,6 +4313,9 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
 
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
+        stats["stale_removed"] = remove_stale_tokens()
+        stats["revisited"] = add_new_candidates()
+        stats["trimmed"] = trim_active_monitoring(max_active=20)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {}), "error": str(e)}
@@ -4174,6 +4334,9 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
     window_name, preset_key, chain, slot = current_scan_slot()
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
+        stats["stale_removed"] = remove_stale_tokens()
+        stats["revisited"] = add_new_candidates()
+        stats["trimmed"] = trim_active_monitoring(max_active=20)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": {}, "error": str(e)}
@@ -4202,6 +4365,9 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
         use_birdeye_trending=use_birdeye_trending,
         birdeye_limit=birdeye_limit,
     )
+    stats["stale_removed"] = remove_stale_tokens()
+    stats["revisited"] = add_new_candidates()
+    stats["trimmed"] = trim_active_monitoring(max_active=20)
     state["last_window"] = window_name
     state["last_preset"] = preset_key
     state["last_chain"] = (chain or "solana").strip().lower()
@@ -4608,6 +4774,8 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         entry_status=entry_status,
         timing=timing,
         anti_rug=anti_rug,
+        live_score=adjusted_live_score,
+        risk_flags=size_info.get("risk_flags", []),
     )
     item = {
         "row": row,
@@ -4644,7 +4812,14 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     elif not alive:
         item["adjusted_live_score"] = round(float(item["adjusted_live_score"]) * 0.3, 2)
         item["live_score"] = item["adjusted_live_score"]
-        item["decision"] = build_final_decision(item.get("base_decision", "WATCH / WAIT"), item.get("entry_status", "WAIT"), timing, anti_rug)
+        item["decision"] = build_final_decision(
+            item.get("base_decision", "WATCH / WAIT"),
+            item.get("entry_status", "UNKNOWN"),
+            timing,
+            anti_rug,
+            live_score=item.get("live_score", 0.0),
+            risk_flags=size_info.get("risk_flags", []),
+        )
         item["risk_level"] = "HIGH"
 
     item["row"] = hydrate_monitoring_row_defaults(row, item)
@@ -5044,6 +5219,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.caption(f"Auto-revisited from Archive: {n}")
         except Exception:
             pass
+    try:
+        revisited_now = revisit_archived(min_days=1, score_threshold=400.0)
+        if revisited_now:
+            st.caption(f"Revisited high-score candidates: {revisited_now}")
+    except Exception:
+        pass
 
     scan_state = scanner_state_load()
     top = st.columns([2,2,3,3])
@@ -5067,12 +5248,17 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         rows.append(row)
 
     active_rows = []
+    _mon_set, active_set = active_base_sets()
     for r in rows:
+        chain = (r.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
+        r["in_portfolio"] = "1" if addr_key(chain, base_addr) in active_set else "0"
         if str(r.get("active", "1")).strip() != "1":
             continue
         if str(r.get("archived_reason", "")).strip().lower() in ("promoted_to_portfolio", "duplicate_portfolio"):
             continue
         active_rows.append(r)
+    active_rows = sorted(active_rows, key=lambda row: parse_float(row.get("priority_score", 0), 0.0), reverse=True)[:20]
     active = list(active_rows)
     archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
     top[0].metric("Active", len(active))
@@ -5142,8 +5328,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         with st.expander(header, expanded=False):
             st.caption(f"{chain.upper()} • entry {item.get('entry_status', 'UNKNOWN')} • risk {item.get('risk_level', 'UNKNOWN')}")
+            if str(r.get("in_portfolio", "0")) == "1":
+                st.caption("🧺 Already in portfolio")
             if str(r.get("portfolio_linked", "0")) == "1":
                 st.caption(r.get("note") or "IN PORTFOLIO")
+            if r.get("weak_reason"):
+                st.caption(f"Weak: {r.get('weak_reason')}")
             flags = item.get("ui_flags") or []
             st.caption("UI flags: " + (" • ".join(flags) if flags else "none"))
             st.caption(
