@@ -1372,10 +1372,10 @@ def passes_monitoring_gate(row: Dict[str, Any], score: float) -> Tuple[bool, str
         if score < 260 and strength_flags < 2:
             return False, "gate: no_entry_weak"
 
-    if score < 140 and strength_flags < 2:
+    if score < 120 and strength_flags < 1:
         return False, "gate: weak_score"
 
-    if score < 190 and vol5 < 1800 and pc1h < 4 and strength_flags < 3:
+    if score < 170 and vol5 < 1200 and pc1h < 2:
         return False, "gate: low_conviction"
 
     if sells5 > buys5 * 1.5 and strength_flags < 3:
@@ -1777,7 +1777,7 @@ def evaluate_entry_safe(token: Dict[str, Any]) -> Tuple[str, float, List[str], s
 
     if liquidity > 30000:
         score += 15
-    else:
+    elif age_minutes > 30:
         score -= 20
         reasons.append("low liquidity risk")
 
@@ -1796,11 +1796,17 @@ def evaluate_entry_safe(token: Dict[str, Any]) -> Tuple[str, float, List[str], s
     if price_change_15m > 0 and price_change_5m > 0:
         score += 5
 
+    momentum_flag = bool(price_change_15m > 2 or price_change_5m > 1)
     score = max(0.0, min(100.0, round(score, 2)))
+    if momentum_flag and score > 65:
+        reasons.append("momentum light")
+        return "READY", score, reasons, "MEDIUM"
     if score >= 60:
         return "READY", score, reasons, "LOW"
     if score >= 35:
         return "WAIT", score, reasons, "MEDIUM"
+    if score > 22 and volume_5m > 800:
+        return "EARLY", score, reasons, "HIGH"
     return "NO_ENTRY", score, reasons, "HIGH"
 
 
@@ -1826,6 +1832,7 @@ def evaluate_entry_aggressive(token: Dict[str, Any]) -> Tuple[str, float, List[s
     score = 0.0
     reasons: List[str] = []
     risk = "MEDIUM"
+    momentum_flag = bool(price_1h > 2 or price_5m > 1)
 
     if price_5m > 10:
         score += 35
@@ -1875,10 +1882,15 @@ def evaluate_entry_aggressive(token: Dict[str, Any]) -> Tuple[str, float, List[s
         return "NO_ENTRY", round(score, 2), ["dump pressure"], "HIGH"
 
     score = round(score, 2)
+    if momentum_flag and score > 45:
+        reasons.append("momentum light")
+        return "READY", score, reasons, risk
     if score >= 70:
         return "READY", score, reasons, risk
     if score >= 40:
         return "WAIT", score, reasons, risk
+    if score > 22 and vol_5m > 800:
+        return "EARLY", score, reasons, "HIGH"
     return "NO_ENTRY", score, reasons, risk
 
 
@@ -1986,7 +1998,7 @@ def build_final_decision(
         return "WATCH / WAIT"
     if entry_status_u == "WAIT":
         return "WATCH / WAIT"
-    if entry_status_u in ("ENTER", "READY"):
+    if entry_status_u in ("ENTER", "READY", "EARLY"):
         return "TRADEABLE"
 
     if "ENTRY" in base_decision_u:
@@ -2048,7 +2060,13 @@ def entry_engine_v2(item: Dict[str, Any]) -> Tuple[str, str, str]:
         return "NO_ENTRY", "RUG_RISK", "EXTREME"
     if detect_breakout(item):
         return "ENTER", "BREAKOUT", "MEDIUM"
+    score = parse_float(item.get("score_live"), 0.0)
     vol5 = parse_float(item.get("vol5_usd"), 0.0)
+    if score > 220 and vol5 > 800:
+        return "EARLY", "EARLY_SIGNAL", "HIGH"
+    risk_level = str(item.get("risk_level", "MEDIUM")).upper()
+    if risk_level == "HIGH" and score < 300:
+        return "NO_ENTRY", "RISK_HIGH_WEAK_SCORE", "HIGH"
     if vol5 > 10000:
         return "WATCH", "MOMENTUM", "MEDIUM"
     return "WAIT", "NO_SIGNAL", "HIGH"
@@ -5014,6 +5032,8 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "pc1h": parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0) if best else 0.0,
         "buys5": parse_float(safe_get(best, "txns", "m5", "buys", default=0), 0.0) if best else 0.0,
         "sells5": parse_float(safe_get(best, "txns", "m5", "sells", default=0), 0.0) if best else 0.0,
+        "score_live": adjusted_live_score,
+        "risk_level": row.get("risk_level", "MEDIUM"),
     }
     entry_status, entry_reason, risk_level = entry_engine_v2(entry_item)
     entry_score = parse_float(row.get("entry_score"), 0.0)
@@ -5273,6 +5293,8 @@ def page_scout(cfg: Dict[str, Any]):
 
     ranked.sort(key=lambda x: x[0], reverse=True)
     ranked = ranked[: int(cfg["top_n"])]
+    if ranked:
+        ranked[0][3]["force_signal"] = True
 
     st.metric("Passed filters", len(ranked))
 
@@ -5320,6 +5342,9 @@ def page_scout(cfg: Dict[str, Any]):
         score += pump_score * 0.5
         decision, tag_list = build_trade_hint(pobj)
         entry_status, entry_score, entry_reasons, risk_level = evaluate_entry(pobj, mode=ENTRY_MODE)
+        if pobj.get("force_signal"):
+            entry_status = "TRADEABLE"
+            entry_reasons = list(entry_reasons or []) + ["force_signal_top_candidate"]
         pobj["entry_status"] = entry_status
         pobj["entry_score"] = entry_score
         pobj["entry_reasons"] = entry_reasons
@@ -5394,8 +5419,10 @@ def page_scout(cfg: Dict[str, Any]):
         st.write(f"Score: {score:,.2f}")
         c_entry_1, c_entry_2 = st.columns(2)
         with c_entry_1:
-            if entry_status == "READY":
+            if entry_status in {"READY", "TRADEABLE"}:
                 st.success("Entry Status: READY")
+            elif entry_status == "EARLY":
+                st.info("Entry Status: EARLY")
             elif entry_status == "WAIT":
                 st.warning("Entry Status: WAIT")
             else:
@@ -5406,6 +5433,10 @@ def page_scout(cfg: Dict[str, Any]):
         st.caption(f"Risk Level: {risk_color} {str(risk_level).upper()}")
         if entry_reasons:
             st.caption("Entry reasons: " + " • ".join(entry_reasons))
+        st.caption(
+            f"score={score:.2f} vol5={parse_float(safe_get(pobj, 'volume', 'm5', default=0), 0.0):.2f} "
+            f"pc1h={parse_float(safe_get(pobj, 'priceChange', 'h1', default=0), 0.0):.2f} risk={risk_level}"
+        )
         st.write(f"Meme Score: {int(pobj.get('meme_score', 0) or 0)}")
         smart_money_label = "YES" if int(pobj.get("smart_money", 0) or 0) == 1 else "NO"
         st.write(f"Smart Money: {smart_money_label}")
