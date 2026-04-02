@@ -4837,7 +4837,7 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
 
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
-        stats["stale_removed"] = remove_stale_tokens()
+        stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
         stats["trimmed"] = trim_active_monitoring(max_active=20)
     except Exception as e:
@@ -4858,7 +4858,7 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
     window_name, preset_key, chain, slot = current_scan_slot()
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
-        stats["stale_removed"] = remove_stale_tokens()
+        stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
         stats["trimmed"] = trim_active_monitoring(max_active=20)
     except Exception as e:
@@ -4889,11 +4889,11 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
         use_birdeye_trending=use_birdeye_trending,
         birdeye_limit=birdeye_limit,
     )
-    stats["stale_removed"] = remove_stale_tokens()
+    stats["stale_removed"] = 0
     stats["revisited"] = add_new_candidates()
     stats["trimmed"] = trim_active_monitoring(max_active=20)
-    stats["cleanup_noise"] = cleanup_monitoring_noise()
-    stats["purged_toxic"] = purge_toxic()
+    stats["cleanup_noise"] = 0
+    stats["purged_toxic"] = 0
     state["last_window"] = window_name
     state["last_preset"] = preset_key
     state["last_chain"] = (chain or "solana").strip().lower()
@@ -4917,24 +4917,24 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
     chain = str(st.session_state.get("chain", "solana")).strip().lower() or "solana"
     tokens = fetch_tokens_unified(chain=chain, limit=limit)
     ts_now = now_utc_str()
-    rows: List[Dict[str, Any]] = []
+    new_rows: List[Dict[str, Any]] = []
 
-    for t in tokens:
-        symbol = str(t.get("symbol") or "NA").strip()
-        address = str(t.get("address") or "").strip()
+    def build_row(token: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        symbol = str(token.get("symbol") or "NA").strip()
+        address = str(token.get("address") or "").strip()
         if not address:
-            continue
+            return None
 
         best = best_pair_for_token_cached(chain, address)
         pair = best if best else {
             "chainId": chain,
-            "dexId": t.get("source", ""),
+            "dexId": token.get("source", ""),
             "pairAddress": "",
             "baseToken": {"symbol": symbol, "address": address},
             "quoteToken": {"symbol": "USDC" if chain == "solana" else "USDT"},
-            "priceUsd": t.get("price", 0),
-            "volume": {"h24": t.get("volume", 0), "m5": 0, "h1": 0},
-            "liquidity": {"usd": t.get("liquidity", 0)},
+            "priceUsd": token.get("price", 0),
+            "volume": {"h24": token.get("volume", 0), "m5": 0, "h1": 0},
+            "liquidity": {"usd": token.get("liquidity", 0)},
             "txns": {"m5": {"buys": 0, "sells": 0}},
             "priceChange": {"m5": 0, "h1": 0},
             "url": "",
@@ -4944,7 +4944,25 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
         decision, _tags = build_trade_hint(pair)
         entry_status, entry_score, _entry_reasons, risk_level = evaluate_entry(pair, mode=ENTRY_MODE)
 
-        rows.append({
+        append_monitoring_history({
+            "ts_utc": ts_now,
+            "chain": chain,
+            "base_symbol": symbol,
+            "base_addr": address,
+            "pair_addr": pair.get("pairAddress", "") or "",
+            "dex": pair.get("dexId", "") or "",
+            "quote_symbol": safe_get(pair, "quoteToken", "symbol", default="") or "",
+            "price_usd": str(parse_float(pair.get("priceUsd"), 0.0)),
+            "liq_usd": str(parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)),
+            "vol24_usd": str(parse_float(safe_get(pair, "volume", "h24", default=0), 0.0)),
+            "vol5_usd": str(parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)),
+            "pc1h": str(parse_float(safe_get(pair, "priceChange", "h1", default=0), 0.0)),
+            "pc5": str(parse_float(safe_get(pair, "priceChange", "m5", default=0), 0.0)),
+            "score_live": str(score_live),
+            "decision": decision,
+        })
+
+        row = {
             "ts_added": ts_now,
             "chain": chain,
             "base_symbol": symbol,
@@ -4977,68 +4995,66 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
             "revisit_count": "0",
             "revisit_after_ts": "",
             "last_revisit_ts": "",
-        })
+            "status": "ACTIVE",
+        }
+        return row
 
-        append_monitoring_history({
-            "ts_utc": ts_now,
-            "chain": chain,
-            "base_symbol": symbol,
-            "base_addr": address,
-            "pair_addr": pair.get("pairAddress", "") or "",
-            "dex": pair.get("dexId", "") or "",
-            "quote_symbol": safe_get(pair, "quoteToken", "symbol", default="") or "",
-            "price_usd": str(parse_float(pair.get("priceUsd"), 0.0)),
-            "liq_usd": str(parse_float(safe_get(pair, "liquidity", "usd", default=0), 0.0)),
-            "vol24_usd": str(parse_float(safe_get(pair, "volume", "h24", default=0), 0.0)),
-            "vol5_usd": str(parse_float(safe_get(pair, "volume", "m5", default=0), 0.0)),
-            "pc1h": str(parse_float(safe_get(pair, "priceChange", "h1", default=0), 0.0)),
-            "pc5": str(parse_float(safe_get(pair, "priceChange", "m5", default=0), 0.0)),
-            "score_live": str(score_live),
-            "decision": decision,
-        })
+    for t in tokens:
+        row = build_row(t)
+        if not row:
+            continue
+        row["status"] = "ACTIVE"
+        new_rows.append(row)
 
-    return rows
+    return new_rows
 
 
 def persist_scanner_result(scanner_rows: List[Dict[str, Any]]) -> Dict[str, int]:
     existing = load_monitoring()
-    by_key: Dict[str, Dict[str, Any]] = {}
-
+    existing_keys: Set[Tuple[str, str]] = set()
     for row in existing:
         chain = str(row.get("chain") or "").strip().lower()
-        base_addr = addr_store(chain, str(row.get("base_addr") or "").strip())
-        if not chain or not base_addr:
-            continue
-        for k in MON_FIELDS:
-            row.setdefault(k, "")
-        by_key[addr_key(chain, base_addr)] = row
+        base_addr = addr_store(chain, str(row.get("base_addr") or row.get("address") or "").strip())
+        if chain and base_addr:
+            existing_keys.add((base_addr, chain))
 
+    new_rows: List[Dict[str, Any]] = []
     inserted = 0
     updated = 0
     for row in scanner_rows:
         chain = str(row.get("chain") or "").strip().lower()
-        base_addr = addr_store(chain, str(row.get("base_addr") or "").strip())
+        base_addr = addr_store(chain, str(row.get("base_addr") or row.get("address") or "").strip())
         if not chain or not base_addr:
             continue
-        key = addr_key(chain, base_addr)
-
-        if key in by_key:
-            old = by_key[key]
-            for k in MON_FIELDS:
-                if row.get(k, "") not in ("", None):
-                    old[k] = row.get(k, "")
-            old["active"] = "1"
-            old["ts_last_seen"] = now_utc_str()
+        normalized = {k: row.get(k, "") for k in MON_FIELDS}
+        normalized["active"] = "1"
+        normalized["status"] = "ACTIVE"
+        normalized["chain"] = chain
+        normalized["base_addr"] = base_addr
+        new_rows.append(normalized)
+        if (base_addr, chain) in existing_keys:
             updated += 1
         else:
-            normalized = {k: row.get(k, "") for k in MON_FIELDS}
-            normalized["active"] = "1"
-            by_key[key] = normalized
             inserted += 1
 
-    out = list(by_key.values())
-    save_monitoring(out)
-    return {"inserted": inserted, "updated": updated, "total": len(out)}
+    combined = existing + new_rows
+    seen: Set[Tuple[str, str]] = set()
+    deduped: List[Dict[str, Any]] = []
+    for r in reversed(combined):
+        chain = str(r.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, str(r.get("base_addr") or r.get("address") or "").strip())
+        key = (base_addr, chain)
+        if not chain or not base_addr:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+    deduped.reverse()
+
+    save_monitoring(deduped)
+    st.write("DEBUG AFTER SAVE:", len(load_monitoring()))
+    return {"inserted": inserted, "updated": updated, "total": len(deduped)}
 
 def source_priority(row: Dict[str, Any]) -> int:
     presets = [x.strip() for x in str(row.get("source_preset", "")).split(",") if x.strip()]
@@ -5812,6 +5828,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
         r["in_portfolio"] = "1" if addr_key(chain, base_addr) in active_set else "0"
         if str(r.get("active", "1")).strip() != "1":
+            continue
+        status_u = str(r.get("status") or r.get("entry_status") or "").strip().upper()
+        if status_u and status_u not in {"ACTIVE", "WATCH", "EARLY"}:
             continue
         if str(r.get("archived_reason", "")).strip().lower() in ("promoted_to_portfolio", "duplicate_portfolio", "promoted"):
             continue
