@@ -576,6 +576,21 @@ DEX_RANK = {
     },
 }
 
+ALLOWED_CHAINS = ("solana", "bsc")
+CHAIN_MAP = {
+    "ethereum": "eth",
+    "eth": "eth",
+    "bsc": "bsc",
+    "binance": "bsc",
+    "solana": "solana",
+}
+
+
+def normalize_chain_name(raw_chain: Any) -> str:
+    value = str(raw_chain or "").strip().lower()
+    return CHAIN_MAP.get(value, value)
+
+
 NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
 
 MAJORS_STABLES = {
@@ -1457,6 +1472,9 @@ def detect_auto_signal(token: Dict[str, Any]) -> bool:
 
 def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
     row = dict(pair)
+    norm_chain = normalize_chain_name(row.get("chainId") or row.get("chain"))
+    row["chain"] = norm_chain
+    row["chainId"] = norm_chain
     row["meme_score"] = meme_token_score(row)
     row["smart_money"] = detect_smart_wallet_activity(row)
     age_minutes = pair_age_minutes(row)
@@ -4131,20 +4149,24 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
     return (f"{entry:.0f}", f"{tp:.0f}")
 
 
-def send_tg(msg: str):
+def send_telegram(text: str):
     token = TG_BOT_TOKEN or str(getattr(st, "secrets", {}).get("TG_BOT_TOKEN", "") or "")
     chat_id = TG_CHAT_ID or str(getattr(st, "secrets", {}).get("TG_CHAT_ID", "") or "")
+
     if not token or not chat_id:
+        print("TG not configured")
         return
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+
     try:
-        requests.post(
-            url,
-            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
-            timeout=5,
-        )
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=5)
     except Exception:
         pass
+
+
+def send_tg(msg: str):
+    send_telegram(msg)
 
 
 def format_signal_msg(row: Dict[str, Any]) -> str:
@@ -4162,7 +4184,7 @@ def format_signal_msg(row: Dict[str, Any]) -> str:
     )
 
 def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any], seeds_raw: str, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> List[Dict[str, Any]]:
-    chain = (chain or "solana").strip().lower()
+    chain = normalize_chain_name(chain or "solana")
     cache_key = safe_json({
         "chain": chain,
         "window_name": window_name,
@@ -4361,15 +4383,17 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             row["toxic_flags"] = ",".join(reasons)
             s -= 200.0
         base_sym = str(safe_get(row, "baseToken", "symbol", default="") or row.get("base_symbol") or "").strip().upper()
-        row_chain = str(row.get("chainId") or row.get("chain") or "").strip().lower()
+        row_chain = normalize_chain_name(row.get("chainId") or row.get("chain"))
+        row["chainId"] = row_chain
+        row["chain"] = row_chain
 
-        if row_chain != chain:
+        if row_chain not in ALLOWED_CHAINS:
             counts["skipped_noise"] += 1
             counts["skipped_wrong_chain"] += 1
             continue
 
         symbol_lc = base_sym.lower()
-        if symbol_lc in {"usdt", "usdc", "eth", "bnb"}:
+        if symbol_lc in {"usdt", "usdc", "eth", "btc", "bnb"}:
             counts["skipped_noise"] += 1
             counts["skipped_major"] += 1
             continue
@@ -4404,9 +4428,9 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             counts["skipped_symbol_duplicate"] += 1
             continue
 
-        chain_id = (row.get("chainId") or row.get("chain") or "").strip().lower()
+        chain_id = normalize_chain_name(row.get("chainId") or row.get("chain"))
         base_addr = (safe_get(row, "baseToken", "address", default="") or row.get("base_addr") or "").strip()
-        dedupe_key = token_key(chain_id, base_addr)
+        dedupe_key = f"{chain_id}:{base_addr}" if chain_id and base_addr else ""
         if dedupe_key:
             if dedupe_key in seen_token_keys:
                 counts["skipped_noise"] += 1
@@ -4414,10 +4438,10 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 continue
             seen_token_keys.add(dedupe_key)
         s = max(float(s), 50.0)
-        if s > 500:
+        if s >= 500:
             entry_status = "READY"
             signal_reason = "breakout"
-        elif s > 300:
+        elif s >= 250:
             entry_status = "WATCH"
             signal_reason = "trend_building"
         else:
@@ -4586,6 +4610,11 @@ def auto_reactivate_archived(days: int = 7, max_revisits: int = 3) -> int:
         reason_upper = reason.upper()
         if "RUG" in reason_upper or "DEAD" in reason_upper:
             continue
+
+        if str(r.get("status", "")).upper() == "ARCHIVED":
+            last = parse_ts(r.get("updated_at")) or parse_ts(r.get("ts_archived"))
+            if last and (now_dt - last).days >= int(days):
+                r["status"] = "ACTIVE"
 
         r["active"] = "1"
         r["ts_added"] = now_utc_str()
@@ -4887,7 +4916,7 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
     window_name = "Manual"
     preset_key = "balanced"
     stats = ingest_window_to_monitoring(
-        chain=(chain or "solana").strip().lower(),
+        chain=normalize_chain_name(chain or "solana"),
         window_name=window_name,
         preset_key=preset_key,
         seeds_raw=seeds_raw,
@@ -4902,7 +4931,7 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
     stats["purged_toxic"] = 0
     state["last_window"] = window_name
     state["last_preset"] = preset_key
-    state["last_chain"] = (chain or "solana").strip().lower()
+    state["last_chain"] = normalize_chain_name(chain or "solana")
     state["last_stats"] = stats
     state["last_run_ts"] = now_utc_str()
     scanner_state_save(state)
@@ -4966,9 +4995,9 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
             score_live += 40
         score_live = max(score_live, 50.0)
 
-        if score_live > 500:
+        if score_live >= 500:
             entry = "READY"
-        elif score_live > 300:
+        elif score_live >= 250:
             entry = "WATCH"
         else:
             entry = "WAIT"
@@ -5059,7 +5088,7 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
             "entry": entry,
             "risk_score": str(risk_score),
             "risk_flags": ",".join(risk_flags),
-            "why": f"entry={entry} | score={int(score_live)} | risk={risk_level}",
+            "why": f"score={score_live:.2f} entry={entry} risk={risk_level}",
         }
         return row
 
@@ -5718,7 +5747,7 @@ def page_scout(cfg: Dict[str, Any]):
         trap_signal, trap_level = liquidity_trap(pobj)
 
         st.markdown("---")
-        st.subheader(f"{base} ({short_addr(base_addr)}) / {quote}")
+        st.subheader(f"{base} / {quote}")
         st.caption(f"{chain_id or '?'} • {pobj.get('dexId','?')}")
 
         btn1, btn2 = st.columns(2)
@@ -5884,7 +5913,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         r["in_portfolio"] = "1" if addr_key(chain, base_addr) in active_set else "0"
         if r["in_portfolio"] == "1":
             r["status"] = "PORTFOLIO"
-        status = str(r.get("status", "")).strip().upper()
+        status_raw = r.get("status", "")
+        status = str(status_raw).strip().upper() if status_raw is not None else ""
         if status in ("ACTIVE", "WATCH", "WAIT", "PORTFOLIO", ""):
             active_rows.append(r)
     if not active_rows:
@@ -6614,6 +6644,10 @@ def main():
     if st.session_state.get("_rerun_flag"):
         st.session_state["_rerun_flag"] = False
         st.rerun()
+
+    if "_tg_test_sent" not in st.session_state:
+        send_telegram("DEX Scout test OK")
+        st.session_state["_tg_test_sent"] = True
 
     ensure_storage()
     if "_migrated_reason_fields" not in st.session_state:
