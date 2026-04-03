@@ -598,6 +598,7 @@ MAJORS_STABLES = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDE", "USDS",
     "WAVAX", "WMATIC",
 }
+HARD_BLOCK_SYMBOLS = {"USDT", "USDC", "ETH", "BTC", "BNB"}
 
 DEFAULT_SEEDS = (
     "meme, memecoin, ai, ai agent, agentic, launch, new, listing, trending, hot, hype, pump, "
@@ -747,9 +748,7 @@ def is_fake_activity(p: Dict[str, Any]) -> bool:
     sells = parse_float(safe_get(p, "txns", "h24", "sells", default=p.get("sells_h24", 0)), 0)
     makers = parse_float(safe_get(p, "txns", "h24", "makers", default=p.get("makers_h24", 0)), 0)
 
-    if buys <= 1 and sells <= 1:
-        return True
-    if makers <= 2:
+    if buys <= 1 and sells <= 1 and makers <= 2:
         return True
     return False
 
@@ -1269,7 +1268,8 @@ def detect_liquidity_migration(pair: Dict[str, Any]) -> Dict[str, Any]:
             "migration_score": 0,
         }
 
-    chain = (pair.get("chainId") or "").lower().strip()
+    raw_chain = (pair.get("chainId") or pair.get("chain") or "").lower().strip()
+    chain = normalize_chain_name(raw_chain)
     base_addr = (safe_get(pair, "baseToken", "address", default="") or "").strip()
     cur_dex = (pair.get("dexId") or "").lower().strip()
 
@@ -1359,7 +1359,8 @@ def detect_cex_listing_probability(pair: Dict[str, Any]) -> Dict[str, Any]:
     pc1h = parse_float(safe_get(pair, "priceChange", "h1", default=0))
 
     base_addr = safe_get(pair, "baseToken", "address", default="")
-    chain = pair.get("chainId")
+    raw_chain = (pair.get("chainId") or pair.get("chain") or "").lower().strip()
+    chain = normalize_chain_name(raw_chain)
 
     try:
         pools = fetch_token_pairs(chain, base_addr)
@@ -1444,10 +1445,6 @@ def passes_monitoring_gate(row: Dict[str, Any], score: float) -> Tuple[bool, str
     if buys5 < 4 and vol5 < 1500:
         return False, "gate: dead_flow"
 
-    if decision == "NO ENTRY":
-        if score < 260 and strength_flags < 2:
-            return False, "gate: no_entry_weak"
-
     if score < 120 and strength_flags < 1:
         return False, "gate: weak_score"
 
@@ -1470,9 +1467,15 @@ def detect_auto_signal(token: Dict[str, Any]) -> bool:
     return False
 
 
-def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     row = dict(pair)
     norm_chain = normalize_chain_name(row.get("chainId") or row.get("chain"))
+    symbol = str(safe_get(row, "baseToken", "symbol", default="")).upper()
+    if norm_chain not in ALLOWED_CHAINS:
+        return None
+    if symbol in HARD_BLOCK_SYMBOLS:
+        return None
+
     row["chain"] = norm_chain
     row["chainId"] = norm_chain
     row["meme_score"] = meme_token_score(row)
@@ -1522,9 +1525,17 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Dict[str, Any]:
         row["risk"] = "HIGH"
         row["decision_reason"] = reasons[0]
         row["toxic_flags"] = ",".join(reasons)
-        row["entry_score"] = parse_float(row.get("entry_score", 0), 0.0) - 200.0
-        row["priority"] = parse_float(row.get("priority", 0), 0.0) - 200.0
-        row["priority_score"] = parse_float(row.get("priority_score", row.get("entry_score", 0)), 0.0) - 200.0
+
+    score = parse_float(row.get("entry_score", 0), 0.0)
+    if score >= 300:
+        row["entry"] = "READY"
+    elif score >= 180:
+        row["entry"] = "WATCH"
+    else:
+        row["entry"] = "WAIT"
+
+    row["priority"] = parse_float(row.get("entry_score", 0), 0.0)
+    row["priority_score"] = parse_float(row.get("priority_score", row.get("entry_score", 0)), 0.0)
     return row
 
 
@@ -2016,9 +2027,6 @@ def classify_entry_status(
         hard_blockers.append("timing_skip")
     if final_size <= 0:
         hard_blockers.append("size_zero")
-    if decision_u == "NO ENTRY":
-        hard_blockers.append("decision_no_entry")
-
     if hard_blockers or entry_status == "NO_ENTRY":
         return {
             "status": "NO_ENTRY",
@@ -4152,9 +4160,10 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 def send_telegram(text: str):
     token = TG_BOT_TOKEN or str(getattr(st, "secrets", {}).get("TG_BOT_TOKEN", "") or "")
     chat_id = TG_CHAT_ID or str(getattr(st, "secrets", {}).get("TG_CHAT_ID", "") or "")
+    print("TG DEBUG:", token, chat_id)
 
     if not token or not chat_id:
-        print("TG not configured")
+        print("TG NOT CONFIGURED")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -4325,6 +4334,8 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         if not base_addr:
             continue
         row = normalize_pair_row(p)
+        if row is None:
+            continue
         out.append(row)
 
     out = dedupe_tokens_by_address(out)
@@ -4357,7 +4368,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     if ranked:
         best = ranked[0][1]
         best_row = normalize_pair_row(best)
-        if (
+        if best_row and (
             best_row.get("entry_status") in ["READY", "WATCH"]
             and str(best_row.get("risk_level", "")).upper() != "HIGH"
         ):
@@ -4376,12 +4387,14 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     for s, p, smart, signal in ranked:
         counts["seen"] += 1
         row = normalize_pair_row(p)
+        if row is None:
+            counts["skipped_noise"] += 1
+            continue
         toxic, reasons = is_toxic_token(p)
         if toxic:
             row["risk"] = "HIGH"
             row["decision_reason"] = reasons[0]
             row["toxic_flags"] = ",".join(reasons)
-            s -= 200.0
         base_sym = str(safe_get(row, "baseToken", "symbol", default="") or row.get("base_symbol") or "").strip().upper()
         row_chain = normalize_chain_name(row.get("chainId") or row.get("chain"))
         row["chainId"] = row_chain
@@ -4412,6 +4425,9 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             counts["skipped_noise"] += 1
             counts["skipped_major_like"] += 1
             continue
+
+        if str(row.get("entry") or "").upper() in ("READY", "WATCH"):
+            send_telegram(f"{base_sym} | {row.get('entry')} | {row.get('entry_score')}")
 
         if looks_like_quote_or_lp(row):
             counts["skipped_noise"] += 1
@@ -4561,6 +4577,8 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             counts["errors"] += 1
     if counts["added"] == 0 and ranked:
         fallback = normalize_pair_row(ranked[0][1])
+        if fallback is None:
+            return counts
         fallback["entry_status"] = "WATCH"
         fallback["status"] = "ACTIVE"
         fallback["signal_reason"] = "fallback_signal"
@@ -5632,7 +5650,8 @@ def page_scout(cfg: Dict[str, Any]):
 
     ranked = []
     for p in filtered:
-        chain_id = (p.get("chainId") or "").lower().strip()
+        raw_chain = (p.get("chainId") or p.get("chain") or "").lower().strip()
+        chain_id = normalize_chain_name(raw_chain)
         base_addr = (safe_get(p, "baseToken", "address", default="") or "").strip()
         if not base_addr:
             continue
@@ -5642,6 +5661,8 @@ def page_scout(cfg: Dict[str, Any]):
             continue
 
         row = normalize_pair_row(p)
+        if row is None:
+            continue
         whale = whale_accumulation(row)
         fresh = fresh_lp(row)
 
@@ -5887,6 +5908,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     # Source of truth for Monitoring page UI: monitoring.csv only.
     monitoring_rows = load_monitoring_rows_cached()
+    clean_rows: List[Dict[str, Any]] = []
+    for r in monitoring_rows:
+        chain = str(r.get("chain") or "").lower().strip()
+        symbol = str(r.get("base_symbol") or "").upper().strip()
+        if chain not in ALLOWED_CHAINS:
+            continue
+        if symbol in HARD_BLOCK_SYMBOLS:
+            continue
+        clean_rows.append(r)
+    monitoring_rows = clean_rows
     mon_source = st.session_state.get("_storage_source_monitoring.csv", "unknown")
     st.caption(f"MONITORING FROM DB: {len(monitoring_rows)} (source: {mon_source})")
     rows: List[Dict[str, Any]] = []
@@ -5958,6 +5989,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if st.button("Refresh live data", use_container_width=True):
             request_rerun()
     with cbtn3:
+        if st.button("🔥 RESET MONITORING", use_container_width=True):
+            save_csv(MONITORING_CSV, [], MON_FIELDS)
+            save_csv(MON_HISTORY_CSV, [], HIST_FIELDS)
+            st.rerun()
         st.caption("Scanner is manual: one click runs one full ingestion pass and saves results.")
 
     if not active_rows:
@@ -6744,6 +6779,8 @@ def main():
         if st.button("Clear cache", use_container_width=True):
             st.cache_data.clear()
             request_rerun()
+        if st.button("📨 TEST TG", use_container_width=True):
+            send_telegram("DEX SCOUT TEST SIGNAL")
 
         st.divider()
         st.markdown("### Storage status")
