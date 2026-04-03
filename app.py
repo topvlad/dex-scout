@@ -4335,7 +4335,10 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     if ranked:
         best = ranked[0][1]
         best_row = normalize_pair_row(best)
-        if best_row.get("entry_status") in ["READY", "WATCH"]:
+        if (
+            best_row.get("entry_status") in ["READY", "WATCH"]
+            and str(best_row.get("risk_level", "")).upper() != "HIGH"
+        ):
             last_ts = parse_float(st.session_state.get("last_alert_ts", 0), 0)
             now_ts = time.time()
             if now_ts - last_ts >= 60:
@@ -4363,6 +4366,12 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         if row_chain != chain:
             counts["skipped_noise"] += 1
             counts["skipped_wrong_chain"] += 1
+            continue
+
+        symbol_lc = base_sym.lower()
+        if symbol_lc in {"usdt", "usdc", "eth", "bnb"}:
+            counts["skipped_noise"] += 1
+            counts["skipped_major"] += 1
             continue
 
         if base_sym in MAJORS_STABLES:
@@ -4404,10 +4413,11 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["skipped_symbol_duplicate"] += 1
                 continue
             seen_token_keys.add(dedupe_key)
-        if float(s) > 500:
+        s = max(float(s), 50.0)
+        if s > 500:
             entry_status = "READY"
             signal_reason = "breakout"
-        elif float(s) > 300:
+        elif s > 300:
             entry_status = "WATCH"
             signal_reason = "trend_building"
         else:
@@ -4421,17 +4431,17 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         decision = "watch"
         row["smart_money"] = smart
         row["signal"] = signal
-        gate_ok, gate_reason = passes_monitoring_gate(row, float(s))
-        row["visible_score"] = float(s)
-        row["bucket"] = classify_bucket(float(s), row)
+        gate_ok, gate_reason = passes_monitoring_gate(row, s)
+        row["visible_score"] = s
+        row["bucket"] = classify_bucket(s, row)
         weak_reasons: List[str] = []
-        st.write(f"entry={entry_status} score={float(s):.2f}")
+        st.write(f"entry={entry_status} score={s:.2f}")
         if not gate_ok:
             counts["skipped_noise"] += 1
             row["note"] = gate_reason
             weak_reasons.append(gate_reason.replace("gate:", "").strip() or "gate_blocked")
         priority = monitoring_priority(
-            score_live=float(s),
+            score_live=s,
             pc1h=parse_float(safe_get(row, "priceChange", "h1", default=0), 0.0),
             pc5=parse_float(safe_get(row, "priceChange", "m5", default=0), 0.0),
             vol5=parse_float(safe_get(row, "volume", "m5", default=0), 0.0),
@@ -4460,7 +4470,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 continue
             res = add_to_monitoring(
                 row,
-                float(s),
+                s,
                 window_name=window_name,
                 preset_key=preset_key,
                 entry_status=entry_status,
@@ -4482,7 +4492,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 "vol5_usd": str(parse_float(safe_get(row, "volume", "m5", default=0), 0.0)),
                 "pc1h": str(parse_float(safe_get(row, "priceChange", "h1", default=0), 0.0)),
                 "pc5": str(parse_float(safe_get(row, "priceChange", "m5", default=0), 0.0)),
-                "score_live": str(float(s)),
+                "score_live": str(s),
                 "decision": gate_reason if decision == "watch" else decision,
             })
 
@@ -4490,7 +4500,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["added"] += 1
                 if base_sym:
                     active_symbols.add(base_sym)
-                if row.get("entry_status") in ["READY", "WATCH"]:
+                if row.get("entry_status") in ["READY", "WATCH"] and str(row.get("risk_level", "")).upper() != "HIGH":
                     if row.get("alert_sent") != "1":
                         msg = format_signal_msg(row)
                         last_ts = parse_float(st.session_state.get("last_alert_ts", 0), 0)
@@ -4501,7 +4511,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                         row["alert_sent"] = "1"
                         add_to_monitoring(
                             row,
-                            float(s),
+                            s,
                             window_name=window_name,
                             preset_key=preset_key,
                             entry_status=entry_status,
@@ -4515,7 +4525,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             if entry_status in {"WATCH", "WAIT"} and detect_auto_signal(row):
                 add_to_monitoring(
                     row,
-                    float(s),
+                    s,
                     window_name="AUTO_SIGNAL",
                     preset_key="AUTO_SIGNAL",
                     entry_status=entry_status,
@@ -5049,7 +5059,7 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
             "entry": entry,
             "risk_score": str(risk_score),
             "risk_flags": ",".join(risk_flags),
-            "why": f"{entry} | score={int(score_live)} | risk={risk_level}",
+            "why": f"entry={entry} | score={int(score_live)} | risk={risk_level}",
         }
         return row
 
@@ -5843,16 +5853,6 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption(f"Revisited high-score candidates: {revisited_now}")
     except Exception:
         pass
-    if not st.session_state.get("_purged_non_solana_once", False):
-        try:
-            purged = purge_non_solana_and_majors()
-            if purged:
-                st.caption(f"Purged non-Solana/majors from Monitoring: {purged}")
-            load_monitoring_rows_cached.clear()
-        except Exception:
-            pass
-        st.session_state["_purged_non_solana_once"] = True
-
     scan_state = scanner_state_load()
     top = st.columns([2,2,3,3])
 
@@ -5882,8 +5882,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         chain = (r.get("chain") or "").strip().lower()
         base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
         r["in_portfolio"] = "1" if addr_key(chain, base_addr) in active_set else "0"
-        if str(r.get("status", "")).strip().upper() == "ACTIVE":
+        if r["in_portfolio"] == "1":
+            r["status"] = "PORTFOLIO"
+        status = str(r.get("status", "")).strip().upper()
+        if status in ("ACTIVE", "WATCH", "WAIT", "PORTFOLIO", ""):
             active_rows.append(r)
+    if not active_rows:
+        active_rows = rows[:20]
     active_rows = sorted(active_rows, key=lambda row: parse_float(row.get("priority_score", 0), 0.0), reverse=True)[:20]
     active = list(active_rows)
     st.write("DEBUG TOKENS:", len(load_monitoring()))
@@ -5983,11 +5988,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         chain = (r.get("chain") or "").strip().lower()
         base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
         sym = extract_name(r).upper()
-        short_addr_label = f"{base_addr[:4]}...{base_addr[-4:]}" if base_addr else "?"
-        if sym in {"", "UNKNOWN", short_addr_label.upper()}:
-            name = short_addr_label
-        else:
-            name = sym
+        name = sym if sym not in {"", "UNKNOWN"} else "UNKNOWN"
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
         decision = item["decision"]
         entry_status = str(item.get("entry_status", "UNKNOWN")).upper()
