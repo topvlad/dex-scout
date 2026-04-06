@@ -688,7 +688,7 @@ MONITORING_SORT_PENALTY_FLOOR = 120.0
 MONITORING_REVIEW_THRESHOLD = 120.0
 MONITORING_DEAD_THRESHOLD = 50.0
 REASON_LABELS = {
-    "fake_pump": "Suspicious pump",
+    # "fake_pump": "Suspicious pump",  # disabled: old anti-rug kill-switch label
     "freezable": "Token can be frozen",
     "fake_activity": "Fake trading activity",
     "no_momentum": "No momentum",
@@ -748,8 +748,9 @@ def is_fake_activity(p: Dict[str, Any]) -> bool:
     sells = parse_float(safe_get(p, "txns", "h24", "sells", default=p.get("sells_h24", 0)), 0)
     makers = parse_float(safe_get(p, "txns", "h24", "makers", default=p.get("makers_h24", 0)), 0)
 
-    if buys <= 1 and sells <= 1 and makers <= 2:
-        return True
+    # disabled: old fake activity blocker was too aggressive and marked almost all tokens as toxic
+    # if buys <= 1 and sells <= 1 and makers <= 2:
+    #     return True
     return False
 
 
@@ -766,8 +767,9 @@ def is_toxic_token(p: Dict[str, Any]) -> Tuple[bool, List[str]]:
     reasons: List[str] = []
     if is_freezable(p):
         reasons.append("freezable")
-    if is_fake_activity(p):
-        reasons.append("fake_activity")
+    # disabled: fake_activity hard-blocker (old anti-rug kill-switch)
+    # if is_fake_activity(p):
+    #     reasons.append("fake_activity")
     # flat chart is a soft penalty in scoring, not a toxic hard-flag
     return (len(reasons) > 0), reasons
 
@@ -2114,12 +2116,13 @@ def is_fake_pump(item: Dict[str, Any]) -> bool:
     sells = int(parse_float(item.get("sells5"), 0))
     vol5 = parse_float(item.get("vol5_usd"), 0.0)
     liq = parse_float(item.get("liq_usd"), 0.0)
-    if vol5 < 3000:
-        return True
-    if liq < 2000:
-        return True
-    if sells > buys * 1.5:
-        return True
+    # disabled: old fake pump logic was too broad and killed valid entries
+    # if vol5 < 3000:
+    #     return True
+    # if liq < 2000:
+    #     return True
+    # if sells > buys * 1.5:
+    #     return True
     return False
 
 
@@ -2145,20 +2148,29 @@ def rug_probability(item: Dict[str, Any]) -> int:
 
 
 def entry_engine_v2(item: Dict[str, Any]) -> Tuple[str, str, str]:
-    if is_liquidity_trap(item):
-        return "NO_ENTRY", "low_liquidity", "EXTREME"
-    if is_fake_pump(item):
-        return "NO_ENTRY", "fake_pump", "HIGH"
-    rug = rug_probability(item)
-    if rug >= 3:
-        return "NO_ENTRY", "fake_activity", "EXTREME"
-
     pc1h = parse_float(item.get("pc1h"), 0.0)
     pc5m = parse_float(item.get("pc5"), 0.0)
     vol5 = parse_float(item.get("vol5_usd"), 0.0)
     liq = parse_float(item.get("liq_usd"), 0.0)
     buys = parse_float(item.get("buys5"), 0.0)
     sells = parse_float(item.get("sells5"), 0.0)
+    txns = int(buys + sells)
+    top_holder_pct = parse_float(item.get("top_holder_pct", 0), 0.0)
+
+    risk_score = 0
+    flags: List[str] = []
+    if liq < 2000:
+        risk_score += 2
+        flags.append("low_liquidity")
+    if top_holder_pct > 25:
+        risk_score += 2
+        flags.append("whale")
+    if sells > buys * 2:
+        risk_score += 1
+        flags.append("sell_pressure")
+    if vol5 < 100 and txns < 5:
+        risk_score += 2
+        flags.append("dead")
 
     score = 0.0
     if vol5 > 12000:
@@ -2196,13 +2208,19 @@ def entry_engine_v2(item: Dict[str, Any]) -> Tuple[str, str, str]:
     if detect_breakout(item):
         momentum_flag = True
 
-    if score > 240 and momentum_flag:
-        return "TRADEABLE", "breakout", "MEDIUM"
-    if score > 200:
-        return "EARLY", "early_momentum", "MEDIUM"
-    if score > 150:
-        return "WATCH", "", "MEDIUM"
-    return "NO_ENTRY", "no_momentum", "HIGH"
+    if risk_score >= 5:
+        risk_level = "HIGH"
+    elif risk_score >= 3:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+
+    # Anti-rug is annotation-only, it does NOT block entry.
+    if score >= 300 and momentum_flag:
+        return "READY", "breakout", risk_level
+    if score >= 180:
+        return "WATCH", "early_momentum", risk_level
+    return "WAIT", "no_momentum", risk_level
 
 
 def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
@@ -4160,7 +4178,8 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 def send_telegram(text: str):
     token = TG_BOT_TOKEN or str(getattr(st, "secrets", {}).get("TG_BOT_TOKEN", "") or "")
     chat_id = TG_CHAT_ID or str(getattr(st, "secrets", {}).get("TG_CHAT_ID", "") or "")
-    print("TG DEBUG:", token, chat_id)
+    print("TG TOKEN:", token)
+    print("TG CHAT:", chat_id)
 
     if not token or not chat_id:
         print("TG NOT CONFIGURED")
@@ -4368,10 +4387,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     if ranked:
         best = ranked[0][1]
         best_row = normalize_pair_row(best)
-        if best_row and (
-            best_row.get("entry_status") in ["READY", "WATCH"]
-            and str(best_row.get("risk_level", "")).upper() != "HIGH"
-        ):
+        if best_row and best_row.get("entry_status") in ["READY", "WATCH"]:
             last_ts = parse_float(st.session_state.get("last_alert_ts", 0), 0)
             now_ts = time.time()
             if now_ts - last_ts >= 60:
@@ -5024,25 +5040,23 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
         entry_status = entry
         entry_score = score_live
 
-        liquidity_locked = parse_float(token.get("liquidity_locked_pct", token.get("liquidity_locked", 100)), 100.0)
         top_holder_pct = parse_float(token.get("top_holder_pct", token.get("top_holder_percent", 0)), 0.0)
         buys = parse_float(txns_raw.get("buys", 0), 0.0)
         sells = parse_float(txns_raw.get("sells", 0), 0.0)
-        buy_sell_ratio = buys / max(sells, 1.0)
         risk_score = 0
         risk_flags: List[str] = []
-        if liquidity_locked < 50:
+        if liquidity < 2000:
             risk_score += 2
-            risk_flags.append("LP_UNLOCKED")
-        if top_holder_pct > 20:
+            risk_flags.append("low_liquidity")
+        if top_holder_pct > 25:
             risk_score += 2
-            risk_flags.append("WHALE_DOMINANCE")
-        if buy_sell_ratio < 0.5:
+            risk_flags.append("whale")
+        if sells > buys * 2:
             risk_score += 1
-            risk_flags.append("SELL_PRESSURE")
-        if age_minutes < 10 and volume_5m > 10000:
+            risk_flags.append("sell_pressure")
+        if volume_5m < 100 and txns < 5:
             risk_score += 2
-            risk_flags.append("PUMP_SPIKE")
+            risk_flags.append("dead")
 
         if risk_score >= 5:
             risk_level = "HIGH"
@@ -5106,7 +5120,7 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
             "entry": entry,
             "risk_score": str(risk_score),
             "risk_flags": ",".join(risk_flags),
-            "why": f"score={score_live:.2f} entry={entry} risk={risk_level}",
+            "why": f"score={score_live:.2f} risk={risk_level} flags={risk_flags}",
         }
         return row
 
@@ -6779,8 +6793,8 @@ def main():
         if st.button("Clear cache", use_container_width=True):
             st.cache_data.clear()
             request_rerun()
-        if st.button("📨 TEST TG", use_container_width=True):
-            send_telegram("DEX SCOUT TEST SIGNAL")
+        if st.button("TEST TG", use_container_width=True):
+            send_telegram("DEX SCOUT WORKING")
 
         st.divider()
         st.markdown("### Storage status")
