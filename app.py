@@ -4174,26 +4174,101 @@ def send_telegram(text: str):
     chat_id = st.secrets.get("TG_CHAT_ID")
 
     if not token or not chat_id:
-        st.error("TG NOT CONFIGURED")
         return False
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     try:
         r = requests.post(
-            url,
+            f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text},
-            timeout=10
+            timeout=10,
         )
-
-        if r.status_code == 200:
-            return True
-
-        st.write("TG ERROR:", r.text)
+        return r.status_code == 200
+    except Exception:
         return False
-    except Exception as e:
-        st.error(f"TG EXCEPTION: {e}")
+
+
+def classify_entry(score: float):
+    if score >= 320:
+        return "READY"
+    elif score >= 220:
+        return "WATCH"
+    elif score >= 150:
+        return "TRACK"
+    else:
+        return "IGNORE"
+
+
+def is_signal_worthy(row: Dict[str, Any]) -> bool:
+    score = float(row.get("entry_score", 0))
+    risk = str(row.get("risk") or row.get("risk_level") or "").upper()
+
+    if score < 200:
         return False
+
+    if risk == "HIGH" and score < 300:
+        return False
+
+    return True
+
+
+def reset_monitoring():
+    st.session_state["_last_status"] = {}
+
+
+def process_signal_transitions(rows: List[Dict[str, Any]]) -> None:
+    st.session_state.setdefault("_last_status", {})
+
+    for row in rows:
+        if not is_signal_worthy(row):
+            continue
+
+        token = (
+            row.get("pair_address")
+            or row.get("pairAddress")
+            or row.get("base_addr")
+            or row.get("base_token_address")
+        )
+        symbol = str(row.get("base_symbol") or row.get("symbol") or token or "UNKNOWN")
+        score = float(row.get("entry_score", 0))
+
+        if not token:
+            continue
+
+        if token not in st.session_state["_last_status"]:
+            send_telegram(f"🆕 NEW TOKEN\n{symbol}\nScore: {round(score,1)}")
+
+        new_status = classify_entry(score)
+        old_status = st.session_state["_last_status"].get(token)
+
+        if old_status != new_status and new_status in ("READY", "WATCH"):
+            msg = (
+                "📡 SIGNAL UPDATE\n"
+                f"{symbol}\n\n"
+                f"Status: {old_status or 'NEW'} → {new_status}\n"
+                f"Score: {round(score,1)}"
+            )
+            send_telegram(msg)
+
+        st.session_state["_last_status"][token] = new_status
+
+
+def process_portfolio_events(portfolio: List[Dict[str, Any]]) -> None:
+    st.session_state.setdefault("_last_portfolio", set())
+
+    current = {
+        str(p.get("pair_address") or "").strip()
+        for p in portfolio
+        if str(p.get("active", "1")).strip() == "1" and str(p.get("pair_address") or "").strip()
+    }
+    prev = st.session_state["_last_portfolio"]
+
+    for t in current - prev:
+        send_telegram(f"🟢 ADDED TO PORTFOLIO\n{t}")
+
+    for t in prev - current:
+        send_telegram(f"🔴 REMOVED FROM PORTFOLIO\n{t}")
+
+    st.session_state["_last_portfolio"] = current
 
 
 def send_tg(msg: str):
@@ -4386,18 +4461,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             s = score_pair(p)
             fallback_ranked.append((s, p, detect_smart_money(p), classify_signal(p)))
         ranked = fallback_ranked
-    st.write(f"pairs={len(pairs)} filtered={len(pairs)} ranked={len(ranked)}")
-    if ranked:
-        best = ranked[0][1]
-        best_row = normalize_pair_row(best)
-        if best_row and best_row.get("entry_status") in ["READY", "WATCH"]:
-            last_ts = parse_float(st.session_state.get("last_alert_ts", 0), 0)
-            now_ts = time.time()
-            if now_ts - last_ts >= 60:
-                send_tg(format_signal_msg(best_row))
-                st.session_state["last_alert_ts"] = now_ts
     seen_token_keys: Set[str] = set()
-    st.session_state.setdefault("_sent_tokens", set())
     existing_rows = load_monitoring()
     active_symbols = {
         str(r.get("base_symbol") or "").strip().upper()
@@ -4472,6 +4536,9 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             seen_token_keys.add(dedupe_key)
         s = max(float(s), 50.0)
         row["entry_score"] = s
+        if not is_signal_worthy(row):
+            counts["skipped_noise"] += 1
+            continue
         score = float(row.get("entry_score", 0))
         if score >= 300:
             entry_status = "READY"
@@ -4494,19 +4561,6 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         row["visible_score"] = s
         row["bucket"] = classify_bucket(s, row)
         weak_reasons: List[str] = []
-        st.write(f"entry={entry_status} score={s:.2f}")
-
-        token_id = (
-            row.get("pair_address")
-            or row.get("pairAddress")
-            or safe_get(row, "baseToken", "address", default="")
-            or row.get("base_addr")
-        )
-        if token_id and token_id not in st.session_state["_sent_tokens"]:
-            if entry_status in ("READY", "WATCH", "TRADEABLE"):
-                ok = send_telegram(f"{base_sym} | {entry_status} | {score:.2f}")
-                if ok:
-                    st.session_state["_sent_tokens"].add(token_id)
 
         if not gate_ok:
             counts["skipped_noise"] += 1
@@ -4572,24 +4626,6 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["added"] += 1
                 if base_sym:
                     active_symbols.add(base_sym)
-                if row.get("entry_status") in ["READY", "WATCH"]:
-                    if row.get("alert_sent") != "1":
-                        msg = format_signal_msg(row)
-                        last_ts = parse_float(st.session_state.get("last_alert_ts", 0), 0)
-                        now_ts = time.time()
-                        if now_ts - last_ts >= 60:
-                            send_tg(msg)
-                            st.session_state["last_alert_ts"] = now_ts
-                        row["alert_sent"] = "1"
-                        add_to_monitoring(
-                            row,
-                            s,
-                            window_name=window_name,
-                            preset_key=preset_key,
-                            entry_status=entry_status,
-                            entry_score=entry_score,
-                            risk_level=str(row.get("risk_level", "MEDIUM")),
-                        )
             elif res == "EXISTS_ACTIVE":
                 counts["skipped_active"] += 1
             elif res == "EXISTS_ARCHIVED":
@@ -5582,6 +5618,20 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
         penalty += 200
         flags.append("dead")
 
+    best = item.get("best", {}) or {}
+    row_vol5 = parse_float(row.get("vol5_usd", 0.0), 0.0)
+    vol5 = parse_float(safe_get(best, "volume", "m5", default=row_vol5), row_vol5)
+    liq = parse_float(safe_get(best, "liquidity", "usd", default=row.get("liq_usd", 0.0)), 0.0)
+    pc5 = parse_float(safe_get(best, "priceChange", "m5", default=row.get("pc5", 0.0)), 0.0)
+    pc1h = parse_float(safe_get(best, "priceChange", "h1", default=row.get("pc1h", 0.0)), 0.0)
+    buys = parse_float(safe_get(best, "txns", "m5", "buys", default=row.get("buys5", 0.0)), 0.0)
+    sells = parse_float(safe_get(best, "txns", "m5", "sells", default=row.get("sells5", 0.0)), 0.0)
+    volume_spike = vol5 > max(liq * 0.6, 4000.0) and pc5 > 8
+    no_follow_through = pc1h <= 2 or sells > buys * 1.1
+    if volume_spike and no_follow_through:
+        penalty += 25
+        flags.append("fake_pump_risk")
+
     penalty = min(penalty, 80.0)
     visible_score = max(0.0, raw_score - penalty)
 
@@ -5991,8 +6041,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         active_rows = rows[:20]
     active_rows = sorted(active_rows, key=lambda row: parse_float(row.get("priority_score", 0), 0.0), reverse=True)[:20]
     active = list(active_rows)
-    st.write("DEBUG TOKENS:", len(load_monitoring()))
-    st.write("DEBUG ACTIVE:", len(active))
+    process_signal_transitions(active_rows)
     archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
     top[0].metric("Active", len(active))
     top[1].metric("Archived", len(archived))
@@ -6030,7 +6079,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     with cbtn3:
         if st.button("🔥 RESET MONITORING", use_container_width=True):
             save_csv(MONITORING_CSV, [], MON_FIELDS)
-            save_csv(MON_HISTORY_CSV, [], HIST_FIELDS)
+            reset_monitoring()
             st.rerun()
         st.caption("Scanner is manual: one click runs one full ingestion pass and saves results.")
 
@@ -6728,6 +6777,10 @@ def main():
         st.rerun()
 
     ensure_storage()
+    if "_last_status" not in st.session_state:
+        st.session_state["_last_status"] = {}
+    if "_last_portfolio" not in st.session_state:
+        st.session_state["_last_portfolio"] = set()
     if "_migrated_reason_fields" not in st.session_state:
         migrate_reason_fields()
         st.session_state["_migrated_reason_fields"] = True
@@ -6739,6 +6792,7 @@ def main():
         "monitoring": len(monitoring_rows),
         "monitoring_history": len(monitoring_history_rows),
     }
+    process_portfolio_events(portfolio_rows)
     st.sidebar.caption(f"📥 portfolio: {len(portfolio_rows)}")
 
     scanner_seeds_raw = str(DEFAULT_SEEDS)
