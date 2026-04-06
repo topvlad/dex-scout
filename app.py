@@ -4170,17 +4170,12 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 
 
 def send_telegram(text: str):
-    st.write("TG FUNCTION CALLED")
-
     token = st.secrets.get("TG_BOT_TOKEN")
     chat_id = st.secrets.get("TG_CHAT_ID")
 
-    st.write("TOKEN:", token)
-    st.write("CHAT_ID:", chat_id)
-
     if not token or not chat_id:
-        st.error("NO TG CONFIG")
-        return
+        st.error("TG NOT CONFIGURED")
+        return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
@@ -4190,10 +4185,15 @@ def send_telegram(text: str):
             json={"chat_id": chat_id, "text": text},
             timeout=10
         )
-        st.write("STATUS:", r.status_code)
-        st.write("RESPONSE:", r.text)
+
+        if r.status_code == 200:
+            return True
+
+        st.write("TG ERROR:", r.text)
+        return False
     except Exception as e:
-        st.error(f"ERROR: {e}")
+        st.error(f"TG EXCEPTION: {e}")
+        return False
 
 
 def send_tg(msg: str):
@@ -4397,6 +4397,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 send_tg(format_signal_msg(best_row))
                 st.session_state["last_alert_ts"] = now_ts
     seen_token_keys: Set[str] = set()
+    st.session_state.setdefault("_sent_tokens", set())
     existing_rows = load_monitoring()
     active_symbols = {
         str(r.get("base_symbol") or "").strip().upper()
@@ -4445,9 +4446,6 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             counts["skipped_major_like"] += 1
             continue
 
-        if str(row.get("entry") or "").upper() in ("READY", "WATCH", "TRADEABLE"):
-            send_telegram(f"{base_sym} | {row.get('entry')} | {row.get('entry_score')}")
-
         if looks_like_quote_or_lp(row):
             counts["skipped_noise"] += 1
             counts["skipped_quote_like"] += 1
@@ -4473,10 +4471,12 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 continue
             seen_token_keys.add(dedupe_key)
         s = max(float(s), 50.0)
-        if s >= 500:
+        row["entry_score"] = s
+        score = float(row.get("entry_score", 0))
+        if score >= 300:
             entry_status = "READY"
             signal_reason = "breakout"
-        elif s >= 250:
+        elif score >= 180:
             entry_status = "WATCH"
             signal_reason = "trend_building"
         else:
@@ -4495,6 +4495,19 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         row["bucket"] = classify_bucket(s, row)
         weak_reasons: List[str] = []
         st.write(f"entry={entry_status} score={s:.2f}")
+
+        token_id = (
+            row.get("pair_address")
+            or row.get("pairAddress")
+            or safe_get(row, "baseToken", "address", default="")
+            or row.get("base_addr")
+        )
+        if token_id and token_id not in st.session_state["_sent_tokens"]:
+            if entry_status in ("READY", "WATCH", "TRADEABLE"):
+                ok = send_telegram(f"{base_sym} | {entry_status} | {score:.2f}")
+                if ok:
+                    st.session_state["_sent_tokens"].add(token_id)
+
         if not gate_ok:
             counts["skipped_noise"] += 1
             row["note"] = gate_reason
@@ -4559,7 +4572,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["added"] += 1
                 if base_sym:
                     active_symbols.add(base_sym)
-                if row.get("entry_status") in ["READY", "WATCH"] and str(row.get("risk_level", "")).upper() != "HIGH":
+                if row.get("entry_status") in ["READY", "WATCH"]:
                     if row.get("alert_sent") != "1":
                         msg = format_signal_msg(row)
                         last_ts = parse_float(st.session_state.get("last_alert_ts", 0), 0)
@@ -6702,14 +6715,13 @@ def page_portfolio():
 # App main
 # =============================
 def main():
-    st.write("APP STARTED")
-    if st.button("PING"):
-        st.write("PING OK")
-
     st.markdown("### Telegram test")
     if st.button("TEST TG"):
-        st.write("CLICK OK")
-        send_telegram("TEST FROM UI")
+        ok = send_telegram("DEX SCOUT TEST OK")
+        if ok:
+            st.success("TG SENT")
+        else:
+            st.error("TG FAILED")
 
     if st.session_state.get("_rerun_flag"):
         st.session_state["_rerun_flag"] = False
