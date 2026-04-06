@@ -6702,13 +6702,18 @@ def page_portfolio():
 # App main
 # =============================
 def main():
+    st.write("APP STARTED")
+    if st.button("PING"):
+        st.write("PING OK")
+
+    st.markdown("### Telegram test")
+    if st.button("TEST TG"):
+        st.write("CLICK OK")
+        send_telegram("TEST FROM UI")
+
     if st.session_state.get("_rerun_flag"):
         st.session_state["_rerun_flag"] = False
         st.rerun()
-
-    if "_tg_test_sent" not in st.session_state:
-        send_telegram("DEX Scout test OK")
-        st.session_state["_tg_test_sent"] = True
 
     ensure_storage()
     if "_migrated_reason_fields" not in st.session_state:
@@ -6805,10 +6810,6 @@ def main():
         if st.button("Clear cache", use_container_width=True):
             st.cache_data.clear()
             request_rerun()
-        if st.button("TEST TG", use_container_width=True):
-            st.write("BUTTON CLICKED")
-            send_telegram("TEST")
-
         st.divider()
         st.markdown("### Storage status")
         if _sb_ok():
