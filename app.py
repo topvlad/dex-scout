@@ -1517,9 +1517,6 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     row["signal_reason"] = signal_reason
     if entry in {"TRADEABLE", "EARLY"}:
         row["entry_status"] = entry
-    elif signal_reason == "low_liquidity":
-        row["decision_reason"] = "low_liquidity"
-        row["entry_status"] = "NO_ENTRY"
     row["timing_label"] = compute_timing(row)
     row["priority"] = entry_score
     toxic, reasons = is_toxic_token(pair)
@@ -1529,12 +1526,9 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         row["toxic_flags"] = ",".join(reasons)
 
     score = parse_float(row.get("entry_score", 0), 0.0)
-    if score >= 300:
-        row["entry"] = "READY"
-    elif score >= 180:
-        row["entry"] = "WATCH"
-    else:
-        row["entry"] = "WAIT"
+    unified_entry = entry_from_score(score)
+    row["entry"] = unified_entry
+    row["entry_status"] = unified_entry
 
     row["priority"] = parse_float(row.get("entry_score", 0), 0.0)
     row["priority_score"] = parse_float(row.get("priority_score", row.get("entry_score", 0)), 0.0)
@@ -4178,19 +4172,22 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 def send_telegram(text: str):
     token = TG_BOT_TOKEN or str(getattr(st, "secrets", {}).get("TG_BOT_TOKEN", "") or "")
     chat_id = TG_CHAT_ID or str(getattr(st, "secrets", {}).get("TG_CHAT_ID", "") or "")
-    print("TG TOKEN:", token)
-    print("TG CHAT:", chat_id)
 
     if not token or not chat_id:
-        print("TG NOT CONFIGURED")
+        st.error("TG NOT CONFIGURED")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     try:
-        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=5)
-    except Exception:
-        pass
+        r = requests.post(
+            url,
+            json={"chat_id": chat_id, "text": text},
+            timeout=10,
+        )
+        st.write("TG RESPONSE:", r.status_code, r.text)
+    except Exception as e:
+        st.error(f"TG ERROR: {e}")
 
 
 def send_tg(msg: str):
@@ -4442,7 +4439,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             counts["skipped_major_like"] += 1
             continue
 
-        if str(row.get("entry") or "").upper() in ("READY", "WATCH"):
+        if str(row.get("entry") or "").upper() in ("READY", "WATCH", "TRADEABLE"):
             send_telegram(f"{base_sym} | {row.get('entry')} | {row.get('entry_score')}")
 
         if looks_like_quote_or_lp(row):
@@ -5293,6 +5290,14 @@ def compute_entry_signal(item: Dict[str, Any]) -> Tuple[str, str]:
     return "NO_ENTRY", "no_momentum"
 
 
+def entry_from_score(score: float) -> str:
+    if score >= 300:
+        return "READY"
+    if score >= 180:
+        return "WATCH"
+    return "WAIT"
+
+
 def compute_timing(item: Dict[str, Any]) -> str:
     pc = parse_float(item.get("price_change_5m", safe_get(item, "priceChange", "m5", default=0)), 0.0)
     if pc > 10:
@@ -5558,6 +5563,7 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
         penalty += 200
         flags.append("dead")
 
+    penalty = min(penalty, 80.0)
     visible_score = max(0.0, raw_score - penalty)
 
     if is_dead:
@@ -6794,7 +6800,7 @@ def main():
             st.cache_data.clear()
             request_rerun()
         if st.button("TEST TG", use_container_width=True):
-            send_telegram("DEX SCOUT WORKING")
+            send_telegram("DEX SCOUT TEST")
 
         st.divider()
         st.markdown("### Storage status")
