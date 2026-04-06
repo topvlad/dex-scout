@@ -4170,11 +4170,16 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 
 
 def send_telegram(text: str):
-    token = TG_BOT_TOKEN or str(getattr(st, "secrets", {}).get("TG_BOT_TOKEN", "") or "")
-    chat_id = TG_CHAT_ID or str(getattr(st, "secrets", {}).get("TG_CHAT_ID", "") or "")
+    st.write("TG FUNCTION CALLED")
+
+    token = st.secrets.get("TG_BOT_TOKEN")
+    chat_id = st.secrets.get("TG_CHAT_ID")
+
+    st.write("TOKEN:", token)
+    st.write("CHAT_ID:", chat_id)
 
     if not token or not chat_id:
-        st.error("TG NOT CONFIGURED")
+        st.error("NO TG CONFIG")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -4183,11 +4188,12 @@ def send_telegram(text: str):
         r = requests.post(
             url,
             json={"chat_id": chat_id, "text": text},
-            timeout=10,
+            timeout=10
         )
-        st.write("TG RESPONSE:", r.status_code, r.text)
+        st.write("STATUS:", r.status_code)
+        st.write("RESPONSE:", r.text)
     except Exception as e:
-        st.error(f"TG ERROR: {e}")
+        st.error(f"ERROR: {e}")
 
 
 def send_tg(msg: str):
@@ -6800,7 +6806,8 @@ def main():
             st.cache_data.clear()
             request_rerun()
         if st.button("TEST TG", use_container_width=True):
-            send_telegram("DEX SCOUT TEST")
+            st.write("BUTTON CLICKED")
+            send_telegram("TEST")
 
         st.divider()
         st.markdown("### Storage status")
