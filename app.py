@@ -105,6 +105,7 @@ MEME_KEYWORDS = [
 PORTFOLIO_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 MONITORING_CSV = os.path.join(DATA_DIR, "monitoring.csv")
 MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
+TG_STATE_FILE = os.path.join(DATA_DIR, "tg_state.json")
 
 
 def request_rerun() -> None:
@@ -4187,19 +4188,48 @@ def send_telegram(text: str):
         return False
 
 
+def load_sent_state() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(TG_STATE_FILE):
+            return {"portfolio": [], "signals": [], "last_run": 0.0, "sent_timestamps": []}
+        with open(TG_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"portfolio": [], "signals": [], "last_run": 0.0, "sent_timestamps": []}
+        data.setdefault("portfolio", [])
+        data.setdefault("signals", [])
+        data.setdefault("last_run", 0.0)
+        data.setdefault("sent_timestamps", [])
+        return data
+    except Exception:
+        return {"portfolio": [], "signals": [], "last_run": 0.0, "sent_timestamps": []}
+
+
+def save_sent_state(state: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(TG_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+tg_state = load_sent_state()
+
+
 def can_send_tg() -> bool:
     now = time.time()
-    st.session_state.setdefault("_tg_last_sent", [])
-    st.session_state["_tg_last_sent"] = [
-        t for t in st.session_state["_tg_last_sent"]
-        if now - float(t) < 3600
-    ]
-    return len(st.session_state["_tg_last_sent"]) < 5
+    sent_ts = [float(t) for t in tg_state.get("sent_timestamps", []) if now - float(t) < 3600]
+    tg_state["sent_timestamps"] = sent_ts
+    save_sent_state(tg_state)
+    return len(sent_ts) < 5
 
 
 def mark_sent() -> None:
-    st.session_state.setdefault("_tg_last_sent", [])
-    st.session_state["_tg_last_sent"].append(time.time())
+    sent_ts = list(tg_state.get("sent_timestamps", []))
+    sent_ts.append(time.time())
+    tg_state["sent_timestamps"] = sent_ts
+    save_sent_state(tg_state)
 
 
 def format_token_msg(row: Dict[str, Any], action: str) -> str:
@@ -4236,15 +4266,21 @@ def reset_monitoring():
     st.session_state.setdefault("_last_status", {})
 
 
-def process_signal_transitions(rows: List[Dict[str, Any]]) -> None:
-    st.session_state.setdefault("_sent_tokens", set())
-    st.session_state.setdefault("_last_run", 0.0)
-    st.session_state.setdefault("_last_status", {})
-
+def should_run_signals() -> bool:
     now = time.time()
-    if now - float(st.session_state.get("_last_run", 0.0)) < 300:
+    last = float(tg_state.get("last_run", 0.0) or 0.0)
+    if now - last < 300:
+        return False
+    tg_state["last_run"] = now
+    save_sent_state(tg_state)
+    return True
+
+
+def process_signal_transitions(rows: List[Dict[str, Any]]) -> None:
+    st.session_state.setdefault("_last_status", {})
+    sent_signals = set(tg_state.get("signals", []))
+    if not should_run_signals():
         return
-    st.session_state["_last_run"] = now
 
     if len(rows) > 50:
         rows = rows[:50]
@@ -4262,14 +4298,16 @@ def process_signal_transitions(rows: List[Dict[str, Any]]) -> None:
             or row.get("base_addr")
             or row.get("base_token_address")
         )
-        if not token or token in st.session_state["_sent_tokens"]:
+        if not token or token in sent_signals:
             continue
         if not can_send_tg():
             break
         if send_telegram(format_token_msg(row, "🚀 SIGNAL")):
             mark_sent()
-            st.session_state["_sent_tokens"].add(token)
+            sent_signals.add(token)
             st.session_state["_last_status"][token] = "SIGNAL_SENT"
+    tg_state["signals"] = list(sent_signals)
+    save_sent_state(tg_state)
 
 
 def portfolio_signal(row: Dict[str, Any]) -> Optional[str]:
@@ -4282,24 +4320,34 @@ def portfolio_signal(row: Dict[str, Any]) -> Optional[str]:
 
 
 def process_portfolio_events(portfolio: List[Dict[str, Any]]) -> None:
-    st.session_state.setdefault("_portfolio_sent", set())
+    current = {
+        str(p.get("pair_address") or p.get("pairAddress") or "").strip()
+        for p in portfolio
+        if str(p.get("pair_address") or p.get("pairAddress") or "").strip()
+    }
+    sent = set(tg_state.get("portfolio", []))
+    new_tokens = current - sent
 
-    rows = portfolio[:50] if len(portfolio) > 50 else portfolio
-    for row in rows:
+    for token in new_tokens:
+        row = next(
+            (
+                r for r in portfolio
+                if str(r.get("pair_address") or r.get("pairAddress") or "").strip() == token
+            ),
+            None,
+        )
+        if not row:
+            continue
         action = portfolio_signal(row)
         if not action:
-            continue
-        token = str(row.get("pair_address") or row.get("pairAddress") or "").strip()
-        if not token:
-            continue
-        key = f"{token}_{action}"
-        if key in st.session_state["_portfolio_sent"]:
             continue
         if not can_send_tg():
             break
         if send_telegram(format_token_msg(row, f"📊 PORTFOLIO {action}")):
             mark_sent()
-            st.session_state["_portfolio_sent"].add(key)
+            sent.add(token)
+    tg_state["portfolio"] = list(sent)
+    save_sent_state(tg_state)
 
 
 def send_tg(msg: str):
@@ -6810,8 +6858,6 @@ def main():
     ensure_storage()
     if "_last_status" not in st.session_state:
         st.session_state["_last_status"] = {}
-    if "_last_portfolio" not in st.session_state:
-        st.session_state["_last_portfolio"] = set()
     if "_migrated_reason_fields" not in st.session_state:
         migrate_reason_fields()
         st.session_state["_migrated_reason_fields"] = True
