@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -14,7 +14,10 @@ USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
 BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "50"))
 
 LAST_STATUS: Dict[str, str] = {}
-LAST_PORTFOLIO: set[str] = set()
+SENT_TOKENS: set[str] = set()
+PORTFOLIO_SENT: set[str] = set()
+TG_LAST_SENT: List[float] = []
+LAST_RUN_TS: float = 0.0
 
 
 def send_telegram(text: str) -> bool:
@@ -33,71 +36,93 @@ def send_telegram(text: str) -> bool:
         return False
 
 
-def classify_entry(score: float) -> str:
-    if score >= 320:
-        return "READY"
-    if score >= 220:
-        return "WATCH"
-    if score >= 150:
-        return "TRACK"
-    return "IGNORE"
+def can_send_tg() -> bool:
+    global TG_LAST_SENT
+    now = time.time()
+    TG_LAST_SENT = [t for t in TG_LAST_SENT if now - float(t) < 3600]
+    return len(TG_LAST_SENT) < 5
 
 
-def is_signal_worthy(row: Dict[str, Any]) -> bool:
+def mark_sent() -> None:
+    TG_LAST_SENT.append(time.time())
+
+
+def format_token_msg(row: Dict[str, Any], action: str) -> str:
+    symbol = str(row.get("base_symbol") or row.get("symbol") or "UNKNOWN").upper()
+    score = round(float(row.get("entry_score", 0) or 0), 1)
+    risk = str(row.get("risk") or row.get("risk_level") or "UNKNOWN").upper()
+    addr = row.get("pair_address") or row.get("pairAddress") or row.get("base_addr") or "N/A"
+    return (
+        f"{action} | {symbol}\n\n"
+        f"score: {score}\n"
+        f"risk: {risk}\n\n"
+        "CA:\n"
+        f"`{addr}`"
+    )
+
+
+def is_top_signal(row: Dict[str, Any]) -> bool:
     score = float(row.get("entry_score", 0) or 0)
     risk = str(row.get("risk") or row.get("risk_level") or "").upper()
-    if score < 200:
+    if score < 260:
         return False
-    if risk == "HIGH" and score < 300:
+    if risk == "HIGH" and score < 320:
         return False
     return True
 
 
 def process_signals(rows: List[Dict[str, Any]]) -> None:
-    global LAST_STATUS
+    global LAST_RUN_TS
+    now = time.time()
+    if now - LAST_RUN_TS < 300:
+        return
+    LAST_RUN_TS = now
 
-    for row in rows:
-        if not is_signal_worthy(row):
-            continue
+    rows = rows[:50] if len(rows) > 50 else rows
+    top_candidates = sorted(
+        [r for r in rows if is_top_signal(r)],
+        key=lambda x: float(x.get("entry_score", 0) or 0),
+        reverse=True,
+    )[:3]
 
+    for row in top_candidates:
         token = row.get("pair_address") or row.get("pairAddress") or row.get("base_addr")
-        symbol = str(row.get("base_symbol") or token or "UNKNOWN")
-        score = float(row.get("entry_score", 0) or 0)
-        if not token:
+        if not token or token in SENT_TOKENS:
             continue
+        if not can_send_tg():
+            break
+        if send_telegram(format_token_msg(row, "🚀 SIGNAL")):
+            mark_sent()
+            SENT_TOKENS.add(str(token))
+            LAST_STATUS[str(token)] = "SIGNAL_SENT"
 
-        if token not in LAST_STATUS:
-            send_telegram(f"🆕 NEW TOKEN\n{symbol}\nScore: {round(score,1)}")
 
-        new_status = classify_entry(score)
-        old_status = LAST_STATUS.get(token)
-        if old_status != new_status and new_status in ("READY", "WATCH"):
-            send_telegram(
-                "📡 SIGNAL UPDATE\n"
-                f"{symbol}\n\n"
-                f"Status: {old_status or 'NEW'} → {new_status}\n"
-                f"Score: {round(score,1)}"
-            )
-
-        LAST_STATUS[token] = new_status
+def portfolio_signal(row: Dict[str, Any]) -> Optional[str]:
+    score = float(row.get("entry_score", 0) or 0)
+    if score > 320:
+        return "ADD"
+    if score < 140:
+        return "EXIT"
+    return None
 
 
 def process_portfolio(rows: List[Dict[str, Any]]) -> None:
-    global LAST_PORTFOLIO
-
-    current = {
-        str(p.get("pair_address") or "").strip()
-        for p in rows
-        if str(p.get("active", "1")).strip() == "1" and str(p.get("pair_address") or "").strip()
-    }
-
-    for t in current - LAST_PORTFOLIO:
-        send_telegram(f"🟢 ADDED TO PORTFOLIO\n{t}")
-
-    for t in LAST_PORTFOLIO - current:
-        send_telegram(f"🔴 REMOVED FROM PORTFOLIO\n{t}")
-
-    LAST_PORTFOLIO = current
+    rows = rows[:50] if len(rows) > 50 else rows
+    for row in rows:
+        action = portfolio_signal(row)
+        if not action:
+            continue
+        token = str(row.get("pair_address") or row.get("pairAddress") or "").strip()
+        if not token:
+            continue
+        key = f"{token}_{action}"
+        if key in PORTFOLIO_SENT:
+            continue
+        if not can_send_tg():
+            break
+        if send_telegram(format_token_msg(row, f"📊 PORTFOLIO {action}")):
+            mark_sent()
+            PORTFOLIO_SENT.add(key)
 
 
 def run_full_scan() -> Dict[str, Any]:
