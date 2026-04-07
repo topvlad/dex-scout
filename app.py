@@ -4171,6 +4171,8 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 
 
 def send_telegram(text: str):
+    if not tg_global_guard():
+        return False
     token = st.secrets.get("TG_BOT_TOKEN")
     chat_id = st.secrets.get("TG_CHAT_ID")
 
@@ -4178,6 +4180,7 @@ def send_telegram(text: str):
         return False
 
     try:
+        print("TG FIRED")
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text},
@@ -4215,6 +4218,15 @@ def save_sent_state(state: Dict[str, Any]) -> None:
 
 
 tg_state = load_sent_state()
+
+
+def tg_global_guard() -> bool:
+    now = time.time()
+    last = float(st.session_state.get("_tg_global_last", 0) or 0)
+    if now - last < 600:
+        return False
+    st.session_state["_tg_global_last"] = now
+    return True
 
 
 def can_send_tg() -> bool:
@@ -4341,11 +4353,12 @@ def process_portfolio_events(portfolio: List[Dict[str, Any]]) -> None:
         action = portfolio_signal(row)
         if not action:
             continue
-        if not can_send_tg():
-            break
-        if send_telegram(format_token_msg(row, f"📊 PORTFOLIO {action}")):
-            mark_sent()
-            sent.add(token)
+        # DISABLED TEMP: portfolio alerts were creating noisy rerun spam.
+        # if not can_send_tg():
+        #     break
+        # if send_telegram(format_token_msg(row, f"📊 PORTFOLIO {action}")):
+        #     mark_sent()
+        #     sent.add(token)
     tg_state["portfolio"] = list(sent)
     save_sent_state(tg_state)
 
