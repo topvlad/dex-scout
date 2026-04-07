@@ -6,137 +6,206 @@ import requests
 
 import app
 
-SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
+SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "600"))
 SCAN_CHAIN = os.getenv("SCAN_CHAIN", "solana")
 SCANNER_SEEDS = os.getenv("SCANNER_SEEDS", str(app.DEFAULT_SEEDS))
 SCANNER_MAX_ITEMS = int(os.getenv("SCANNER_MAX_ITEMS", "100"))
 USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
 BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "50"))
 
+TG_MAX_PER_HOUR = int(os.getenv("TG_MAX_PER_HOUR", "5"))
+TG_SCAN_COOLDOWN_SEC = int(os.getenv("TG_SCAN_COOLDOWN_SEC", "600"))
+
 LAST_STATUS: Dict[str, str] = {}
-SENT_TOKENS: set[str] = set()
-PORTFOLIO_SENT: set[str] = set()
-TG_LAST_SENT: List[float] = []
-LAST_RUN_TS: float = 0.0
-TG_GLOBAL_LAST: float = 0.0
+
+tg_state: Dict[str, Any] = app.load_sent_state()
+
+def _parse_score(row: Dict[str, Any]) -> float:
+    try:
+        return float(row.get("entry_score", 0) or 0)
+    except Exception:
+        return 0.0
 
 
-def tg_global_guard() -> bool:
-    global TG_GLOBAL_LAST
+def _risk(row: Dict[str, Any]) -> str:
+    return str(row.get("risk") or row.get("risk_level") or "").upper().strip()
+
+
+def _addr(row: Dict[str, Any]) -> str:
+    return str(
+        row.get("pair_address")
+        or row.get("pairAddress")
+        or row.get("base_addr")
+        or row.get("base_token_address")
+        or ""
+    ).strip()
+
+
+def tg_should_fire() -> bool:
     now = time.time()
-    if now - TG_GLOBAL_LAST < 600:
+    last = float(tg_state.get("last_run", 0.0) or 0.0)
+    if now - last < TG_SCAN_COOLDOWN_SEC:
         return False
-    TG_GLOBAL_LAST = now
+    tg_state["last_run"] = now
+    app.save_sent_state(tg_state)
     return True
 
 
-def send_telegram(text: str) -> bool:
-    if not tg_global_guard():
-        return False
+def can_send_tg() -> bool:
+    sent = tg_state.get("sent_ts", [])
+    now = time.time()
+    sent = [float(ts) for ts in sent if now - float(ts) < 3600]
+    tg_state["sent_ts"] = sent
+    return len(sent) < TG_MAX_PER_HOUR
+
+
+def mark_sent_ts() -> None:
+    sent = tg_state.get("sent_ts", [])
+    sent.append(time.time())
+    tg_state["sent_ts"] = sent[-300:]
+
+
+def send_telegram(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> bool:
     token = (os.getenv("TG_BOT_TOKEN") or app._get_secret("TG_BOT_TOKEN", "")).strip()
     chat_id = (os.getenv("TG_CHAT_ID") or app._get_secret("TG_CHAT_ID", "")).strip()
     if not token or not chat_id:
         return False
+    if not can_send_tg():
+        return False
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
-        print("TG FIRED", flush=True)
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json=payload,
             timeout=10,
         )
-        return r.status_code == 200
+        ok = r.status_code == 200
+        if ok:
+            mark_sent_ts()
+        return ok
     except Exception:
         return False
 
 
-def can_send_tg() -> bool:
-    global TG_LAST_SENT
-    now = time.time()
-    TG_LAST_SENT = [t for t in TG_LAST_SENT if now - float(t) < 3600]
-    return len(TG_LAST_SENT) < 5
-
-
-def mark_sent() -> None:
-    TG_LAST_SENT.append(time.time())
-
-
-def format_token_msg(row: Dict[str, Any], action: str) -> str:
-    symbol = str(row.get("base_symbol") or row.get("symbol") or "UNKNOWN").upper()
-    score = round(float(row.get("entry_score", 0) or 0), 1)
-    risk = str(row.get("risk") or row.get("risk_level") or "UNKNOWN").upper()
-    addr = row.get("pair_address") or row.get("pairAddress") or row.get("base_addr") or "N/A"
-    return (
-        f"{action} | {symbol}\n\n"
-        f"score: {score}\n"
-        f"risk: {risk}\n\n"
-        "CA:\n"
-        f"`{addr}`"
-    )
-
-
-def is_top_signal(row: Dict[str, Any]) -> bool:
-    score = float(row.get("entry_score", 0) or 0)
-    risk = str(row.get("risk") or row.get("risk_level") or "").upper()
-    if score < 260:
+def is_valid(row: Dict[str, Any]) -> bool:
+    score = _parse_score(row)
+    risk = _risk(row)
+    if score <= 0:
         return False
-    if risk == "HIGH" and score < 320:
+    if not risk or risk == "UNKNOWN":
+        return False
+    if not _addr(row):
         return False
     return True
 
 
-def process_signals(rows: List[Dict[str, Any]]) -> None:
-    global LAST_RUN_TS
-    now = time.time()
-    if now - LAST_RUN_TS < 300:
-        return
-    LAST_RUN_TS = now
-
-    rows = rows[:50] if len(rows) > 50 else rows
-    top_candidates = sorted(
-        [r for r in rows if is_top_signal(r)],
-        key=lambda x: float(x.get("entry_score", 0) or 0),
-        reverse=True,
-    )[:3]
-
-    for row in top_candidates:
-        token = row.get("pair_address") or row.get("pairAddress") or row.get("base_addr")
-        if not token or token in SENT_TOKENS:
-            continue
-        if not can_send_tg():
-            break
-        if send_telegram(format_token_msg(row, "🚀 SIGNAL")):
-            mark_sent()
-            SENT_TOKENS.add(str(token))
-            LAST_STATUS[str(token)] = "SIGNAL_SENT"
-
-
-def portfolio_signal(row: Dict[str, Any]) -> Optional[str]:
-    score = float(row.get("entry_score", 0) or 0)
-    if score > 320:
-        return "ADD"
-    if score < 140:
-        return "EXIT"
+def build_signal(row: Dict[str, Any], source: str) -> Optional[Dict[str, str]]:
+    score = _parse_score(row)
+    if score >= 320:
+        return {
+            "type": "ENTRY NOW",
+            "priority": "HIGH",
+            "reason": "strong momentum + structure",
+        }
+    if 260 <= score < 320:
+        return {
+            "type": "WATCH ENTRY",
+            "priority": "MEDIUM",
+            "reason": "early signal forming",
+        }
+    if source == "portfolio" and score < 140:
+        return {
+            "type": "EXIT",
+            "priority": "HIGH",
+            "reason": "structure breakdown",
+        }
     return None
 
 
-def process_portfolio(rows: List[Dict[str, Any]]) -> None:
-    rows = rows[:50] if len(rows) > 50 else rows
+def was_sent(key: str) -> bool:
+    return key in set(tg_state.get("sent_events", []))
+
+
+def mark_sent(key: str) -> None:
+    sent_events = list(tg_state.get("sent_events", []))
+    sent_events.append(key)
+    tg_state["sent_events"] = sent_events[-200:]
+
+
+def fmt(row: Dict[str, Any], signal: Dict[str, str], source: str) -> str:
+    ca = _addr(row) or "N/A"
+    symbol = str(row.get("base_symbol") or row.get("symbol") or "UNKNOWN").upper()
+    timing = str(row.get("timing") or row.get("timing_label") or "UNKNOWN")
+    return (
+        f"🚀 {signal['type']} | {symbol}\n\n"
+        f"source: {source}\n"
+        f"score: {round(_parse_score(row), 1)}\n"
+        f"risk: {_risk(row)}\n"
+        f"timing: {timing}\n\n"
+        f"reason:\n{signal['reason']}\n\n"
+        f"CA:\n<code>{ca}</code>"
+    )
+
+
+def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
+    ca = _addr(row)
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "➕ Portfolio", "callback_data": f"add_pf|{ca}"},
+                {"text": "👀 Monitor", "callback_data": f"add_mon|{ca}"},
+            ],
+            [{"text": "❌ Remove", "callback_data": f"remove|{ca}"}],
+        ]
+    }
+
+
+def run_signal_engine(rows: List[Dict[str, Any]], portfolio: List[Dict[str, Any]]) -> None:
+    if not tg_should_fire():
+        return
+
+    sent = 0
+
     for row in rows:
-        action = portfolio_signal(row)
-        if not action:
+        if not is_valid(row):
             continue
-        token = str(row.get("pair_address") or row.get("pairAddress") or "").strip()
-        if not token:
+        signal = build_signal(row, "monitoring")
+        if not signal:
             continue
-        key = f"{token}_{action}"
-        if key in PORTFOLIO_SENT:
+        key = f"{_addr(row)}_{signal['type']}"
+        if was_sent(key):
             continue
-        # DISABLED TEMP: portfolio alerts were creating noisy rerun spam.
-        # if not can_send_tg():
-        #     break
-        # if send_telegram(format_token_msg(row, f"📊 PORTFOLIO {action}")):
-        #     mark_sent()
-        #     PORTFOLIO_SENT.add(key)
+        if send_telegram(fmt(row, signal, "monitoring"), reply_markup=tg_buttons(row)):
+            mark_sent(key)
+            sent += 1
+            LAST_STATUS[_addr(row)] = signal["type"]
+        if sent >= 3:
+            break
+
+    for row in portfolio:
+        if not is_valid(row):
+            continue
+        signal = build_signal(row, "portfolio")
+        if not signal:
+            continue
+        key = f"{_addr(row)}_{signal['type']}"
+        if was_sent(key):
+            continue
+        if send_telegram(fmt(row, signal, "portfolio"), reply_markup=tg_buttons(row)):
+            mark_sent(key)
+            sent += 1
+            LAST_STATUS[_addr(row)] = signal["type"]
+        if sent >= 5:
+            break
+
+    app.save_sent_state(tg_state)
 
 
 def run_full_scan() -> Dict[str, Any]:
@@ -157,10 +226,8 @@ def run_worker_loop() -> None:
             print(f"[worker] scan done: {stats}", flush=True)
 
             monitoring = app.load_monitoring()
-            process_signals(monitoring)
-
             portfolio = app.load_portfolio()
-            process_portfolio(portfolio)
+            run_signal_engine(monitoring, portfolio)
         except Exception as exc:
             print(f"[worker] error: {type(exc).__name__}: {exc}", flush=True)
 
