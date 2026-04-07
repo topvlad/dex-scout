@@ -17,6 +17,7 @@ TG_MAX_PER_HOUR = int(os.getenv("TG_MAX_PER_HOUR", "5"))
 TG_SCAN_COOLDOWN_SEC = int(os.getenv("TG_SCAN_COOLDOWN_SEC", "600"))
 
 LAST_STATUS: Dict[str, str] = {}
+STATE: Dict[str, Any] = {"tokens": {}, "last_update": 0.0}
 
 tg_state: Dict[str, Any] = app.load_sent_state()
 
@@ -96,14 +97,40 @@ def send_telegram(text: str, reply_markup: Optional[Dict[str, Any]] = None) -> b
 
 def is_valid(row: Dict[str, Any]) -> bool:
     score = _parse_score(row)
-    risk = _risk(row)
-    if score <= 0:
-        return False
-    if not risk or risk == "UNKNOWN":
-        return False
-    if not _addr(row):
-        return False
-    return True
+    return bool(_addr(row)) and score > 50
+
+
+def update_state(rows: List[Dict[str, Any]], source: str) -> None:
+    now_ts = time.time()
+    for r in rows:
+        ca = _addr(r)
+        if not ca:
+            continue
+        STATE["tokens"][f"{source}:{ca}"] = {
+            "source": source,
+            "address": ca,
+            "symbol": str(r.get("base_symbol") or r.get("symbol") or "UNKNOWN").upper(),
+            "score": _parse_score(r),
+            "risk": _risk(r) or "UNKNOWN",
+            "timing": str(r.get("timing") or r.get("timing_label") or "UNKNOWN"),
+            "updated": now_ts,
+            "row": r,
+        }
+    STATE["last_update"] = now_ts
+
+
+def state_signals(source: str) -> List[Dict[str, Any]]:
+    signals: List[Dict[str, Any]] = []
+    for token in STATE["tokens"].values():
+        if token.get("source") != source:
+            continue
+        score = float(token.get("score", 0))
+        if score > 300:
+            signals.append({"type": "ENTRY NOW", "priority": "HIGH", "reason": "score breakout", "token": token})
+        elif source == "portfolio" and score < 120:
+            signals.append({"type": "EXIT", "priority": "HIGH", "reason": "score breakdown", "token": token})
+    signals.sort(key=lambda x: float(x["token"].get("score", 0)), reverse=True)
+    return signals
 
 
 def build_signal(row: Dict[str, Any], source: str) -> Optional[Dict[str, str]]:
@@ -171,14 +198,15 @@ def run_signal_engine(rows: List[Dict[str, Any]], portfolio: List[Dict[str, Any]
     if not tg_should_fire():
         return
 
+    update_state(rows, "monitoring")
+    update_state(portfolio, "portfolio")
     sent = 0
 
-    for row in rows:
+    for item in state_signals("monitoring"):
+        row = item["token"]["row"]
         if not is_valid(row):
             continue
-        signal = build_signal(row, "monitoring")
-        if not signal:
-            continue
+        signal = {k: item[k] for k in ("type", "priority", "reason")}
         key = f"{_addr(row)}_{signal['type']}"
         if was_sent(key):
             continue
@@ -189,12 +217,11 @@ def run_signal_engine(rows: List[Dict[str, Any]], portfolio: List[Dict[str, Any]
         if sent >= 3:
             break
 
-    for row in portfolio:
+    for item in state_signals("portfolio"):
+        row = item["token"]["row"]
         if not is_valid(row):
             continue
-        signal = build_signal(row, "portfolio")
-        if not signal:
-            continue
+        signal = {k: item[k] for k in ("type", "priority", "reason")}
         key = f"{_addr(row)}_{signal['type']}"
         if was_sent(key):
             continue
@@ -227,6 +254,10 @@ def run_worker_loop() -> None:
 
             monitoring = app.load_monitoring()
             portfolio = app.load_portfolio()
+            valid_rows = [r for r in monitoring if _parse_score(r) > 0]
+            print(f"[worker] rows={len(monitoring)} valid={len(valid_rows)} state={len(STATE['tokens'])}", flush=True)
+            if monitoring:
+                print(f"[worker] raw_row_sample={monitoring[0]}", flush=True)
             run_signal_engine(monitoring, portfolio)
         except Exception as exc:
             print(f"[worker] error: {type(exc).__name__}: {exc}", flush=True)
