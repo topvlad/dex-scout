@@ -4171,8 +4171,6 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 
 
 def send_telegram(text: str):
-    if not tg_global_guard():
-        return False
     token = st.secrets.get("TG_BOT_TOKEN")
     chat_id = st.secrets.get("TG_CHAT_ID")
 
@@ -4194,18 +4192,17 @@ def send_telegram(text: str):
 def load_sent_state() -> Dict[str, Any]:
     try:
         if not os.path.exists(TG_STATE_FILE):
-            return {"portfolio": [], "signals": [], "last_run": 0.0, "sent_timestamps": []}
+            return {"sent_tokens": [], "sent_portfolio": [], "last_run": 0.0}
         with open(TG_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"portfolio": [], "signals": [], "last_run": 0.0, "sent_timestamps": []}
-        data.setdefault("portfolio", [])
-        data.setdefault("signals", [])
+            return {"sent_tokens": [], "sent_portfolio": [], "last_run": 0.0}
+        data.setdefault("sent_tokens", data.get("signals", []))
+        data.setdefault("sent_portfolio", data.get("portfolio", []))
         data.setdefault("last_run", 0.0)
-        data.setdefault("sent_timestamps", [])
         return data
     except Exception:
-        return {"portfolio": [], "signals": [], "last_run": 0.0, "sent_timestamps": []}
+        return {"sent_tokens": [], "sent_portfolio": [], "last_run": 0.0}
 
 
 def save_sent_state(state: Dict[str, Any]) -> None:
@@ -4220,28 +4217,14 @@ def save_sent_state(state: Dict[str, Any]) -> None:
 tg_state = load_sent_state()
 
 
-def tg_global_guard() -> bool:
+def tg_cooldown_ok() -> bool:
     now = time.time()
-    last = float(st.session_state.get("_tg_global_last", 0) or 0)
+    last = float(tg_state.get("last_run", 0.0) or 0.0)
     if now - last < 600:
         return False
-    st.session_state["_tg_global_last"] = now
+    tg_state["last_run"] = now
+    save_sent_state(tg_state)
     return True
-
-
-def can_send_tg() -> bool:
-    now = time.time()
-    sent_ts = [float(t) for t in tg_state.get("sent_timestamps", []) if now - float(t) < 3600]
-    tg_state["sent_timestamps"] = sent_ts
-    save_sent_state(tg_state)
-    return len(sent_ts) < 5
-
-
-def mark_sent() -> None:
-    sent_ts = list(tg_state.get("sent_timestamps", []))
-    sent_ts.append(time.time())
-    tg_state["sent_timestamps"] = sent_ts
-    save_sent_state(tg_state)
 
 
 def format_token_msg(row: Dict[str, Any], action: str) -> str:
@@ -4278,21 +4261,11 @@ def reset_monitoring():
     st.session_state.setdefault("_last_status", {})
 
 
-def should_run_signals() -> bool:
-    now = time.time()
-    last = float(tg_state.get("last_run", 0.0) or 0.0)
-    if now - last < 300:
-        return False
-    tg_state["last_run"] = now
-    save_sent_state(tg_state)
-    return True
-
-
 def process_signal_transitions(rows: List[Dict[str, Any]]) -> None:
     st.session_state.setdefault("_last_status", {})
-    sent_signals = set(tg_state.get("signals", []))
-    if not should_run_signals():
+    if not tg_cooldown_ok():
         return
+    sent_signals = set(tg_state.get("sent_tokens", []))
 
     if len(rows) > 50:
         rows = rows[:50]
@@ -4312,13 +4285,10 @@ def process_signal_transitions(rows: List[Dict[str, Any]]) -> None:
         )
         if not token or token in sent_signals:
             continue
-        if not can_send_tg():
-            break
         if send_telegram(format_token_msg(row, "🚀 SIGNAL")):
-            mark_sent()
             sent_signals.add(token)
             st.session_state["_last_status"][token] = "SIGNAL_SENT"
-    tg_state["signals"] = list(sent_signals)
+    tg_state["sent_tokens"] = list(sent_signals)
     save_sent_state(tg_state)
 
 
@@ -4332,34 +4302,21 @@ def portfolio_signal(row: Dict[str, Any]) -> Optional[str]:
 
 
 def process_portfolio_events(portfolio: List[Dict[str, Any]]) -> None:
-    current = {
-        str(p.get("pair_address") or p.get("pairAddress") or "").strip()
-        for p in portfolio
-        if str(p.get("pair_address") or p.get("pairAddress") or "").strip()
-    }
-    sent = set(tg_state.get("portfolio", []))
-    new_tokens = current - sent
+    sent = set(tg_state.get("sent_portfolio", []))
 
-    for token in new_tokens:
-        row = next(
-            (
-                r for r in portfolio
-                if str(r.get("pair_address") or r.get("pairAddress") or "").strip() == token
-            ),
-            None,
-        )
-        if not row:
+    for row in portfolio:
+        token = str(row.get("pair_address") or row.get("pairAddress") or "").strip()
+        if not token:
             continue
         action = portfolio_signal(row)
         if not action:
             continue
-        # DISABLED TEMP: portfolio alerts were creating noisy rerun spam.
-        # if not can_send_tg():
-        #     break
-        # if send_telegram(format_token_msg(row, f"📊 PORTFOLIO {action}")):
-        #     mark_sent()
-        #     sent.add(token)
-    tg_state["portfolio"] = list(sent)
+        event_key = f"{token}_{action}"
+        if event_key in sent:
+            continue
+        if send_telegram(format_token_msg(row, f"📊 {action}")):
+            sent.add(event_key)
+    tg_state["sent_portfolio"] = list(sent)
     save_sent_state(tg_state)
 
 
