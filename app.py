@@ -106,6 +106,7 @@ PORTFOLIO_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 MONITORING_CSV = os.path.join(DATA_DIR, "monitoring.csv")
 MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
 TG_STATE_FILE = os.path.join(DATA_DIR, "tg_state.json")
+TG_STATE_KEY = "tg_state.json"
 
 
 def request_rerun() -> None:
@@ -4170,154 +4171,205 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
     return (f"{entry:.0f}", f"{tp:.0f}")
 
 
-def send_telegram(text: str):
+def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> bool:
     token = st.secrets.get("TG_BOT_TOKEN")
     chat_id = st.secrets.get("TG_CHAT_ID")
 
     if not token or not chat_id:
+        debug_log("tg_not_configured")
         return False
 
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
     try:
-        print("TG FIRED")
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json=payload,
             timeout=10,
         )
-        return r.status_code == 200
-    except Exception:
+        ok = r.status_code == 200
+        debug_log(f"tg_send status={r.status_code} ok={ok}")
+        return ok
+    except Exception as e:
+        debug_log(f"tg_send_exception {type(e).__name__}:{e}")
         return False
 
 
-def load_sent_state() -> Dict[str, Any]:
+def load_tg_state() -> Dict[str, Any]:
+    default = {
+        "last_signal_run": 0.0,
+        "last_scan_ts_processed": "",
+        "sent_events": {},
+        "sent_portfolio_events": {},
+    }
     try:
-        if not os.path.exists(TG_STATE_FILE):
-            return {"sent_tokens": [], "sent_portfolio": [], "last_run": 0.0}
-        with open(TG_STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {"sent_tokens": [], "sent_portfolio": [], "last_run": 0.0}
-        data.setdefault("sent_tokens", data.get("signals", []))
-        data.setdefault("sent_portfolio", data.get("portfolio", []))
-        data.setdefault("last_run", 0.0)
-        return data
+        raw = sb_get_storage(TG_STATE_KEY) if USE_SUPABASE else None
+        if raw:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for k, v in default.items():
+                    data.setdefault(k, v)
+                return data
     except Exception:
-        return {"sent_tokens": [], "sent_portfolio": [], "last_run": 0.0}
+        pass
+    return default
 
 
-def save_sent_state(state: Dict[str, Any]) -> None:
+def save_tg_state(state: Dict[str, Any]) -> None:
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(TG_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f)
+        payload = json.dumps(state, ensure_ascii=False)
+        if USE_SUPABASE:
+            sb_put_storage(TG_STATE_KEY, payload)
+        else:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(TG_STATE_FILE, "w", encoding="utf-8") as f:
+                f.write(payload)
     except Exception:
         pass
 
 
-tg_state = load_sent_state()
-
-
-def tg_cooldown_ok() -> bool:
+def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 900) -> bool:
     now = time.time()
-    last = float(tg_state.get("last_run", 0.0) or 0.0)
-    if now - last < 600:
+    last = float(state.get("last_signal_run", 0.0) or 0.0)
+    if now - last < seconds:
         return False
-    tg_state["last_run"] = now
-    save_sent_state(tg_state)
+    state["last_signal_run"] = now
     return True
 
 
-def format_token_msg(row: Dict[str, Any], action: str) -> str:
-    symbol = str(row.get("base_symbol") or row.get("symbol") or "UNKNOWN").upper()
+def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    score = parse_float(row.get("entry_score", 0), 0.0)
+    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+
+    if score <= 0 or risk == "UNKNOWN":
+        return None
+
+    if score >= 320 and risk in ("LOW", "MEDIUM"):
+        return {"bucket": "ENTRY_NOW", "horizon": "short-term", "action": "Entry now"}
+    if 240 <= score < 320:
+        return {"bucket": "WATCH_ENTRY", "horizon": "short-term", "action": "Watch for confirmation"}
+    if 180 <= score < 240:
+        return {"bucket": "TRACK", "horizon": "monitor", "action": "Track only"}
+    return None
+
+
+def classify_portfolio_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    score = parse_float(row.get("entry_score", 0), 0.0)
+    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+    addr = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
+    active_raw = str(row.get("active", row.get("is_active", "1"))).strip().lower()
+
+    if score <= 0 or risk == "UNKNOWN" or not addr:
+        return None
+    if active_raw in {"0", "false", "no"}:
+        return None
+
+    if score < 120:
+        return {"bucket": "EXIT", "horizon": "now", "action": "Consider exit / reduce"}
+    if score >= 320 and risk in ("LOW", "MEDIUM"):
+        return {"bucket": "ADD", "horizon": "now", "action": "Consider adding"}
+    return None
+
+
+def signal_event_key(source: str, row: Dict[str, Any], signal: Dict[str, str]) -> str:
+    chain = str(row.get("chain") or "").lower()
+    addr = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
+    return f"{source}|{chain}|{addr}|{signal['bucket']}"
+
+
+def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> str:
+    symbol = str(row.get("base_symbol") or "UNKNOWN").upper()
     score = round(parse_float(row.get("entry_score", 0), 0.0), 1)
-    risk = str(row.get("risk") or row.get("risk_level") or "UNKNOWN").upper()
-    addr = (
-        row.get("pair_address")
-        or row.get("pairAddress")
-        or row.get("base_addr")
-        or row.get("base_token_address")
-        or "N/A"
-    )
+    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+    timing = str(row.get("timing_label") or "NA").upper()
+    addr = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
+    why = str(row.get("signal_reason") or row.get("decision_reason") or row.get("weak_reason") or "n/a")
+    chain = str(row.get("chain") or "").upper()
     return (
-        f"{action} | {symbol}\n\n"
+        f"<b>{signal['action']}</b> | <b>{symbol}</b>\n\n"
+        f"source: {source}\n"
+        f"chain: {chain}\n"
         f"score: {score}\n"
-        f"risk: {risk}\n\n"
-        "CA:\n"
-        f"`{addr}`"
+        f"risk: {risk}\n"
+        f"timing: {timing}\n"
+        f"horizon: {signal['horizon']}\n"
+        f"reason: {why}\n\n"
+        f"CA:\n<code>{addr}</code>"
     )
 
 
-def is_top_signal(row: Dict[str, Any]) -> bool:
-    score = float(row.get("entry_score", 0))
-    risk = str(row.get("risk") or row.get("risk_level") or "").upper()
-    if score < 260:
-        return False
-    if risk == "HIGH" and score < 320:
-        return False
-    return True
+def run_auto_notifications(
+    scan_state: Dict[str, Any],
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+) -> None:
+    state = load_tg_state()
+    last_scan_ts = str(scan_state.get("last_run_ts") or "")
+    if not last_scan_ts:
+        return
+    if state.get("last_scan_ts_processed") == last_scan_ts:
+        return
+    if not tg_cooldown_ok(state, seconds=900):
+        return
+
+    sent_events = state.get("sent_events", {})
+    sent_portfolio = state.get("sent_portfolio_events", {})
+    sent_now = 0
+
+    monitoring_candidates = []
+    for row in monitoring_rows:
+        signal = classify_monitoring_signal(row)
+        if signal:
+            monitoring_candidates.append((parse_float(row.get("entry_score", 0), 0.0), row, signal))
+    monitoring_candidates.sort(key=lambda x: x[0], reverse=True)
+    monitoring_candidates = monitoring_candidates[:3]
+
+    for _, row, signal in monitoring_candidates:
+        key = signal_event_key("monitoring", row, signal)
+        if key in sent_events:
+            continue
+        msg = format_signal_message(row, signal, "monitoring")
+        if send_telegram(msg):
+            sent_events[key] = last_scan_ts
+            sent_now += 1
+        if sent_now >= 3:
+            break
+
+    portfolio_candidates = []
+    for row in portfolio_rows:
+        signal = classify_portfolio_signal(row)
+        if signal:
+            portfolio_candidates.append((parse_float(row.get("entry_score", 0), 0.0), row, signal))
+    portfolio_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    portfolio_sent = 0
+    for _, row, signal in portfolio_candidates:
+        key = signal_event_key("portfolio", row, signal)
+        if key in sent_portfolio:
+            continue
+        msg = format_signal_message(row, signal, "portfolio")
+        if send_telegram(msg):
+            sent_portfolio[key] = last_scan_ts
+            sent_now += 1
+            portfolio_sent += 1
+        if portfolio_sent >= 2:
+            break
+
+    state["sent_events"] = sent_events
+    state["sent_portfolio_events"] = sent_portfolio
+    state["last_scan_ts_processed"] = last_scan_ts
+    save_tg_state(state)
 
 
 def reset_monitoring():
     st.session_state.setdefault("_last_status", {})
-
-
-def process_signal_transitions(rows: List[Dict[str, Any]]) -> None:
-    st.session_state.setdefault("_last_status", {})
-    if not tg_cooldown_ok():
-        return
-    sent_signals = set(tg_state.get("sent_tokens", []))
-
-    if len(rows) > 50:
-        rows = rows[:50]
-
-    top_candidates = sorted(
-        [r for r in rows if is_top_signal(r)],
-        key=lambda x: parse_float(x.get("entry_score", 0), 0.0),
-        reverse=True,
-    )[:3]
-
-    for row in top_candidates:
-        token = (
-            row.get("pair_address")
-            or row.get("pairAddress")
-            or row.get("base_addr")
-            or row.get("base_token_address")
-        )
-        if not token or token in sent_signals:
-            continue
-        if send_telegram(format_token_msg(row, "🚀 SIGNAL")):
-            sent_signals.add(token)
-            st.session_state["_last_status"][token] = "SIGNAL_SENT"
-    tg_state["sent_tokens"] = list(sent_signals)
-    save_sent_state(tg_state)
-
-
-def portfolio_signal(row: Dict[str, Any]) -> Optional[str]:
-    score = parse_float(row.get("entry_score", 0), 0.0)
-    if score > 320:
-        return "ADD"
-    if score < 140:
-        return "EXIT"
-    return None
-
-
-def process_portfolio_events(portfolio: List[Dict[str, Any]]) -> None:
-    sent = set(tg_state.get("sent_portfolio", []))
-
-    for row in portfolio:
-        token = str(row.get("pair_address") or row.get("pairAddress") or "").strip()
-        if not token:
-            continue
-        action = portfolio_signal(row)
-        if not action:
-            continue
-        event_key = f"{token}_{action}"
-        if event_key in sent:
-            continue
-        if send_telegram(format_token_msg(row, f"📊 {action}")):
-            sent.add(event_key)
-    tg_state["sent_portfolio"] = list(sent)
-    save_sent_state(tg_state)
 
 
 def send_tg(msg: str):
@@ -5045,6 +5097,20 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
     })
     scanner_state_save(state)
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
+
+def is_signal_worthy(row: Dict[str, Any]) -> bool:
+    score = parse_float(row.get("entry_score", 0), 0.0)
+    risk = str(row.get("risk_level") or row.get("risk") or "").upper()
+    weak_reason = str(row.get("weak_reason") or "").lower()
+
+    if score <= 0:
+        return False
+    if "gate_blocked" in weak_reason:
+        return False
+    if risk == "HIGH" and score < 180:
+        return False
+    return True
+
 
 def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
     state = scanner_state_load() or {}
@@ -6087,10 +6153,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if status in ("ACTIVE", "WATCH", "WAIT", "PORTFOLIO", ""):
             active_rows.append(r)
     if not active_rows:
-        active_rows = rows[:20]
-    active_rows = sorted(active_rows, key=lambda row: parse_float(row.get("priority_score", 0), 0.0), reverse=True)[:20]
+        active_rows = rows[:40]
+    active_rows = sorted(active_rows, key=lambda row: parse_float(row.get("priority_score", 0), 0.0), reverse=True)[:40]
     active = list(active_rows)
-    process_signal_transitions(active_rows)
     archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
     top[0].metric("Active", len(active))
     top[1].metric("Archived", len(archived))
@@ -6126,11 +6191,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if st.button("Refresh live data", use_container_width=True):
             request_rerun()
     with cbtn3:
-        if st.button("🔥 RESET MONITORING", use_container_width=True):
+        if st.button("🔥 WIPE MONITORING (destructive)", use_container_width=True):
             save_csv(MONITORING_CSV, [], MON_FIELDS)
             reset_monitoring()
             st.rerun()
-        st.caption("Scanner is manual: one click runs one full ingestion pass and saves results.")
+        st.caption("Clears monitoring.csv. Does not restore history automatically.")
 
     if not active_rows:
         st.info("Monitoring is empty. Run scanner now to fetch and save tokens.")
@@ -6156,18 +6221,23 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     signals_cards = [c for c in cards_all if c["ui_bucket"] in ("tradable", "caution")]
     review_cards = [c for c in cards_all if c["ui_bucket"] == "review"]
     dead_cards = [c for c in cards_all if c["ui_bucket"] == "dead"]
+    promoted_review = [c for c in review_cards if float(c.get("ui_visible_score", 0)) >= 120]
+    signals_cards.extend(promoted_review)
+    review_cards = [c for c in review_cards if float(c.get("ui_visible_score", 0)) < 120]
 
     def render_dedupe(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        best_by_symbol: Dict[str, Dict[str, Any]] = {}
+        best_by_key: Dict[str, Dict[str, Any]] = {}
         for c in cards:
             r = c.get("row", {})
             sym = str(r.get("base_symbol") or extract_name(r) or "").strip().upper()
+            chain = str(r.get("chain") or "").strip().lower()
             if not sym:
                 continue
-            prev = best_by_symbol.get(sym)
+            key = f"{chain}:{sym}"
+            prev = best_by_key.get(key)
             if prev is None or float(c.get("ui_visible_score", 0)) > float(prev.get("ui_visible_score", 0)):
-                best_by_symbol[sym] = c
-        return list(best_by_symbol.values())
+                best_by_key[key] = c
+        return list(best_by_key.values())
 
     signals_cards = render_dedupe(signals_cards)
     review_cards = render_dedupe(review_cards)
@@ -6175,9 +6245,6 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     review_cards.sort(key=lambda x: x["ui_visible_score"], reverse=True)
 
     top_cards = sorted(cards_all, key=lambda x: float(x.get("ui_visible_score", 0.0)), reverse=True)
-    if top_cards:
-        top_cards[0]["entry_status"] = "TRADEABLE"
-        top_cards[0]["entry"] = "TRADEABLE"
 
 
     st.subheader("Signals / Watchlist")
@@ -6813,13 +6880,13 @@ def page_portfolio():
 # App main
 # =============================
 def main():
-    st.markdown("### Telegram test")
-    if st.button("TEST TG"):
-        ok = send_telegram("DEX SCOUT TEST OK")
-        if ok:
-            st.success("TG SENT")
-        else:
-            st.error("TG FAILED")
+    with st.expander("Debug / Telegram test", expanded=False):
+        if st.button("TEST TG"):
+            ok = send_telegram("DEX SCOUT TEST OK")
+            if ok:
+                st.success("TG SENT")
+            else:
+                st.error("TG FAILED")
 
     if st.session_state.get("_rerun_flag"):
         st.session_state["_rerun_flag"] = False
@@ -6834,12 +6901,18 @@ def main():
     portfolio_rows = load_csv(PORTFOLIO_CSV, PORTFOLIO_FIELDS)
     monitoring_rows = load_csv(MONITORING_CSV, MON_FIELDS)
     monitoring_history_rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
+    scan_state = scanner_state_load()
+    active_portfolio_rows = [
+        row
+        for row in portfolio_rows
+        if str(row.get("active", row.get("is_active", "1"))).strip().lower() not in {"0", "false", "no"}
+    ]
+    run_auto_notifications(scan_state, monitoring_rows, active_portfolio_rows)
     st.session_state["_preload_counts"] = {
         "portfolio": len(portfolio_rows),
         "monitoring": len(monitoring_rows),
         "monitoring_history": len(monitoring_history_rows),
     }
-    process_portfolio_events(portfolio_rows)
     st.sidebar.caption(f"📥 portfolio: {len(portfolio_rows)}")
 
     scanner_seeds_raw = str(DEFAULT_SEEDS)
@@ -6923,6 +6996,9 @@ def main():
         if st.button("Clear cache", use_container_width=True):
             st.cache_data.clear()
             request_rerun()
+        with st.expander("Background alerts limitation", expanded=False):
+            st.caption("Streamlit sends alerts only while the app process is running and scans are executed.")
+            st.caption("For reliable background alerts, run a dedicated worker (for example Render/Railway worker or VPS service).")
         st.divider()
         st.markdown("### Storage status")
         if _sb_ok():
