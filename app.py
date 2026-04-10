@@ -4171,6 +4171,8 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
     return (f"{entry:.0f}", f"{tp:.0f}")
 
 
+TG_NEW_ENGINE_ONLY = True
+
 def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> bool:
     token = st.secrets.get("TG_BOT_TOKEN")
     chat_id = st.secrets.get("TG_CHAT_ID")
@@ -4178,6 +4180,8 @@ def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Di
     if not token or not chat_id:
         debug_log("tg_not_configured")
         return False
+
+    debug_log(f"TG NEW ENGINE: {text[:40]}")
 
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
@@ -4235,7 +4239,7 @@ def save_tg_state(state: Dict[str, Any]) -> None:
         pass
 
 
-def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 900) -> bool:
+def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
     now = time.time()
     last = float(state.get("last_signal_run", 0.0) or 0.0)
     if now - last < seconds:
@@ -4262,19 +4266,19 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 def classify_portfolio_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
-    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
-    addr = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
-    active_raw = str(row.get("active", row.get("is_active", "1"))).strip().lower()
+    risk = str(row.get("risk_level") or row.get("risk") or "").upper()
 
-    if score <= 0 or risk == "UNKNOWN" or not addr:
-        return None
-    if active_raw in {"0", "false", "no"}:
+    # 🚫 HARD BLOCK
+    if score <= 120:
         return None
 
-    if score < 120:
-        return {"bucket": "EXIT", "horizon": "now", "action": "Consider exit / reduce"}
-    if score >= 320 and risk in ("LOW", "MEDIUM"):
-        return {"bucket": "ADD", "horizon": "now", "action": "Consider adding"}
+    if risk not in ("LOW", "MEDIUM"):
+        return None
+
+    # тільки meaningful сигнали
+    if score >= 320:
+        return {"bucket": "ADD", "horizon": "now", "action": "Add position"}
+
     return None
 
 
@@ -4284,23 +4288,26 @@ def signal_event_key(source: str, row: Dict[str, Any], signal: Dict[str, str]) -
     return f"{source}|{chain}|{addr}|{signal['bucket']}"
 
 
-def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> str:
+def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> Optional[str]:
     symbol = str(row.get("base_symbol") or "UNKNOWN").upper()
     score = round(parse_float(row.get("entry_score", 0), 0.0), 1)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
     timing = str(row.get("timing_label") or "NA").upper()
-    addr = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
-    why = str(row.get("signal_reason") or row.get("decision_reason") or row.get("weak_reason") or "n/a")
+    addr = str(row.get("base_addr") or row.get("pair_address") or "").strip()
     chain = str(row.get("chain") or "").upper()
+
+    if score <= 0:
+        return None
+
+    if risk == "UNKNOWN":
+        return None
+
     return (
-        f"<b>{signal['action']}</b> | <b>{symbol}</b>\n\n"
-        f"source: {source}\n"
-        f"chain: {chain}\n"
-        f"score: {score}\n"
-        f"risk: {risk}\n"
-        f"timing: {timing}\n"
-        f"horizon: {signal['horizon']}\n"
-        f"reason: {why}\n\n"
+        f"<b>{signal['action']}</b> | <b>{symbol}</b>\n"
+        f"{source} | {chain}\n\n"
+        f"score: <b>{score}</b>\n"
+        f"risk: <b>{risk}</b>\n"
+        f"timing: {timing}\n\n"
         f"CA:\n<code>{addr}</code>"
     )
 
@@ -4316,7 +4323,7 @@ def run_auto_notifications(
         return
     if state.get("last_scan_ts_processed") == last_scan_ts:
         return
-    if not tg_cooldown_ok(state, seconds=900):
+    if not tg_cooldown_ok(state):
         return
 
     sent_events = state.get("sent_events", {})
@@ -4329,13 +4336,15 @@ def run_auto_notifications(
         if signal:
             monitoring_candidates.append((parse_float(row.get("entry_score", 0), 0.0), row, signal))
     monitoring_candidates.sort(key=lambda x: x[0], reverse=True)
-    monitoring_candidates = monitoring_candidates[:3]
+    monitoring_candidates = monitoring_candidates[:2]
 
     for _, row, signal in monitoring_candidates:
         key = signal_event_key("monitoring", row, signal)
         if key in sent_events:
             continue
         msg = format_signal_message(row, signal, "monitoring")
+        if not msg:
+            continue
         if send_telegram(msg):
             sent_events[key] = last_scan_ts
             sent_now += 1
@@ -4348,6 +4357,7 @@ def run_auto_notifications(
         if signal:
             portfolio_candidates.append((parse_float(row.get("entry_score", 0), 0.0), row, signal))
     portfolio_candidates.sort(key=lambda x: x[0], reverse=True)
+    portfolio_candidates = portfolio_candidates[:1]
 
     portfolio_sent = 0
     for _, row, signal in portfolio_candidates:
@@ -4355,11 +4365,13 @@ def run_auto_notifications(
         if key in sent_portfolio:
             continue
         msg = format_signal_message(row, signal, "portfolio")
+        if not msg:
+            continue
         if send_telegram(msg):
             sent_portfolio[key] = last_scan_ts
             sent_now += 1
             portfolio_sent += 1
-        if portfolio_sent >= 2:
+        if portfolio_sent >= 1:
             break
 
     state["sent_events"] = sent_events
@@ -6153,8 +6165,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         if status in ("ACTIVE", "WATCH", "WAIT", "PORTFOLIO", ""):
             active_rows.append(r)
     if not active_rows:
-        active_rows = rows[:40]
-    active_rows = sorted(active_rows, key=lambda row: parse_float(row.get("priority_score", 0), 0.0), reverse=True)[:40]
+        active_rows = rows[:50]
+    active_rows = sorted(active_rows, key=lambda row: parse_float(row.get("priority_score", 0), 0.0), reverse=True)[:50]
     active = list(active_rows)
     archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
     top[0].metric("Active", len(active))
@@ -6880,9 +6892,11 @@ def page_portfolio():
 # App main
 # =============================
 def main():
+    st.write("TG ENGINE: NEW V2")
+
     with st.expander("Debug / Telegram test", expanded=False):
         if st.button("TEST TG"):
-            ok = send_telegram("DEX SCOUT TEST OK")
+            ok = send_telegram(f"TEST {time.time()}")
             if ok:
                 st.success("TG SENT")
             else:
@@ -6907,7 +6921,14 @@ def main():
         for row in portfolio_rows
         if str(row.get("active", row.get("is_active", "1"))).strip().lower() not in {"0", "false", "no"}
     ]
-    run_auto_notifications(scan_state, monitoring_rows, active_portfolio_rows)
+    if st.session_state.get("last_scan_ts") != scan_state.get("last_run_ts"):
+        st.session_state["last_scan_ts"] = scan_state.get("last_run_ts")
+
+        run_auto_notifications(
+            scan_state,
+            monitoring_rows,
+            active_portfolio_rows
+        )
     st.session_state["_preload_counts"] = {
         "portfolio": len(portfolio_rows),
         "monitoring": len(monitoring_rows),
