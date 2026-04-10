@@ -4212,6 +4212,7 @@ def load_tg_state() -> Dict[str, Any]:
         "last_scan_ts_processed": "",
         "sent_events": {},
         "sent_portfolio_events": {},
+        "engine_version": "v3",
     }
     try:
         raw = sb_get_storage(TG_STATE_KEY) if USE_SUPABASE else None
@@ -4220,6 +4221,11 @@ def load_tg_state() -> Dict[str, Any]:
             if isinstance(data, dict):
                 for k, v in default.items():
                     data.setdefault(k, v)
+                if data.get("engine_version") != "v3":
+                    data["sent_events"] = {}
+                    data["sent_portfolio_events"] = {}
+                    data["last_scan_ts_processed"] = ""
+                    data["engine_version"] = "v3"
                 return data
     except Exception:
         pass
@@ -4251,15 +4257,16 @@ def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
 def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+    timing = str(row.get("timing_label") or "").upper()
 
     if score <= 0 or risk == "UNKNOWN":
         return None
 
-    if score >= 320 and risk in ("LOW", "MEDIUM"):
+    if score >= 300 and risk in ("LOW", "MEDIUM"):
         return {"bucket": "ENTRY_NOW", "horizon": "short-term", "action": "Entry now"}
-    if 240 <= score < 320:
-        return {"bucket": "WATCH_ENTRY", "horizon": "short-term", "action": "Watch for confirmation"}
-    if 180 <= score < 240:
+    if 220 <= score < 300:
+        return {"bucket": "WATCH_ENTRY", "horizon": "short-term", "action": "Watch / entry setup"}
+    if 150 <= score < 220 and timing not in ("SKIP",):
         return {"bucket": "TRACK", "horizon": "monitor", "action": "Track only"}
     return None
 
@@ -4267,17 +4274,14 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
 def classify_portfolio_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or "").upper()
-
-    # 🚫 HARD BLOCK
-    if score <= 120:
+    timing = str(row.get("timing_label") or "").upper()
+    if score <= 0 or risk in ("", "UNKNOWN"):
         return None
 
-    if risk not in ("LOW", "MEDIUM"):
-        return None
-
-    # тільки meaningful сигнали
-    if score >= 320:
-        return {"bucket": "ADD", "horizon": "now", "action": "Add position"}
+    if score >= 320 and risk in ("LOW", "MEDIUM"):
+        return {"bucket": "ADD", "horizon": "now", "action": "Consider adding"}
+    if score < 120 and risk == "HIGH" and timing in ("SKIP", "NEUTRAL"):
+        return {"bucket": "REDUCE", "horizon": "now", "action": "Consider reducing"}
 
     return None
 
@@ -4293,23 +4297,47 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
     score = round(parse_float(row.get("entry_score", 0), 0.0), 1)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
     timing = str(row.get("timing_label") or "NA").upper()
-    addr = str(row.get("base_addr") or row.get("pair_address") or "").strip()
+    addr = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
     chain = str(row.get("chain") or "").upper()
 
-    if score <= 0:
+    if not addr or score <= 0 or risk == "UNKNOWN":
         return None
 
-    if risk == "UNKNOWN":
-        return None
+    reason = (
+        row.get("signal_reason")
+        or row.get("decision_reason")
+        or row.get("weak_reason")
+        or row.get("note")
+        or "n/a"
+    )
 
     return (
         f"<b>{signal['action']}</b> | <b>{symbol}</b>\n"
-        f"{source} | {chain}\n\n"
+        f"source: {source}\n"
+        f"chain: {chain}\n"
         f"score: <b>{score}</b>\n"
         f"risk: <b>{risk}</b>\n"
-        f"timing: {timing}\n\n"
+        f"timing: <b>{timing}</b>\n"
+        f"horizon: {signal['horizon']}\n"
+        f"reason: {reason}\n\n"
         f"CA:\n<code>{addr}</code>"
     )
+
+
+def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
+    ca = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
+    chain = str(row.get("chain") or "").strip().lower()
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"},
+                {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
+            ],
+            [
+                {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
+            ],
+        ]
+    }
 
 
 def run_auto_notifications(
@@ -4323,7 +4351,7 @@ def run_auto_notifications(
         return
     if state.get("last_scan_ts_processed") == last_scan_ts:
         return
-    if not tg_cooldown_ok(state):
+    if not tg_cooldown_ok(state, seconds=1800):
         return
 
     sent_events = state.get("sent_events", {})
@@ -4336,7 +4364,7 @@ def run_auto_notifications(
         if signal:
             monitoring_candidates.append((parse_float(row.get("entry_score", 0), 0.0), row, signal))
     monitoring_candidates.sort(key=lambda x: x[0], reverse=True)
-    monitoring_candidates = monitoring_candidates[:2]
+    monitoring_candidates = monitoring_candidates[:3]
 
     for _, row, signal in monitoring_candidates:
         key = signal_event_key("monitoring", row, signal)
@@ -4345,7 +4373,7 @@ def run_auto_notifications(
         msg = format_signal_message(row, signal, "monitoring")
         if not msg:
             continue
-        if send_telegram(msg):
+        if send_telegram(msg, reply_markup=tg_buttons(row)):
             sent_events[key] = last_scan_ts
             sent_now += 1
         if sent_now >= 3:
@@ -4357,7 +4385,7 @@ def run_auto_notifications(
         if signal:
             portfolio_candidates.append((parse_float(row.get("entry_score", 0), 0.0), row, signal))
     portfolio_candidates.sort(key=lambda x: x[0], reverse=True)
-    portfolio_candidates = portfolio_candidates[:1]
+    portfolio_candidates = portfolio_candidates[:2]
 
     portfolio_sent = 0
     for _, row, signal in portfolio_candidates:
@@ -4367,11 +4395,11 @@ def run_auto_notifications(
         msg = format_signal_message(row, signal, "portfolio")
         if not msg:
             continue
-        if send_telegram(msg):
+        if send_telegram(msg, reply_markup=tg_buttons(row)):
             sent_portfolio[key] = last_scan_ts
             sent_now += 1
             portfolio_sent += 1
-        if portfolio_sent >= 1:
+        if portfolio_sent >= 2:
             break
 
     state["sent_events"] = sent_events
@@ -4384,23 +4412,18 @@ def reset_monitoring():
     st.session_state.setdefault("_last_status", {})
 
 
-def send_tg(msg: str):
-    send_telegram(msg)
+def is_signal_worthy(row: Dict[str, Any]) -> bool:
+    score = parse_float(row.get("entry_score", 0), 0.0)
+    risk = str(row.get("risk_level") or row.get("risk") or "").upper()
+    weak_reason = str(row.get("weak_reason") or "").lower()
 
-
-def format_signal_msg(row: Dict[str, Any]) -> str:
-    sym = str(row.get("base_symbol") or "").upper()
-    score = parse_float(row.get("priority_score", row.get("score_init", 0)), 0)
-    risk = row.get("risk", row.get("risk_level", ""))
-    entry = row.get("entry_status", "")
-    reason = row.get("signal_reason") or row.get("decision_reason") or ""
-    label = REASON_LABELS.get(str(reason), str(reason))
-    return (
-        f"<b>{sym}</b>\n"
-        f"{entry} • {label}\n\n"
-        f"Score: {score:.0f}\n"
-        f"Risk: {risk}"
-    )
+    if score <= 0:
+        return False
+    if "gate_blocked" in weak_reason:
+        return False
+    if risk == "HIGH" and score < 180:
+        return False
+    return True
 
 def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any], seeds_raw: str, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> List[Dict[str, Any]]:
     chain = normalize_chain_name(chain or "solana")
@@ -5073,7 +5096,7 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
         stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
-        stats["trimmed"] = trim_active_monitoring(max_active=20)
+        stats["trimmed"] = trim_active_monitoring(max_active=60)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {}), "error": str(e)}
@@ -5094,7 +5117,7 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
         stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
-        stats["trimmed"] = trim_active_monitoring(max_active=20)
+        stats["trimmed"] = trim_active_monitoring(max_active=60)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": {}, "error": str(e)}
@@ -5109,20 +5132,6 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
     })
     scanner_state_save(state)
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
-
-def is_signal_worthy(row: Dict[str, Any]) -> bool:
-    score = parse_float(row.get("entry_score", 0), 0.0)
-    risk = str(row.get("risk_level") or row.get("risk") or "").upper()
-    weak_reason = str(row.get("weak_reason") or "").lower()
-
-    if score <= 0:
-        return False
-    if "gate_blocked" in weak_reason:
-        return False
-    if risk == "HIGH" and score < 180:
-        return False
-    return True
-
 
 def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
     state = scanner_state_load() or {}
@@ -5139,7 +5148,7 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
     )
     stats["stale_removed"] = 0
     stats["revisited"] = add_new_candidates()
-    stats["trimmed"] = trim_active_monitoring(max_active=20)
+    stats["trimmed"] = trim_active_monitoring(max_active=60)
     stats["cleanup_noise"] = 0
     stats["purged_toxic"] = 0
     state["last_window"] = window_name
@@ -5712,34 +5721,34 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
     base_sym = str(row.get("base_symbol") or "").strip().upper()
 
     if decision in ("NO ENTRY", "NO_ENTRY"):
-        penalty += 35
+        penalty += 15
         flags.append("no_entry")
     if entry_status == "WAIT":
-        penalty += 10
+        penalty += 5
         flags.append("wait")
     if timing_state == "SKIP":
-        penalty += 25
+        penalty += 20
         flags.append("timing_skip")
     elif timing_state == "NEUTRAL":
-        penalty += 10
+        penalty += 5
         flags.append("timing_neutral")
     if anti_level == "WARNING":
-        penalty += 30
+        penalty += 15
         flags.append("anti_rug_warning")
     elif anti_level == "CRITICAL":
-        penalty += 80
+        penalty += 45
         flags.append("anti_rug_critical")
     if liq_level == "WEAK":
-        penalty += 20
+        penalty += 10
         flags.append("liq_weak")
     elif liq_level == "CRITICAL":
-        penalty += 60
+        penalty += 35
         flags.append("liq_critical")
     if is_rug:
-        penalty += 120
+        penalty += 80
         flags.append("post_rug")
     if is_symbol_major_like(base_sym):
-        penalty += 120
+        penalty += 60
         flags.append("major_like_symbol")
     if is_dead:
         penalty += 200
@@ -5759,7 +5768,7 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
         penalty += 25
         flags.append("fake_pump_risk")
 
-    penalty = min(penalty, 80.0)
+    penalty = min(penalty, 60.0)
     visible_score = max(0.0, raw_score - penalty)
 
     if is_dead:
@@ -6233,9 +6242,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     signals_cards = [c for c in cards_all if c["ui_bucket"] in ("tradable", "caution")]
     review_cards = [c for c in cards_all if c["ui_bucket"] == "review"]
     dead_cards = [c for c in cards_all if c["ui_bucket"] == "dead"]
-    promoted_review = [c for c in review_cards if float(c.get("ui_visible_score", 0)) >= 120]
+    promoted_review = [c for c in review_cards if float(c.get("ui_visible_score", 0)) >= 90]
     signals_cards.extend(promoted_review)
-    review_cards = [c for c in review_cards if float(c.get("ui_visible_score", 0)) < 120]
+    review_cards = [c for c in review_cards if float(c.get("ui_visible_score", 0)) < 90]
 
     def render_dedupe(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         best_by_key: Dict[str, Dict[str, Any]] = {}
@@ -6245,7 +6254,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             chain = str(r.get("chain") or "").strip().lower()
             if not sym:
                 continue
-            key = f"{chain}:{sym}"
+            addr = str(r.get("base_addr") or r.get("pair_address") or r.get("pairAddress") or "").strip()
+            key = f"{chain}:{sym}:{addr}"
             prev = best_by_key.get(key)
             if prev is None or float(c.get("ui_visible_score", 0)) > float(prev.get("ui_visible_score", 0)):
                 best_by_key[key] = c
@@ -6891,10 +6901,24 @@ def page_portfolio():
 # =============================
 # App main
 # =============================
-def main():
-    st.write("TG ENGINE: NEW V2")
+def build_active_monitoring_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    active_rows: List[Dict[str, Any]] = []
+    for r in rows:
+        status = str(r.get("status", "")).strip().upper()
+        if status in ("ACTIVE", "WATCH", "WAIT", "", "TRACK", "READY"):
+            active_rows.append(r)
 
-    with st.expander("Debug / Telegram test", expanded=False):
+    active_rows = sorted(
+        active_rows,
+        key=lambda x: parse_float(x.get("entry_score", x.get("last_score", 0)), 0.0),
+        reverse=True,
+    )[:40]
+    return active_rows
+
+
+def main():
+    with st.expander("Debug / Telegram", expanded=False):
+        st.write("TG ENGINE: NEW V3")
         if st.button("TEST TG"):
             ok = send_telegram(f"TEST {time.time()}")
             if ok:
@@ -6916,6 +6940,7 @@ def main():
     monitoring_rows = load_csv(MONITORING_CSV, MON_FIELDS)
     monitoring_history_rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
     scan_state = scanner_state_load()
+    active_monitoring_rows = build_active_monitoring_rows(monitoring_rows)
     active_portfolio_rows = [
         row
         for row in portfolio_rows
@@ -6926,7 +6951,7 @@ def main():
 
         run_auto_notifications(
             scan_state,
-            monitoring_rows,
+            active_monitoring_rows,
             active_portfolio_rows
         )
     st.session_state["_preload_counts"] = {
