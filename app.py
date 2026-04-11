@@ -29,6 +29,7 @@ import json
 import random
 import hashlib
 import inspect
+from urllib.parse import quote_plus
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional, Set
@@ -601,6 +602,21 @@ MAJORS_STABLES = {
     "WAVAX", "WMATIC",
 }
 HARD_BLOCK_SYMBOLS = {"USDT", "USDC", "ETH", "BTC", "BNB"}
+MIN_LIQ_USD = 10000
+MIN_TXNS_5M = 5
+MIN_VOL_5M = 1500
+MAX_DEX_SEARCH_PER_TERM = 20
+DEX_SEARCH_TERMS = [
+    "meme", "memecoin", "ai", "ai agent", "agentic", "launch", "new", "listing",
+    "trending", "hot", "hype", "pump", "pepe", "trump", "inu", "dog", "cat",
+    "frog", "shiba", "community", "cto", "community takeover", "takeover",
+    "revival", "fairlaunch", "stealth", "presale", "airdrop", "claim", "points",
+    "quest", "rewards", "wl", "whitelist", "relaunch", "rebrand", "migration",
+    "upgrade", "depin", "rwa", "gaming", "gamefi", "esports", "defi", "dex",
+    "perp", "perps", "leverage", "staking", "apr", "farming", "bridge",
+    "crosschain", "multichain", "ecosystem", "partnership", "burn", "buyback",
+    "revenue share", "pumpfun", "pumpswap", "launchpad",
+]
 
 DEFAULT_SEEDS = (
     "meme, memecoin, ai, ai agent, agentic, launch, new, listing, trending, hot, hype, pump, "
@@ -738,6 +754,23 @@ def parse_float(x, default=0.0) -> float:
         return float(x)
     except Exception:
         return float(default)
+
+
+def parse_int(x, default=0) -> int:
+    try:
+        return int(float(x))
+    except Exception:
+        return int(default)
+
+
+def pct_change(a: float, b: float) -> float:
+    if not b:
+        return 0.0
+    return ((a - b) / b) * 100.0
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
 def is_freezable(p: Dict[str, Any]) -> bool:
@@ -1069,6 +1102,50 @@ def fetch_dexscreener_trending(chain: str, limit: int = 40) -> List[Dict[str, An
 
     except Exception:
         return []
+
+
+def fetch_dexscreener_search(terms: List[str], max_per_term: int = 20) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    for term in terms:
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/search?q={quote_plus(term)}"
+            r = requests.get(url, timeout=12)
+            r.raise_for_status()
+            pairs = (r.json() or {}).get("pairs", [])[:max_per_term]
+
+            for p in pairs:
+                chain = normalize_chain_name(p.get("chainId") or p.get("chain"))
+                pair_addr = str(p.get("pairAddress") or p.get("pair_address") or "").strip()
+                if not pair_addr:
+                    continue
+                if chain not in ALLOWED_CHAINS:
+                    continue
+                key = f"{chain}:{pair_addr}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(p)
+        except Exception as e:
+            debug_log(f"dex_search_fail term={term} err={type(e).__name__}:{e}")
+
+    debug_log(f"dex_search_ok count={len(out)}")
+    return out
+
+
+def fetch_birdeye_pairs(limit: int = 50) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not BIRDEYE_ENABLED:
+        return out
+    for mint in birdeye_trending_solana(limit=limit):
+        try:
+            bp = best_pair_for_token_cached("solana", mint)
+            if bp:
+                out.append(bp)
+        except Exception:
+            continue
+    return out
 
 @st.cache_data(ttl=60, max_entries=500, show_spinner=False)
 def fetch_latest_pairs_for_query(q: str) -> List[Dict[str, Any]]:
@@ -1471,10 +1548,152 @@ def detect_auto_signal(token: Dict[str, Any]) -> bool:
     return False
 
 
+def build_entry_engine(row: Dict[str, Any]) -> Dict[str, Any]:
+    price = parse_float(row.get("price_usd") or row.get("priceUsd"), 0.0)
+    liq = parse_float(row.get("liq_usd") or safe_get(row, "liquidity", "usd", default=0), 0.0)
+    vol_5m = parse_float(row.get("vol_5m") or safe_get(row, "volume", "m5", default=0), 0.0)
+    vol_1h = parse_float(row.get("vol_1h") or safe_get(row, "volume", "h1", default=0), 0.0)
+    _ = vol_1h
+
+    buys_5m = parse_int(safe_get(row, "txns", "m5", "buys", default=row.get("buys_5m", 0)), 0)
+    sells_5m = parse_int(safe_get(row, "txns", "m5", "sells", default=row.get("sells_5m", 0)), 0)
+    txns_5m = buys_5m + sells_5m
+
+    chg_5m = parse_float(row.get("priceChange_m5") or safe_get(row, "priceChange", "m5", default=0), 0.0)
+    chg_1h = parse_float(row.get("priceChange_h1") or safe_get(row, "priceChange", "h1", default=0), 0.0)
+    fdv = parse_float(row.get("fdv") or row.get("fdv_usd"), 0.0)
+
+    buy_ratio = buys_5m / txns_5m if txns_5m else 0.0
+    vol_to_liq = vol_5m / liq if liq else 0.0
+    score = 100.0
+
+    if liq >= 100000:
+        score += 80
+    elif liq >= 50000:
+        score += 55
+    elif liq >= 20000:
+        score += 35
+    elif liq >= 10000:
+        score += 20
+
+    if txns_5m >= 60:
+        score += 70
+    elif txns_5m >= 30:
+        score += 45
+    elif txns_5m >= 15:
+        score += 25
+    elif txns_5m >= 5:
+        score += 10
+
+    if vol_5m >= 50000:
+        score += 70
+    elif vol_5m >= 20000:
+        score += 45
+    elif vol_5m >= 8000:
+        score += 25
+    elif vol_5m >= 1500:
+        score += 10
+
+    if 1 <= chg_5m <= 12:
+        score += 40
+    elif 12 < chg_5m <= 25:
+        score += 15
+    elif chg_5m > 25:
+        score -= 30
+    elif chg_5m < -8:
+        score -= 35
+
+    if chg_1h > 25:
+        score += 15
+    elif chg_1h < -20:
+        score -= 25
+
+    if buy_ratio >= 0.65:
+        score += 30
+    elif buy_ratio >= 0.55:
+        score += 15
+    elif buy_ratio < 0.40:
+        score -= 30
+
+    if vol_to_liq >= 0.50:
+        score += 25
+    elif vol_to_liq >= 0.20:
+        score += 15
+    elif vol_to_liq < 0.03:
+        score -= 20
+
+    risk_flags: List[str] = []
+    if liq < 15000:
+        risk_flags.append("low_liq")
+        score -= 20
+    if fdv and liq and fdv / liq > 80:
+        risk_flags.append("fdv_stretched")
+        score -= 20
+    if txns_5m < 5:
+        risk_flags.append("thin_flow")
+        score -= 20
+
+    score = clamp(score, 0, 500)
+
+    timing = "NEUTRAL"
+    if txns_5m >= 20 and 2 <= chg_5m <= 12 and buy_ratio >= 0.55:
+        timing = "GOOD"
+    elif chg_5m > 18 and buy_ratio < 0.50:
+        timing = "LATE"
+    elif chg_5m < -8:
+        timing = "WEAK"
+
+    action = "WAIT"
+    horizon = "monitor"
+    if score >= 280 and timing == "GOOD":
+        action = "ENTRY_NOW"
+        horizon = "0-30m"
+    elif score >= 220 and timing in ("GOOD", "NEUTRAL"):
+        action = "WATCH_ENTRY"
+        horizon = "0-2h"
+    elif score >= 150:
+        action = "TRACK"
+        horizon = "2-12h"
+
+    entry_now = price
+    pullback_1 = price * 0.97 if price else 0.0
+    pullback_2 = price * 0.94 if price else 0.0
+    invalidation = price * 0.90 if price else 0.0
+    tp1 = price * 1.12 if price else 0.0
+    tp2 = price * 1.25 if price else 0.0
+
+    reason: List[str] = []
+    if txns_5m >= 20:
+        reason.append("active flow")
+    if buy_ratio >= 0.55:
+        reason.append("buyers in control")
+    if 2 <= chg_5m <= 12:
+        reason.append("healthy short-term momentum")
+    if vol_to_liq >= 0.2:
+        reason.append("volume confirms move")
+    if not reason:
+        reason.append("watchlist candidate")
+
+    return {
+        "entry_score": round(score, 2),
+        "entry_action": action,
+        "entry_horizon": horizon,
+        "timing_label": timing,
+        "entry_reason": ", ".join(reason),
+        "entry_now": round(entry_now, 12) if entry_now else 0.0,
+        "pullback_1": round(pullback_1, 12) if pullback_1 else 0.0,
+        "pullback_2": round(pullback_2, 12) if pullback_2 else 0.0,
+        "invalidation": round(invalidation, 12) if invalidation else 0.0,
+        "tp1": round(tp1, 12) if tp1 else 0.0,
+        "tp2": round(tp2, 12) if tp2 else 0.0,
+        "risk_flags": ",".join(risk_flags),
+    }
+
+
 def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     row = dict(pair)
     norm_chain = normalize_chain_name(row.get("chainId") or row.get("chain"))
-    symbol = str(safe_get(row, "baseToken", "symbol", default="")).upper()
+    symbol = str(safe_get(row, "baseToken", "symbol", default=row.get("base_symbol", ""))).upper().strip()
     if norm_chain not in ALLOWED_CHAINS:
         return None
     if symbol in HARD_BLOCK_SYMBOLS:
@@ -1491,6 +1710,22 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     row["liquidity"] = parse_float(safe_get(row, "liquidity", "usd", default=row.get("liquidity", 0)), 0.0)
     row["fdv"] = parse_float(row.get("fdv", 0), 0.0)
     row["age_minutes"] = parse_float(age_minutes if age_minutes is not None else row.get("age_minutes", 0), 0.0)
+    liq_usd = parse_float(
+        safe_get(row, "liquidity", "usd", default=row.get("liq_usd", 0)),
+        0.0,
+    )
+    vol_5m = parse_float(
+        safe_get(row, "volume", "m5", default=row.get("vol_5m", 0)),
+        0.0,
+    )
+    txns_5m = (
+        parse_int(safe_get(row, "txns", "m5", "buys", default=0), 0) +
+        parse_int(safe_get(row, "txns", "m5", "sells", default=0), 0)
+    )
+    if liq_usd < MIN_LIQ_USD:
+        return None
+    if vol_5m < MIN_VOL_5M and txns_5m < MIN_TXNS_5M:
+        return None
 
     mig = detect_liquidity_migration(row)
     row["migration"] = mig.get("migration", 0)
@@ -1509,28 +1744,29 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     row["dev_risk"] = dev_wallet_risk(row)
     row["whale"] = whale_accumulation(row)
     row["signal"] = classify_signal(row)
-    entry_status, entry_score, entry_reasons, risk_level = evaluate_entry(row, mode=ENTRY_MODE)
-    entry, signal_reason = compute_entry_signal(row)
-    row["entry_status"] = entry_status
-    row["entry_score"] = entry_score
-    row["entry_reasons"] = entry_reasons
-    row["risk_level"] = risk_level
-    row["entry"] = entry
-    row["signal_reason"] = signal_reason
-    if entry in {"TRADEABLE", "EARLY"}:
-        row["entry_status"] = entry
-    row["timing_label"] = compute_timing(row)
-    row["priority"] = entry_score
+    entry_data = build_entry_engine(row)
+    row.update(entry_data)
+    action = row.get("entry_action", "WAIT")
+    if action == "ENTRY_NOW":
+        row["status"] = "ACTIVE"
+        row["entry"] = "READY"
+    elif action == "WATCH_ENTRY":
+        row["status"] = "ACTIVE"
+        row["entry"] = "WATCH"
+    elif action == "TRACK":
+        row["status"] = "ACTIVE"
+        row["entry"] = "TRACK"
+    else:
+        row["status"] = "ACTIVE"
+        row["entry"] = "WAIT"
+    row["entry_status"] = row["entry"]
+    row["signal_reason"] = row.get("entry_reason") or row.get("signal_reason") or ""
+    row["risk_level"] = str(row.get("risk_level") or "MEDIUM").upper()
     toxic, reasons = is_toxic_token(pair)
     if toxic:
         row["risk"] = "HIGH"
         row["decision_reason"] = reasons[0]
         row["toxic_flags"] = ",".join(reasons)
-
-    score = parse_float(row.get("entry_score", 0), 0.0)
-    unified_entry = entry_from_score(score)
-    row["entry"] = unified_entry
-    row["entry_status"] = unified_entry
 
     row["priority"] = parse_float(row.get("entry_score", 0), 0.0)
     row["priority_score"] = parse_float(row.get("priority_score", row.get("entry_score", 0)), 0.0)
@@ -4256,31 +4492,31 @@ def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
 
 def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
+    action = str(row.get("entry_action") or row.get("entry") or "").upper()
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
-    timing = str(row.get("timing_label") or "").upper()
 
     if score <= 0 or risk == "UNKNOWN":
         return None
 
-    if score >= 300 and risk in ("LOW", "MEDIUM"):
-        return {"bucket": "ENTRY_NOW", "horizon": "short-term", "action": "Entry now"}
-    if 220 <= score < 300:
-        return {"bucket": "WATCH_ENTRY", "horizon": "short-term", "action": "Watch / entry setup"}
-    if 150 <= score < 220 and timing not in ("SKIP",):
-        return {"bucket": "TRACK", "horizon": "monitor", "action": "Track only"}
+    if action in ("ENTRY_NOW", "READY"):
+        return {"bucket": "ENTRY_NOW", "horizon": "0-30m", "action": "Entry now"}
+    if action in ("WATCH_ENTRY", "WATCH"):
+        return {"bucket": "WATCH_ENTRY", "horizon": "0-2h", "action": "Watch / entry setup"}
+    if action in ("TRACK",):
+        return {"bucket": "TRACK", "horizon": "2-12h", "action": "Track only"}
     return None
 
 
 def classify_portfolio_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
+    action = str(row.get("entry_action") or row.get("entry") or "").upper()
     risk = str(row.get("risk_level") or row.get("risk") or "").upper()
-    timing = str(row.get("timing_label") or "").upper()
     if score <= 0 or risk in ("", "UNKNOWN"):
         return None
 
-    if score >= 320 and risk in ("LOW", "MEDIUM"):
+    if score >= 320 and action in ("ENTRY_NOW", "READY") and risk in ("LOW", "MEDIUM"):
         return {"bucket": "ADD", "horizon": "now", "action": "Consider adding"}
-    if score < 120 and risk == "HIGH" and timing in ("SKIP", "NEUTRAL"):
+    if score < 120 and risk == "HIGH":
         return {"bucket": "REDUCE", "horizon": "now", "action": "Consider reducing"}
 
     return None
@@ -4303,13 +4539,11 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
     if not addr or score <= 0 or risk == "UNKNOWN":
         return None
 
-    reason = (
-        row.get("signal_reason")
-        or row.get("decision_reason")
-        or row.get("weak_reason")
-        or row.get("note")
-        or "n/a"
-    )
+    reason = str(row.get("entry_reason") or row.get("signal_reason") or row.get("decision_reason") or "n/a")
+    entry_now = parse_float(row.get("entry_now", 0), 0.0)
+    pullback_1 = parse_float(row.get("pullback_1", 0), 0.0)
+    pullback_2 = parse_float(row.get("pullback_2", 0), 0.0)
+    invalidation = parse_float(row.get("invalidation", 0), 0.0)
 
     return (
         f"<b>{signal['action']}</b> | <b>{symbol}</b>\n"
@@ -4320,6 +4554,10 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
         f"timing: <b>{timing}</b>\n"
         f"horizon: {signal['horizon']}\n"
         f"reason: {reason}\n\n"
+        f"entry now: {entry_now}\n"
+        f"pullback 1: {pullback_1}\n"
+        f"pullback 2: {pullback_2}\n"
+        f"invalidation: {invalidation}\n\n"
         f"CA:\n<code>{addr}</code>"
     )
 
@@ -4448,55 +4686,43 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
 
     sampled = sample_seeds(seeds, int(preset.get("seed_k", 12)), refresh=False)
     all_pairs: List[Dict[str, Any]] = []
-    tokens: List[Dict[str, Any]] = []
+    pairs: List[Dict[str, Any]] = []
 
-    if chain == "solana":
-        unified_tokens = fetch_tokens_unified(chain=chain, limit=50)
-        for t in unified_tokens:
-            symbol = t.get("symbol", "NA")
-            address = t.get("address", "")
-            price = parse_float(t.get("price", 0), 0.0)
-            volume = parse_float(t.get("volume", 0), 0.0)
-            liquidity = parse_float(t.get("liquidity", 0), 0.0)
-            if not address:
-                continue
-            tokens.append(
-                {
-                    "chainId": "solana",
-                    "dexId": "unified",
-                    "pairAddress": address,
-                    "baseToken": {"symbol": symbol, "address": address},
-                    "quoteToken": {"symbol": "USDC"},
-                    "priceUsd": price,
-                    "volume": {"h24": volume, "m5": 0, "h1": 0},
-                    "liquidity": {"usd": liquidity},
-                    "txns": {"m5": {"buys": 0, "sells": 0}},
-                    "priceChange": {"m5": 0, "h1": 0},
-                    "url": "",
-                }
-            )
-    elif chain == "bsc":
+    if use_birdeye_trending and chain == "solana":
         try:
-            tokens.extend(fetch_dexscreener_latest(chain, limit=40))
-        except Exception:
-            pass
-        try:
-            tokens.extend(fetch_dexscreener_trending(chain, limit=40))
-        except Exception:
-            pass
-    else:
-        tokens = []
+            pairs.extend(fetch_birdeye_pairs(limit=int(birdeye_limit)))
+        except Exception as e:
+            debug_log(f"birdeye_fail {type(e).__name__}:{e}")
 
-    all_pairs.extend(tokens)
+    try:
+        pairs.extend(fetch_dexscreener_search(DEX_SEARCH_TERMS, MAX_DEX_SEARCH_PER_TERM))
+    except Exception as e:
+        debug_log(f"dex_merge_fail {type(e).__name__}:{e}")
 
     for q in sampled:
         if len(q.strip()) < 2:
             continue
         try:
-            all_pairs.extend(fetch_latest_pairs_for_query(q))
+            pairs.extend(fetch_latest_pairs_for_query(q))
             time.sleep(0.06)
         except Exception:
             continue
+
+    dedup_pairs: List[Dict[str, Any]] = []
+    seen_pairs: Set[str] = set()
+    for p in pairs:
+        chain_id = normalize_chain_name(p.get("chainId") or p.get("chain"))
+        pair_addr = str(p.get("pairAddress") or p.get("pair_address") or "").strip()
+        if not pair_addr:
+            continue
+        key = f"{chain_id}:{pair_addr}"
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        dedup_pairs.append(p)
+    pairs = dedup_pairs
+    debug_log(f"pairs_after_dedup count={len(pairs)}")
+    all_pairs.extend(pairs)
 
     target_chain = str(chain or "").lower().strip()
 
@@ -4524,16 +4750,16 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     if target_chain == "solana":
         all_pairs = [p for p in all_pairs if not is_wrong_network(p)]
 
-    pairs = dedupe_mode(all_pairs, by_base_token=False)
-    pairs = sorted(
-        pairs,
+    deduped_all_pairs = dedupe_mode(all_pairs, by_base_token=False)
+    deduped_all_pairs = sorted(
+        deduped_all_pairs,
         key=lambda p: float(safe_get(p, "volume", "h24", default=0) or 0),
         reverse=True,
     )
-    pairs = dedupe_mode(pairs, by_base_token=bool(preset.get("dedupe_by_base", True)))
+    deduped_all_pairs = dedupe_mode(deduped_all_pairs, by_base_token=bool(preset.get("dedupe_by_base", True)))
 
     filtered, _fstats, _freasons = filter_pairs_with_debug(
-        pairs=pairs,
+        pairs=deduped_all_pairs,
         chain=chain,
         any_dex=True,
         allowed_dexes=set(),
@@ -4556,8 +4782,8 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         for p in filtered
         if not is_symbol_major_like(str(safe_get(p, "baseToken", "symbol", default="") or ""))
     ]
-    if len(filtered) == 0 and pairs:
-        filtered = pairs[:5]
+    if len(filtered) == 0 and deduped_all_pairs:
+        filtered = deduped_all_pairs[:5]
     filtered = dedupe_by_symbol_family(filtered, per_symbol_limit=1)
     # toxic candidates are marked later, not hard-skipped at collection stage
 
@@ -4580,9 +4806,13 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     preset = PRESETS.get(window_name, {})
     counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "skipped_wrong_chain": 0, "skipped_major": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
+    debug_log(f"ingest_pairs_raw={len(pairs)}")
+    normalized = [r for r in pairs if r is not None]
+    debug_log(f"ingest_pairs_normalized={len(normalized)}")
+    debug_log(f"ingest_pairs_signalworthy={len([r for r in normalized if is_signal_worthy(r)])}")
     ranked = []
     smart_wallets = load_smart_wallets()
-    for p in pairs:
+    for p in normalized:
         smart = detect_smart_money(p)
         signal = classify_signal(p)
         score = score_pair(p)
@@ -4675,16 +4905,16 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         if not is_signal_worthy(row):
             counts["skipped_noise"] += 1
             continue
-        score = float(row.get("entry_score", 0))
-        if score >= 300:
+        action = str(row.get("entry_action", "WAIT")).upper()
+        if action == "ENTRY_NOW":
             entry_status = "READY"
-            signal_reason = "breakout"
-        elif score >= 180:
+        elif action == "WATCH_ENTRY":
             entry_status = "WATCH"
-            signal_reason = "trend_building"
+        elif action == "TRACK":
+            entry_status = "TRACK"
         else:
             entry_status = "WAIT"
-            signal_reason = "early"
+        signal_reason = str(row.get("entry_reason") or row.get("signal_reason") or "watchlist candidate")
         row["entry_status"] = entry_status
         row["entry"] = entry_status
         row["status"] = "ACTIVE"
@@ -5096,7 +5326,7 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
         stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
-        stats["trimmed"] = trim_active_monitoring(max_active=60)
+        stats["trimmed"] = trim_active_monitoring(max_active=80)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {}), "error": str(e)}
@@ -5117,7 +5347,7 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
         stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
-        stats["trimmed"] = trim_active_monitoring(max_active=60)
+        stats["trimmed"] = trim_active_monitoring(max_active=80)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": {}, "error": str(e)}
@@ -5148,7 +5378,7 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
     )
     stats["stale_removed"] = 0
     stats["revisited"] = add_new_candidates()
-    stats["trimmed"] = trim_active_monitoring(max_active=60)
+    stats["trimmed"] = trim_active_monitoring(max_active=80)
     stats["cleanup_noise"] = 0
     stats["purged_toxic"] = 0
     state["last_window"] = window_name
@@ -5710,14 +5940,14 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
     visible_score = raw_score
     penalty = 0.0
     flags: List[str] = []
-    decision = str(item.get("decision", "")).upper()
-    entry_status = str(item.get("entry_status", "")).upper()
-    timing_state = str(item.get("timing", {}).get("timing", "UNKNOWN") or "UNKNOWN").upper()
+    row = item.get("row", {}) or {}
+    entry_status = str(row.get("entry") or row.get("entry_action") or "").upper()
+    timing_state = str(row.get("timing_label") or "").upper()
+    decision = entry_status
     anti_level = str(item.get("anti_rug", {}).get("level", "SAFE") or "SAFE").upper()
     liq_level = str(item.get("liq_health", {}).get("level", "UNKNOWN") or "UNKNOWN").upper()
     is_dead = bool(item.get("is_dead"))
     is_rug = bool(item.get("is_rug"))
-    row = item.get("row", {}) or {}
     base_sym = str(row.get("base_symbol") or "").strip().upper()
 
     if decision in ("NO ENTRY", "NO_ENTRY"):
@@ -5769,20 +5999,23 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
         flags.append("fake_pump_risk")
 
     penalty = min(penalty, 60.0)
-    visible_score = max(0.0, raw_score - penalty)
+    visible_score = max(raw_score - penalty, 1.0 if raw_score > 0 else 0.0)
 
-    if is_dead:
-        bucket = "dead"
-        badge = "DEAD"
-    elif is_rug or anti_level == "CRITICAL" or liq_level == "CRITICAL":
-        bucket = "review"
-        badge = "REVIEW"
-    elif decision in ("NO ENTRY", "NO_ENTRY") or timing_state in ("SKIP", "NEUTRAL") or anti_level == "WARNING":
-        bucket = "caution"
-        badge = "CAUTION"
-    else:
+    if entry_status in ("READY", "ENTRY_NOW"):
         bucket = "tradable"
         badge = "TRADEABLE"
+    elif entry_status in ("WATCH", "WATCH_ENTRY", "TRACK"):
+        bucket = "caution"
+        badge = "CAUTION"
+    elif visible_score > 0:
+        bucket = "review"
+        badge = "REVIEW"
+    elif is_dead:
+        bucket = "dead"
+        badge = "DEAD"
+    else:
+        bucket = "dead"
+        badge = "DEAD"
 
     return {
         "bucket": bucket,
@@ -6912,7 +7145,7 @@ def build_active_monitoring_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, A
         active_rows,
         key=lambda x: parse_float(x.get("entry_score", x.get("last_score", 0)), 0.0),
         reverse=True,
-    )[:40]
+    )[:80]
     return active_rows
 
 
