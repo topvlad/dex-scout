@@ -46,6 +46,10 @@ def run_worker_loop() -> None:
                 active_monitoring_rows,
                 active_portfolio_rows,
             )
+            print(
+                f"[worker] notifications called with {len(active_monitoring_rows)} monitoring + {len(active_portfolio_rows)} portfolio",
+                flush=True,
+            )
             print("[worker] notifications processed", flush=True)
         except Exception as exc:
             print(f"[worker] error: {type(exc).__name__}: {exc}", flush=True)
