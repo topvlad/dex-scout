@@ -63,6 +63,7 @@ def add_contract_to_monitoring(chain: str, ca: str) -> None:
         if addr_key(row_chain, row_ca) == key:
             r["active"] = "1"
             r["status"] = r.get("status") or "WATCH"
+            r["last_seen"] = now_utc_str()
             save_monitoring(rows)
             return
 
@@ -70,6 +71,7 @@ def add_contract_to_monitoring(chain: str, ca: str) -> None:
     row.update(
         {
             "ts_added": now_utc_str(),
+            "last_seen": now_utc_str(),
             "chain": chain,
             "base_symbol": "UNKNOWN",
             "base_addr": ca,
