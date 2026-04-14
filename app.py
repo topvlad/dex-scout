@@ -4418,17 +4418,30 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 
 TG_NEW_ENGINE_ONLY = True
 
+def get_tg_token() -> str:
+    import os
+    try:
+        return os.getenv("TELEGRAM_BOT_TOKEN") or st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+    except Exception:
+        return os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+def get_tg_chat_id() -> str:
+    import os
+    try:
+        return os.getenv("TELEGRAM_CHAT_ID") or st.secrets.get("TELEGRAM_CHAT_ID", "")
+    except Exception:
+        return os.getenv("TELEGRAM_CHAT_ID", "")
+
 def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> bool:
-    token = st.secrets.get("TG_BOT_TOKEN")
-    chat_id = st.secrets.get("TG_CHAT_ID")
+    token = get_tg_token()
+    chat_id = get_tg_chat_id()
 
     if not token or not chat_id:
         debug_log("tg_not_configured")
+        print("[TG] no token/chat_id -> skip", flush=True)
         return False
 
-    debug_log(f"TG NEW ENGINE: {text[:40]}")
-
-    payload: Dict[str, Any] = {
+    payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": parse_mode,
@@ -4438,6 +4451,7 @@ def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Di
         payload["reply_markup"] = reply_markup
 
     try:
+        print("[TG] sending...", flush=True)
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json=payload,
@@ -4445,9 +4459,11 @@ def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Di
         )
         ok = r.status_code == 200
         debug_log(f"tg_send status={r.status_code} ok={ok}")
+        print(f"[TG] sent status={r.status_code} ok={ok}", flush=True)
         return ok
     except Exception as e:
         debug_log(f"tg_send_exception {type(e).__name__}:{e}")
+        print(f"[TG] exception {type(e).__name__}: {e}", flush=True)
         return False
 
 
@@ -7333,6 +7349,7 @@ def main():
         st.markdown("### Background alerts limitation")
         st.caption("This Streamlit app does not run alerts in the background when the browser/session is closed.")
         st.caption("For true background alerts, run scanner_worker.py as a separate worker service.")
+        st.caption("TG mode: ENV + Streamlit secrets fallback")
         st.divider()
         st.markdown("### Storage status")
         if _sb_ok():
