@@ -39,8 +39,7 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
             scan_state = app.scanner_state_load() or {}
             active_monitoring_rows = app.build_active_monitoring_rows(monitoring_rows)
             active_portfolio_rows = [
-                r
-                for r in portfolio_rows
+                r for r in portfolio_rows
                 if str(r.get("active", "1")).strip() == "1"
             ]
 
