@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Dict
+from typing import Optional
 
 import app
 
@@ -12,10 +12,14 @@ USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
 BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "50"))
 
 
-def run_worker_loop() -> None:
+def run_worker_loop(stop_event: Optional[object] = None) -> None:
     app.ensure_storage()
 
     while True:
+        if stop_event is not None and stop_event.is_set():
+            print("[worker] stop requested", flush=True)
+            break
+
         try:
             stats = app.run_full_ingestion_now(
                 chain=SCAN_CHAIN,
@@ -28,7 +32,7 @@ def run_worker_loop() -> None:
 
             monitoring_rows = app.load_monitoring()
             portfolio_rows = app.load_portfolio()
-            scan_state: Dict[str, str] = app.scanner_state_load() or {}
+            scan_state = app.scanner_state_load() or {}
             active_monitoring_rows = app.build_active_monitoring_rows(monitoring_rows)
             active_portfolio_rows = [
                 r
@@ -37,8 +41,8 @@ def run_worker_loop() -> None:
             ]
 
             print(
-                f"[worker] monitoring_total={len(monitoring_rows)} active_monitoring={len(active_monitoring_rows)} "
-                f"portfolio_total={len(portfolio_rows)} active_portfolio={len(active_portfolio_rows)}",
+                f"[worker] notifications called with "
+                f"{len(active_monitoring_rows)} monitoring + {len(active_portfolio_rows)} portfolio",
                 flush=True,
             )
             app.run_auto_notifications(
@@ -46,19 +50,18 @@ def run_worker_loop() -> None:
                 active_monitoring_rows,
                 active_portfolio_rows,
             )
-            print(
-                f"[worker] notifications called with {len(active_monitoring_rows)} monitoring + {len(active_portfolio_rows)} portfolio",
-                flush=True,
-            )
             print("[worker] notifications processed", flush=True)
         except Exception as exc:
             print(f"[worker] error: {type(exc).__name__}: {exc}", flush=True)
 
-        print(
-            f"[worker] heartbeat ts={time.time()} scan_chain={SCAN_CHAIN} interval={SCAN_INTERVAL_SEC}",
-            flush=True,
-        )
-        time.sleep(max(300, SCAN_INTERVAL_SEC))
+        sleep_for = max(300, SCAN_INTERVAL_SEC)
+        slept = 0
+        while slept < sleep_for:
+            if stop_event is not None and stop_event.is_set():
+                print("[worker] stop requested during sleep", flush=True)
+                return
+            time.sleep(1)
+            slept += 1
 
 
 if __name__ == "__main__":
