@@ -2993,6 +2993,26 @@ def token_exists(contract: str) -> bool:
     return False
 
 
+def update_existing_token(
+    p: Dict[str, Any],
+    score: float,
+    window_name: str = "",
+    preset_key: str = "",
+    entry_status: str = "",
+    entry_score: float = 0.0,
+    risk_level: str = "",
+) -> str:
+    return add_to_monitoring(
+        p,
+        score,
+        window_name=window_name,
+        preset_key=preset_key,
+        entry_status=entry_status,
+        entry_score=entry_score,
+        risk_level=risk_level,
+    )
+
+
 def add_to_monitoring(
     p: Dict[str, Any],
     score: float,
@@ -4784,11 +4804,11 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
 def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, int]:
     chain = (chain or "solana").strip().lower()
     preset = PRESETS.get(window_name, PRESETS.get("Wide Net (explore)", {}))
-    counts = {"added": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "skipped_wrong_chain": 0, "skipped_major": 0, "errors": 0, "seen": 0}
+    counts = {"added": 0, "updated_active": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "skipped_wrong_chain": 0, "skipped_major": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     debug_log(f"ingest_pairs_raw={len(pairs)}")
     normalized = [r for r in pairs if r is not None]
-    normalized = normalized[:max(1, MAX_KEEP)]
+    normalized = normalized[: max(30, MAX_KEEP)]
     debug_log(f"ingest_pairs_normalized={len(normalized)}")
     debug_log(f"ingest_pairs_signalworthy={len([r for r in normalized if is_signal_worthy(r)])}")
     ranked = []
@@ -4801,7 +4821,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             score += 4
         ranked.append((score, p, smart, signal))
     ranked.sort(key=lambda x: x[0], reverse=True)
-    ranked = ranked[: max(1, int(max_items))]
+    ranked = ranked[: max(50, int(max_items))]
     if len(ranked) == 0 and pairs:
         fallback_ranked = []
         for p in pairs[:5]:
@@ -4862,7 +4882,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             counts["skipped_quote_like"] += 1
             continue
 
-        if is_major_or_stable(row):
+        if is_major_or_stable(row) and float(s) < 120.0:
             counts["skipped_noise"] += 1
             counts["skipped_major_like"] += 1
             continue
@@ -4879,7 +4899,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["skipped_symbol_duplicate"] += 1
                 continue
             seen_token_keys.add(dedupe_key)
-        s = max(float(s), 50.0)
+        s = float(s)
         row["entry_score"] = s
         if not is_signal_worthy(row):
             counts["skipped_noise"] += 1
@@ -4895,13 +4915,12 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         row["signal"] = signal
         gate_ok, gate_reason = passes_monitoring_gate(row, s)
         row["visible_score"] = s
-        row["bucket"] = classify_bucket(s, row)
+        row["bucket"] = "watch"
         weak_reasons: List[str] = []
 
         if not gate_ok:
-            counts["skipped_noise"] += 1
-            row["note"] = gate_reason
-            weak_reasons.append(gate_reason.replace("gate:", "").strip() or "gate_blocked")
+            gate_tag = str(gate_reason or "gate_blocked").strip()
+            row["weak_reason"] = gate_tag if gate_tag.startswith("gate:") else f"gate:{gate_tag}"
         priority = monitoring_priority(
             score_live=s,
             pc1h=parse_float(safe_get(row, "priceChange", "h1", default=0), 0.0),
@@ -4913,7 +4932,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             cex_prob=parse_float(row.get("cex_prob", 0), 0.0),
         )
         if priority < 3:
-            weak_reasons.append("low_priority")
+            row["low_priority_flag"] = True
         if weak_reasons:
             row["weak_reason"] = "|".join(sorted(set(weak_reasons)))
 
@@ -4928,7 +4947,8 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         try:
             contract = addr_store(row.get("chainId", ""), safe_get(row, "baseToken", "address", default=""))
             if token_exists(contract):
-                counts["skipped_active"] += 1
+                update_existing_token(row, s, window_name=window_name, preset_key=preset_key, entry_status=entry_status, entry_score=entry_score, risk_level=str(row.get("risk_level", "MEDIUM")))
+                counts["updated_active"] += 1
                 continue
             res = add_to_monitoring(
                 row,
