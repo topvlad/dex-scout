@@ -4431,6 +4431,7 @@ def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Di
 
 
 def load_tg_state() -> Dict[str, Any]:
+    print("[TG] loading state", flush=True)
     default = {
         "last_signal_run": 0.0,
         "last_scan_ts_processed": "",
@@ -4457,6 +4458,7 @@ def load_tg_state() -> Dict[str, Any]:
 
 
 def save_tg_state(state: Dict[str, Any]) -> None:
+    print("[TG] saving state", flush=True)
     try:
         payload = json.dumps(state, ensure_ascii=False)
         if USE_SUPABASE:
@@ -4482,6 +4484,9 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
     action = str(row.get("entry_action") or "").upper()
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+
+    if score > 50:
+        return {"bucket": "TRACK", "horizon": "test", "action": "TEST SIGNAL"}
 
     if score <= 0 or risk == "UNKNOWN":
         return None
