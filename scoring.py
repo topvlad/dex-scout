@@ -16,8 +16,6 @@ def passes_safe_filters(row: dict) -> bool:
     sells = row.get("sells_m5") or 0
     ratio = (buys / max(1, sells))
 
-    if liq < MIN_LIQ_USD:
-        return False
     if txns_m5 < MIN_TXNS_M5:
         return False
     if vol_m5 < MIN_VOLUME_M5:
@@ -45,6 +43,9 @@ def score_row(row: dict) -> float:
     score += W_VOLUME_M5 * (vol_m5 / 10_000)
     score += W_LIQ * (liq / 50_000)
     score -= W_PCHG_M5_PENALTY * abs(pc_m5)
+
+    if liq < MIN_LIQ_USD:
+        score -= 5
 
     return float(score)
 
