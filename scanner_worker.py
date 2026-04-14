@@ -1,4 +1,6 @@
 import os
+os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
+
 import time
 from typing import Optional
 
@@ -12,7 +14,7 @@ USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
 BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "50"))
 
 
-def run_worker_loop(stop_event: Optional[object] = None) -> None:
+def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False) -> None:
     app.ensure_storage()
 
     while True:
@@ -21,6 +23,7 @@ def run_worker_loop(stop_event: Optional[object] = None) -> None:
             break
 
         try:
+            print("[worker] starting ingestion", flush=True)
             stats = app.run_full_ingestion_now(
                 chain=SCAN_CHAIN,
                 seeds_raw=SCANNER_SEEDS,
@@ -29,6 +32,7 @@ def run_worker_loop(stop_event: Optional[object] = None) -> None:
                 birdeye_limit=BIRDEYE_LIMIT,
             )
             print(f"[worker] scan done: {stats}", flush=True)
+            print("[worker] ingestion finished", flush=True)
 
             monitoring_rows = app.load_monitoring()
             portfolio_rows = app.load_portfolio()
@@ -40,6 +44,7 @@ def run_worker_loop(stop_event: Optional[object] = None) -> None:
                 if str(r.get("active", "1")).strip() == "1"
             ]
 
+            print("[worker] starting notifications", flush=True)
             print(
                 f"[worker] notifications called with "
                 f"{len(active_monitoring_rows)} monitoring + {len(active_portfolio_rows)} portfolio",
@@ -51,6 +56,11 @@ def run_worker_loop(stop_event: Optional[object] = None) -> None:
                 active_portfolio_rows,
             )
             print("[worker] notifications processed", flush=True)
+            print("[worker] notifications finished", flush=True)
+
+            if one_pass:
+                print("[worker] one_pass done", flush=True)
+                return
         except Exception as exc:
             print(f"[worker] error: {type(exc).__name__}: {exc}", flush=True)
 

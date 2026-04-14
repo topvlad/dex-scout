@@ -87,6 +87,8 @@ DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
 ENTRY_MODE = "aggressive"
 TEMP_DISABLE_BEST_PAIR = False
+WORKER_FAST_MODE = os.getenv("DEX_SCOUT_WORKER_MODE", "0") == "1"
+USE_HEAVY_MIGRATION_CHECK = not WORKER_FAST_MODE
 
 SCAN_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 300
@@ -1136,9 +1138,17 @@ def fetch_dexscreener_search(term: str, limit: int = 20) -> List[Dict[str, Any]]
 
 @st.cache_data(ttl=60, max_entries=500, show_spinner=False)
 def fetch_token_pairs(chain: str, token_address: str) -> List[Dict[str, Any]]:
-    url = f"{DEX_BASE}/token-pairs/v1/{chain}/{token_address}"
-    data = _http_get_json(url, params=None, timeout=20, max_retries=3)
-    return data or []
+    if not token_address:
+        return []
+    try:
+        url = f"{DEX_BASE}/token-pairs/v1/{chain}/{token_address}"
+        data = _http_get_json(url, params=None, timeout=8, max_retries=1)
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        debug_log(f"fetch_token_pairs_fail chain={chain} token={token_address} err={type(e).__name__}:{e}")
+        return []
 
 @st.cache_data(ttl=60, max_entries=500)
 def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, Any]]:
@@ -1695,10 +1705,21 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     row["weak_liq"] = liq_usd < MIN_LIQ_USD
     row["weak_activity"] = (vol_5m < MIN_VOL_5M and txns_5m < MIN_TXNS_5M)
 
-    mig = detect_liquidity_migration(row)
-    row["migration"] = mig.get("migration", 0)
-    row["migration_label"] = mig.get("migration_label", "")
-    row["migration_score"] = mig.get("migration_score", 0)
+    if USE_HEAVY_MIGRATION_CHECK:
+        mig = detect_liquidity_migration(row)
+    else:
+        mig = {
+            "lp_migrated": False,
+            "migration_flag": "",
+            "migration_note": "",
+            "migration": 0,
+            "migration_label": "",
+            "migration_score": 0,
+        }
+    row.update(mig)
+    row["migration"] = parse_int(row.get("migration", 0), 0)
+    row["migration_label"] = str(row.get("migration_label", "") or "")
+    row["migration_score"] = parse_float(row.get("migration_score", 0), 0.0)
 
     cex = detect_cex_listing_probability(row)
     row["cex_prob"] = cex.get("cex_prob", 0)
@@ -4485,9 +4506,6 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     action = str(row.get("entry_action") or "").upper()
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
 
-    if score > 50:
-        return {"bucket": "TRACK", "horizon": "test", "action": "TEST SIGNAL"}
-
     if score <= 0 or risk == "UNKNOWN":
         return None
 
@@ -4604,7 +4622,7 @@ def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
                 {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
             ],
             [
-                {"text": "❌ Remove", "callback_data": f"remove|{chain}|{ca}"}
+                {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
             ],
         ]
     }
