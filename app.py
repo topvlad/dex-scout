@@ -605,6 +605,7 @@ HARD_BLOCK_SYMBOLS = {"USDT", "USDC", "ETH", "BTC", "BNB"}
 MIN_LIQ_USD = 10000
 MIN_TXNS_5M = 5
 MIN_VOL_5M = 1500
+MAX_KEEP = int(os.getenv("SCANNER_MAX_KEEP", "80"))
 MAX_DEX_SEARCH_PER_TERM = 20
 DEX_SEARCH_TERMS = [
     "meme", "memecoin", "ai", "ai agent", "agentic", "launch", "new", "listing",
@@ -1643,8 +1644,8 @@ def build_entry_engine(row: Dict[str, Any]) -> Dict[str, Any]:
     elif chg_5m < -8:
         timing = "WEAK"
 
-    action = "WAIT"
-    horizon = "monitor"
+    action = "TRASH"
+    horizon = "observe"
     if score >= 280 and timing == "GOOD":
         action = "ENTRY_NOW"
         horizon = "0-30m"
@@ -1654,6 +1655,9 @@ def build_entry_engine(row: Dict[str, Any]) -> Dict[str, Any]:
     elif score >= 150:
         action = "TRACK"
         horizon = "2-12h"
+    elif score >= 80:
+        action = "EARLY"
+        horizon = "12-48h"
 
     entry_now = price
     pullback_1 = price * 0.97 if price else 0.0
@@ -1722,10 +1726,8 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         parse_int(safe_get(row, "txns", "m5", "buys", default=0), 0) +
         parse_int(safe_get(row, "txns", "m5", "sells", default=0), 0)
     )
-    if liq_usd < MIN_LIQ_USD:
-        return None
-    if vol_5m < MIN_VOL_5M and txns_5m < MIN_TXNS_5M:
-        return None
+    row["weak_liq"] = liq_usd < MIN_LIQ_USD
+    row["weak_activity"] = (vol_5m < MIN_VOL_5M and txns_5m < MIN_TXNS_5M)
 
     mig = detect_liquidity_migration(row)
     row["migration"] = mig.get("migration", 0)
@@ -1756,6 +1758,9 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     elif action == "TRACK":
         row["status"] = "ACTIVE"
         row["entry"] = "TRACK"
+    elif action == "EARLY":
+        row["status"] = "ACTIVE"
+        row["entry"] = "EARLY"
     else:
         row["status"] = "ACTIVE"
         row["entry"] = "WAIT"
@@ -4498,12 +4503,20 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     if score <= 0 or risk == "UNKNOWN":
         return None
 
+    chg_5m = parse_float(row.get("price_change_5m", safe_get(row, "priceChange", "m5", default=0)), 0.0)
+    chg_1h = parse_float(row.get("price_change_1h", safe_get(row, "priceChange", "h1", default=0)), 0.0)
+    movement_trigger = abs(chg_5m) > 5 or abs(chg_1h) > 15
+
     if action in ("ENTRY_NOW", "READY"):
         return {"bucket": "ENTRY_NOW", "horizon": "0-30m", "action": "Entry now"}
     if action in ("WATCH_ENTRY", "WATCH"):
         return {"bucket": "WATCH_ENTRY", "horizon": "0-2h", "action": "Watch / entry setup"}
     if action in ("TRACK",):
         return {"bucket": "TRACK", "horizon": "2-12h", "action": "Track only"}
+    if action == "EARLY" and movement_trigger:
+        return {"bucket": "EARLY", "horizon": "12-48h", "action": "Early movement"}
+    if movement_trigger and score >= 80:
+        return {"bucket": "MOVEMENT", "horizon": "0-2h", "action": "Market movement"}
     return None
 
 
@@ -4602,7 +4615,7 @@ def run_auto_notifications(
         if signal:
             monitoring_candidates.append((parse_float(row.get("entry_score", 0), 0.0), row, signal))
     monitoring_candidates.sort(key=lambda x: x[0], reverse=True)
-    monitoring_candidates = monitoring_candidates[:3]
+    monitoring_candidates = monitoring_candidates[:5]
 
     for _, row, signal in monitoring_candidates:
         key = signal_event_key("monitoring", row, signal)
@@ -4623,7 +4636,7 @@ def run_auto_notifications(
         if signal:
             portfolio_candidates.append((parse_float(row.get("entry_score", 0), 0.0), row, signal))
     portfolio_candidates.sort(key=lambda x: x[0], reverse=True)
-    portfolio_candidates = portfolio_candidates[:2]
+    portfolio_candidates = portfolio_candidates[:5]
 
     portfolio_sent = 0
     for _, row, signal in portfolio_candidates:
@@ -4808,6 +4821,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     debug_log(f"ingest_pairs_raw={len(pairs)}")
     normalized = [r for r in pairs if r is not None]
+    normalized = normalized[:max(1, MAX_KEEP)]
     debug_log(f"ingest_pairs_normalized={len(normalized)}")
     debug_log(f"ingest_pairs_signalworthy={len([r for r in normalized if is_signal_worthy(r)])}")
     ranked = []
@@ -5027,6 +5041,9 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         )
         counts["added"] += 1
     save_smart_wallets(smart_wallets)
+    debug_log(f"RAW: {len(pairs)}")
+    debug_log(f"NORMALIZED: {len(normalized)}")
+    debug_log(f"FINAL: {counts['added']}")
     return counts
 
 def auto_reactivate_archived(days: int = 7, max_revisits: int = 3) -> int:
@@ -5731,10 +5748,18 @@ def compute_timing(item: Dict[str, Any]) -> str:
 
 
 def classify_bucket(score: float, _item: Optional[Dict[str, Any]] = None) -> str:
+    item = _item or {}
+    action = str(item.get("entry_action") or item.get("entry") or "").upper()
+    if action in ("ENTRY_NOW", "READY"):
+        return "signals"
+    if action in ("WATCH_ENTRY", "WATCH", "TRACK"):
+        return "watchlist"
+    if action == "EARLY":
+        return "early"
     if score > 700:
-        return "tradable"
+        return "signals"
     if score > 400:
-        return "watch"
+        return "watchlist"
     return "noise"
 
 
