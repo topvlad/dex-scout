@@ -2,6 +2,7 @@ import os
 os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
 
 import time
+import threading
 from typing import Optional
 
 import app
@@ -9,9 +10,9 @@ import app
 SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
 SCAN_CHAIN = os.getenv("SCAN_CHAIN", "solana")
 SCANNER_SEEDS = os.getenv("SCANNER_SEEDS", str(app.DEFAULT_SEEDS))
-SCANNER_MAX_ITEMS = int(os.getenv("SCANNER_MAX_ITEMS", "80"))
+SCANNER_MAX_ITEMS = int(os.getenv("SCANNER_MAX_ITEMS", "10"))
 USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
-BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "50"))
+BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "10"))
 
 
 def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False) -> None:
@@ -24,13 +25,29 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
 
         try:
             print("[worker] starting ingestion", flush=True)
-            stats = app.run_full_ingestion_now(
-                chain=SCAN_CHAIN,
-                seeds_raw=SCANNER_SEEDS,
-                max_items=SCANNER_MAX_ITEMS,
-                use_birdeye_trending=USE_BIRDEYE_TRENDING,
-                birdeye_limit=BIRDEYE_LIMIT,
-            )
+            print("[worker] BEFORE ingestion", flush=True)
+
+            result = {}
+
+            def run_ingest() -> None:
+                result["stats"] = app.run_full_ingestion_now(
+                    chain=SCAN_CHAIN,
+                    seeds_raw=SCANNER_SEEDS,
+                    max_items=SCANNER_MAX_ITEMS,
+                    use_birdeye_trending=USE_BIRDEYE_TRENDING,
+                    birdeye_limit=BIRDEYE_LIMIT,
+                )
+
+            t = threading.Thread(target=run_ingest)
+            t.start()
+            t.join(timeout=20)
+
+            if t.is_alive():
+                print("[worker] ingestion TIMEOUT", flush=True)
+                return
+
+            stats = result.get("stats")
+            print("[worker] AFTER ingestion", flush=True)
             print(f"[worker] scan done: {stats}", flush=True)
             print("[worker] ingestion finished", flush=True)
 
