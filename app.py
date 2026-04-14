@@ -29,7 +29,6 @@ import json
 import random
 import hashlib
 import inspect
-import threading
 from urllib.parse import quote_plus
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -608,7 +607,7 @@ MIN_TXNS_5M = 5
 MIN_VOL_5M = 1500
 MAX_KEEP = int(os.getenv("SCANNER_MAX_KEEP", "80"))
 MAX_DEX_SEARCH_PER_TERM = 20
-INGEST_TARGET_KEEP = 120
+INGEST_TARGET_KEEP = 200
 DEX_SEARCH_TERMS = [
     "meme", "memecoin", "ai", "ai agent", "agentic", "launch", "new", "listing",
     "trending", "hot", "hype", "pump", "pepe", "trump", "inu", "dog", "cat",
@@ -4617,7 +4616,7 @@ def run_auto_notifications(
     portfolio_rows: List[Dict[str, Any]],
 ) -> None:
     state = load_tg_state()
-    if not tg_cooldown_ok(state, seconds=240):
+    if not tg_cooldown_ok(state, seconds=1800):
         return
 
     prev_token_state = state.get("token_state", {})
@@ -5189,7 +5188,7 @@ def monitoring_rank_for_trim(r: Dict[str, Any]) -> Tuple[float, float]:
     return (score, freshness)
 
 
-def trim_active_monitoring(max_active: int = 120) -> int:
+def trim_active_monitoring(max_active: int = 150) -> int:
     rows = load_monitoring()
     active_rows = [r for r in rows if str(r.get("active", "1")).strip() == "1"]
     if len(active_rows) <= max_active:
@@ -5356,7 +5355,7 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
         stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
-        stats["trimmed"] = trim_active_monitoring(max_active=120)
+        stats["trimmed"] = trim_active_monitoring(max_active=150)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {}), "error": str(e)}
@@ -5377,7 +5376,7 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
         stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
-        stats["trimmed"] = trim_active_monitoring(max_active=120)
+        stats["trimmed"] = trim_active_monitoring(max_active=150)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": {}, "error": str(e)}
@@ -5408,7 +5407,7 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
     )
     stats["stale_removed"] = 0
     stats["revisited"] = add_new_candidates()
-    stats["trimmed"] = trim_active_monitoring(max_active=120)
+    stats["trimmed"] = trim_active_monitoring(max_active=150)
     stats["cleanup_noise"] = 0
     stats["purged_toxic"] = 0
     state["last_window"] = window_name
@@ -7183,55 +7182,8 @@ def build_active_monitoring_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, A
         active_rows,
         key=lambda x: parse_float(x.get("entry_score", x.get("last_score", 0)), 0.0),
         reverse=True,
-    )[:120]
+    )[:150]
     return active_rows
-
-
-def init_worker_state() -> None:
-    if "_worker_thread" not in st.session_state:
-        st.session_state["_worker_thread"] = None
-    if "_worker_stop_event" not in st.session_state:
-        st.session_state["_worker_stop_event"] = None
-    if "_worker_running" not in st.session_state:
-        st.session_state["_worker_running"] = False
-    if "auto_start_worker" not in st.session_state:
-        st.session_state["auto_start_worker"] = False
-
-
-def worker_alive() -> bool:
-    thread = st.session_state.get("_worker_thread")
-    if thread is None:
-        return False
-    return bool(thread.is_alive())
-
-
-def start_ui_worker() -> None:
-    if st.session_state.get("_worker_running") and worker_alive():
-        return
-
-    import scanner_worker
-
-    stop_event = threading.Event()
-    thread = threading.Thread(
-        target=scanner_worker.run_worker_loop,
-        kwargs={"stop_event": stop_event},
-        daemon=True,
-    )
-    thread.start()
-
-    st.session_state["_worker_stop_event"] = stop_event
-    st.session_state["_worker_thread"] = thread
-    st.session_state["_worker_running"] = True
-
-
-def stop_ui_worker() -> None:
-    stop_event = st.session_state.get("_worker_stop_event")
-    if stop_event is not None:
-        stop_event.set()
-
-    st.session_state["_worker_running"] = False
-    st.session_state["_worker_stop_event"] = None
-    st.session_state["_worker_thread"] = None
 
 
 def main():
@@ -7249,7 +7201,6 @@ def main():
         st.rerun()
 
     ensure_storage()
-    init_worker_state()
     if "_last_status" not in st.session_state:
         st.session_state["_last_status"] = {}
     if "_migrated_reason_fields" not in st.session_state:
@@ -7361,36 +7312,9 @@ def main():
         if st.button("Clear cache", use_container_width=True):
             st.cache_data.clear()
             request_rerun()
-        with st.expander("Background alerts limitation", expanded=False):
-            st.caption("Streamlit sends alerts only while the app process is running and scans are executed.")
-            st.caption("For reliable background alerts, run a dedicated worker (for example Render/Railway worker or VPS service).")
-        st.divider()
-        st.markdown("### Worker")
-        st.caption("Worker control: UI session mode")
-        alive = worker_alive()
-        if st.session_state.get("_worker_running") and not alive:
-            st.session_state["_worker_running"] = False
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Start worker", use_container_width=True):
-                start_ui_worker()
-        with col2:
-            if st.button("Stop worker", use_container_width=True):
-                stop_ui_worker()
-
-        auto_start_worker = st.checkbox(
-            "Auto-start worker in this session",
-            value=bool(st.session_state.get("auto_start_worker", False)),
-        )
-        st.session_state["auto_start_worker"] = bool(auto_start_worker)
-        if auto_start_worker and not worker_alive():
-            start_ui_worker()
-
-        st.caption(
-            "Worker status: RUNNING" if worker_alive() else "Worker status: STOPPED"
-        )
-        st.caption("UI worker works only while this Streamlit session is alive.")
+        st.markdown("### Background alerts limitation")
+        st.caption("This Streamlit app does not run alerts in the background when the browser/session is closed.")
+        st.caption("For true background alerts, run scanner_worker.py as a separate worker service.")
         st.divider()
         st.markdown("### Storage status")
         if _sb_ok():
