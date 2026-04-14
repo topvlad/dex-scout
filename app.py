@@ -4516,6 +4516,41 @@ def signal_event_key(source: str, row: Dict[str, Any], signal: Dict[str, str]) -
     return f"{source}|{chain}|{addr}|{signal['bucket']}"
 
 
+def build_token_state_key(row: Dict[str, Any]) -> str:
+    chain = str(row.get("chain") or "").strip().lower()
+    addr = str(
+        row.get("base_addr")
+        or row.get("pair_address")
+        or row.get("pairAddress")
+        or ""
+    ).strip()
+    if not chain or not addr:
+        return ""
+    return f"{chain}:{addr}"
+
+
+def detect_signal_change(prev: Optional[Dict[str, Any]], curr: Dict[str, Any]) -> Optional[str]:
+    if not prev:
+        return "NEW"
+
+    prev_action = str(prev.get("entry_action") or "").upper()
+    curr_action = str(curr.get("entry_action") or "").upper()
+    if prev_action != curr_action:
+        return "ACTION_CHANGE"
+
+    prev_score = parse_float(prev.get("entry_score", 0), 0.0)
+    curr_score = parse_float(curr.get("entry_score", 0), 0.0)
+    if abs(prev_score - curr_score) > 40:
+        return "SCORE_SPIKE"
+
+    prev_risk = str(prev.get("risk_level") or "").upper()
+    curr_risk = str(curr.get("risk_level") or curr.get("risk") or "").upper()
+    if prev_risk != curr_risk:
+        return "RISK_CHANGE"
+
+    return None
+
+
 def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> Optional[str]:
     symbol = str(row.get("base_symbol") or "UNKNOWN").upper()
     score = round(parse_float(row.get("entry_score", 0), 0.0), 1)
@@ -4576,65 +4611,61 @@ def run_auto_notifications(
     portfolio_rows: List[Dict[str, Any]],
 ) -> None:
     state = load_tg_state()
-    last_scan_ts = str(scan_state.get("last_run_ts") or "")
-    if not last_scan_ts:
-        return
-    if state.get("last_scan_ts_processed") == last_scan_ts:
-        return
-    if not tg_cooldown_ok(state, seconds=1800):
+    if not tg_cooldown_ok(state, seconds=240):
         return
 
-    sent_events = state.get("sent_events", {})
-    sent_portfolio = state.get("sent_portfolio_events", {})
+    prev_token_state = state.get("token_state", {})
+    if not isinstance(prev_token_state, dict):
+        prev_token_state = {}
+
     sent_now = 0
+    max_per_run = 5
+    new_token_state: Dict[str, Dict[str, Any]] = {}
+    candidates: List[Tuple[float, str, Dict[str, Any]]] = []
 
-    monitoring_candidates = []
     for row in monitoring_rows:
-        signal = classify_monitoring_signal(row)
-        if signal:
-            monitoring_candidates.append((parse_float(row.get("entry_score", 0), 0.0), row, signal))
-    monitoring_candidates.sort(key=lambda x: x[0], reverse=True)
-    monitoring_candidates = monitoring_candidates[:5]
-
-    for _, row, signal in monitoring_candidates:
-        key = signal_event_key("monitoring", row, signal)
-        if key in sent_events:
-            continue
-        msg = format_signal_message(row, signal, "monitoring")
-        if not msg:
-            continue
-        if send_telegram(msg, reply_markup=tg_buttons(row)):
-            sent_events[key] = last_scan_ts
-            sent_now += 1
-        if sent_now >= 3:
-            break
-
-    portfolio_candidates = []
+        candidates.append((parse_float(row.get("entry_score", 0), 0.0), "monitoring", row))
     for row in portfolio_rows:
-        signal = classify_portfolio_signal(row)
-        if signal:
-            portfolio_candidates.append((parse_float(row.get("entry_score", 0), 0.0), row, signal))
-    portfolio_candidates.sort(key=lambda x: x[0], reverse=True)
-    portfolio_candidates = portfolio_candidates[:5]
+        candidates.append((parse_float(row.get("entry_score", 0), 0.0), "portfolio", row))
 
-    portfolio_sent = 0
-    for _, row, signal in portfolio_candidates:
-        key = signal_event_key("portfolio", row, signal)
-        if key in sent_portfolio:
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    for _, source, row in candidates:
+        token_key = build_token_state_key(row)
+        if not token_key:
             continue
-        msg = format_signal_message(row, signal, "portfolio")
+
+        current_snapshot = {
+            "entry_action": str(row.get("entry_action") or "").upper(),
+            "entry_score": parse_float(row.get("entry_score", 0), 0.0),
+            "risk_level": str(row.get("risk_level") or row.get("risk") or "").upper(),
+            "source": source,
+        }
+        prev = prev_token_state.get(token_key)
+        change = detect_signal_change(prev, current_snapshot)
+        new_token_state[token_key] = current_snapshot
+        if not change:
+            continue
+
+        signal = classify_monitoring_signal(row) if source == "monitoring" else classify_portfolio_signal(row)
+        if not signal:
+            continue
+
+        if source == "portfolio" and signal.get("bucket") == "ADD":
+            if parse_float(row.get("entry_score", 0), 0.0) < 180:
+                continue
+
+        msg = format_signal_message(row, signal, source)
         if not msg:
             continue
+
         if send_telegram(msg, reply_markup=tg_buttons(row)):
-            sent_portfolio[key] = last_scan_ts
             sent_now += 1
-            portfolio_sent += 1
-        if portfolio_sent >= 2:
+        if sent_now >= max_per_run:
             break
 
-    state["sent_events"] = sent_events
-    state["sent_portfolio_events"] = sent_portfolio
-    state["last_scan_ts_processed"] = last_scan_ts
+    state["token_state"] = new_token_state
+    state["last_scan_ts_processed"] = str(scan_state.get("last_run_ts") or now_utc_str())
     save_tg_state(state)
 
 
