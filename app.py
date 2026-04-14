@@ -81,7 +81,7 @@ def maybe_safe_auto_refresh(enabled: bool, interval_sec: int = 60) -> None:
         st.rerun()
 
 
-VERSION = "0.5.5"
+VERSION = "v0.5.6-entry-engine-v1"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
@@ -4490,7 +4490,7 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
         return {"bucket": "ENTRY_NOW", "horizon": "0-30m", "action": "Entry now"}
     if action == "WATCH_ENTRY":
         return {"bucket": "WATCH_ENTRY", "horizon": "0-2h", "action": "Watch / entry setup"}
-    if action in ("TRACK", "EARLY") and score >= 120:
+    if action in ("TRACK", "EARLY") and score >= 90:
         return {"bucket": "TRACK", "horizon": "2-12h", "action": "Track only"}
     return None
 
@@ -4599,7 +4599,7 @@ def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
                 {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
             ],
             [
-                {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
+                {"text": "❌ Remove", "callback_data": f"remove|{chain}|{ca}"}
             ],
         ]
     }
@@ -4680,9 +4680,9 @@ def is_signal_worthy(row: Dict[str, Any]) -> bool:
 
     if score <= 0:
         return False
-    if "gate_blocked" in weak_reason:
+    if "gate_blocked" in weak_reason and score < 60:
         return False
-    if risk == "HIGH" and score < 180:
+    if risk == "HIGH" and score < 80:
         return False
     return True
 
@@ -5183,7 +5183,7 @@ def monitoring_rank_for_trim(r: Dict[str, Any]) -> Tuple[float, float]:
     return (score, freshness)
 
 
-def trim_active_monitoring(max_active: int = 80) -> int:
+def trim_active_monitoring(max_active: int = 120) -> int:
     rows = load_monitoring()
     active_rows = [r for r in rows if str(r.get("active", "1")).strip() == "1"]
     if len(active_rows) <= max_active:
@@ -5350,7 +5350,7 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
         stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
-        stats["trimmed"] = trim_active_monitoring(max_active=80)
+        stats["trimmed"] = trim_active_monitoring(max_active=120)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {}), "error": str(e)}
@@ -5371,7 +5371,7 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
         stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
-        stats["trimmed"] = trim_active_monitoring(max_active=80)
+        stats["trimmed"] = trim_active_monitoring(max_active=120)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": {}, "error": str(e)}
@@ -5402,7 +5402,7 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
     )
     stats["stale_removed"] = 0
     stats["revisited"] = add_new_candidates()
-    stats["trimmed"] = trim_active_monitoring(max_active=80)
+    stats["trimmed"] = trim_active_monitoring(max_active=120)
     stats["cleanup_noise"] = 0
     stats["purged_toxic"] = 0
     state["last_window"] = window_name
@@ -7177,7 +7177,7 @@ def build_active_monitoring_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, A
         active_rows,
         key=lambda x: parse_float(x.get("entry_score", x.get("last_score", 0)), 0.0),
         reverse=True,
-    )[:80]
+    )[:120]
     return active_rows
 
 

@@ -1,78 +1,60 @@
 import os
 import time
-from typing import Any, Dict, List
+from typing import Dict
 
 import app
 
 SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
 SCAN_CHAIN = os.getenv("SCAN_CHAIN", "solana")
-SCANNER_WINDOW = os.getenv("SCANNER_WINDOW", "Wide Net (explore)")
-SCANNER_PRESET = os.getenv("SCANNER_PRESET", "wide")
 SCANNER_SEEDS = os.getenv("SCANNER_SEEDS", str(app.DEFAULT_SEEDS))
 SCANNER_MAX_ITEMS = int(os.getenv("SCANNER_MAX_ITEMS", "80"))
 USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
 BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "50"))
 
 
-def _parse_score(row: Dict[str, Any]) -> float:
-    return app.parse_float(row.get("entry_score", 0), 0.0)
-
-
-def _active_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        r
-        for r in rows
-        if str(r.get("active", r.get("is_active", "1"))).strip().lower() not in {"0", "false", "no"}
-    ]
-
-
-def run_ingest_cycle() -> Dict[str, Any]:
-    stats = app.ingest_window_to_monitoring(
-        chain=app.normalize_chain_name(SCAN_CHAIN or "solana"),
-        window_name=SCANNER_WINDOW,
-        preset_key=SCANNER_PRESET,
-        seeds_raw=SCANNER_SEEDS,
-        max_items=SCANNER_MAX_ITEMS,
-        use_birdeye_trending=USE_BIRDEYE_TRENDING,
-        birdeye_limit=BIRDEYE_LIMIT,
-    )
-    stats["revisited"] = app.add_new_candidates()
-    stats["trimmed"] = app.trim_active_monitoring(max_active=120)
-
-    state = app.scanner_state_load()
-    state.update(
-        {
-            "last_run_ts": app.now_utc_str(),
-            "last_window": SCANNER_WINDOW,
-            "last_preset": SCANNER_PRESET,
-            "last_chain": app.normalize_chain_name(SCAN_CHAIN or "solana"),
-            "last_stats": stats,
-        }
-    )
-    app.scanner_state_save(state)
-    return state
-
-
 def run_worker_loop() -> None:
     app.ensure_storage()
+
     while True:
         try:
-            scan_state = run_ingest_cycle()
-            monitoring = _active_rows(app.load_monitoring())
-            portfolio = _active_rows(app.load_portfolio())
-            scored = len([r for r in monitoring if _parse_score(r) > 0])
+            stats = app.run_full_ingestion_now(
+                chain=SCAN_CHAIN,
+                seeds_raw=SCANNER_SEEDS,
+                max_items=SCANNER_MAX_ITEMS,
+                use_birdeye_trending=USE_BIRDEYE_TRENDING,
+                birdeye_limit=BIRDEYE_LIMIT,
+            )
+            print(f"[worker] scan done: {stats}", flush=True)
+
+            monitoring_rows = app.load_monitoring()
+            portfolio_rows = app.load_portfolio()
+            scan_state: Dict[str, str] = app.scanner_state_load() or {}
+            active_monitoring_rows = app.build_active_monitoring_rows(monitoring_rows)
+            active_portfolio_rows = [
+                r
+                for r in portfolio_rows
+                if str(r.get("active", "1")).strip() == "1"
+            ]
 
             print(
-                f"[worker] monitoring={len(monitoring)} scored={scored} portfolio={len(portfolio)}",
+                f"[worker] monitoring_total={len(monitoring_rows)} active_monitoring={len(active_monitoring_rows)} "
+                f"portfolio_total={len(portfolio_rows)} active_portfolio={len(active_portfolio_rows)}",
                 flush=True,
             )
-            app.run_auto_notifications(scan_state, monitoring, portfolio)
+            app.run_auto_notifications(
+                scan_state,
+                active_monitoring_rows,
+                active_portfolio_rows,
+            )
+            print("[worker] notifications processed", flush=True)
         except Exception as exc:
             print(f"[worker] error: {type(exc).__name__}: {exc}", flush=True)
-            time.sleep(60)
-            continue
 
-        time.sleep(max(60, SCAN_INTERVAL_SEC))
+        print(
+            f"[worker] heartbeat ts={time.time()} scan_chain={SCAN_CHAIN} interval={SCAN_INTERVAL_SEC}",
+            flush=True,
+        )
+        time.sleep(max(300, SCAN_INTERVAL_SEC))
 
 
 if __name__ == "__main__":
