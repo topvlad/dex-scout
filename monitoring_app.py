@@ -183,8 +183,6 @@ def status_label(score: float) -> str:
 # App
 # -----------------------------
 def main():
-    st.set_page_config(page_title="DEX Scout — Monitoring", layout="wide")
-
     st.title("DEX Scout — Monitoring")
     st.caption(f"Version {VERSION} • AUTO refresh")
 
