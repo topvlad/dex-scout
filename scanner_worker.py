@@ -127,6 +127,8 @@ def state_signals(source: str) -> List[Dict[str, Any]]:
         score = float(token.get("score", 0))
         if score > 300:
             signals.append({"type": "ENTRY NOW", "priority": "HIGH", "reason": "score breakout", "token": token})
+        elif score >= 220:
+            signals.append({"type": "WATCH ENTRY", "priority": "MEDIUM", "reason": "setup forming", "token": token})
         elif source == "portfolio" and score < 120:
             signals.append({"type": "EXIT", "priority": "HIGH", "reason": "score breakdown", "token": token})
     signals.sort(key=lambda x: float(x["token"].get("score", 0)), reverse=True)
