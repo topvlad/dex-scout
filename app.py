@@ -4738,35 +4738,31 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     all_pairs = sorted(
         all_pairs,
         key=lambda p: (
+            parse_float(safe_get(p, "txns", "m5", "buys", default=0), 0.0),
             parse_float(safe_get(p, "volume", "m5", default=0), 0.0),
-            parse_float(safe_get(p, "txns", "m5", "buys", default=0), 0.0) +
-            parse_float(safe_get(p, "txns", "m5", "sells", default=0), 0.0),
             parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0),
-            parse_float(safe_get(p, "volume", "h24", default=0), 0.0),
         ),
         reverse=True,
     )
     all_pairs = all_pairs[:INGEST_TARGET_KEEP]
-    filtered, _fstats, _freasons = filter_pairs_with_debug(
-        pairs=all_pairs,
-        chain=chain,
-        any_dex=True,
-        allowed_dexes=set(),
-        min_liq=float(preset.get("min_liq", 0)),
-        min_vol24=float(preset.get("min_vol24", 0)),
-        min_trades_m5=int(preset.get("min_trades_m5", 0)),
-        min_sells_m5=int(preset.get("min_sells_m5", 0)),
-        max_buy_sell_imbalance=int(preset.get("max_imbalance", 9999)),
-        block_suspicious_names=bool(preset.get("block_suspicious_names", False)),
-        block_majors=True,
-        min_age_min=int(preset.get("min_age_min", 0)),
-        max_age_min=int(preset.get("max_age_min", 86400)),
-        enforce_age=bool(preset.get("enforce_age", False)),
-        hide_solana_unverified=False,
-    )
+    # SOFT FILTER – do not kill flow
+    filtered = []
+    for p in all_pairs:
+        try:
+            liq = parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0)
+            vol24 = parse_float(safe_get(p, "volume", "h24", default=0), 0.0)
+            buys = parse_int(safe_get(p, "txns", "m5", "buys", default=0), 0)
+            sells = parse_int(safe_get(p, "txns", "m5", "sells", default=0), 0)
+            txns = buys + sells
+            if liq <= 0 and vol24 <= 0:
+                continue
+            filtered.append(p)
+        except Exception:
+            continue
+    debug_log(f"soft_filter_kept={len(filtered)} from_raw={len(all_pairs)}")
 
     filtered = [p for p in filtered if not looks_like_quote_or_lp(p)]
-    filtered = dedupe_mode(filtered, by_base_token=True)
+    filtered = dedupe_mode(filtered, by_base_token=False)
     if len(filtered) == 0:
         filtered = all_pairs[:20]
     debug_log(f"collect_candidates raw={len(all_pairs)} filtered={len(filtered)}")
@@ -4886,6 +4882,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         s = max(float(s), 50.0)
         row["entry_score"] = s
         if not is_signal_worthy(row):
+            counts["skipped_noise"] += 1
             row["weak_reason"] = "|".join(sorted(set(filter(None, [
                 str(row.get("weak_reason") or ""),
                 "weak_signal"
