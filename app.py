@@ -4528,6 +4528,18 @@ def save_tg_state(state: Dict[str, Any]) -> None:
         print(f"[TG] save state fail {type(e).__name__}: {e}", flush=True)
 
 
+def reset_tg_state() -> None:
+    state = {
+        "last_signal_run": 0.0,
+        "last_scan_ts_processed": "",
+        "sent_events": {},
+        "sent_portfolio_events": {},
+        "engine_version": "v3",
+        "token_state": {},
+    }
+    save_tg_state(state)
+
+
 def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
     now = time.time()
     last = float(state.get("last_signal_run", 0.0) or 0.0)
@@ -4539,17 +4551,20 @@ def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
 
 def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
-    action = str(row.get("entry_action") or "").upper()
+    action = str(row.get("entry_action") or row.get("entry") or "").upper()
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
 
-    if score <= 0 or risk == "UNKNOWN":
+    if score <= 0:
         return None
 
-    if action == "ENTRY_NOW" and risk in ("LOW", "MEDIUM", "HIGH"):
+    if action in ("ENTRY_NOW", "READY") and risk in ("LOW", "MEDIUM", "HIGH", "UNKNOWN"):
         return {"bucket": "ENTRY_NOW", "horizon": "0-30m", "action": "Entry now"}
 
-    if action in ("WATCH_PULLBACK", "TRACK", "EARLY") and score >= 90:
-        return {"bucket": "WATCH", "horizon": "0-12h", "action": "Watch"}
+    if action in ("WATCH_PULLBACK", "WATCH", "EARLY") and score >= 120:
+        return {"bucket": "WATCH", "horizon": "0-2h", "action": "Watch pullback"}
+
+    if action in ("TRACK", "WAIT") and score >= 90:
+        return {"bucket": "TRACK", "horizon": "2-12h", "action": "Track"}
 
     return None
 
@@ -4669,17 +4684,19 @@ def run_auto_notifications(
     portfolio_rows: List[Dict[str, Any]],
 ) -> None:
     state = load_tg_state()
+
     cooldown_seconds = 60 if WORKER_FAST_MODE else 1800
     if not tg_cooldown_ok(state, seconds=cooldown_seconds):
-        return
-
-    last_scan_ts = str(scan_state.get("last_run_ts") or "")
-    if state.get("last_scan_ts_processed") == last_scan_ts and not WORKER_FAST_MODE:
+        print("[TG] cooldown active -> skip", flush=True)
         return
 
     prev_token_state = state.get("token_state", {})
     if not isinstance(prev_token_state, dict):
         prev_token_state = {}
+
+    sent_events = state.get("sent_events", {})
+    if not isinstance(sent_events, dict):
+        sent_events = {}
 
     sent_now = 0
     max_per_run = 5
@@ -4693,41 +4710,63 @@ def run_auto_notifications(
 
     candidates.sort(key=lambda x: x[0], reverse=True)
 
+    stats = {
+        "total": len(candidates),
+        "no_token_key": 0,
+        "no_signal": 0,
+        "no_msg": 0,
+        "already_sent": 0,
+        "sent": 0,
+    }
+
     for _, source, row in candidates:
         token_key = build_token_state_key(row)
         if not token_key:
+            stats["no_token_key"] += 1
             continue
 
         current_snapshot = {
-            "entry_action": str(row.get("entry_action") or "").upper(),
+            "entry_action": str(row.get("entry_action") or row.get("entry") or "").upper(),
             "entry_score": parse_float(row.get("entry_score", 0), 0.0),
             "risk_level": str(row.get("risk_level") or row.get("risk") or "").upper(),
             "source": source,
         }
+
         prev = prev_token_state.get(token_key)
         change = detect_signal_change(prev, current_snapshot)
-        new_token_state[token_key] = current_snapshot
-        if not change:
-            continue
-
         signal = classify_monitoring_signal(row) if source == "monitoring" else classify_portfolio_signal(row)
+
+        # always refresh in-memory state snapshot
+        new_token_state[token_key] = current_snapshot
+
         if not signal:
+            stats["no_signal"] += 1
             continue
 
-        if source == "portfolio" and signal.get("bucket") == "ADD":
-            if parse_float(row.get("entry_score", 0), 0.0) < 180:
-                continue
+        event_key = signal_event_key(source, row, signal)
+
+        # allow first send even if change is None, unless event already sent
+        if not change and event_key in sent_events:
+            stats["already_sent"] += 1
+            continue
 
         msg = format_signal_message(row, signal, source)
         if not msg:
+            stats["no_msg"] += 1
             continue
 
         if send_telegram(msg, reply_markup=tg_buttons(row)):
+            sent_events[event_key] = now_utc_str()
             sent_now += 1
+            stats["sent"] += 1
+
         if sent_now >= max_per_run:
             break
 
+    print(f"[TG] notification stats: {stats}", flush=True)
+
     state["token_state"] = new_token_state
+    state["sent_events"] = sent_events
     state["last_scan_ts_processed"] = str(scan_state.get("last_run_ts") or now_utc_str())
     save_tg_state(state)
 
