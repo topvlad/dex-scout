@@ -6483,6 +6483,7 @@ def page_scout(cfg: Dict[str, Any]):
 def page_monitoring(auto_cfg: Dict[str, Any]):
     st.title("Monitoring")
     st.caption("Manual pipeline: click scanner → save snapshot → render Monitoring.")
+    st.caption("Telegram callbacks update storage directly. Use Refresh live data or reload the page to see external changes.")
 
     if "selected_token" not in st.session_state:
         st.session_state.selected_token = None
@@ -6582,6 +6583,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             request_rerun()
     with cbtn2:
         if st.button("Refresh live data", use_container_width=True):
+            st.cache_data.clear()
+            load_monitoring_rows_cached.clear()
+            _ = load_monitoring()
+            _ = load_portfolio()
             request_rerun()
     with cbtn3:
         if st.button("🔥 WIPE MONITORING (destructive)", use_container_width=True):
