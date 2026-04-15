@@ -1725,11 +1725,14 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
             pullback_1 = price * 0.97
             pullback_2 = price * 0.93
             invalidation = price * 0.89
-            tp1 = price * 1.12
-            tp2 = price * 1.25
+            tp1 = price * 1.10
+            tp2 = price * 1.20
         elif action == "TRACK":
-            pullback_1 = price * 0.95
+            pullback_1 = price * 0.96
+            pullback_2 = price * 0.92
             invalidation = price * 0.88
+            tp1 = price * 1.08
+            tp2 = price * 1.16
 
     risk_level = "LOW"
     if liq < 15000 or buy_ratio < 0.45 or txns5 < 8:
@@ -4708,6 +4711,7 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
         or row.get("address")
         or ""
     ).strip()
+    addr = str(addr or "").strip()
 
     score = parse_float(row.get("entry_score"), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
@@ -4757,22 +4761,28 @@ def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
         or ""
     ).strip()
 
-    dex_url = dex_url_for_token(chain, ca)
+    buttons: List[List[Dict[str, str]]] = []
 
-    buttons = [
-        [
-            {"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"},
-            {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
-        ],
-        [
-            {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
-        ],
-    ]
+    if chain and ca:
+        buttons.append(
+            [
+                {"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"},
+                {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
+            ]
+        )
+        buttons.append(
+            [
+                {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
+            ]
+        )
 
-    if dex_url:
-        buttons.append([
-            {"text": "🔎 DEX", "url": dex_url}
-        ])
+        dex_url = dex_url_for_token(chain, ca)
+        if dex_url:
+            buttons.append(
+                [
+                    {"text": "📈 Dex", "url": dex_url}
+                ]
+            )
 
     return {"inline_keyboard": buttons}
 

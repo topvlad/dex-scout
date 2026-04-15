@@ -302,6 +302,9 @@ async def tg_webhook(req: Request):
         safe_chain = str(chain or "").upper()
         safe_ca = str(ca or "")
         safe_label = str(token_label or "")
+        result_title = result_text
+        if not safe_label:
+            safe_label = safe_ca[:8]
 
         if chat_id and message_id:
             resp = tg_api(
@@ -310,7 +313,7 @@ async def tg_webhook(req: Request):
                     "chat_id": chat_id,
                     "message_id": message_id,
                     "text": (
-                        f"{result_text}\n"
+                        f"<b>{result_title}</b>\n"
                         f"chain: {safe_chain}\n"
                         f"token: {safe_label}\n"
                         f"CA:\n<code>{safe_ca}</code>"
