@@ -83,15 +83,47 @@ def _touch_active(row: Dict[str, Any], note: str) -> None:
     row["note"] = note
 
 
+def find_token_meta(chain: str, ca: str) -> Dict[str, str]:
+    chain = normalize_chain_name(chain)
+    ca_norm = addr_store(chain, ca)
+
+    def match_addr(row: Dict[str, Any]) -> bool:
+        vals = [
+            row.get("base_addr"),
+            row.get("base_token_address"),
+            row.get("ca"),
+            row.get("address"),
+        ]
+        return any(addr_store(chain, str(v or "")) == ca_norm for v in vals if str(v or "").strip())
+
+    for row in load_monitoring():
+        if match_addr(row):
+            return {
+                "symbol": str(row.get("base_symbol") or row.get("symbol") or "").strip(),
+                "name": str(row.get("name") or row.get("base_symbol") or row.get("symbol") or "").strip(),
+            }
+
+    for row in load_portfolio():
+        if match_addr(row):
+            return {
+                "symbol": str(row.get("base_symbol") or row.get("symbol") or "").strip(),
+                "name": str(row.get("name") or row.get("base_symbol") or row.get("symbol") or "").strip(),
+            }
+
+    return {"symbol": "", "name": ""}
+
+
 def add_contract_to_portfolio(chain: str, ca: str) -> bool:
-    chain, ca = _norm_contract(chain, ca)
+    chain = normalize_chain_name(chain)
+    ca = addr_store(chain, ca)
     if not chain or not ca:
         return False
 
     rows = load_portfolio()
     for row in rows:
-        row_chain, row_ca = _norm_contract(row.get("chain", ""), row.get("base_token_address", ""))
-        if row_chain == chain and row_ca == ca:
+        row_chain = normalize_chain_name(row.get("chain", ""))
+        vals = [row.get("base_token_address"), row.get("base_addr"), row.get("ca"), row.get("address")]
+        if row_chain == chain and any(addr_store(chain, str(v or "")) == ca for v in vals if str(v or "").strip()):
             _touch_active(row, "added_from_tg_callback")
             save_portfolio(rows)
             return True
@@ -113,16 +145,19 @@ def add_contract_to_portfolio(chain: str, ca: str) -> bool:
 
 
 def add_contract_to_monitoring(chain: str, ca: str) -> bool:
-    chain, ca = _norm_contract(chain, ca)
+    chain = normalize_chain_name(chain)
+    ca = addr_store(chain, ca)
     if not chain or not ca:
         return False
 
     rows = load_monitoring()
     for row in rows:
-        row_chain, row_ca = _norm_contract(row.get("chain", ""), row.get("base_addr", ""))
-        if row_chain == chain and row_ca == ca:
+        row_chain = normalize_chain_name(row.get("chain", ""))
+        vals = [row.get("base_addr"), row.get("base_token_address"), row.get("ca"), row.get("address")]
+        if row_chain == chain and any(addr_store(chain, str(v or "")) == ca for v in vals if str(v or "").strip()):
             _touch_active(row, "added_from_tg_callback")
             row["status"] = "ACTIVE"
+            row["updated_at"] = now_utc_str()
             save_monitoring(rows)
             return True
 
@@ -144,14 +179,16 @@ def add_contract_to_monitoring(chain: str, ca: str) -> bool:
 
 
 def remove_contract_everywhere(chain: str, ca: str) -> bool:
-    chain, ca = _norm_contract(chain, ca)
+    chain = normalize_chain_name(chain)
+    ca = addr_store(chain, ca)
     if not chain or not ca:
         return False
 
     p_rows = load_portfolio()
     for row in p_rows:
-        row_chain, row_ca = _norm_contract(row.get("chain", ""), row.get("base_token_address", ""))
-        if row_chain == chain and row_ca == ca:
+        row_chain = normalize_chain_name(row.get("chain", ""))
+        vals = [row.get("base_token_address"), row.get("base_addr"), row.get("ca"), row.get("address")]
+        if row_chain == chain and any(addr_store(chain, str(v or "")) == ca for v in vals if str(v or "").strip()):
             row["active"] = "0"
             row["archived"] = "1"
             row["note"] = "removed_from_tg_callback"
@@ -160,8 +197,9 @@ def remove_contract_everywhere(chain: str, ca: str) -> bool:
 
     m_rows = load_monitoring()
     for row in m_rows:
-        row_chain, row_ca = _norm_contract(row.get("chain", ""), row.get("base_addr", ""))
-        if row_chain == chain and row_ca == ca:
+        row_chain = normalize_chain_name(row.get("chain", ""))
+        vals = [row.get("base_addr"), row.get("base_token_address"), row.get("ca"), row.get("address")]
+        if row_chain == chain and any(addr_store(chain, str(v or "")) == ca for v in vals if str(v or "").strip()):
             row["active"] = "0"
             row["archived"] = "1"
             row["status"] = "ARCHIVED"
@@ -231,18 +269,24 @@ async def tg_webhook(req: Request):
             return {"ok": True, "ignored": True, "reason": "bad_callback_data"}
 
         action, chain, ca = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        chain = normalize_chain_name(chain)
+        ca = addr_store(chain, ca)
         print(f"[TG_WEBHOOK] callback raw={raw} action={action} chain={chain} ca={ca}", flush=True)
+
+        meta = find_token_meta(chain, ca)
+        token_label = meta.get("symbol") or meta.get("name") or ca[:8]
+        print(f"[TG_WEBHOOK] token_label={token_label}", flush=True)
 
         result_text = "Ignored"
         if action in ("pf", "pf_add", "portfolio", "portfolio_add"):
             add_contract_to_portfolio(chain, ca)
-            result_text = "Added to portfolio"
+            result_text = f"Added to portfolio | {token_label}"
         elif action in ("mn", "mon_add", "monitor", "monitor_add"):
             add_contract_to_monitoring(chain, ca)
-            result_text = "Added to monitoring"
+            result_text = f"Added to monitoring | {token_label}"
         elif action in ("rm", "remove", "delete", "archive"):
             remove_contract_everywhere(chain, ca)
-            result_text = "Removed / archived"
+            result_text = f"Removed / archived | {token_label}"
 
         print(f"[TG_WEBHOOK] result={result_text}", flush=True)
 
@@ -250,13 +294,14 @@ async def tg_webhook(req: Request):
             "answerCallbackQuery",
             {
                 "callback_query_id": cb_id,
-                "text": result_text,
+                "text": result_text[:180],
                 "show_alert": False,
             },
         )
 
         safe_chain = str(chain or "").upper()
         safe_ca = str(ca or "")
+        safe_label = str(token_label or "")
 
         if chat_id and message_id:
             resp = tg_api(
@@ -264,7 +309,12 @@ async def tg_webhook(req: Request):
                 {
                     "chat_id": chat_id,
                     "message_id": message_id,
-                    "text": (f"{result_text}\n" f"chain: {safe_chain}\n" f"CA:\n<code>{safe_ca}</code>"),
+                    "text": (
+                        f"{result_text}\n"
+                        f"chain: {safe_chain}\n"
+                        f"token: {safe_label}\n"
+                        f"CA:\n<code>{safe_ca}</code>"
+                    ),
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True,
                 },
