@@ -4418,19 +4418,26 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 
 TG_NEW_ENGINE_ONLY = True
 
-def get_tg_token() -> str:
+def get_secret(name: str, default: str = "") -> str:
     import os
+
+    env_val = os.getenv(name)
+    if env_val:
+        return env_val
+
+    # worker / bare python mode must not hard-fail on st.secrets
     try:
-        return os.getenv("TELEGRAM_BOT_TOKEN") or st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+        return st.secrets.get(name, default)
     except Exception:
-        return os.getenv("TELEGRAM_BOT_TOKEN", "")
+        return default
+
+
+def get_tg_token() -> str:
+    return get_secret("TELEGRAM_BOT_TOKEN", "")
+
 
 def get_tg_chat_id() -> str:
-    import os
-    try:
-        return os.getenv("TELEGRAM_CHAT_ID") or st.secrets.get("TELEGRAM_CHAT_ID", "")
-    except Exception:
-        return os.getenv("TELEGRAM_CHAT_ID", "")
+    return get_secret("TELEGRAM_CHAT_ID", "")
 
 def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> bool:
     token = get_tg_token()
@@ -4469,6 +4476,7 @@ def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Di
 
 def load_tg_state() -> Dict[str, Any]:
     print("[TG] loading state", flush=True)
+
     default = {
         "last_signal_run": 0.0,
         "last_scan_ts_processed": "",
@@ -4476,6 +4484,7 @@ def load_tg_state() -> Dict[str, Any]:
         "sent_portfolio_events": {},
         "engine_version": "v3",
     }
+
     try:
         raw = sb_get_storage(TG_STATE_KEY) if USE_SUPABASE else None
         if raw:
@@ -4489,13 +4498,15 @@ def load_tg_state() -> Dict[str, Any]:
                     data["last_scan_ts_processed"] = ""
                     data["engine_version"] = "v3"
                 return data
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[TG] load state fallback {type(e).__name__}: {e}", flush=True)
+
     return default
 
 
 def save_tg_state(state: Dict[str, Any]) -> None:
     print("[TG] saving state", flush=True)
+
     try:
         payload = json.dumps(state, ensure_ascii=False)
         if USE_SUPABASE:
@@ -4504,8 +4515,8 @@ def save_tg_state(state: Dict[str, Any]) -> None:
             os.makedirs(DATA_DIR, exist_ok=True)
             with open(TG_STATE_FILE, "w", encoding="utf-8") as f:
                 f.write(payload)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[TG] save state fail {type(e).__name__}: {e}", flush=True)
 
 
 def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
