@@ -127,12 +127,16 @@ async def tg_webhook(req: Request):
         return {"ok": True}
 
     action, chain, ca = parts
+    print(f"[TG CALLBACK] action={action} chain={chain} ca={ca}", flush=True)
 
     if action == "pf_add":
         add_contract_to_portfolio(chain, ca)
+        print(f"[TG CALLBACK] applied action={action} chain={chain} ca={ca}", flush=True)
     elif action == "mon_add":
         add_contract_to_monitoring(chain, ca)
+        print(f"[TG CALLBACK] applied action={action} chain={chain} ca={ca}", flush=True)
     elif action == "remove":
         remove_contract_everywhere(chain, ca)
+        print(f"[TG CALLBACK] applied action={action} chain={chain} ca={ca}", flush=True)
 
     return {"ok": True}

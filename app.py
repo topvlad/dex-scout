@@ -1555,6 +1555,34 @@ def detect_auto_signal(token: Dict[str, Any]) -> bool:
     return False
 
 
+def normalize_timing_label(value: str) -> str:
+    v = str(value or "").strip().upper()
+    mapping = {
+        "DUMP": "LATE",
+        "PUMP": "GOOD",
+        "CHASE": "LATE",
+        "SKIP": "SKIP",
+        "EARLY": "EARLY",
+        "GOOD": "GOOD",
+        "NEUTRAL": "NEUTRAL",
+        "LATE": "LATE",
+    }
+    return mapping.get(v, "NEUTRAL")
+
+
+def has_actionable_levels(row: Dict[str, Any]) -> bool:
+    return any(
+        [
+            parse_float(row.get("entry_now"), 0.0) > 0,
+            parse_float(row.get("pullback_1"), 0.0) > 0,
+            parse_float(row.get("pullback_2"), 0.0) > 0,
+            parse_float(row.get("invalidation"), 0.0) > 0,
+            parse_float(row.get("tp1"), 0.0) > 0,
+            parse_float(row.get("tp2"), 0.0) > 0,
+        ]
+    )
+
+
 def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
     price = parse_float(row.get("priceUsd") or row.get("price_usd"), 0.0)
     liq = parse_float(safe_get(row, "liquidity", "usd", default=row.get("liquidity", 0)), 0.0)
@@ -1654,6 +1682,7 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
         timing = "SKIP"
         horizon = "ignore"
         reason = "weak structure"
+    timing = normalize_timing_label(timing)
 
     # actionable levels
     entry_now = price if action == "ENTRY_NOW" and price > 0 else 0.0
@@ -4586,8 +4615,12 @@ def classify_portfolio_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 def signal_event_key(source: str, row: Dict[str, Any], signal: Dict[str, str]) -> str:
     chain = str(row.get("chain") or "").lower()
-    addr = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
-    return f"{source}|{chain}|{addr}|{signal['bucket']}"
+    addr = str(row.get("base_addr") or row.get("address") or row.get("token_address") or "").strip().lower()
+    action = str(row.get("entry_action") or row.get("entry") or "").upper()
+    risk = str(row.get("risk_level") or row.get("risk") or "").upper()
+    timing = normalize_timing_label(row.get("timing_label") or "")
+    score_bucket = int(parse_float(row.get("entry_score"), 0.0) // 25)
+    return f"{source}|{chain}|{addr}|{action}|{risk}|{timing}|{score_bucket}"
 
 
 def build_token_state_key(row: Dict[str, Any]) -> str:
@@ -4603,78 +4636,114 @@ def build_token_state_key(row: Dict[str, Any]) -> str:
     return f"{chain}:{addr}"
 
 
-def detect_signal_change(prev: Optional[Dict[str, Any]], curr: Dict[str, Any]) -> Optional[str]:
+def is_material_signal_change(prev: Optional[Dict[str, Any]], current: Dict[str, Any]) -> bool:
     if not prev:
-        return "NEW"
+        return True
 
     prev_action = str(prev.get("entry_action") or "").upper()
-    curr_action = str(curr.get("entry_action") or "").upper()
+    curr_action = str(current.get("entry_action") or "").upper()
     if prev_action != curr_action:
-        return "ACTION_CHANGE"
-
-    prev_score = parse_float(prev.get("entry_score", 0), 0.0)
-    curr_score = parse_float(curr.get("entry_score", 0), 0.0)
-    if abs(prev_score - curr_score) > 40:
-        return "SCORE_SPIKE"
+        return True
 
     prev_risk = str(prev.get("risk_level") or "").upper()
-    curr_risk = str(curr.get("risk_level") or curr.get("risk") or "").upper()
+    curr_risk = str(current.get("risk_level") or "").upper()
     if prev_risk != curr_risk:
-        return "RISK_CHANGE"
+        return True
 
-    return None
+    prev_score = parse_float(prev.get("entry_score", 0), 0.0)
+    curr_score = parse_float(current.get("entry_score", 0), 0.0)
+    if abs(curr_score - prev_score) >= 35:
+        return True
+
+    prev_timing = normalize_timing_label(prev.get("timing_label") or "")
+    curr_timing = normalize_timing_label(current.get("timing_label") or "")
+    if prev_timing != curr_timing:
+        return True
+
+    return False
 
 
 def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> Optional[str]:
-    symbol = str(row.get("base_symbol") or "UNKNOWN").upper()
-    score = round(parse_float(row.get("entry_score", 0), 0.0), 1)
-    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
-    timing = str(row.get("timing_label") or "NA").upper()
-    addr = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
+    symbol = str(row.get("symbol") or row.get("base_symbol") or "UNKNOWN")
     chain = str(row.get("chain") or "").upper()
+    addr = str(row.get("base_addr") or row.get("address") or row.get("token_address") or "").strip()
+    score = parse_float(row.get("entry_score"), 0.0)
+    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+    timing = normalize_timing_label(row.get("timing_label") or "")
+    reason = str(row.get("entry_reason") or row.get("signal_reason") or "n/a")
+    horizon = str(signal.get("horizon") or row.get("entry_horizon") or "n/a")
 
-    if not addr or score <= 0 or risk == "UNKNOWN":
+    entry_now = parse_float(row.get("entry_now"), 0.0)
+    pb1 = parse_float(row.get("pullback_1"), 0.0)
+    pb2 = parse_float(row.get("pullback_2"), 0.0)
+    invalidation = parse_float(row.get("invalidation"), 0.0)
+    tp1 = parse_float(row.get("tp1"), 0.0)
+    tp2 = parse_float(row.get("tp2"), 0.0)
+
+    src_label = "MONITOR" if source == "monitoring" else "PORTFOLIO"
+
+    if not addr:
         return None
 
-    reason = str(row.get("entry_reason") or row.get("signal_reason") or "n/a")
-    entry_now = parse_float(row.get("entry_now", 0), 0.0)
-    pullback_1 = parse_float(row.get("pullback_1", 0), 0.0)
-    pullback_2 = parse_float(row.get("pullback_2", 0), 0.0)
-    invalidation = parse_float(row.get("invalidation", 0), 0.0)
-    tp1 = parse_float(row.get("tp1", 0), 0.0)
-    tp2 = parse_float(row.get("tp2", 0), 0.0)
+    if has_actionable_levels(row):
+        return (
+            f"<b>{signal['action']} | {symbol}</b>\n"
+            f"source: {src_label}\n"
+            f"chain: {chain}\n"
+            f"score: <b>{score}</b>\n"
+            f"risk: <b>{risk}</b>\n"
+            f"timing: <b>{timing}</b>\n"
+            f"horizon: {horizon}\n"
+            f"reason: {reason}\n"
+            f"entry now: {entry_now}\n"
+            f"pullback 1: {pb1}\n"
+            f"pullback 2: {pb2}\n"
+            f"invalidation: {invalidation}\n"
+            f"tp1: {tp1}\n"
+            f"tp2: {tp2}\n\n"
+            f"CA:\n<code>{addr}</code>"
+        )
 
     return (
-        f"<b>{signal['action']}</b> | <b>{symbol}</b>\n"
+        f"<b>{signal['action']} | {symbol}</b>\n"
+        f"source: {src_label}\n"
         f"chain: {chain}\n"
         f"score: <b>{score}</b>\n"
         f"risk: <b>{risk}</b>\n"
         f"timing: <b>{timing}</b>\n"
-        f"horizon: {signal['horizon']}\n"
+        f"horizon: {horizon}\n"
         f"reason: {reason}\n"
-        f"entry now: {entry_now}\n"
-        f"pullback 1: {pullback_1}\n"
-        f"pullback 2: {pullback_2}\n"
-        f"invalidation: {invalidation}\n"
-        f"tp1: {tp1}\n"
-        f"tp2: {tp2}\n\n"
+        f"setup: <b>watch only</b>\n\n"
         f"CA:\n<code>{addr}</code>"
     )
 
 
 def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
-    ca = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
+    ca = str(row.get("base_addr") or row.get("address") or row.get("token_address") or "").strip()
     chain = str(row.get("chain") or "").strip().lower()
+    pair = str(row.get("pair_address") or row.get("pairAddress") or "").strip()
+
+    ds_url = ""
+    if chain and pair:
+        ds_url = f"https://dexscreener.com/{chain}/{pair}"
+    elif chain and ca:
+        ds_url = f"https://dexscreener.com/{chain}/{ca}"
+
+    keyboard = [
+        [
+            {"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"},
+            {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
+        ],
+        [
+            {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
+        ],
+    ]
+
+    if ds_url:
+        keyboard.append([{"text": "📈 Dex", "url": ds_url}])
+
     return {
-        "inline_keyboard": [
-            [
-                {"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"},
-                {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
-            ],
-            [
-                {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
-            ],
-        ]
+        "inline_keyboard": keyboard
     }
 
 
@@ -4729,11 +4798,12 @@ def run_auto_notifications(
             "entry_action": str(row.get("entry_action") or row.get("entry") or "").upper(),
             "entry_score": parse_float(row.get("entry_score", 0), 0.0),
             "risk_level": str(row.get("risk_level") or row.get("risk") or "").upper(),
+            "timing_label": normalize_timing_label(row.get("timing_label") or ""),
             "source": source,
         }
 
         prev = prev_token_state.get(token_key)
-        change = detect_signal_change(prev, current_snapshot)
+        change = is_material_signal_change(prev, current_snapshot)
         signal = classify_monitoring_signal(row) if source == "monitoring" else classify_portfolio_signal(row)
 
         # always refresh in-memory state snapshot
@@ -5968,7 +6038,7 @@ def hydrate_monitoring_row_defaults(row: Dict[str, Any], item: Dict[str, Any]) -
     if not row.get("signal_reason"):
         row["signal_reason"] = item.get("signal_reason") or ""
     if not row.get("timing_label"):
-        row["timing_label"] = item.get("timing_label") or "NEUTRAL"
+        row["timing_label"] = normalize_timing_label(item.get("timing_label") or "NEUTRAL")
     if row.get("portfolio_linked") == "1" and not row.get("note"):
         row["note"] = "IN PORTFOLIO"
     return row
@@ -5995,7 +6065,7 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     entry_status = str(row.get("entry") or row.get("entry_status") or "").upper()
     entry_reason = str(row.get("entry_reason") or row.get("signal_reason") or "")
     decision_reason = str(row.get("decision_reason") or "")
-    timing_label = str(row.get("timing_label") or "NEUTRAL").upper()
+    timing_label = normalize_timing_label(row.get("timing_label") or "NEUTRAL")
     risk_level = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
 
     dead = is_token_dead(best)
@@ -6048,7 +6118,7 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
     flags: List[str] = []
 
     entry_status = str(row.get("entry") or row.get("entry_status") or "").upper()
-    timing_state = str(row.get("timing_label") or "").upper()
+    timing_state = normalize_timing_label(row.get("timing_label") or "")
     anti_level = str(item.get("anti_rug", {}).get("level", "SAFE") or "SAFE").upper()
     liq_level = str(item.get("liq_health", {}).get("level", "UNKNOWN") or "UNKNOWN").upper()
     is_dead = bool(item.get("is_dead"))
@@ -6616,7 +6686,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         with st.expander(header, expanded=False):
             decision_label = str(item.get("decision") or item.get("entry_status") or "UNKNOWN")
-            st.caption(f"{chain.upper()} • decision {decision_label} • risk {item.get('risk_level', 'UNKNOWN')}")
+            timing_label = normalize_timing_label(item.get("timing_label") or r.get("timing_label") or "")
+            st.caption(
+                f"{chain.upper()} • decision {decision_label} • timing {timing_label} • risk {item.get('risk_level', 'UNKNOWN')}"
+            )
             st.caption(f"score={score} risk={item.get('risk_level', 'UNKNOWN')}")
             if str(r.get("in_portfolio", "0")) == "1":
                 st.caption("🧺 Already in portfolio")
@@ -6669,7 +6742,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             with m1:
                 st.metric("Entry", item["entry"])
             with m2:
-                st.metric("Timing", item.get("timing_label", "NA"))
+                st.metric("Timing", normalize_timing_label(item.get("timing_label", "NA")))
             with m3:
                 st.metric("Risk", item["risk_level"])
             with m4:
@@ -6691,7 +6764,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             tp2 = parse_float(r.get("tp2"), 0.0)
             horizon = str(r.get("entry_horizon") or "n/a")
 
-            if any([entry_now, pullback_1, pullback_2, invalidation, tp1, tp2]):
+            if has_actionable_levels(r):
                 st.caption(
                     f"Horizon: {horizon} • "
                     f"Entry now: {entry_now} • "
