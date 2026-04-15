@@ -4669,40 +4669,35 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
     addr = str(row.get("base_addr") or row.get("address") or row.get("token_address") or "").strip()
     score = parse_float(row.get("entry_score"), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
-    timing = normalize_timing_label(row.get("timing_label") or "")
+    timing = str(row.get("timing_label") or "NEUTRAL").upper()
+    if timing == "DUMP":
+        timing = "LATE"
     reason = str(row.get("entry_reason") or row.get("signal_reason") or "n/a")
     horizon = str(signal.get("horizon") or row.get("entry_horizon") or "n/a")
 
     entry_now = parse_float(row.get("entry_now"), 0.0)
-    pb1 = parse_float(row.get("pullback_1"), 0.0)
-    pb2 = parse_float(row.get("pullback_2"), 0.0)
+    pullback_1 = parse_float(row.get("pullback_1"), 0.0)
+    pullback_2 = parse_float(row.get("pullback_2"), 0.0)
     invalidation = parse_float(row.get("invalidation"), 0.0)
     tp1 = parse_float(row.get("tp1"), 0.0)
     tp2 = parse_float(row.get("tp2"), 0.0)
+
+    if any([entry_now, pullback_1, pullback_2, invalidation, tp1, tp2]):
+        levels_block = (
+            f"entry now: {entry_now}\n"
+            f"pullback 1: {pullback_1}\n"
+            f"pullback 2: {pullback_2}\n"
+            f"invalidation: {invalidation}\n"
+            f"tp1: {tp1}\n"
+            f"tp2: {tp2}"
+        )
+    else:
+        levels_block = "levels: not ready yet"
 
     src_label = "MONITOR" if source == "monitoring" else "PORTFOLIO"
 
     if not addr:
         return None
-
-    if has_actionable_levels(row):
-        return (
-            f"<b>{signal['action']} | {symbol}</b>\n"
-            f"source: {src_label}\n"
-            f"chain: {chain}\n"
-            f"score: <b>{score}</b>\n"
-            f"risk: <b>{risk}</b>\n"
-            f"timing: <b>{timing}</b>\n"
-            f"horizon: {horizon}\n"
-            f"reason: {reason}\n"
-            f"entry now: {entry_now}\n"
-            f"pullback 1: {pb1}\n"
-            f"pullback 2: {pb2}\n"
-            f"invalidation: {invalidation}\n"
-            f"tp1: {tp1}\n"
-            f"tp2: {tp2}\n\n"
-            f"CA:\n<code>{addr}</code>"
-        )
 
     return (
         f"<b>{signal['action']} | {symbol}</b>\n"
@@ -4713,37 +4708,27 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
         f"timing: <b>{timing}</b>\n"
         f"horizon: {horizon}\n"
         f"reason: {reason}\n"
-        f"setup: <b>watch only</b>\n\n"
+        f"{levels_block}\n\n"
         f"CA:\n<code>{addr}</code>"
     )
 
 
 def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
-    ca = str(row.get("base_addr") or row.get("address") or row.get("token_address") or "").strip()
     chain = str(row.get("chain") or "").strip().lower()
-    pair = str(row.get("pair_address") or row.get("pairAddress") or "").strip()
-
-    ds_url = ""
-    if chain and pair:
-        ds_url = f"https://dexscreener.com/{chain}/{pair}"
-    elif chain and ca:
-        ds_url = f"https://dexscreener.com/{chain}/{ca}"
-
-    keyboard = [
-        [
-            {"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"},
-            {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
-        ],
-        [
-            {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
-        ],
-    ]
-
-    if ds_url:
-        keyboard.append([{"text": "📈 Dex", "url": ds_url}])
+    ca = str(row.get("base_addr") or row.get("ca") or row.get("address") or "").strip()
+    if not chain or not ca:
+        return {"inline_keyboard": []}
 
     return {
-        "inline_keyboard": keyboard
+        "inline_keyboard": [
+            [
+                {"text": "＋ Portfolio", "callback_data": f"pf|{chain}|{ca}"},
+                {"text": "👀 Monitor", "callback_data": f"mn|{chain}|{ca}"},
+            ],
+            [
+                {"text": "－ Remove", "callback_data": f"rm|{chain}|{ca}"}
+            ],
+        ]
     }
 
 
