@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: dex-scout-tg-webhook
+    env: python
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn tg_webhook:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: TG_CHAT_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
