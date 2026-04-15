@@ -173,7 +173,10 @@ def save_smart_wallets(data: Dict[str, Any]):
 # Так дані й архіви не зникають між деплоями Streamlit Cloud.
 
 def _get_secret(name: str, default: str = "") -> str:
-    # Streamlit secrets
+    env_val = os.environ.get(name)
+    if env_val:
+        return str(env_val)
+
     try:
         return str(st.secrets.get(name) or default)
     except Exception:
@@ -182,7 +185,6 @@ def _get_secret(name: str, default: str = "") -> str:
 
 def get_tg_token() -> str:
     return _get_secret("TG_BOT_TOKEN", "").strip() or _get_secret("TELEGRAM_BOT_TOKEN", "").strip()
-
 
 def get_tg_chat_id() -> str:
     return _get_secret("TG_CHAT_ID", "").strip() or _get_secret("TELEGRAM_CHAT_ID", "").strip()
