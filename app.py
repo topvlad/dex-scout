@@ -6557,6 +6557,21 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     else:
         active = list(active_rows)
 
+    # --- DEDUP BY SYMBOL WITH BEST SCORE ---
+    best_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for t in active:
+        symbol = str(t.get("symbol") or t.get("base_symbol") or "").upper().strip()
+        score = parse_float(t.get("score", t.get("priority_score", 0)), 0.0)
+
+        if symbol not in best_by_symbol:
+            best_by_symbol[symbol] = t
+        else:
+            prev_score = parse_float(best_by_symbol[symbol].get("score", best_by_symbol[symbol].get("priority_score", 0)), 0.0)
+            if score > prev_score:
+                best_by_symbol[symbol] = t
+
+    active = list(best_by_symbol.values())
+
     cards_raw = [monitoring_row_to_card(r) for r in active]
     cards_all = []
     for c in cards_raw:
@@ -6576,19 +6591,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     review_cards = [c for c in review_cards if float(c.get("ui_visible_score", 0)) < 90]
 
     def render_dedupe(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        best_by_key: Dict[str, Dict[str, Any]] = {}
+        best_by_symbol: Dict[str, Dict[str, Any]] = {}
         for c in cards:
             r = c.get("row", {})
             sym = str(r.get("base_symbol") or extract_name(r) or "").strip().upper()
-            chain = str(r.get("chain") or "").strip().lower()
             if not sym:
                 continue
-            addr = str(r.get("base_addr") or r.get("pair_address") or r.get("pairAddress") or "").strip()
-            key = f"{chain}:{sym}:{addr}"
-            prev = best_by_key.get(key)
+            prev = best_by_symbol.get(sym)
             if prev is None or float(c.get("ui_visible_score", 0)) > float(prev.get("ui_visible_score", 0)):
-                best_by_key[key] = c
-        return list(best_by_key.values())
+                best_by_symbol[sym] = c
+        return list(best_by_symbol.values())
 
     signals_cards = render_dedupe(signals_cards)
     review_cards = render_dedupe(review_cards)
