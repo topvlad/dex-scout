@@ -3,4 +3,4 @@ requests==2.32.3
 supabase>=2.0.0
 streamlit-autorefresh
 fastapi
-uvicorn
+uvicorn[standard]
