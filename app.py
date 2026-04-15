@@ -1555,19 +1555,36 @@ def detect_auto_signal(token: Dict[str, Any]) -> bool:
     return False
 
 
+def dex_url_for_token(chain: str, ca: str) -> str:
+    chain = str(chain or "").strip().lower()
+    ca = str(ca or "").strip()
+    if not chain or not ca:
+        return ""
+
+    chain_map = {
+        "solana": "solana",
+        "bsc": "bsc",
+        "binance-smart-chain": "bsc",
+    }
+    dex_chain = chain_map.get(chain, chain)
+    return f"https://dexscreener.com/{dex_chain}/{ca}"
+
+
 def normalize_timing_label(value: str) -> str:
-    v = str(value or "").strip().upper()
+    t = str(value or "").strip().upper()
+
     mapping = {
         "DUMP": "LATE",
-        "PUMP": "GOOD",
-        "CHASE": "LATE",
-        "SKIP": "SKIP",
-        "EARLY": "EARLY",
         "GOOD": "GOOD",
-        "NEUTRAL": "NEUTRAL",
+        "EARLY": "EARLY",
         "LATE": "LATE",
+        "NEUTRAL": "NEUTRAL",
+        "SKIP": "SKIP",
+        "WAIT": "WAIT",
+        "READY": "GOOD",
     }
-    return mapping.get(v, "NEUTRAL")
+
+    return mapping.get(t, "NEUTRAL")
 
 
 def has_actionable_levels(row: Dict[str, Any]) -> bool:
@@ -1604,6 +1621,8 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
         score += 60
     elif liq >= 15000:
         score += 30
+    else:
+        score -= 25
 
     if vol5 >= 50000:
         score += 80
@@ -1611,6 +1630,8 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
         score += 45
     elif vol5 >= 2000:
         score += 20
+    else:
+        score -= 15
 
     if txns5 >= 50:
         score += 70
@@ -1618,6 +1639,8 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
         score += 40
     elif txns5 >= 8:
         score += 15
+    else:
+        score -= 20
 
     if 2 <= pc5 <= 12:
         score += 35
@@ -1657,8 +1680,8 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
     if pc5 > 25:
         risk_flags.append("overextended")
 
-    timing = "NEUTRAL"
     action = "TRACK"
+    timing = "NEUTRAL"
     horizon = "2-12h"
     reason = "watch candidate"
 
@@ -1667,14 +1690,14 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
         timing = "GOOD"
         horizon = "0-30m"
         reason = "active flow"
-    elif score >= 200 and txns5 >= 8:
+    elif score >= 190 and txns5 >= 8 and liq >= 12000:
         action = "WATCH_PULLBACK"
         timing = "EARLY"
         horizon = "0-2h"
         reason = "building flow"
-    elif score >= 120:
+    elif score >= 110:
         action = "TRACK"
-        timing = "EARLY"
+        timing = "WAIT"
         horizon = "2-12h"
         reason = "early structure"
     else:
@@ -1682,23 +1705,31 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
         timing = "SKIP"
         horizon = "ignore"
         reason = "weak structure"
-    timing = normalize_timing_label(timing)
 
-    # actionable levels
-    entry_now = price if action == "ENTRY_NOW" and price > 0 else 0.0
-    pullback_1 = price * 0.97 if price > 0 else 0.0
-    pullback_2 = price * 0.93 if price > 0 else 0.0
-    invalidation = price * 0.89 if price > 0 else 0.0
-    tp1 = price * 1.12 if price > 0 else 0.0
-    tp2 = price * 1.25 if price > 0 else 0.0
+    entry_now = 0.0
+    pullback_1 = 0.0
+    pullback_2 = 0.0
+    invalidation = 0.0
+    tp1 = 0.0
+    tp2 = 0.0
 
-    if action == "AVOID":
-        entry_now = 0.0
-        pullback_1 = 0.0
-        pullback_2 = 0.0
-        invalidation = 0.0
-        tp1 = 0.0
-        tp2 = 0.0
+    if price > 0:
+        if action == "ENTRY_NOW":
+            entry_now = price
+            pullback_1 = price * 0.97
+            pullback_2 = price * 0.93
+            invalidation = price * 0.89
+            tp1 = price * 1.12
+            tp2 = price * 1.25
+        elif action == "WATCH_PULLBACK":
+            pullback_1 = price * 0.97
+            pullback_2 = price * 0.93
+            invalidation = price * 0.89
+            tp1 = price * 1.12
+            tp2 = price * 1.25
+        elif action == "TRACK":
+            pullback_1 = price * 0.95
+            invalidation = price * 0.88
 
     risk_level = "LOW"
     if liq < 15000 or buy_ratio < 0.45 or txns5 < 8:
@@ -1710,7 +1741,7 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
         "entry_score": round(score, 2),
         "entry_action": action,
         "entry_horizon": horizon,
-        "timing_label": timing,
+        "timing_label": normalize_timing_label(timing),
         "entry_reason": reason,
         "entry_now": round(entry_now, 12) if entry_now else 0.0,
         "pullback_1": round(pullback_1, 12) if pullback_1 else 0.0,
@@ -4581,12 +4612,11 @@ def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
 def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
     action = str(row.get("entry_action") or row.get("entry") or "").upper()
-    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
 
     if score <= 0:
         return None
 
-    if action in ("ENTRY_NOW", "READY") and risk in ("LOW", "MEDIUM", "HIGH", "UNKNOWN"):
+    if action in ("ENTRY_NOW", "READY"):
         return {"bucket": "ENTRY_NOW", "horizon": "0-30m", "action": "Entry now"}
 
     if action in ("WATCH_PULLBACK", "WATCH", "EARLY") and score >= 120:
@@ -4600,15 +4630,20 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 def classify_portfolio_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
+    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
     action = str(row.get("entry_action") or row.get("entry") or "").upper()
-    risk = str(row.get("risk_level") or row.get("risk") or "").upper()
-    if score <= 0 or risk in ("", "UNKNOWN"):
+
+    if score <= 0:
         return None
 
-    if score >= 320 and action in ("ENTRY_NOW", "READY") and risk in ("LOW", "MEDIUM"):
-        return {"bucket": "ADD", "horizon": "now", "action": "Consider adding"}
-    if score < 120 and risk == "HIGH":
-        return {"bucket": "REDUCE", "horizon": "now", "action": "Consider reducing"}
+    if risk == "HIGH" and action in ("AVOID", "NO_ENTRY"):
+        return {"bucket": "EXIT", "horizon": "now", "action": "Consider exit"}
+
+    if action in ("WATCH_PULLBACK", "TRACK", "WAIT", "EARLY") and score >= 100:
+        return {"bucket": "HOLD", "horizon": "2-12h", "action": "Hold / monitor"}
+
+    if action in ("ENTRY_NOW", "READY") and score >= 180:
+        return {"bucket": "ADD", "horizon": "0-2h", "action": "Consider add"}
 
     return None
 
@@ -4663,17 +4698,22 @@ def is_material_signal_change(prev: Optional[Dict[str, Any]], current: Dict[str,
     return False
 
 
-def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> Optional[str]:
-    symbol = str(row.get("symbol") or row.get("base_symbol") or "UNKNOWN")
-    chain = str(row.get("chain") or "").upper()
-    addr = str(row.get("base_addr") or row.get("address") or row.get("token_address") or "").strip()
+def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> str:
+    symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
+    chain = str(row.get("chain") or "").strip().upper()
+    addr = str(
+        row.get("base_addr")
+        or row.get("base_token_address")
+        or row.get("ca")
+        or row.get("address")
+        or ""
+    ).strip()
+
     score = parse_float(row.get("entry_score"), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
-    timing = str(row.get("timing_label") or "NEUTRAL").upper()
-    if timing == "DUMP":
-        timing = "LATE"
+    timing = normalize_timing_label(str(row.get("timing_label") or "NEUTRAL"))
     reason = str(row.get("entry_reason") or row.get("signal_reason") or "n/a")
-    horizon = str(signal.get("horizon") or row.get("entry_horizon") or "n/a")
+    horizon = str(row.get("entry_horizon") or signal.get("horizon") or "n/a")
 
     entry_now = parse_float(row.get("entry_now"), 0.0)
     pullback_1 = parse_float(row.get("pullback_1"), 0.0)
@@ -4694,14 +4734,8 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
     else:
         levels_block = "levels: not ready yet"
 
-    src_label = "MONITOR" if source == "monitoring" else "PORTFOLIO"
-
-    if not addr:
-        return None
-
     return (
-        f"<b>{signal['action']} | {symbol}</b>\n"
-        f"source: {src_label}\n"
+        f"<b>{signal['action']}</b> | <b>{symbol}</b>\n"
         f"chain: {chain}\n"
         f"score: <b>{score}</b>\n"
         f"risk: <b>{risk}</b>\n"
@@ -4715,21 +4749,32 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
 
 def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
     chain = str(row.get("chain") or "").strip().lower()
-    ca = str(row.get("base_addr") or row.get("ca") or row.get("address") or "").strip()
-    if not chain or not ca:
-        return {"inline_keyboard": []}
+    ca = str(
+        row.get("base_addr")
+        or row.get("base_token_address")
+        or row.get("ca")
+        or row.get("address")
+        or ""
+    ).strip()
 
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "＋ Portfolio", "callback_data": f"pf|{chain}|{ca}"},
-                {"text": "👀 Monitor", "callback_data": f"mn|{chain}|{ca}"},
-            ],
-            [
-                {"text": "－ Remove", "callback_data": f"rm|{chain}|{ca}"}
-            ],
-        ]
-    }
+    dex_url = dex_url_for_token(chain, ca)
+
+    buttons = [
+        [
+            {"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"},
+            {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
+        ],
+        [
+            {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
+        ],
+    ]
+
+    if dex_url:
+        buttons.append([
+            {"text": "🔎 DEX", "url": dex_url}
+        ])
+
+    return {"inline_keyboard": buttons}
 
 
 def run_auto_notifications(
@@ -4739,7 +4784,7 @@ def run_auto_notifications(
 ) -> None:
     state = load_tg_state()
 
-    cooldown_seconds = 60 if WORKER_FAST_MODE else 1800
+    cooldown_seconds = 900 if WORKER_FAST_MODE else 1800
     if not tg_cooldown_ok(state, seconds=cooldown_seconds):
         print("[TG] cooldown active -> skip", flush=True)
         return
@@ -4753,7 +4798,7 @@ def run_auto_notifications(
         sent_events = {}
 
     sent_now = 0
-    max_per_run = 5
+    max_per_run = 3 if WORKER_FAST_MODE else 5
     new_token_state: Dict[str, Dict[str, Any]] = {}
     candidates: List[Tuple[float, str, Dict[str, Any]]] = []
 
