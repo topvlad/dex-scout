@@ -222,7 +222,7 @@ def _status_text(action: str, chain: str, ca: str) -> str:
     else:
         header = "Action processed"
 
-    return f"{header}\nchain: {chain_label}\nCA:\n<code>{ca_safe}</code>"
+    return f"{header}\nchain: {chain_label}\nCA:\n<pre>{ca_safe}</pre>"
 
 
 def _do_action(action: str) -> Callable[[str, str], bool]:
@@ -299,10 +299,10 @@ async def tg_webhook(req: Request):
             },
         )
 
-        safe_chain = str(chain or "").upper()
-        safe_ca = str(ca or "")
-        safe_label = str(token_label or "")
-        result_title = result_text
+        safe_chain = escape(str(chain or "").upper())
+        safe_ca = escape(str(ca or ""))
+        safe_label = escape(str(token_label or ""))
+        result_title = escape(result_text)
         if not safe_label:
             safe_label = safe_ca[:8]
 
@@ -316,7 +316,7 @@ async def tg_webhook(req: Request):
                         f"<b>{result_title}</b>\n"
                         f"chain: {safe_chain}\n"
                         f"token: {safe_label}\n"
-                        f"CA:\n<code>{safe_ca}</code>"
+                        f"CA:\n<pre>{safe_ca}</pre>"
                     ),
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True,

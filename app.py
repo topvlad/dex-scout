@@ -1570,6 +1570,20 @@ def dex_url_for_token(chain: str, ca: str) -> str:
     return f"https://dexscreener.com/{dex_chain}/{ca}"
 
 
+def token_ca(row: Dict[str, Any]) -> str:
+    return str(
+        row.get("base_addr")
+        or row.get("base_token_address")
+        or row.get("ca")
+        or row.get("address")
+        or ""
+    ).strip()
+
+
+def token_chain(row: Dict[str, Any]) -> str:
+    return str(row.get("chain") or "").strip().lower()
+
+
 def normalize_timing_label(value: str) -> str:
     t = str(value or "").strip().upper()
 
@@ -4615,6 +4629,10 @@ def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
 def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
     action = str(row.get("entry_action") or row.get("entry") or "").upper()
+    pullback_1 = parse_float(row.get("pullback_1"), 0.0)
+    pullback_2 = parse_float(row.get("pullback_2"), 0.0)
+    entry_now = parse_float(row.get("entry_now"), 0.0)
+    has_levels = any([entry_now, pullback_1, pullback_2])
 
     if score <= 0:
         return None
@@ -4622,7 +4640,7 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     if action in ("ENTRY_NOW", "READY"):
         return {"bucket": "ENTRY_NOW", "horizon": "0-30m", "action": "Entry now"}
 
-    if action in ("WATCH_PULLBACK", "WATCH", "EARLY") and score >= 120:
+    if action in ("WATCH_PULLBACK", "WATCH", "EARLY") and score >= 120 and has_levels:
         return {"bucket": "WATCH", "horizon": "0-2h", "action": "Watch pullback"}
 
     if action in ("TRACK", "WAIT") and score >= 90:
@@ -4652,8 +4670,8 @@ def classify_portfolio_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 
 def signal_event_key(source: str, row: Dict[str, Any], signal: Dict[str, str]) -> str:
-    chain = str(row.get("chain") or "").lower()
-    addr = str(row.get("base_addr") or row.get("address") or row.get("token_address") or "").strip().lower()
+    chain = token_chain(row)
+    addr = str(token_ca(row) or row.get("token_address") or "").strip().lower()
     action = str(row.get("entry_action") or row.get("entry") or "").upper()
     risk = str(row.get("risk_level") or row.get("risk") or "").upper()
     timing = normalize_timing_label(row.get("timing_label") or "")
@@ -4703,15 +4721,8 @@ def is_material_signal_change(prev: Optional[Dict[str, Any]], current: Dict[str,
 
 def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> str:
     symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
-    chain = str(row.get("chain") or "").strip().upper()
-    addr = str(
-        row.get("base_addr")
-        or row.get("base_token_address")
-        or row.get("ca")
-        or row.get("address")
-        or ""
-    ).strip()
-    addr = str(addr or "").strip()
+    chain = token_chain(row).upper()
+    addr = token_ca(row)
 
     score = parse_float(row.get("entry_score"), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
@@ -4736,7 +4747,7 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
             f"tp2: {tp2}"
         )
     else:
-        levels_block = "levels: not ready yet"
+        levels_block = "setup: watch only"
 
     return (
         f"<b>{signal['action']}</b> | <b>{symbol}</b>\n"
@@ -4747,42 +4758,32 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
         f"horizon: {horizon}\n"
         f"reason: {reason}\n"
         f"{levels_block}\n\n"
-        f"CA:\n<code>{addr}</code>"
+        f"CA:\n<pre>{addr}</pre>"
     )
 
 
 def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
-    chain = str(row.get("chain") or "").strip().lower()
-    ca = str(
-        row.get("base_addr")
-        or row.get("base_token_address")
-        or row.get("ca")
-        or row.get("address")
-        or ""
-    ).strip()
+    chain = token_chain(row)
+    ca = token_ca(row)
+    dex_url = dex_url_for_token(chain, ca)
 
-    buttons: List[List[Dict[str, str]]] = []
+    if not chain or not ca:
+        return {"inline_keyboard": []}
 
-    if chain and ca:
-        buttons.append(
-            [
-                {"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"},
-                {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
-            ]
-        )
-        buttons.append(
-            [
-                {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
-            ]
-        )
+    buttons = [
+        [
+            {"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"},
+            {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
+        ],
+        [
+            {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
+        ],
+    ]
 
-        dex_url = dex_url_for_token(chain, ca)
-        if dex_url:
-            buttons.append(
-                [
-                    {"text": "📈 Dex", "url": dex_url}
-                ]
-            )
+    if dex_url:
+        buttons.append([
+            {"text": "📈 Dex", "url": dex_url}
+        ])
 
     return {"inline_keyboard": buttons}
 
@@ -4829,6 +4830,11 @@ def run_auto_notifications(
     }
 
     for _, source, row in candidates:
+        chain = token_chain(row)
+        ca = token_ca(row)
+        if not chain or not ca:
+            continue
+
         token_key = build_token_state_key(row)
         if not token_key:
             stats["no_token_key"] += 1
@@ -6720,8 +6726,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     for item in signals_cards:
         r = item["row"]
         best = item["best"]
-        chain = (r.get("chain") or "").strip().lower()
-        base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
+        chain = token_chain(r)
+        base_addr = token_ca(r)
         sym = extract_name(r).upper()
         name = sym if sym not in {"", "UNKNOWN"} else "UNKNOWN"
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
@@ -6763,7 +6769,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
             c1, c2, c3 = st.columns(3)
             with c1:
-                if best and best.get("url"):
+                dex_url = dex_url_for_token(token_chain(r), token_ca(r))
+                if dex_url:
+                    link_button("Dex", dex_url, use_container_width=True)
+                elif best and best.get("url"):
                     link_button("Dex", best.get("url"), use_container_width=True)
             with c2:
                 swap_url = build_swap_url(chain, base_addr)
@@ -6781,7 +6790,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                         st.info("Already in portfolio.")
                         request_rerun()
 
-            st.code(str(base_addr or ""), language="text")
+            st.code(token_ca(r), language="text")
 
             m1, m2, m3, m4 = st.columns(4)
             with m1:
@@ -7251,8 +7260,11 @@ def page_portfolio():
             else:
                 st.markdown("### " + symbol)
             st.caption(f"Chain: {chain} • DEX: {best.get('dexId','') if best else r.get('dex','')}")
-            st.code(str(base_addr or ""), language="text")
-            if best and best.get("url"):
+            st.code(token_ca(r), language="text")
+            dex_url = dex_url_for_token(token_chain(r), token_ca(r))
+            if dex_url:
+                link_button("DexScreener", dex_url, use_container_width=True, key=f"p_ds_{idx}_{hkey(base_addr)}")
+            elif best and best.get("url"):
                 link_button("DexScreener", best.get("url", ""), use_container_width=True, key=f"p_ds_{idx}_{hkey(base_addr)}")
             elif r.get("dexscreener_url"):
                 link_button("DexScreener", r["dexscreener_url"], use_container_width=True, key=f"p_ds_{idx}_{hkey(base_addr)}")
