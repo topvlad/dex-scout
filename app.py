@@ -1612,49 +1612,57 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
     timing = "NEUTRAL"
     action = "TRACK"
     horizon = "2-12h"
+    reason = "watch candidate"
 
     if score >= 260 and 2 <= pc5 <= 12 and buy_ratio >= 0.55:
         action = "ENTRY_NOW"
         timing = "GOOD"
         horizon = "0-30m"
-    elif score >= 200 and (pc5 > 12 or buy_ratio >= 0.50):
+        reason = "active flow"
+    elif score >= 200 and txns5 >= 8:
         action = "WATCH_PULLBACK"
-        timing = "GOOD" if pc5 <= 15 else "LATE"
+        timing = "EARLY"
         horizon = "0-2h"
+        reason = "building flow"
     elif score >= 120:
         action = "TRACK"
         timing = "EARLY"
         horizon = "2-12h"
+        reason = "early structure"
     else:
         action = "AVOID"
         timing = "SKIP"
         horizon = "ignore"
+        reason = "weak structure"
 
-    entry_now = price
-    pullback_1 = price * 0.97 if price else 0.0
-    pullback_2 = price * 0.93 if price else 0.0
-    invalidation = price * 0.89 if price else 0.0
-    tp1 = price * 1.12 if price else 0.0
-    tp2 = price * 1.25 if price else 0.0
+    # actionable levels
+    entry_now = price if action == "ENTRY_NOW" and price > 0 else 0.0
+    pullback_1 = price * 0.97 if price > 0 else 0.0
+    pullback_2 = price * 0.93 if price > 0 else 0.0
+    invalidation = price * 0.89 if price > 0 else 0.0
+    tp1 = price * 1.12 if price > 0 else 0.0
+    tp2 = price * 1.25 if price > 0 else 0.0
 
-    reasons = []
-    if txns5 >= 20:
-        reasons.append("active flow")
-    if buy_ratio >= 0.55:
-        reasons.append("buyers in control")
-    if 2 <= pc5 <= 12:
-        reasons.append("healthy momentum")
-    if vol_to_liq >= 0.12:
-        reasons.append("volume confirms move")
-    if not reasons:
-        reasons.append("watch candidate")
+    if action == "AVOID":
+        entry_now = 0.0
+        pullback_1 = 0.0
+        pullback_2 = 0.0
+        invalidation = 0.0
+        tp1 = 0.0
+        tp2 = 0.0
+
+    risk_level = "LOW"
+    if liq < 15000 or buy_ratio < 0.45 or txns5 < 8:
+        risk_level = "MEDIUM"
+    if liq < 8000 or txns5 < 4:
+        risk_level = "HIGH"
 
     return {
         "entry_score": round(score, 2),
         "entry_action": action,
         "entry_horizon": horizon,
         "timing_label": timing,
-        "entry_reason": ", ".join(reasons),
+        "entry_reason": reason,
         "entry_now": round(entry_now, 12) if entry_now else 0.0,
         "pullback_1": round(pullback_1, 12) if pullback_1 else 0.0,
         "pullback_2": round(pullback_2, 12) if pullback_2 else 0.0,
@@ -1662,8 +1670,8 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
         "tp1": round(tp1, 12) if tp1 else 0.0,
         "tp2": round(tp2, 12) if tp2 else 0.0,
         "risk_flags": ",".join(risk_flags),
+        "risk_level": risk_level,
     }
-
 
 def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     row = dict(pair)
@@ -1730,14 +1738,14 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     row["signal"] = classify_signal(row)
     entry_data = build_entry_engine_v2(row)
     row.update(entry_data)
-    action = row.get("entry_action", "TRACK")
+    action = str(row.get("entry_action") or "").upper()
 
     if action == "ENTRY_NOW":
         row["entry_status"] = "READY"
         row["entry"] = "READY"
     elif action == "WATCH_PULLBACK":
-        row["entry_status"] = "WATCH"
-        row["entry"] = "WATCH"
+        row["entry_status"] = "EARLY"
+        row["entry"] = "EARLY"
     elif action == "TRACK":
         row["entry_status"] = "WAIT"
         row["entry"] = "WAIT"
@@ -4427,12 +4435,9 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 TG_NEW_ENGINE_ONLY = True
 
 def get_secret(name: str, default: str = "") -> str:
-    import os
-
     env_val = os.getenv(name)
     if env_val:
         return env_val
-
     try:
         return str(st.secrets.get(name) or default)
     except Exception:
@@ -6572,7 +6577,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         header = f"{name} | {item.get('ui_badge', 'NA')} | {entry_status} | {score:.2f}"
 
         with st.expander(header, expanded=False):
-            st.caption(f"{chain.upper()} • decision {decision} • risk {item.get('risk_level', 'UNKNOWN')}")
+            decision_label = str(item.get("decision") or item.get("entry_status") or "UNKNOWN")
+            st.caption(f"{chain.upper()} • decision {decision_label} • risk {item.get('risk_level', 'UNKNOWN')}")
             st.caption(f"score={score} risk={item.get('risk_level', 'UNKNOWN')}")
             if str(r.get("in_portfolio", "0")) == "1":
                 st.caption("🧺 Already in portfolio")
@@ -6647,14 +6653,17 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             tp2 = parse_float(r.get("tp2"), 0.0)
             horizon = str(r.get("entry_horizon") or "n/a")
 
-            st.caption(
-                f"Horizon: {horizon} • "
-                f"Entry now: {entry_now} • "
-                f"PB1: {pullback_1} • "
-                f"PB2: {pullback_2} • "
-                f"Invalidation: {invalidation} • "
-                f"TP1: {tp1} • TP2: {tp2}"
-            )
+            if any([entry_now, pullback_1, pullback_2, invalidation, tp1, tp2]):
+                st.caption(
+                    f"Horizon: {horizon} • "
+                    f"Entry now: {entry_now} • "
+                    f"PB1: {pullback_1} • "
+                    f"PB2: {pullback_2} • "
+                    f"Invalidation: {invalidation} • "
+                    f"TP1: {tp1} • TP2: {tp2}"
+                )
+            else:
+                st.caption(f"Horizon: {horizon} • No actionable levels yet.")
 
             if item["entry_reasons"]:
                 st.info(" • ".join(item["entry_reasons"][:3]))
