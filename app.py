@@ -177,9 +177,15 @@ def _get_secret(name: str, default: str = "") -> str:
     try:
         return str(st.secrets.get(name) or default)
     except Exception:
-        pass
-    # Env fallback
-    return str(os.environ.get(name, default) or default)
+        return default
+
+
+def get_tg_token() -> str:
+    return _get_secret("TG_BOT_TOKEN", "").strip() or _get_secret("TELEGRAM_BOT_TOKEN", "").strip()
+
+
+def get_tg_chat_id() -> str:
+    return _get_secret("TG_CHAT_ID", "").strip() or _get_secret("TELEGRAM_CHAT_ID", "").strip()
 
 SUPABASE_URL = _get_secret("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -4434,23 +4440,6 @@ def suggest_entry_and_tp_usd(p: Optional[Dict[str, Any]], risk: str = "") -> Tup
 
 TG_NEW_ENGINE_ONLY = True
 
-def get_secret(name: str, default: str = "") -> str:
-    env_val = os.getenv(name)
-    if env_val:
-        return env_val
-    try:
-        return str(st.secrets.get(name) or default)
-    except Exception:
-        return default
-
-
-def get_tg_token() -> str:
-    return get_secret("TG_BOT_TOKEN", "") or get_secret("TELEGRAM_BOT_TOKEN", "")
-
-
-def get_tg_chat_id() -> str:
-    return get_secret("TG_CHAT_ID", "") or get_secret("TELEGRAM_CHAT_ID", "")
-
 def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> bool:
     token = get_tg_token()
     chat_id = get_tg_chat_id()
@@ -7133,7 +7122,6 @@ def page_portfolio():
             st.write(f"Recommended action: {action_plan['action_label']}")
             st.write(f"Liquidity health: {liq_health['level']}")
             st.write(f"Anti-rug: {anti_rug['level']} ({anti_rug['score']})")
-            st.caption("Why:")
             for rr in explain_reco(reco, liq_health, anti_rug, exit_signal):
                 st.caption(f"– {rr}")
             for f in anti_rug.get("flags", [])[:4]:
