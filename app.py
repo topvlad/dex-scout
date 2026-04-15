@@ -131,10 +131,19 @@ def log_error(err: Exception):
 
 
 def debug_log(msg: str):
-    if "debug_log" not in st.session_state:
-        st.session_state["debug_log"] = []
-    st.session_state["debug_log"].append(f"{now_utc_str()} | {msg}")
-    st.session_state["debug_log"] = st.session_state["debug_log"][-50:]
+    line = f"{now_utc_str()} | {msg}"
+    print(line, flush=True)
+
+    if WORKER_FAST_MODE:
+        return
+
+    try:
+        if "debug_log" not in st.session_state:
+            st.session_state["debug_log"] = []
+        st.session_state["debug_log"].append(line)
+        st.session_state["debug_log"] = st.session_state["debug_log"][-50:]
+    except Exception:
+        return
 
 
 def load_smart_wallets() -> Dict[str, Any]:
@@ -177,10 +186,13 @@ def _get_secret(name: str, default: str = "") -> str:
     if env_val:
         return str(env_val)
 
+    if WORKER_FAST_MODE:
+        return str(default)
+
     try:
         return str(st.secrets.get(name) or default)
     except Exception:
-        return default
+        return str(default)
 
 
 def get_tg_token() -> str:
@@ -2706,22 +2718,13 @@ def dedupe_mode(pairs: List[Dict[str, Any]], by_base_token: bool) -> List[Dict[s
     return list(best.values())
 
 
-def sample_seeds(seeds: List[str], k: int, refresh: bool) -> List[str]:
-    cleaned = []
-    for s in seeds:
-        s = (s or "").strip()
-        if not s:
-            continue
-        if len(s) < 2:
-            continue
-        if s.lower() in {"x"}:
-            continue
-        cleaned.append(s)
-
+def sample_seeds(seed_list: List[str], k: int, refresh: bool = False) -> List[str]:
+    cleaned = [x.strip() for x in seed_list if str(x).strip()]
     if not cleaned:
         return []
 
-    k = max(1, min(int(k), len(cleaned)))
+    if WORKER_FAST_MODE:
+        return random.sample(cleaned, min(k, len(cleaned)))
 
     if "seed_sample" not in st.session_state or refresh:
         st.session_state["seed_sample"] = random.sample(cleaned, min(k, len(cleaned)))
@@ -3372,6 +3375,9 @@ def active_base_sets() -> Tuple[set, set]:
 # Monitoring history snapshots
 # =============================
 def should_snapshot(chain: str, base_addr: str, min_interval_sec: int = 60) -> bool:
+    if WORKER_FAST_MODE:
+        return True
+
     key_id = addr_key(chain, base_addr)
     if not key_id:
         return False
