@@ -217,45 +217,59 @@ async def tg_webhook(req: Request):
         msg = cb.get("message", {})
         chat_id = ((msg.get("chat") or {}).get("id"))
         message_id = msg.get("message_id")
-        raw = cb.get("data", "")
-
-        action = ""
-        chain = ""
-        ca = ""
-        parts = str(raw).split("|", 2)
-        if len(parts) == 3:
-            action, chain, ca = parts
-
-        ok = False
-        if action and chain and ca:
-            func = _do_action(action)
-            ok = bool(func(chain, ca))
-        else:
-            print(f"[tg_webhook] malformed callback data: {raw}", flush=True)
-
-        if cb_id:
+        raw = str(cb.get("data") or "").strip()
+        parts = raw.split("|", 2)
+        if len(parts) != 3:
             tg_api(
                 "answerCallbackQuery",
                 {
                     "callback_query_id": cb_id,
-                    "text": "Done" if ok else "Ignored",
+                    "text": "Ignored",
                     "show_alert": False,
                 },
             )
+            return {"ok": True, "ignored": True, "reason": "bad_callback_data"}
 
-        if chat_id is not None and message_id is not None and action in {"pf", "mn", "rm"} and chain and ca:
-            text = _status_text(action, chain, ca)
-            res = tg_api(
+        action, chain, ca = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        print(f"[TG_WEBHOOK] callback raw={raw} action={action} chain={chain} ca={ca}", flush=True)
+
+        result_text = "Ignored"
+        if action in ("pf", "pf_add", "portfolio", "portfolio_add"):
+            add_contract_to_portfolio(chain, ca)
+            result_text = "Added to portfolio"
+        elif action in ("mn", "mon_add", "monitor", "monitor_add"):
+            add_contract_to_monitoring(chain, ca)
+            result_text = "Added to monitoring"
+        elif action in ("rm", "remove", "delete", "archive"):
+            remove_contract_everywhere(chain, ca)
+            result_text = "Removed / archived"
+
+        print(f"[TG_WEBHOOK] result={result_text}", flush=True)
+
+        tg_api(
+            "answerCallbackQuery",
+            {
+                "callback_query_id": cb_id,
+                "text": result_text,
+                "show_alert": False,
+            },
+        )
+
+        safe_chain = str(chain or "").upper()
+        safe_ca = str(ca or "")
+
+        if chat_id and message_id:
+            resp = tg_api(
                 "editMessageText",
                 {
                     "chat_id": chat_id,
                     "message_id": message_id,
-                    "text": text,
+                    "text": (f"{result_text}\n" f"chain: {safe_chain}\n" f"CA:\n<code>{safe_ca}</code>"),
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True,
                 },
             )
-            if not res.get("ok"):
+            if not resp.get("ok"):
                 tg_api(
                     "editMessageReplyMarkup",
                     {
