@@ -1537,73 +1537,73 @@ def detect_auto_signal(token: Dict[str, Any]) -> bool:
     return False
 
 
-def build_entry_engine(row: Dict[str, Any]) -> Dict[str, Any]:
+def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
     price = parse_float(row.get("priceUsd") or row.get("price_usd"), 0.0)
     liq = parse_float(safe_get(row, "liquidity", "usd", default=row.get("liquidity", 0)), 0.0)
     vol5 = parse_float(safe_get(row, "volume", "m5", default=row.get("volume_5m", 0)), 0.0)
-    vol24 = parse_float(safe_get(row, "volume", "h24", default=row.get("volume_24h", 0)), 0.0)
-    _ = vol24
     pc5 = parse_float(safe_get(row, "priceChange", "m5", default=row.get("price_change_5m", 0)), 0.0)
     pc1h = parse_float(safe_get(row, "priceChange", "h1", default=row.get("price_change_1h", 0)), 0.0)
-
     buys5 = parse_int(safe_get(row, "txns", "m5", "buys", default=0), 0)
     sells5 = parse_int(safe_get(row, "txns", "m5", "sells", default=0), 0)
+
     txns5 = buys5 + sells5
     buy_ratio = buys5 / txns5 if txns5 else 0.0
     vol_to_liq = vol5 / liq if liq else 0.0
 
-    score = 80.0
+    score = 100.0
 
     if liq >= 100000:
-        score += 80
+        score += 90
     elif liq >= 50000:
-        score += 50
+        score += 60
     elif liq >= 15000:
-        score += 25
+        score += 30
 
     if vol5 >= 50000:
-        score += 70
+        score += 80
     elif vol5 >= 10000:
-        score += 40
+        score += 45
     elif vol5 >= 2000:
-        score += 15
+        score += 20
 
     if txns5 >= 50:
-        score += 60
+        score += 70
     elif txns5 >= 20:
-        score += 35
+        score += 40
     elif txns5 >= 8:
         score += 15
 
-    if 1 <= pc5 <= 12:
+    if 2 <= pc5 <= 12:
         score += 35
-    elif 12 < pc5 <= 25:
+    elif 12 < pc5 <= 22:
         score += 10
-    elif pc5 > 25:
-        score -= 25
-    elif pc5 < -8:
+    elif pc5 > 22:
         score -= 30
+    elif pc5 < -8:
+        score -= 25
 
     if pc1h > 20:
         score += 15
     elif pc1h < -20:
         score -= 20
 
-    if buy_ratio >= 0.62:
+    if buy_ratio >= 0.60:
         score += 25
-    elif buy_ratio >= 0.55:
+    elif buy_ratio >= 0.52:
         score += 10
     elif buy_ratio < 0.40:
         score -= 20
 
-    if vol_to_liq >= 0.35:
+    if vol_to_liq >= 0.30:
         score += 20
-    elif vol_to_liq >= 0.15:
+    elif vol_to_liq >= 0.12:
         score += 10
     elif vol_to_liq < 0.03:
         score -= 15
 
-    risk_flags: List[str] = []
+    score = max(score, 1.0)
+
+    risk_flags = []
     if liq < 12000:
         risk_flags.append("low_liq")
     if txns5 < 5:
@@ -1611,28 +1611,26 @@ def build_entry_engine(row: Dict[str, Any]) -> Dict[str, Any]:
     if pc5 > 25:
         risk_flags.append("overextended")
 
-    score = max(score, 1.0)
+    timing = "NEUTRAL"
+    action = "TRACK"
+    horizon = "2-12h"
 
     if score >= 260 and 2 <= pc5 <= 12 and buy_ratio >= 0.55:
         action = "ENTRY_NOW"
-        horizon = "0-30m"
         timing = "GOOD"
-    elif score >= 200 and buy_ratio >= 0.50:
-        action = "WATCH_ENTRY"
+        horizon = "0-30m"
+    elif score >= 200 and (pc5 > 12 or buy_ratio >= 0.50):
+        action = "WATCH_PULLBACK"
+        timing = "GOOD" if pc5 <= 15 else "LATE"
         horizon = "0-2h"
-        timing = "NEUTRAL"
     elif score >= 120:
         action = "TRACK"
+        timing = "EARLY"
         horizon = "2-12h"
-        timing = "EARLY"
-    elif score >= 60:
-        action = "EARLY"
-        horizon = "12-24h"
-        timing = "EARLY"
     else:
-        action = "TRASH"
-        horizon = "ignore"
+        action = "AVOID"
         timing = "SKIP"
+        horizon = "ignore"
 
     entry_now = price
     pullback_1 = price * 0.97 if price else 0.0
@@ -1646,12 +1644,12 @@ def build_entry_engine(row: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append("active flow")
     if buy_ratio >= 0.55:
         reasons.append("buyers in control")
-    if 1 <= pc5 <= 12:
-        reasons.append("healthy short-term momentum")
-    if vol_to_liq >= 0.15:
+    if 2 <= pc5 <= 12:
+        reasons.append("healthy momentum")
+    if vol_to_liq >= 0.12:
         reasons.append("volume confirms move")
     if not reasons:
-        reasons.append("early watch candidate")
+        reasons.append("watch candidate")
 
     return {
         "entry_score": round(score, 2),
@@ -1732,21 +1730,23 @@ def normalize_pair_row(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     row["dev_risk"] = dev_wallet_risk(row)
     row["whale"] = whale_accumulation(row)
     row["signal"] = classify_signal(row)
-    entry_data = build_entry_engine(row)
+    entry_data = build_entry_engine_v2(row)
     row.update(entry_data)
     action = row.get("entry_action", "TRACK")
+
     if action == "ENTRY_NOW":
         row["entry_status"] = "READY"
         row["entry"] = "READY"
-    elif action == "WATCH_ENTRY":
+    elif action == "WATCH_PULLBACK":
         row["entry_status"] = "WATCH"
         row["entry"] = "WATCH"
-    elif action in ("TRACK", "EARLY"):
+    elif action == "TRACK":
         row["entry_status"] = "WAIT"
         row["entry"] = "WAIT"
     else:
-        row["entry_status"] = "WAIT"
-        row["entry"] = "WAIT"
+        row["entry_status"] = "NO_ENTRY"
+        row["entry"] = "NO_ENTRY"
+
     row["status"] = "ACTIVE"
     row["signal_reason"] = row.get("entry_reason") or row.get("signal_reason") or ""
     row["risk_level"] = str(row.get("risk_level") or "MEDIUM").upper()
@@ -4424,9 +4424,8 @@ def get_secret(name: str, default: str = "") -> str:
     if env_val:
         return env_val
 
-    # worker / bare python mode must not hard-fail on st.secrets
     try:
-        return st.secrets.get(name, default)
+        return str(st.secrets.get(name) or default)
     except Exception:
         return default
 
@@ -4537,10 +4536,13 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
     if action == "ENTRY_NOW" and risk in ("LOW", "MEDIUM"):
         return {"bucket": "ENTRY_NOW", "horizon": "0-30m", "action": "Entry now"}
-    if action == "WATCH_ENTRY":
-        return {"bucket": "WATCH_ENTRY", "horizon": "0-2h", "action": "Watch / entry setup"}
-    if action in ("TRACK", "EARLY") and score >= 90:
+
+    if action == "WATCH_PULLBACK":
+        return {"bucket": "WATCH_PULLBACK", "horizon": "0-2h", "action": "Watch pullback"}
+
+    if action == "TRACK" and score >= 120:
         return {"bucket": "TRACK", "horizon": "2-12h", "action": "Track only"}
+
     return None
 
 
@@ -4621,7 +4623,6 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
 
     return (
         f"<b>{signal['action']}</b> | <b>{symbol}</b>\n"
-        f"source: {source}\n"
         f"chain: {chain}\n"
         f"score: <b>{score}</b>\n"
         f"risk: <b>{risk}</b>\n"
@@ -6097,7 +6098,7 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
     penalty = min(penalty, 60.0)
     visible_score = max(raw_score - penalty, 1.0 if raw_score > 0 else 0.0)
 
-    if entry_status in ("READY",):
+    if entry_status == "READY":
         bucket = "tradable"
         badge = "TRADEABLE"
     elif entry_status in ("WATCH", "WAIT"):
@@ -6106,9 +6107,6 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
     elif visible_score > 0:
         bucket = "review"
         badge = "REVIEW"
-    elif is_dead:
-        bucket = "dead"
-        badge = "DEAD"
     else:
         bucket = "dead"
         badge = "DEAD"
