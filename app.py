@@ -186,8 +186,6 @@ SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 SUPABASE_ANON_KEY = _get_secret("SUPABASE_ANON_KEY", "").strip()
 
 USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
-TG_BOT_TOKEN = _get_secret("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID = _get_secret("TG_CHAT_ID", "").strip()
 
 def _sb_ok() -> bool:
     return bool(USE_SUPABASE)
@@ -2816,6 +2814,11 @@ HIST_FIELDS = [
     "pc5",
     "score_live",
     "decision",
+    "entry_score",
+    "entry_action",
+    "entry_reason",
+    "timing_label",
+    "risk_level",
 ]
 
 
@@ -2998,7 +3001,13 @@ def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
 
 
 def append_monitoring_history(row: Dict[str, Any]):
-    payload = {k: row.get(k, "") for k in HIST_FIELDS}
+    hist_row = dict(row)
+    hist_row["entry_score"] = str(row.get("entry_score", ""))
+    hist_row["entry_action"] = str(row.get("entry_action", ""))
+    hist_row["entry_reason"] = str(row.get("entry_reason", ""))
+    hist_row["timing_label"] = str(row.get("timing_label", ""))
+    hist_row["risk_level"] = str(row.get("risk_level", ""))
+    payload = {k: hist_row.get(k, "") for k in HIST_FIELDS}
     append_csv(MON_HISTORY_CSV, payload, HIST_FIELDS)
 
 
@@ -4431,11 +4440,11 @@ def get_secret(name: str, default: str = "") -> str:
 
 
 def get_tg_token() -> str:
-    return get_secret("TELEGRAM_BOT_TOKEN", "") or get_secret("TG_BOT_TOKEN", "")
+    return get_secret("TG_BOT_TOKEN", "") or get_secret("TELEGRAM_BOT_TOKEN", "")
 
 
 def get_tg_chat_id() -> str:
-    return get_secret("TELEGRAM_CHAT_ID", "") or get_secret("TG_CHAT_ID", "")
+    return get_secret("TG_CHAT_ID", "") or get_secret("TELEGRAM_CHAT_ID", "")
 
 def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> bool:
     token = get_tg_token()
@@ -5057,6 +5066,11 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 "pc5": str(parse_float(safe_get(row, "priceChange", "m5", default=0), 0.0)),
                 "score_live": str(s),
                 "decision": gate_reason if decision == "watch" else decision,
+                "entry_score": str(row.get("entry_score", "")),
+                "entry_action": str(row.get("entry_action", "")),
+                "entry_reason": str(row.get("entry_reason", "")),
+                "timing_label": str(row.get("timing_label", "")),
+                "risk_level": str(row.get("risk_level", "")),
             })
 
             if res == "OK":
@@ -5573,6 +5587,11 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
             "pc5": str(parse_float(safe_get(pair, "priceChange", "m5", default=0), 0.0)),
             "score_live": str(score_live),
             "decision": decision,
+            "entry_score": str(entry_score),
+            "entry_action": str(entry_status),
+            "entry_reason": "",
+            "timing_label": "",
+            "risk_level": str(risk_level),
         })
 
         row = {
@@ -5914,141 +5933,86 @@ def hydrate_monitoring_row_defaults(row: Dict[str, Any], item: Dict[str, Any]) -
 
 def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     chain = (row.get("chain") or "").strip().lower()
-    base_addr = addr_store(chain, (row.get("base_addr") or "").strip())
+    base_addr = addr_store(chain, str(row.get("base_addr") or "").strip())
     best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
     hist = token_history_rows(chain, base_addr, limit=30)
+
+    liq_health = liquidity_health(best)
+    anti_rug = anti_rug_early_detector(best, hist)
+    size_info = position_sizing_engine(best, portfolio_value_usd=1000.0, hist=hist) if best else {
+        "size_pct": 0.0,
+        "size_label": "NA",
+        "usd_size": 0.0,
+        "risk_score": 0.0,
+        "risk_flags": [],
+    }
+
+    entry_score = parse_float(row.get("entry_score"), 0.0)
+    entry_action = str(row.get("entry_action") or "").upper()
+    entry_status = str(row.get("entry") or row.get("entry_status") or "").upper()
+    entry_reason = str(row.get("entry_reason") or row.get("signal_reason") or "")
+    decision_reason = str(row.get("decision_reason") or "")
+    timing_label = str(row.get("timing_label") or "NEUTRAL").upper()
+    risk_level = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
 
     dead = is_token_dead(best)
     post_rug = is_post_rug(best, hist)
     alive = is_alive(best)
 
     if dead:
-        item = {
-            "row": row,
-            "best": best,
-            "hist": hist,
-            "raw_live_score": 0.0,
-            "adjusted_live_score": 0.0,
-            "live_score": 0.0,
-            "decision": "DEAD",
-            "tags": [],
-            "timing": {},
-            "liq_health": {},
-            "anti_rug": {},
-            "size_info": {"size_pct": 0.0, "size_label": "NA", "usd_size": 0.0, "risk_score": 0.0, "risk_flags": []},
-            "entry_status": "NO_ENTRY",
-            "entry": "SKIP",
-            "decision_reason": "low_liquidity",
-            "signal_reason": "",
-            "entry_score": 0.0,
-            "entry_reasons": ["token_dead"],
-            "risk_level": "EXTREME",
-            "timing_label": "NEUTRAL",
-            "is_dead": True,
-            "is_post_rug": False,
-            "is_rug": False,
-            "is_alive": False,
-        }
-        item["row"] = hydrate_monitoring_row_defaults(row, item)
-        return item
+        entry_status = "NO_ENTRY"
+        entry_action = "AVOID"
+        risk_level = "EXTREME"
 
-    raw_live_score = score_pair(best) if best else parse_float(row.get("last_score"), 0.0)
-    adjusted_live_score = raw_live_score
-    decision, tags = build_trade_hint(best) if best else (str(row.get("last_decision") or "NO DATA"), [])
-    timing = entry_timing_signal(best, hist)
-    liq_health = liquidity_health(best)
-    anti_rug = anti_rug_early_detector(best, hist)
-    size_info = position_sizing_engine(best, portfolio_value_usd=1000.0, hist=hist) if best else {
-        "size_pct": 0.0, "size_label": "NA", "usd_size": 0.0, "risk_score": 0.0, "risk_flags": []
-    }
-    entry_item = {
-        "liq_usd": parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0) if best else 0.0,
-        "vol5_usd": parse_float(safe_get(best, "volume", "m5", default=0), 0.0) if best else 0.0,
-        "vol24_usd": parse_float(safe_get(best, "volume", "h24", default=0), 0.0) if best else 0.0,
-        "pc5": parse_float(safe_get(best, "priceChange", "m5", default=0), 0.0) if best else 0.0,
-        "pc1h": parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0) if best else 0.0,
-        "buys5": parse_float(safe_get(best, "txns", "m5", "buys", default=0), 0.0) if best else 0.0,
-        "sells5": parse_float(safe_get(best, "txns", "m5", "sells", default=0), 0.0) if best else 0.0,
-    }
-    entry_status, decision_reason, risk_level = entry_engine_v2(entry_item)
-    entry_score = parse_float(row.get("entry_score"), 0.0)
-    entry_reasons = [decision_reason] if decision_reason else []
-    entry = entry_status
-    final_decision = build_final_decision(
-        base_decision=decision,
-        entry_status=entry_status,
-        timing=timing,
-        anti_rug=anti_rug,
-        live_score=adjusted_live_score,
-        risk_flags=size_info.get("risk_flags", []),
-    )
+    if post_rug:
+        risk_level = "EXTREME"
+
     item = {
         "row": row,
         "best": best,
         "hist": hist,
-        "raw_live_score": raw_live_score,
-        "adjusted_live_score": adjusted_live_score,
-        "live_score": adjusted_live_score,
-        "base_decision": decision,
-        "decision": final_decision,
-        "tags": tags,
-        "timing": timing,
+        "raw_live_score": entry_score,
+        "adjusted_live_score": entry_score,
+        "live_score": entry_score,
+        "decision": entry_action,
+        "tags": [],
+        "timing": {"timing": timing_label},
         "liq_health": liq_health,
         "anti_rug": anti_rug,
         "size_info": size_info,
         "entry_status": entry_status,
-        "entry": row.get("entry") or entry or "UNKNOWN",
-        "decision_reason": row.get("decision_reason") or decision_reason,
-        "signal_reason": row.get("signal_reason") or "",
+        "entry": entry_status,
+        "decision_reason": decision_reason,
+        "signal_reason": entry_reason,
         "entry_score": entry_score,
-        "entry_reasons": entry_reasons,
+        "entry_reasons": [entry_reason] if entry_reason else [],
         "risk_level": risk_level,
-        "timing_label": row.get("timing_label") or str((timing or {}).get("timing", "UNKNOWN") or "UNKNOWN"),
+        "timing_label": timing_label,
+        "is_dead": dead,
+        "is_post_rug": post_rug,
+        "is_rug": post_rug,
+        "is_alive": alive,
     }
-    item["is_dead"] = dead
-    item["is_post_rug"] = post_rug
-    item["is_rug"] = post_rug
-    item["is_alive"] = alive
-
-    if post_rug:
-        item["adjusted_live_score"] = round(float(item["adjusted_live_score"]) * 0.1, 2)
-        item["live_score"] = item["adjusted_live_score"]
-        item["decision"] = "NO ENTRY"
-        item["risk_level"] = "EXTREME"
-    elif not alive:
-        item["adjusted_live_score"] = round(float(item["adjusted_live_score"]) * 0.3, 2)
-        item["live_score"] = item["adjusted_live_score"]
-        item["decision"] = build_final_decision(
-            item.get("base_decision", "WATCH / WAIT"),
-            item.get("entry_status", "UNKNOWN"),
-            timing,
-            anti_rug,
-            live_score=item.get("live_score", 0.0),
-            risk_flags=size_info.get("risk_flags", []),
-        )
-        item["risk_level"] = "HIGH"
 
     item["row"] = hydrate_monitoring_row_defaults(row, item)
     return item
 
-
 def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
-    raw_score = float(item.get("raw_live_score", item.get("live_score", 0.0)) or 0.0)
+    row = item.get("row", {}) or {}
+    raw_score = parse_float(row.get("entry_score", item.get("entry_score", 0.0)), 0.0)
     visible_score = raw_score
     penalty = 0.0
     flags: List[str] = []
-    row = item.get("row", {}) or {}
-    entry_status = str(row.get("entry") or row.get("entry_action") or "").upper()
+
+    entry_status = str(row.get("entry") or row.get("entry_status") or "").upper()
     timing_state = str(row.get("timing_label") or "").upper()
-    decision = entry_status
     anti_level = str(item.get("anti_rug", {}).get("level", "SAFE") or "SAFE").upper()
     liq_level = str(item.get("liq_health", {}).get("level", "UNKNOWN") or "UNKNOWN").upper()
     is_dead = bool(item.get("is_dead"))
     is_rug = bool(item.get("is_rug"))
-    base_sym = str(row.get("base_symbol") or "").strip().upper()
 
-    if decision in ("NO ENTRY", "NO_ENTRY"):
-        penalty += 15
+    if entry_status in ("NO_ENTRY", "AVOID", "SKIP"):
+        penalty += 25
         flags.append("no_entry")
     if entry_status == "WAIT":
         penalty += 5
@@ -6060,43 +6024,25 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
         penalty += 5
         flags.append("timing_neutral")
     if anti_level == "WARNING":
-        penalty += 15
+        penalty += 10
         flags.append("anti_rug_warning")
     elif anti_level == "CRITICAL":
-        penalty += 45
+        penalty += 35
         flags.append("anti_rug_critical")
     if liq_level == "WEAK":
         penalty += 10
         flags.append("liq_weak")
     elif liq_level == "CRITICAL":
-        penalty += 35
+        penalty += 25
         flags.append("liq_critical")
     if is_rug:
         penalty += 80
         flags.append("post_rug")
-    if is_symbol_major_like(base_sym):
-        penalty += 60
-        flags.append("major_like_symbol")
     if is_dead:
         penalty += 200
         flags.append("dead")
 
-    best = item.get("best", {}) or {}
-    row_vol5 = parse_float(row.get("vol5_usd", 0.0), 0.0)
-    vol5 = parse_float(safe_get(best, "volume", "m5", default=row_vol5), row_vol5)
-    liq = parse_float(safe_get(best, "liquidity", "usd", default=row.get("liq_usd", 0.0)), 0.0)
-    pc5 = parse_float(safe_get(best, "priceChange", "m5", default=row.get("pc5", 0.0)), 0.0)
-    pc1h = parse_float(safe_get(best, "priceChange", "h1", default=row.get("pc1h", 0.0)), 0.0)
-    buys = parse_float(safe_get(best, "txns", "m5", "buys", default=row.get("buys5", 0.0)), 0.0)
-    sells = parse_float(safe_get(best, "txns", "m5", "sells", default=row.get("sells5", 0.0)), 0.0)
-    volume_spike = vol5 > max(liq * 0.6, 4000.0) and pc5 > 8
-    no_follow_through = pc1h <= 2 or sells > buys * 1.1
-    if volume_spike and no_follow_through:
-        penalty += 25
-        flags.append("fake_pump_risk")
-
-    penalty = min(penalty, 60.0)
-    visible_score = max(raw_score - penalty, 1.0 if raw_score > 0 else 0.0)
+    visible_score = max(raw_score - penalty, 0.0)
 
     if entry_status == "READY":
         bucket = "tradable"
@@ -6118,6 +6064,7 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
         "flags": flags,
         "badge": badge,
     }
+
 
 # =============================
 # Pages
@@ -6424,9 +6371,9 @@ def page_scout(cfg: Dict[str, Any]):
 
         with st.expander("Addresses", expanded=False):
             st.caption("Token contract (baseToken.address)")
-            st.code(base_addr)
+            st.code(str(base_addr or ""), language="text")
             st.caption("Pair / pool address")
-            st.code(pair_addr)
+            st.code(str(pair_addr or ""), language="text")
 
         if chain_id == "solana":
             st.caption("Solana: check Jupiter/JupShield warnings before swapping.")
@@ -6631,8 +6578,6 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.caption("🧺 Already in portfolio")
             if str(r.get("portfolio_linked", "0")) == "1":
                 st.caption(r.get("note") or "IN PORTFOLIO")
-            if r.get("weak_reason"):
-                st.caption(f"Weak: {r.get('weak_reason')}")
             if r.get("toxic_flags"):
                 st.caption(f"Toxic: {r.get('toxic_flags')}")
             flags = item.get("ui_flags") or []
@@ -6642,13 +6587,17 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 f"Penalty: -{float(item.get('ui_penalty', 0.0)):.2f} • "
                 f"Visible: {float(item.get('ui_visible_score', 0.0)):.2f}"
             )
-            reason = r.get("decision_reason") or r.get("signal_reason") or ""
-            label = REASON_LABELS.get(str(reason), str(reason))
-            st.caption(f"Why: {label}")
-            if r.get("signal_reason"):
-                st.caption(f"Signal: {REASON_LABELS.get(str(r.get('signal_reason')), str(r.get('signal_reason')))}")
-            if r.get("decision_reason"):
-                st.caption(f"Blocked: {REASON_LABELS.get(str(r.get('decision_reason')), str(r.get('decision_reason')))}")
+            reason = str(r.get("entry_reason") or r.get("signal_reason") or "")
+            if reason:
+                st.caption(f"Reason: {reason}")
+
+            blocker = str(r.get("decision_reason") or "")
+            if blocker:
+                st.caption(f"Blockers: {blocker}")
+
+            weak = str(r.get("weak_reason") or "")
+            if weak:
+                st.caption(f"Weak: {weak}")
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -6670,7 +6619,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                         st.info("Already in portfolio.")
                         request_rerun()
 
-            st.code(base_addr)
+            st.code(str(base_addr or ""), language="text")
 
             m1, m2, m3, m4 = st.columns(4)
             with m1:
@@ -6690,14 +6639,56 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             with p3:
                 st.write(f"TP: {r.get('tp_target_pct') or '25'}%")
 
+            entry_now = parse_float(r.get("entry_now"), 0.0)
+            pullback_1 = parse_float(r.get("pullback_1"), 0.0)
+            pullback_2 = parse_float(r.get("pullback_2"), 0.0)
+            invalidation = parse_float(r.get("invalidation"), 0.0)
+            tp1 = parse_float(r.get("tp1"), 0.0)
+            tp2 = parse_float(r.get("tp2"), 0.0)
+            horizon = str(r.get("entry_horizon") or "n/a")
+
+            st.caption(
+                f"Horizon: {horizon} • "
+                f"Entry now: {entry_now} • "
+                f"PB1: {pullback_1} • "
+                f"PB2: {pullback_2} • "
+                f"Invalidation: {invalidation} • "
+                f"TP1: {tp1} • TP2: {tp2}"
+            )
+
             if item["entry_reasons"]:
                 st.info(" • ".join(item["entry_reasons"][:3]))
 
-            hist = item.get("hist", [])
-            if hist:
-                price_series = [parse_float(h.get("price_usd"), 0.0) for h in hist if str(h.get("price_usd", "")).strip()]
-                if price_series:
-                    st.line_chart(price_series, height=100, use_container_width=True)
+            hist = item.get("hist", []) or []
+
+            price_series = [
+                parse_float(h.get("price_usd"), 0.0)
+                for h in hist
+                if str(h.get("price_usd", "")).strip()
+            ]
+
+            score_series = [
+                parse_float(h.get("last_score"), 0.0)
+                for h in hist
+                if str(h.get("last_score", "")).strip()
+            ]
+
+            entry_series = [
+                parse_float(h.get("entry_score"), 0.0)
+                for h in hist
+                if str(h.get("entry_score", "")).strip()
+            ]
+
+            series = [x for x in price_series if x > 0]
+            if len(series) < 3:
+                series = [x for x in score_series if x > 0]
+            if len(series) < 3:
+                series = [x for x in entry_series if x > 0]
+
+            if len(series) >= 3:
+                st.line_chart(pd.DataFrame({"value": series}), height=120)
+            else:
+                st.caption("Not enough history yet.")
 
     st.subheader("Needs review")
     if not review_cards:
@@ -6720,13 +6711,17 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 f"Penalty: -{float(item.get('ui_penalty', 0.0)):.2f} • "
                 f"Visible: {float(item.get('ui_visible_score', 0.0)):.2f}"
             )
-            reason = r.get("decision_reason") or r.get("signal_reason") or ""
-            label = REASON_LABELS.get(str(reason), str(reason))
-            st.caption(f"Why: {label}")
-            if r.get("signal_reason"):
-                st.caption(f"Signal: {REASON_LABELS.get(str(r.get('signal_reason')), str(r.get('signal_reason')))}")
-            if r.get("decision_reason"):
-                st.caption(f"Blocked: {REASON_LABELS.get(str(r.get('decision_reason')), str(r.get('decision_reason')))}")
+            reason = str(r.get("entry_reason") or r.get("signal_reason") or "")
+            if reason:
+                st.caption(f"Reason: {reason}")
+
+            blocker = str(r.get("decision_reason") or "")
+            if blocker:
+                st.caption(f"Blockers: {blocker}")
+
+            weak = str(r.get("weak_reason") or "")
+            if weak:
+                st.caption(f"Weak: {weak}")
 
     with st.expander("Auto-archived / Dead candidates", expanded=False):
         if not dead_cards:
@@ -6766,7 +6761,7 @@ def page_archive():
         with cols[0]:
             st.subheader(base_sym)
             st.caption(f"Chain: {chain}")
-            st.code(base_addr, language="text")
+            st.code(str(base_addr or ""), language="text")
         with cols[1]:
             st.write(f"Archived: {ts_a or 'n/a'}")
             st.write(f"Reason: {reason or 'n/a'}")
@@ -7091,7 +7086,7 @@ def page_portfolio():
             else:
                 st.markdown("### " + symbol)
             st.caption(f"Chain: {chain} • DEX: {best.get('dexId','') if best else r.get('dex','')}")
-            st.code(base_addr, language="text")
+            st.code(str(base_addr or ""), language="text")
             if best and best.get("url"):
                 link_button("DexScreener", best.get("url", ""), use_container_width=True, key=f"p_ds_{idx}_{hkey(base_addr)}")
             elif r.get("dexscreener_url"):
