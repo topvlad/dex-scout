@@ -175,8 +175,7 @@ def save_smart_wallets(data: Dict[str, Any]):
 def _get_secret(name: str, default: str = "") -> str:
     # Streamlit secrets
     try:
-        if hasattr(st, "secrets") and name in st.secrets:
-            return str(st.secrets.get(name) or default)
+        return str(st.secrets.get(name) or default)
     except Exception:
         pass
     # Env fallback
@@ -4433,11 +4432,11 @@ def get_secret(name: str, default: str = "") -> str:
 
 
 def get_tg_token() -> str:
-    return get_secret("TELEGRAM_BOT_TOKEN", "")
+    return get_secret("TELEGRAM_BOT_TOKEN", "") or get_secret("TG_BOT_TOKEN", "")
 
 
 def get_tg_chat_id() -> str:
-    return get_secret("TELEGRAM_CHAT_ID", "")
+    return get_secret("TELEGRAM_CHAT_ID", "") or get_secret("TG_CHAT_ID", "")
 
 def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> bool:
     token = get_tg_token()
@@ -5616,7 +5615,22 @@ def run_scanner_once(limit: int = 50) -> List[Dict[str, Any]]:
         }
         return row
 
+    seen_token_keys: Set[Tuple[str, str]] = set()
+    deduped_tokens: List[Dict[str, Any]] = []
     for t in tokens:
+        t_chain = str(t.get("chain") or chain).strip().lower()
+        t_address = addr_store(t_chain, str(t.get("address") or "").strip())
+        t_symbol = str(t.get("symbol") or "").strip().lower()
+        dedupe_value = t_address or t_symbol
+        if not dedupe_value:
+            continue
+        key = (t_chain, dedupe_value)
+        if key in seen_token_keys:
+            continue
+        seen_token_keys.add(key)
+        deduped_tokens.append(t)
+
+    for t in deduped_tokens:
         row = build_row(t)
         if not row:
             continue
