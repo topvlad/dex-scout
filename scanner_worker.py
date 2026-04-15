@@ -2,7 +2,6 @@ import os
 os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
 
 import time
-import threading
 from typing import Optional
 
 import app
@@ -24,32 +23,7 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
             break
 
         try:
-            print("[worker] starting ingestion", flush=True)
-            print("[worker] BEFORE ingestion", flush=True)
-
-            result = {}
-
-            def run_ingest() -> None:
-                result["stats"] = app.run_full_ingestion_now(
-                    chain=SCAN_CHAIN,
-                    seeds_raw=SCANNER_SEEDS,
-                    max_items=SCANNER_MAX_ITEMS,
-                    use_birdeye_trending=USE_BIRDEYE_TRENDING,
-                    birdeye_limit=BIRDEYE_LIMIT,
-                )
-
-            t = threading.Thread(target=run_ingest)
-            t.start()
-            t.join(timeout=20)
-
-            if t.is_alive():
-                print("[worker] ingestion TIMEOUT", flush=True)
-                return
-
-            stats = result.get("stats")
-            print("[worker] AFTER ingestion", flush=True)
-            print(f"[worker] scan done: {stats}", flush=True)
-            print("[worker] ingestion finished", flush=True)
+            print("[worker] loading monitoring/portfolio", flush=True)
 
             monitoring_rows = app.load_monitoring()
             portfolio_rows = app.load_portfolio()
@@ -60,7 +34,6 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
                 if str(r.get("active", "1")).strip() == "1"
             ]
 
-            print("[worker] starting notifications", flush=True)
             print(
                 f"[worker] notifications called with "
                 f"{len(active_monitoring_rows)} monitoring + {len(active_portfolio_rows)} portfolio",
@@ -72,7 +45,6 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
                 active_portfolio_rows,
             )
             print("[worker] notifications processed", flush=True)
-            print("[worker] notifications finished", flush=True)
 
             if one_pass:
                 print("[worker] one_pass done", flush=True)

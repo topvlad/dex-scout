@@ -4545,14 +4545,11 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     if score <= 0 or risk == "UNKNOWN":
         return None
 
-    if action == "ENTRY_NOW" and risk in ("LOW", "MEDIUM"):
+    if action == "ENTRY_NOW" and risk in ("LOW", "MEDIUM", "HIGH"):
         return {"bucket": "ENTRY_NOW", "horizon": "0-30m", "action": "Entry now"}
 
-    if action == "WATCH_PULLBACK":
-        return {"bucket": "WATCH_PULLBACK", "horizon": "0-2h", "action": "Watch pullback"}
-
-    if action == "TRACK" and score >= 120:
-        return {"bucket": "TRACK", "horizon": "2-12h", "action": "Track only"}
+    if action in ("WATCH_PULLBACK", "TRACK", "EARLY") and score >= 90:
+        return {"bucket": "WATCH", "horizon": "0-12h", "action": "Watch"}
 
     return None
 
@@ -4672,7 +4669,12 @@ def run_auto_notifications(
     portfolio_rows: List[Dict[str, Any]],
 ) -> None:
     state = load_tg_state()
-    if not tg_cooldown_ok(state, seconds=1800):
+    cooldown_seconds = 60 if WORKER_FAST_MODE else 1800
+    if not tg_cooldown_ok(state, seconds=cooldown_seconds):
+        return
+
+    last_scan_ts = str(scan_state.get("last_run_ts") or "")
+    if state.get("last_scan_ts_processed") == last_scan_ts and not WORKER_FAST_MODE:
         return
 
     prev_token_state = state.get("token_state", {})
