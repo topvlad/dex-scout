@@ -78,7 +78,9 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
                 print("[worker] one_pass done", flush=True)
                 return
         except Exception as exc:
+            import traceback
             print(f"[worker] error: {type(exc).__name__}: {exc}", flush=True)
+            traceback.print_exc()
 
         sleep_for = max(300, SCAN_INTERVAL_SEC)
         slept = 0
