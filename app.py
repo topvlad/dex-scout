@@ -1645,9 +1645,9 @@ def suggested_position_size(row: Dict[str, Any], unified: Dict[str, Any]) -> str
 
     if action in ("ENTER NOW", "HOLD") and risk in ("LOW", "MEDIUM"):
         return "NORMAL"
-    if action in ("WATCH SMALL", "WAIT FOR PULLBACK"):
+    if action in ("WAIT FOR PULLBACK",):
         return "SMALL" if risk == "LOW" else "WATCH ONLY"
-    if action in ("WAIT", "WATCH CLOSELY"):
+    if action in ("TRACK ONLY", "WATCH CLOSELY", "WAIT"):
         return "WATCH ONLY"
     if action in ("REDUCE", "TAKE PROFIT", "EXIT", "NO ENTRY"):
         return "SKIP"
@@ -1666,7 +1666,7 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str) -> Dict[str
     trap_score = parse_float(row.get("trap_score", row.get("trap", 0)), 0.0)
     anti_rug = str(row.get("anti_rug") or row.get("safe") or "").upper()
     liquidity_health = str(row.get("liquidity_health") or "").upper()
-    final_action = "WAIT"
+    final_action = "TRACK ONLY"
     final_reason = "watch structure"
 
     if source == "portfolio":
@@ -1690,12 +1690,9 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str) -> Dict[str
         elif entry_action in ("ENTRY_NOW", "READY"):
             final_action, final_reason = "ENTER NOW", "setup is ready with momentum"
         elif entry_action in ("WATCH_PULLBACK", "EARLY"):
-            if risk == "LOW":
-                final_action, final_reason = "WATCH SMALL", "pullback entry preferred"
-            else:
-                final_action, final_reason = "WAIT FOR PULLBACK", "risk requires deeper pullback"
+            final_action, final_reason = "WAIT FOR PULLBACK", "pullback entry preferred"
         elif entry_action in ("TRACK", "WAIT", "WATCH"):
-            final_action, final_reason = "WAIT", "monitor without entry confirmation"
+            final_action, final_reason = "TRACK ONLY", "monitor without entry confirmation"
         else:
             final_action, final_reason = "NO ENTRY", "no actionable edge"
 
@@ -2893,10 +2890,13 @@ def portfolio_action_badge(action: str) -> str:
 
 
 def get_portfolio_entry_price(row: Dict[str, Any]) -> float:
-    for key in ("avg_entry_price", "entry_price", "entry_price_usd", "entry", "price_at_add"):
+    for key in ("avg_entry_price", "entry_price", "entry", "price_at_add"):
         val = parse_float(row.get(key), 0.0)
         if val > 0:
             return val
+    legacy_entry_usd = parse_float(row.get("entry_price_usd"), 0.0)
+    if legacy_entry_usd > 0:
+        return legacy_entry_usd
     return 0.0
 
 
@@ -3101,8 +3101,10 @@ PORTFOLIO_FIELDS = [
     "action",
     "tags",
     "entry_price_usd",
+    "avg_entry_price",
     "note",
     "active",
+    "updated_at",
 ]
 
 MON_FIELDS = [
@@ -7098,35 +7100,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         with st.expander(header, expanded=False):
             timing_label = unified.get("timing") or normalize_timing_label(item.get("timing_label") or r.get("timing_label") or "NEUTRAL")
             risk_label = str(item.get("risk_level", "UNKNOWN"))
+            final_reason = str(unified.get("final_reason", "n/a"))
             st.caption(
                 f"{chain.upper()} • timing {timing_label} • risk {risk_label} • status {secondary}"
             )
             st.markdown(f"**Recommendation: {primary}**")
-            st.caption(f"Reason: {unified.get('final_reason', 'n/a')}")
+            st.caption(f"Reason: {final_reason}")
             st.caption(f"Suggested size: {unified.get('size_hint', 'WATCH ONLY')}")
-            st.caption(f"score={score} risk={item.get('risk_level', 'UNKNOWN')}")
             if item.get("is_portfolio_active"):
                 st.caption("In portfolio • still monitored")
-            if r.get("toxic_flags"):
-                st.caption(f"Toxic: {r.get('toxic_flags')}")
-            flags = item.get("ui_flags") or []
-            st.caption("UI flags: " + (" • ".join(flags) if flags else "none"))
-            st.caption(
-                f"Raw score: {float(item.get('raw_live_score', 0.0)):.2f} • "
-                f"Penalty: -{float(item.get('ui_penalty', 0.0)):.2f} • "
-                f"Visible: {float(item.get('ui_visible_score', 0.0)):.2f}"
-            )
-            reason = str(r.get("entry_reason") or r.get("signal_reason") or "")
-            if reason:
-                st.caption(f"Reason: {reason}")
-
-            blocker = str(r.get("decision_reason") or "")
-            if blocker:
-                st.caption(f"Blockers: {blocker}")
-
-            weak = str(r.get("weak_reason") or "")
-            if weak:
-                st.caption(f"Weak: {weak}")
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -7153,49 +7135,41 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
             st.code(token_ca(r), language="text")
 
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.metric("Entry", item["entry"])
-            with m2:
-                st.metric("Timing", normalize_timing_label(item.get("timing_label", "NA")))
-            with m3:
-                st.metric("Risk", item["risk_level"])
-            with m4:
-                st.metric("Safe", item["anti_rug"].get("level", "UNKNOWN"))
-
-            p1, p2, p3 = st.columns(3)
-            with p1:
-                st.write(f"Size: {item['size_info'].get('size_label', 'NA')}")
-            with p2:
-                st.write(f"USD: ${float(item['size_info'].get('usd_size', 0) or 0):.2f}")
-            with p3:
-                st.write(f"TP: {r.get('tp_target_pct') or '25'}%")
-
             entry_now = parse_float(r.get("entry_now"), 0.0)
             pullback_1 = parse_float(r.get("pullback_1"), 0.0)
             pullback_2 = parse_float(r.get("pullback_2"), 0.0)
             invalidation = parse_float(r.get("invalidation"), 0.0)
             tp1 = parse_float(r.get("tp1"), 0.0)
             tp2 = parse_float(r.get("tp2"), 0.0)
-            horizon = str(r.get("entry_horizon") or "n/a")
+            with st.expander("Setup / levels", expanded=False):
+                if has_actionable_levels(r):
+                    st.write(f"entry_now: {entry_now}")
+                    st.write(f"pullback_1: {pullback_1}")
+                    st.write(f"pullback_2: {pullback_2}")
+                    st.write(f"invalidation: {invalidation}")
+                    st.write(f"tp1: {tp1}")
+                    st.write(f"tp2: {tp2}")
+                else:
+                    st.caption("setup: watch only")
 
-            if has_actionable_levels(r):
-                st.caption(
-                    f"Horizon: {horizon} • "
-                    f"Entry now: {entry_now} • "
-                    f"PB1: {pullback_1} • "
-                    f"PB2: {pullback_2} • "
-                    f"Invalidation: {invalidation} • "
-                    f"TP1: {tp1} • TP2: {tp2}"
-                )
-            else:
-                st.caption(f"Horizon: {horizon} • setup: watch only")
-
-            if item["entry_reasons"]:
-                st.info(" • ".join(item["entry_reasons"][:3]))
+            with st.expander("Diagnostics", expanded=False):
+                st.write(f"secondary/ui badge: {secondary}")
+                st.write(f"score: {parse_float(r.get('score', 0.0), 0.0):.2f}")
+                st.write(f"risk: {risk_label}")
+                st.write(f"raw score: {float(item.get('raw_live_score', 0.0)):.2f}")
+                st.write(f"penalty: {float(item.get('ui_penalty', 0.0)):.2f}")
+                st.write(f"visible score: {float(item.get('ui_visible_score', 0.0)):.2f}")
+                st.write(f"reason: {final_reason}")
+                st.write(f"weak flags: {str(r.get('weak_reason') or 'none')}")
+                flags = item.get("ui_flags") or []
+                st.write("ui flags: " + (" • ".join(flags) if flags else "none"))
+                blocker = str(r.get("decision_reason") or r.get("gate_reason") or r.get("gate_blocker") or "").strip()
+                if blocker:
+                    st.write(f"gate/blocker: {blocker}")
 
             hist = item.get("hist", []) or []
-            render_monitoring_sparklines(hist)
+            with st.expander("Dynamics", expanded=False):
+                render_monitoring_sparklines(hist)
 
     st.subheader("Priority watchlist")
     if not priority_cards:
@@ -7600,8 +7574,6 @@ def page_portfolio():
             if swap_url:
                 link_button("Swap", swap_url, use_container_width=True, key=f"p_sw_{idx}_{hkey(base_addr, chain)}")
 
-            st.caption(f"Model decision: {decision}")
-
         with c2:
             st.markdown(f"### {portfolio_action_badge(unified['final_action'])}")
             st.markdown(f"**Recommended action: {unified['final_action']}**")
@@ -7611,6 +7583,10 @@ def page_portfolio():
                 st.write(f"Entry: ${entry_price_str}")
                 st.write(f"Now: ${cur_price:.8f}" if cur_price else "Now: n/a")
                 st.write(f"PnL: {pnl:+.2f}%" if entry_price and cur_price else "PnL: n/a")
+                if entry_price > 0 and cur_price > 0:
+                    st.write(f"Δ vs entry: {cur_price - entry_price:+.10f}")
+                else:
+                    st.write("Δ vs entry: n/a")
                 st.write(f"Liq: {fmt_usd(liq)}" if best else "Liq: n/a")
                 st.write(f"Vol24: {fmt_usd(vol24)}" if best else "Vol24: n/a")
                 st.write(f"Vol5: {fmt_usd(vol5)}" if best else "Vol5: n/a")
