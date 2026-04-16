@@ -288,7 +288,7 @@ def health_head():
     return Response(status_code=200)
 
 
-@app.post("/tg/webhook")
+@app.post("/tg_webhook")
 async def tg_webhook(req: Request):
     try:
         data = await req.json()
@@ -382,6 +382,11 @@ async def tg_webhook(req: Request):
         print(f"[tg_webhook] error: {type(e).__name__}: {e}", flush=True)
 
     return {"ok": True}
+
+
+@app.post("/tg/webhook")
+async def tg_webhook_alias(req: Request):
+    return await tg_webhook(req)
 
 
 @app.get("/tg/summary")

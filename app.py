@@ -1637,6 +1637,98 @@ def normalize_timing_label(value: str) -> str:
     return mapping.get(t, "NEUTRAL")
 
 
+def monitoring_primary_decision(row: Dict[str, Any]) -> str:
+    action = str(row.get("entry_action") or row.get("entry") or row.get("entry_status") or "").upper()
+    score = parse_float(row.get("entry_score", 0), 0.0)
+    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+
+    if action in ("ENTRY_NOW", "READY"):
+        return "ENTER NOW"
+    if action in ("WATCH_PULLBACK", "EARLY"):
+        return "WATCH SMALL"
+    if action in ("TRACK", "WAIT", "WATCH"):
+        return "WAIT FOR PULLBACK"
+    if score <= 0 or risk == "HIGH":
+        return "NO ENTRY"
+    return "WAIT"
+
+
+def suggested_position_size(row: Dict[str, Any]) -> str:
+    action = str(row.get("entry_action") or row.get("entry") or "").upper()
+    risk = str(row.get("risk_level") or "UNKNOWN").upper()
+
+    if action in ("ENTRY_NOW", "READY") and risk == "LOW":
+        return "NORMAL"
+    if action in ("WATCH_PULLBACK", "EARLY") and risk in ("LOW", "MEDIUM"):
+        return "SMALL"
+    if action in ("TRACK", "WAIT"):
+        return "WATCH ONLY"
+    return "SKIP"
+
+
+def is_in_portfolio_active(row: Dict[str, Any], portfolio_rows: List[Dict[str, Any]]) -> bool:
+    chain = str(row.get("chain") or "").strip().lower()
+    addr = str(row.get("base_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
+    if not chain or not addr:
+        return False
+
+    key = f"{chain}:{addr}"
+    for p in portfolio_rows:
+        if str(p.get("active", "1")).strip() != "1":
+            continue
+        p_chain = str(p.get("chain") or "").strip().lower()
+        p_addr = str(
+            p.get("base_token_address")
+            or p.get("base_addr")
+            or p.get("pair_address")
+            or p.get("pairAddress")
+            or ""
+        ).strip()
+        if f"{p_chain}:{p_addr}" == key:
+            return True
+    return False
+
+
+def build_history_series(hist: List[Dict[str, Any]]) -> Dict[str, List[float]]:
+    return {
+        "price": [parse_float(h.get("price_usd"), 0.0) for h in hist if str(h.get("price_usd", "")).strip()],
+        "score": [parse_float(h.get("last_score"), 0.0) for h in hist if str(h.get("last_score", "")).strip()],
+        "entry_score": [parse_float(h.get("entry_score"), 0.0) for h in hist if str(h.get("entry_score", "")).strip()],
+        "liq": [parse_float(h.get("liq_usd"), 0.0) for h in hist if str(h.get("liq_usd", "")).strip()],
+        "vol5": [parse_float(h.get("vol5"), 0.0) for h in hist if str(h.get("vol5", "")).strip()],
+        "vol24": [parse_float(h.get("vol24"), 0.0) for h in hist if str(h.get("vol24", "")).strip()],
+    }
+
+
+def render_monitoring_sparklines(hist: List[Dict[str, Any]]) -> None:
+    series = build_history_series(hist)
+    valid = {k: [x for x in v if x > 0] for k, v in series.items()}
+
+    enough = sum(1 for v in valid.values() if len(v) >= 3)
+    if enough == 0:
+        st.caption("Not enough history yet.")
+        return
+
+    st.caption("Dynamics (sparklines)")
+    cols = st.columns(3)
+    items = [
+        ("Price", valid["price"]),
+        ("Score", valid["score"] or valid["entry_score"]),
+        ("Liquidity", valid["liq"]),
+        ("Vol24", valid["vol24"]),
+        ("Vol5", valid["vol5"]),
+    ]
+
+    idx = 0
+    for label, values in items:
+        if len(values) < 3:
+            continue
+        with cols[idx % 3]:
+            st.caption(label)
+            st.line_chart(pd.DataFrame({"value": values}), height=100)
+        idx += 1
+
+
 def has_actionable_levels(row: Dict[str, Any]) -> bool:
     return any(
         [
@@ -4840,7 +4932,7 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
         f"horizon: {horizon}\n"
         f"reason: {reason}\n"
         f"{levels_block}\n\n"
-        f"CA:\n<pre>{addr}</pre>"
+        f"CA:\n<code>{addr}</code>"
     )
 
 
@@ -6832,6 +6924,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     cards_raw = [monitoring_row_to_card(r) for r in active]
     cards_all = []
+    portfolio_rows = load_portfolio()
     for c in cards_raw:
         ui = monitoring_ui_state(c)
         c["ui_bucket"] = ui["bucket"]
@@ -6841,12 +6934,25 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         c["ui_badge"] = ui["badge"]
         cards_all.append(c)
 
-    signals_cards = [c for c in cards_all if c["ui_bucket"] in ("tradable", "caution")]
-    review_cards = [c for c in cards_all if c["ui_bucket"] == "review"]
+    priority_cards: List[Dict[str, Any]] = []
+    portfolio_linked_cards: List[Dict[str, Any]] = []
+    review_cards: List[Dict[str, Any]] = []
     dead_cards = [c for c in cards_all if c["ui_bucket"] == "dead"]
-    promoted_review = [c for c in review_cards if float(c.get("ui_visible_score", 0)) >= 60]
-    signals_cards.extend(promoted_review)
-    review_cards = [c for c in review_cards if float(c.get("ui_visible_score", 0)) < 90]
+
+    for c in cards_all:
+        if c.get("ui_bucket") == "dead":
+            continue
+        row = c.get("row", {})
+        in_pf = is_in_portfolio_active(row, portfolio_rows)
+        c["is_portfolio_active"] = in_pf
+        weak_score = float(c.get("ui_visible_score", 0.0)) < 90
+        is_review = str(c.get("ui_badge", "")).upper() == "REVIEW" or c.get("ui_bucket") == "review" or weak_score
+        if in_pf:
+            portfolio_linked_cards.append(c)
+        elif is_review:
+            review_cards.append(c)
+        else:
+            priority_cards.append(c)
 
     def render_dedupe(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         best_by_symbol: Dict[str, Dict[str, Any]] = {}
@@ -6860,19 +6966,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 best_by_symbol[sym] = c
         return list(best_by_symbol.values())
 
-    signals_cards = render_dedupe(signals_cards)
+    priority_cards = render_dedupe(priority_cards)
+    portfolio_linked_cards = render_dedupe(portfolio_linked_cards)
     review_cards = render_dedupe(review_cards)
-    signals_cards.sort(key=lambda x: x["ui_visible_score"], reverse=True)
+    priority_cards.sort(key=lambda x: x["ui_visible_score"], reverse=True)
+    portfolio_linked_cards.sort(key=lambda x: x["ui_visible_score"], reverse=True)
     review_cards.sort(key=lambda x: x["ui_visible_score"], reverse=True)
 
-    top_cards = sorted(cards_all, key=lambda x: float(x.get("ui_visible_score", 0.0)), reverse=True)
-
-
-    st.subheader("Signals / Watchlist")
-    if not signals_cards:
-        st.info("No items in Signals / Watchlist yet.")
-
-    for item in signals_cards:
+    def render_monitoring_card(item: Dict[str, Any]) -> None:
         r = item["row"]
         best = item["best"]
         chain = token_chain(r)
@@ -6880,21 +6981,22 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         sym = extract_name(r).upper()
         name = sym if sym not in {"", "UNKNOWN"} else "UNKNOWN"
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
-        decision = item["decision"]
-        entry_status = str(item.get("entry_status", "UNKNOWN")).upper()
-        header = f"{name} | {item.get('ui_badge', 'NA')} | {entry_status} | {score:.2f}"
+        primary = monitoring_primary_decision(r)
+        secondary = item.get("ui_badge", "INFO")
+        header = f"{name} | {primary} | {score:.2f}"
 
         with st.expander(header, expanded=False):
-            decision_label = str(item.get("decision") or item.get("entry_status") or "UNKNOWN")
-            timing_label = normalize_timing_label(item.get("timing_label") or r.get("timing_label") or "")
+            timing_label = normalize_timing_label(item.get("timing_label") or r.get("timing_label") or "NEUTRAL")
+            risk_label = str(item.get("risk_level", "UNKNOWN"))
             st.caption(
-                f"{chain.upper()} • decision {decision_label} • timing {timing_label} • risk {item.get('risk_level', 'UNKNOWN')}"
+                f"{chain.upper()} • {primary} • timing {timing_label} • risk {risk_label}"
             )
+            st.markdown(f"**Recommendation: {primary}**")
+            st.caption(f"Suggested size: {suggested_position_size(r)}")
+            st.caption(f"Secondary: {secondary}")
             st.caption(f"score={score} risk={item.get('risk_level', 'UNKNOWN')}")
-            if str(r.get("in_portfolio", "0")) == "1":
-                st.caption("🧺 Already in portfolio")
-            if str(r.get("portfolio_linked", "0")) == "1":
-                st.caption(r.get("note") or "IN PORTFOLIO")
+            if item.get("is_portfolio_active"):
+                st.caption("In portfolio • still monitored")
             if r.get("toxic_flags"):
                 st.caption(f"Toxic: {r.get('toxic_flags')}")
             flags = item.get("ui_flags") or []
@@ -6936,7 +7038,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     elif res == "NO_LIVE_PAIR":
                         st.error("No live pool found.")
                     else:
-                        st.info("Already in portfolio.")
+                        st.caption("In portfolio • still monitored")
                         request_rerun()
 
             st.code(token_ca(r), language="text")
@@ -6983,68 +7085,25 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.info(" • ".join(item["entry_reasons"][:3]))
 
             hist = item.get("hist", []) or []
+            render_monitoring_sparklines(hist)
 
-            price_series = [
-                parse_float(h.get("price_usd"), 0.0)
-                for h in hist
-                if str(h.get("price_usd", "")).strip()
-            ]
+    st.subheader("Priority watchlist")
+    if not priority_cards:
+        st.info("No items in priority watchlist yet.")
+    for item in priority_cards:
+        render_monitoring_card(item)
 
-            score_series = [
-                parse_float(h.get("last_score"), 0.0)
-                for h in hist
-                if str(h.get("last_score", "")).strip()
-            ]
-
-            entry_series = [
-                parse_float(h.get("entry_score"), 0.0)
-                for h in hist
-                if str(h.get("entry_score", "")).strip()
-            ]
-
-            series = [x for x in price_series if x > 0]
-            if len(series) < 3:
-                series = [x for x in score_series if x > 0]
-            if len(series) < 3:
-                series = [x for x in entry_series if x > 0]
-
-            if len(series) >= 3:
-                st.line_chart(pd.DataFrame({"value": series}), height=120)
-            else:
-                st.caption("Not enough history yet.")
+    st.subheader("Portfolio-linked monitoring")
+    if not portfolio_linked_cards:
+        st.caption("No portfolio-linked monitoring tokens.")
+    for item in portfolio_linked_cards:
+        render_monitoring_card(item)
 
     st.subheader("Needs review")
     if not review_cards:
         st.caption("No review candidates.")
     for item in review_cards:
-        r = item["row"]
-        chain = (r.get("chain") or "").strip().lower()
-        name = extract_name(r).upper()
-        decision = item["decision"]
-        score = round(float(item.get("ui_visible_score", 0.0)), 2)
-        with st.expander(f"{name} | {item.get('ui_badge', 'REVIEW')} | {decision} | {score:.2f}", expanded=False):
-            st.caption(f"{chain.upper()} • entry {item.get('entry_status', 'UNKNOWN')} • risk {item.get('risk_level', 'UNKNOWN')}")
-            st.caption(f"score={score} risk={item.get('risk_level', 'UNKNOWN')}")
-            if r.get("toxic_flags"):
-                st.caption(f"Toxic: {r.get('toxic_flags')}")
-            flags = item.get("ui_flags") or []
-            st.caption("UI flags: " + (" • ".join(flags) if flags else "none"))
-            st.caption(
-                f"Raw score: {float(item.get('raw_live_score', 0.0)):.2f} • "
-                f"Penalty: -{float(item.get('ui_penalty', 0.0)):.2f} • "
-                f"Visible: {float(item.get('ui_visible_score', 0.0)):.2f}"
-            )
-            reason = str(r.get("entry_reason") or r.get("signal_reason") or "")
-            if reason:
-                st.caption(f"Reason: {reason}")
-
-            blocker = str(r.get("decision_reason") or "")
-            if blocker:
-                st.caption(f"Blockers: {blocker}")
-
-            weak = str(r.get("weak_reason") or "")
-            if weak:
-                st.caption(f"Weak: {weak}")
+        render_monitoring_card(item)
 
     with st.expander("Auto-archived / Dead candidates", expanded=False):
         if not dead_cards:
@@ -7425,19 +7484,25 @@ def page_portfolio():
             st.markdown(action_badge(decision), unsafe_allow_html=True)
 
         with c2:
-            st.write(f"Score: {s_live:.2f}" if best else f"Score: {r.get('score','n/a')}")
-            st.write(f"Entry: ${entry_price_str}")
-            st.write(f"Now: ${cur_price:.8f}" if cur_price else "Now: n/a")
-            st.write(f"PnL: {pnl:+.2f}%" if entry_price and cur_price else "PnL: n/a")
-            st.write(f"Liq: {fmt_usd(liq)}" if best else "Liq: n/a")
-            st.write(f"Vol24: {fmt_usd(vol24)}" if best else "Vol24: n/a")
+            st.markdown(f"### Recommended action: {action_plan['action_label']}")
+            st.caption(f"Exit signal: {level}")
+            st.caption(f"Liquidity health: {liq_health['level']}")
+            st.caption(f"Anti-rug: {anti_rug['level']}")
+            with st.expander("Market / position metrics", expanded=False):
+                st.write(f"Score: {s_live:.2f}" if best else f"Score: {r.get('score','n/a')}")
+                st.write(f"Entry: ${entry_price_str}")
+                st.write(f"Now: ${cur_price:.8f}" if cur_price else "Now: n/a")
+                st.write(f"PnL: {pnl:+.2f}%" if entry_price and cur_price else "PnL: n/a")
+                st.write(f"Liq: {fmt_usd(liq)}" if best else "Liq: n/a")
+                st.write(f"Vol24: {fmt_usd(vol24)}" if best else "Vol24: n/a")
+                st.write(f"Vol5: {fmt_usd(vol5)}" if best else "Vol5: n/a")
+                st.write(f"Δ m5: {fmt_pct(pc5)}")
+                st.write(f"Δ h1: {fmt_pct(pc1h)}")
+                st.write(f"Strength: {strength_cls} ({strength_score:.1f})")
+                st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
 
         with c3:
-            st.write(f"Vol5: {fmt_usd(vol5)}" if best else "Vol5: n/a")
-            st.write(f"Δ m5: {fmt_pct(pc5)}")
-            st.write(f"Δ h1: {fmt_pct(pc1h)}")
-            st.write(f"Reco: {reco}")
-            st.write(f"Strength: {strength_cls} ({strength_score:.1f})")
+            st.write(f"Reco model: {reco}")
             if strength_cls == "WEAK":
                 st.caption("⚠ weak position – candidate for rotation")
                 if base_sym in weak_rotation_symbols:
@@ -7445,38 +7510,35 @@ def page_portfolio():
                     if best_strong:
                         rotate_to = best_strong.get("base_symbol") or best_strong.get("symbol") or "?"
                         st.caption(f"→ rotate into {rotate_to}")
-            st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
-            st.write(f"Exit signal: {level}")
-            st.write(f"Recommended action: {action_plan['action_label']}")
-            st.write(f"Liquidity health: {liq_health['level']}")
-            st.write(f"Anti-rug: {anti_rug['level']} ({anti_rug['score']})")
-            for rr in explain_reco(reco, liq_health, anti_rug, exit_signal):
-                st.caption(f"– {rr}")
-            for f in anti_rug.get("flags", [])[:4]:
-                st.caption(f"– {f}")
-            if anti_rug["level"] == "CRITICAL":
-                st.error("early rug risk – exit")
-            elif anti_rug["level"] == "WARNING":
-                st.warning("rug risk building – reduce/watch")
-            if liq_health["level"] == "DEAD":
-                st.error("☠ liquidity dead – pool practically unusable")
-            elif liq_health["level"] == "CRITICAL":
-                st.error("🔴 liquidity critical – exit immediately")
-            elif liq_health["level"] == "WEAK":
-                st.warning("⚠ liquidity weak – reduce risk")
-            for fl in liq_health.get("flags", []):
-                st.caption(f"– {fl}")
-            if level in ("EXIT", "EARLY"):
-                if level == "EXIT":
-                    st.error(f"{level} ({exit_signal.get('exit_score', 0)})")
-                else:
-                    st.warning(f"{level} ({exit_signal.get('exit_score', 0)})")
-                for f in exit_signal.get("exit_flags", [])[:3]:
+            with st.expander("Risk diagnostics", expanded=False):
+                st.write(f"Anti-rug score: {anti_rug['score']}")
+                for rr in explain_reco(reco, liq_health, anti_rug, exit_signal):
+                    st.caption(f"– {rr}")
+                for f in anti_rug.get("flags", [])[:4]:
                     st.caption(f"– {f}")
-                st.caption(
-                    f"Persistence: exit_hits={persistence.get('exit_hits', 0)}, "
-                    f"early_hits={persistence.get('early_hits', 0)}"
-                )
+                if anti_rug["level"] == "CRITICAL":
+                    st.error("early rug risk – exit")
+                elif anti_rug["level"] == "WARNING":
+                    st.warning("rug risk building – reduce/watch")
+                if liq_health["level"] == "DEAD":
+                    st.error("☠ liquidity dead – pool practically unusable")
+                elif liq_health["level"] == "CRITICAL":
+                    st.error("🔴 liquidity critical – exit immediately")
+                elif liq_health["level"] == "WEAK":
+                    st.warning("⚠ liquidity weak – reduce risk")
+                for fl in liq_health.get("flags", []):
+                    st.caption(f"– {fl}")
+                if level in ("EXIT", "EARLY"):
+                    if level == "EXIT":
+                        st.error(f"{level} ({exit_signal.get('exit_score', 0)})")
+                    else:
+                        st.warning(f"{level} ({exit_signal.get('exit_score', 0)})")
+                    for f in exit_signal.get("exit_flags", [])[:3]:
+                        st.caption(f"– {f}")
+                    st.caption(
+                        f"Persistence: exit_hits={persistence.get('exit_hits', 0)}, "
+                        f"early_hits={persistence.get('early_hits', 0)}"
+                    )
             note_key = f"note_{idx}_{hkey(base_addr, chain)}"
             note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
 
