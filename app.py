@@ -1672,6 +1672,8 @@ def _series_is_flat(values: List[float], rel_eps: float = 0.01, abs_eps: float =
 
 
 def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> Dict[str, Any]:
+    grace_age_min = 45.0
+    grace_hist_points = 4
     liq_usd = _float_from_any(row, ["liq_usd", "liquidity", "liquidity_usd"], 0.0)
     vol5 = _float_from_any(row, ["vol5", "vol5_usd", "volume_m5", "volume5"], 0.0)
     vol24 = _float_from_any(row, ["vol24", "vol24_usd", "volume_h24", "volume24"], 0.0)
@@ -1682,7 +1684,7 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
     if vol24 <= 0:
         vol24 = _float_from_any(row, ["volume_h24_usd"], 0.0)
 
-    dead_flags = [
+    explicit_dead_flags = [
         str(row.get("dead_flag") or "").strip().lower() in ("1", "true", "yes"),
         str(row.get("is_dead") or "").strip().lower() in ("1", "true", "yes"),
         str(row.get("rug_flag") or "").strip().lower() in ("1", "true", "yes"),
@@ -1690,11 +1692,17 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
         str(row.get("liquidity_health") or "").strip().upper() in ("DEAD", "CRITICAL"),
         str(row.get("anti_rug") or "").strip().upper() == "CRITICAL",
     ]
-    is_dead = any(dead_flags) or (price <= 0 and liq_usd <= 0 and vol24 <= 0)
+    explicit_dead_rug = any(explicit_dead_flags)
+    is_dead = explicit_dead_rug or (price <= 0 and liq_usd <= 0 and vol24 <= 0)
 
     low_liq_threshold = 1000.0
     is_low_liq = liq_usd < low_liq_threshold
 
+    ts_added = (
+        parse_ts(row.get("ts_added"))
+        or parse_ts(row.get("added_at"))
+        or parse_ts(row.get("created_at"))
+    )
     latest_ts = parse_ts(row.get("updated_at")) or parse_ts(row.get("ts_utc"))
     hist_times: List[datetime] = []
     for h in hist or []:
@@ -1705,8 +1713,21 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
         latest_hist_ts = max(hist_times)
         if latest_ts is None or latest_hist_ts > latest_ts:
             latest_ts = latest_hist_ts
+    first_hist_ts = min(hist_times) if hist_times else None
+    position_origin_ts = ts_added or first_hist_ts or latest_ts
+    position_age_min = (
+        (datetime.utcnow() - position_origin_ts).total_seconds() / 60.0
+        if position_origin_ts
+        else 10_000.0
+    )
+    hist_points = len(hist_times)
+    insufficient_history = hist_points < grace_hist_points
+    young_position = position_age_min < grace_age_min
+    health_grace_applied = bool(young_position and insufficient_history and not explicit_dead_rug)
     age_min = (datetime.utcnow() - latest_ts).total_seconds() / 60.0 if latest_ts else 10_000.0
     is_stale = age_min >= 240.0
+    if health_grace_applied:
+        is_stale = False
 
     price_hist = [parse_float(h.get("price_usd", h.get("priceUsd", 0)), 0.0) for h in hist or []]
     liq_hist = [parse_float(h.get("liq_usd", h.get("liquidity", 0)), 0.0) for h in hist or []]
@@ -1720,6 +1741,8 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
     flat_vol5 = _series_is_flat(vol5_hist, rel_eps=0.05) if vol5_hist else False
     all_flat_recent = all([flat_price or not price_hist, flat_liq or not liq_hist, flat_vol24 or not vol24_hist, flat_vol5 or not vol5_hist])
     is_cold = bool(near_zero or all_flat_recent)
+    if health_grace_applied and is_cold:
+        is_cold = False
 
     no_recent_flow = (liq_usd <= 0 or is_low_liq) and vol24 < 10 and vol5 <= 0
     is_untradeable = bool(is_dead or (is_stale and is_cold) or no_recent_flow)
@@ -1747,10 +1770,12 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
 
     return {
         "is_dead": is_dead,
+        "explicit_dead_rug": explicit_dead_rug,
         "is_stale": is_stale,
         "is_cold": is_cold,
         "is_low_liq": is_low_liq,
         "is_untradeable": is_untradeable,
+        "health_grace_applied": health_grace_applied,
         "health_label": health_label,
         "health_reason": health_reason,
         "liq_usd": liq_usd,
@@ -1758,6 +1783,8 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
         "vol5": vol5,
         "price": price,
         "snapshot_age_min": age_min,
+        "position_age_min": position_age_min,
+        "history_points": hist_points,
     }
 
 
@@ -1791,12 +1818,23 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str, hist: Optio
         else:
             final_action, final_reason = "HOLD", "position still within hold conditions"
 
+        grace_mode = bool(health.get("health_grace_applied"))
+        has_explicit_dead_rug = bool(health.get("explicit_dead_rug"))
         if health.get("is_dead"):
-            final_action, final_reason = "EXIT", "Token appears dead / non-tradeable"
+            if grace_mode and not has_explicit_dead_rug:
+                final_action, final_reason = "REDUCE", "Grace mode: early weak data, reduce risk instead of full exit"
+            else:
+                final_action, final_reason = "EXIT", "Token appears dead / non-tradeable"
         elif health.get("is_untradeable"):
-            final_action, final_reason = "EXIT", str(health.get("health_reason") or "Position is not tradeable")
+            if grace_mode and not has_explicit_dead_rug:
+                final_action, final_reason = "WATCH CLOSELY", "Grace mode: insufficient history, monitor before forcing exit"
+            else:
+                final_action, final_reason = "EXIT", str(health.get("health_reason") or "Position is not tradeable")
         elif health.get("is_stale") and health.get("is_cold"):
-            final_action, final_reason = "EXIT", "Position is stale and cold"
+            if grace_mode and not has_explicit_dead_rug:
+                final_action, final_reason = "WATCH CLOSELY", "Grace mode: freshly added position with limited history"
+            else:
+                final_action, final_reason = "EXIT", "Position is stale and cold"
         elif health.get("is_low_liq") and health.get("is_cold"):
             final_action, final_reason = "REDUCE", "Liquidity collapsed / weak exit conditions"
     else:
@@ -7767,6 +7805,11 @@ def page_portfolio():
                     f"Health flags: dead={bool(health.get('is_dead'))}, "
                     f"stale={bool(health.get('is_stale'))}, cold={bool(health.get('is_cold'))}, "
                     f"low_liq={bool(health.get('is_low_liq'))}, untradeable={bool(health.get('is_untradeable'))}"
+                )
+                st.write(
+                    f"Health grace mode: applied={bool(health.get('health_grace_applied'))}, "
+                    f"position_age_min={parse_float(health.get('position_age_min', 0), 0.0):.1f}, "
+                    f"history_points={int(parse_float(health.get('history_points', 0), 0.0))}"
                 )
                 st.write(
                     f"Health checks: liq={fmt_usd(parse_float(health.get('liq_usd', 0), 0.0))}, "
