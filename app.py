@@ -1654,7 +1654,115 @@ def suggested_position_size(row: Dict[str, Any], unified: Dict[str, Any]) -> str
     return "WATCH ONLY"
 
 
-def compute_unified_recommendation(row: Dict[str, Any], source: str) -> Dict[str, Any]:
+def _float_from_any(data: Dict[str, Any], keys: List[str], default: float = 0.0) -> float:
+    for k in keys:
+        if k in data and str(data.get(k, "")).strip() != "":
+            return parse_float(data.get(k), default)
+    return default
+
+
+def _series_is_flat(values: List[float], rel_eps: float = 0.01, abs_eps: float = 1e-12) -> bool:
+    if len(values) < 3:
+        return False
+    tail = values[-6:]
+    vmax = max(tail)
+    vmin = min(tail)
+    span = vmax - vmin
+    baseline = max(abs(vmax), abs(vmin), abs_eps)
+    return span <= max(abs_eps, baseline * rel_eps)
+
+
+def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> Dict[str, Any]:
+    liq_usd = _float_from_any(row, ["liq_usd", "liquidity", "liquidity_usd"], 0.0)
+    vol5 = _float_from_any(row, ["vol5", "vol5_usd", "volume_m5", "volume5"], 0.0)
+    vol24 = _float_from_any(row, ["vol24", "vol24_usd", "volume_h24", "volume24"], 0.0)
+    price = _float_from_any(row, ["priceUsd", "price_usd", "price"], 0.0)
+
+    if liq_usd <= 0:
+        liq_usd = _float_from_any(row, ["liq"], 0.0)
+    if vol24 <= 0:
+        vol24 = _float_from_any(row, ["volume_h24_usd"], 0.0)
+
+    dead_flags = [
+        str(row.get("dead_flag") or "").strip().lower() in ("1", "true", "yes"),
+        str(row.get("is_dead") or "").strip().lower() in ("1", "true", "yes"),
+        str(row.get("rug_flag") or "").strip().lower() in ("1", "true", "yes"),
+        str(row.get("rugged") or "").strip().lower() in ("1", "true", "yes"),
+        str(row.get("liquidity_health") or "").strip().upper() in ("DEAD", "CRITICAL"),
+        str(row.get("anti_rug") or "").strip().upper() == "CRITICAL",
+    ]
+    is_dead = any(dead_flags) or (price <= 0 and liq_usd <= 0 and vol24 <= 0)
+
+    low_liq_threshold = 1000.0
+    is_low_liq = liq_usd < low_liq_threshold
+
+    latest_ts = parse_ts(row.get("updated_at")) or parse_ts(row.get("ts_utc"))
+    hist_times: List[datetime] = []
+    for h in hist or []:
+        hts = parse_ts(h.get("ts_utc")) or parse_ts(h.get("updated_at"))
+        if hts:
+            hist_times.append(hts)
+    if hist_times:
+        latest_hist_ts = max(hist_times)
+        if latest_ts is None or latest_hist_ts > latest_ts:
+            latest_ts = latest_hist_ts
+    age_min = (datetime.utcnow() - latest_ts).total_seconds() / 60.0 if latest_ts else 10_000.0
+    is_stale = age_min >= 240.0
+
+    price_hist = [parse_float(h.get("price_usd", h.get("priceUsd", 0)), 0.0) for h in hist or []]
+    liq_hist = [parse_float(h.get("liq_usd", h.get("liquidity", 0)), 0.0) for h in hist or []]
+    vol24_hist = [parse_float(h.get("vol24", h.get("vol24_usd", 0)), 0.0) for h in hist or []]
+    vol5_hist = [parse_float(h.get("vol5", h.get("vol5_usd", 0)), 0.0) for h in hist or []]
+
+    near_zero = (vol24 < 100.0 and vol5 <= 0.0) or (liq_usd <= 0 and vol24 <= 0 and vol5 <= 0)
+    flat_price = _series_is_flat(price_hist, rel_eps=0.003) if price_hist else False
+    flat_liq = _series_is_flat(liq_hist, rel_eps=0.01) if liq_hist else False
+    flat_vol24 = _series_is_flat(vol24_hist, rel_eps=0.05) if vol24_hist else False
+    flat_vol5 = _series_is_flat(vol5_hist, rel_eps=0.05) if vol5_hist else False
+    all_flat_recent = all([flat_price or not price_hist, flat_liq or not liq_hist, flat_vol24 or not vol24_hist, flat_vol5 or not vol5_hist])
+    is_cold = bool(near_zero or all_flat_recent)
+
+    no_recent_flow = (liq_usd <= 0 or is_low_liq) and vol24 < 10 and vol5 <= 0
+    is_untradeable = bool(is_dead or (is_stale and is_cold) or no_recent_flow)
+
+    health_label = "OK"
+    health_reason = "market activity looks tradable"
+    if is_dead:
+        health_label = "DEAD"
+        health_reason = "dead/rug flags or no price-liquidity-volume activity"
+    elif is_untradeable:
+        health_label = "UNTRADEABLE"
+        health_reason = "no liquidity and no recent flow"
+    elif is_stale and is_cold:
+        health_label = "STALE"
+        health_reason = "snapshots stale and history cold"
+    elif is_cold:
+        health_label = "COLD"
+        health_reason = "recent history is flat / inactive"
+    elif is_low_liq:
+        health_label = "LOW_LIQ"
+        health_reason = "liquidity below safety threshold"
+    elif is_stale:
+        health_label = "STALE"
+        health_reason = "latest snapshot is too old"
+
+    return {
+        "is_dead": is_dead,
+        "is_stale": is_stale,
+        "is_cold": is_cold,
+        "is_low_liq": is_low_liq,
+        "is_untradeable": is_untradeable,
+        "health_label": health_label,
+        "health_reason": health_reason,
+        "liq_usd": liq_usd,
+        "vol24": vol24,
+        "vol5": vol5,
+        "price": price,
+        "snapshot_age_min": age_min,
+    }
+
+
+def compute_unified_recommendation(row: Dict[str, Any], source: str, hist: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     source = str(source or "monitoring").strip().lower()
     entry_action = str(row.get("entry_action") or row.get("entry") or "").upper()
     entry_score = parse_float(row.get("entry_score", row.get("score", 0)), 0.0)
@@ -1668,6 +1776,7 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str) -> Dict[str
     liquidity_health = str(row.get("liquidity_health") or "").upper()
     final_action = "TRACK ONLY"
     final_reason = "watch structure"
+    health = detect_position_health(row, hist or [])
 
     if source == "portfolio":
         if reco_model.startswith("CLOSE") or exit_signal in ("EXIT", "CLOSE", "SELL"):
@@ -1682,6 +1791,15 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str) -> Dict[str
             final_action, final_reason = "WATCH CLOSELY", "trap pressure detected"
         else:
             final_action, final_reason = "HOLD", "position still within hold conditions"
+
+        if health.get("is_dead"):
+            final_action, final_reason = "EXIT", "Token appears dead / non-tradeable"
+        elif health.get("is_untradeable"):
+            final_action, final_reason = "EXIT", str(health.get("health_reason") or "Position is not tradeable")
+        elif health.get("is_stale") and health.get("is_cold"):
+            final_action, final_reason = "EXIT", "Position is stale and cold"
+        elif health.get("is_low_liq") and health.get("is_cold"):
+            final_action, final_reason = "REDUCE", "Liquidity collapsed / weak exit conditions"
     else:
         weak = str(row.get("weak_reason") or "").strip().lower()
         score = parse_float(row.get("score", entry_score), 0.0)
@@ -1716,6 +1834,7 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str) -> Dict[str
         "size_hint": "WATCH ONLY",
         "regime": source,
         "confidence": confidence,
+        "health": health,
     }
     unified["size_hint"] = suggested_position_size(row, unified)
 
@@ -7143,29 +7262,45 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             tp2 = parse_float(r.get("tp2"), 0.0)
             with st.expander("Setup / levels", expanded=False):
                 if has_actionable_levels(r):
-                    st.write(f"entry_now: {entry_now}")
-                    st.write(f"pullback_1: {pullback_1}")
-                    st.write(f"pullback_2: {pullback_2}")
-                    st.write(f"invalidation: {invalidation}")
-                    st.write(f"tp1: {tp1}")
-                    st.write(f"tp2: {tp2}")
+                    level_rows = []
+                    for lbl, val in [
+                        ("entry_now", entry_now),
+                        ("pullback_1", pullback_1),
+                        ("pullback_2", pullback_2),
+                        ("invalidation", invalidation),
+                        ("tp1", tp1),
+                        ("tp2", tp2),
+                    ]:
+                        if val > 0:
+                            level_rows.append({"level": lbl, "value": val})
+                    if level_rows:
+                        st.table(pd.DataFrame(level_rows))
+                    else:
+                        st.caption("setup: watch only")
                 else:
                     st.caption("setup: watch only")
 
             with st.expander("Diagnostics", expanded=False):
-                st.write(f"secondary/ui badge: {secondary}")
-                st.write(f"score: {parse_float(r.get('score', 0.0), 0.0):.2f}")
+                st.markdown("**Engine snapshot**")
                 st.write(f"risk: {risk_label}")
-                st.write(f"raw score: {float(item.get('raw_live_score', 0.0)):.2f}")
-                st.write(f"penalty: {float(item.get('ui_penalty', 0.0)):.2f}")
+                st.write(f"timing: {timing_label}")
+                st.write(f"status/ui badge: {secondary}")
                 st.write(f"visible score: {float(item.get('ui_visible_score', 0.0)):.2f}")
-                st.write(f"reason: {final_reason}")
-                st.write(f"weak flags: {str(r.get('weak_reason') or 'none')}")
-                flags = item.get("ui_flags") or []
-                st.write("ui flags: " + (" • ".join(flags) if flags else "none"))
                 blocker = str(r.get("decision_reason") or r.get("gate_reason") or r.get("gate_blocker") or "").strip()
                 if blocker:
                     st.write(f"gate/blocker: {blocker}")
+                debug_mode = bool(st.session_state.get("debug_mode", False) or st.session_state.get("show_debug_raw", False))
+                if debug_mode:
+                    st.markdown("**Raw internals**")
+                    st.write(f"raw score: {float(item.get('raw_live_score', 0.0)):.2f}")
+                    st.write(f"penalty: {float(item.get('ui_penalty', 0.0)):.2f}")
+                    st.write(f"score(raw row): {parse_float(r.get('score', 0.0), 0.0):.2f}")
+                    st.write(f"reason: {final_reason}")
+                    st.write(f"weak flags: {str(r.get('weak_reason') or 'none')}")
+                    flags = item.get("ui_flags") or []
+                    st.write("ui flags: " + (" • ".join(flags) if flags else "none"))
+                else:
+                    st.caption("Raw internals hidden (debug mode only).")
 
             hist = item.get("hist", []) or []
             with st.expander("Dynamics", expanded=False):
@@ -7545,9 +7680,26 @@ def page_portfolio():
                 "anti_rug": anti_rug.get("level", "SAFE"),
                 "liquidity_health": liq_health.get("level", "OK"),
                 "score": s_live,
+                "price_usd": cur_price,
+                "liq_usd": liq,
+                "vol24": vol24,
+                "vol5": vol5,
             },
             source="portfolio",
+            hist=hist,
         )
+        health = dict(unified.get("health") or detect_position_health(
+            {
+                **r,
+                "price_usd": cur_price,
+                "liq_usd": liq,
+                "vol24": vol24,
+                "vol5": vol5,
+                "liquidity_health": liq_health.get("level", "OK"),
+                "anti_rug": anti_rug.get("level", "SAFE"),
+            },
+            hist,
+        ))
 
         c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
 
@@ -7570,6 +7722,8 @@ def page_portfolio():
                 link_button("DexScreener", best.get("url", ""), use_container_width=True, key=f"p_ds_{idx}_{hkey(base_addr)}")
             elif r.get("dexscreener_url"):
                 link_button("DexScreener", r["dexscreener_url"], use_container_width=True, key=f"p_ds_{idx}_{hkey(base_addr)}")
+            if str(health.get("health_label", "OK")) in ("DEAD", "UNTRADEABLE"):
+                st.caption(f"⚠ Market health: {health.get('health_label')} — {health.get('health_reason')}")
             swap_url = r.get("swap_url") or build_swap_url(chain, base_addr)
             if swap_url:
                 link_button("Swap", swap_url, use_container_width=True, key=f"p_sw_{idx}_{hkey(base_addr, chain)}")
@@ -7578,6 +7732,9 @@ def page_portfolio():
             st.markdown(f"### {portfolio_action_badge(unified['final_action'])}")
             st.markdown(f"**Recommended action: {unified['final_action']}**")
             st.caption(f"Reason: {unified['final_reason']}")
+            if str(health.get("health_label", "OK")) != "OK":
+                health_copy = str(health.get("health_label", "UNKNOWN")).replace("_", " ")
+                st.caption(f"⚠ Health override: {health_copy}")
             with st.expander("Market / position metrics", expanded=False):
                 st.write(f"Score: {s_live:.2f}" if best else f"Score: {r.get('score','n/a')}")
                 st.write(f"Entry: ${entry_price_str}")
@@ -7605,6 +7762,19 @@ def page_portfolio():
             with st.expander("Risk diagnostics", expanded=False):
                 st.write(f"Reco model: {reco}")
                 st.write(f"Exit signal: {level}")
+                st.write(f"Health label: {health.get('health_label', 'OK')}")
+                st.write(f"Health reason: {health.get('health_reason', 'n/a')}")
+                st.write(
+                    f"Health flags: dead={bool(health.get('is_dead'))}, "
+                    f"stale={bool(health.get('is_stale'))}, cold={bool(health.get('is_cold'))}, "
+                    f"low_liq={bool(health.get('is_low_liq'))}, untradeable={bool(health.get('is_untradeable'))}"
+                )
+                st.write(
+                    f"Health checks: liq={fmt_usd(parse_float(health.get('liq_usd', 0), 0.0))}, "
+                    f"vol24={fmt_usd(parse_float(health.get('vol24', 0), 0.0))}, "
+                    f"vol5={fmt_usd(parse_float(health.get('vol5', 0), 0.0))}, "
+                    f"snapshot_age_min={parse_float(health.get('snapshot_age_min', 0), 0.0):.1f}"
+                )
                 st.write(f"Liquidity health: {liq_health['level']}")
                 st.write(f"Anti-rug: {anti_rug['level']}")
                 st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
