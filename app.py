@@ -1609,6 +1609,8 @@ def dex_url_for_token(chain: str, ca: str) -> str:
 def token_ca(row: Dict[str, Any]) -> str:
     return str(
         row.get("base_addr")
+        or row.get("pair_address")
+        or row.get("pairAddress")
         or row.get("base_token_address")
         or row.get("ca")
         or row.get("address")
@@ -1637,33 +1639,97 @@ def normalize_timing_label(value: str) -> str:
     return mapping.get(t, "NEUTRAL")
 
 
-def monitoring_primary_decision(row: Dict[str, Any]) -> str:
-    action = str(row.get("entry_action") or row.get("entry") or row.get("entry_status") or "").upper()
-    score = parse_float(row.get("entry_score", 0), 0.0)
+def suggested_position_size(row: Dict[str, Any], unified: Dict[str, Any]) -> str:
+    action = str(unified.get("final_action") or "").upper()
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
 
-    if action in ("ENTRY_NOW", "READY"):
-        return "ENTER NOW"
-    if action in ("WATCH_PULLBACK", "EARLY"):
-        return "WATCH SMALL"
-    if action in ("TRACK", "WAIT", "WATCH"):
-        return "WAIT FOR PULLBACK"
-    if score <= 0 or risk == "HIGH":
-        return "NO ENTRY"
-    return "WAIT"
-
-
-def suggested_position_size(row: Dict[str, Any]) -> str:
-    action = str(row.get("entry_action") or row.get("entry") or "").upper()
-    risk = str(row.get("risk_level") or "UNKNOWN").upper()
-
-    if action in ("ENTRY_NOW", "READY") and risk == "LOW":
+    if action in ("ENTER NOW", "HOLD") and risk in ("LOW", "MEDIUM"):
         return "NORMAL"
-    if action in ("WATCH_PULLBACK", "EARLY") and risk in ("LOW", "MEDIUM"):
-        return "SMALL"
-    if action in ("TRACK", "WAIT"):
+    if action in ("WATCH SMALL", "WAIT FOR PULLBACK"):
+        return "SMALL" if risk == "LOW" else "WATCH ONLY"
+    if action in ("WAIT", "WATCH CLOSELY"):
         return "WATCH ONLY"
-    return "SKIP"
+    if action in ("REDUCE", "TAKE PROFIT", "EXIT", "NO ENTRY"):
+        return "SKIP"
+    return "WATCH ONLY"
+
+
+def compute_unified_recommendation(row: Dict[str, Any], source: str) -> Dict[str, Any]:
+    source = str(source or "monitoring").strip().lower()
+    entry_action = str(row.get("entry_action") or row.get("entry") or "").upper()
+    entry_score = parse_float(row.get("entry_score", row.get("score", 0)), 0.0)
+    timing = normalize_timing_label(str(row.get("timing_label") or "NEUTRAL"))
+    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+    pnl = parse_float(row.get("pnl_pct", row.get("pnl", 0)), 0.0)
+    reco_model = str(row.get("reco_model") or "").upper()
+    exit_signal = str(row.get("exit_signal") or "").upper()
+    trap_score = parse_float(row.get("trap_score", row.get("trap", 0)), 0.0)
+    anti_rug = str(row.get("anti_rug") or row.get("safe") or "").upper()
+    liquidity_health = str(row.get("liquidity_health") or "").upper()
+    final_action = "WAIT"
+    final_reason = "watch structure"
+
+    if source == "portfolio":
+        if reco_model.startswith("CLOSE") or exit_signal in ("EXIT", "CLOSE", "SELL"):
+            final_action, final_reason = "EXIT", "exit/cut signal triggered"
+        elif reco_model.startswith("TAKE PROFIT") or pnl >= 25:
+            final_action, final_reason = "TAKE PROFIT", "target profit zone reached"
+        elif reco_model.startswith("CUT") or (
+            risk == "HIGH" and (trap_score > 0 or anti_rug in ("WARNING", "CRITICAL"))
+        ):
+            final_action, final_reason = "REDUCE", "risk elevated vs position quality"
+        elif trap_score > 0:
+            final_action, final_reason = "WATCH CLOSELY", "trap pressure detected"
+        else:
+            final_action, final_reason = "HOLD", "position still within hold conditions"
+    else:
+        weak = str(row.get("weak_reason") or "").strip().lower()
+        score = parse_float(row.get("score", entry_score), 0.0)
+        if score <= 0 or "gate_blocked" in weak or entry_action in ("AVOID", "INVALID"):
+            final_action, final_reason = "NO ENTRY", "invalid/weak setup"
+        elif entry_action in ("ENTRY_NOW", "READY"):
+            final_action, final_reason = "ENTER NOW", "setup is ready with momentum"
+        elif entry_action in ("WATCH_PULLBACK", "EARLY"):
+            if risk == "LOW":
+                final_action, final_reason = "WATCH SMALL", "pullback entry preferred"
+            else:
+                final_action, final_reason = "WAIT FOR PULLBACK", "risk requires deeper pullback"
+        elif entry_action in ("TRACK", "WAIT", "WATCH"):
+            final_action, final_reason = "WAIT", "monitor without entry confirmation"
+        else:
+            final_action, final_reason = "NO ENTRY", "no actionable edge"
+
+    severity = "low"
+    if final_action in ("WATCH CLOSELY", "REDUCE", "TAKE PROFIT", "WAIT FOR PULLBACK"):
+        severity = "medium"
+    if final_action in ("EXIT", "NO ENTRY"):
+        severity = "high"
+
+    confidence = "LOW"
+    if entry_score >= 220:
+        confidence = "HIGH"
+    elif entry_score >= 120:
+        confidence = "MEDIUM"
+
+    unified = {
+        "final_action": final_action,
+        "final_reason": final_reason,
+        "severity": severity,
+        "timing": timing,
+        "size_hint": "WATCH ONLY",
+        "regime": source,
+        "confidence": confidence,
+    }
+    unified["size_hint"] = suggested_position_size(row, unified)
+
+    if liquidity_health in ("DEAD", "CRITICAL"):
+        unified["severity"] = "high"
+        if source == "portfolio":
+            unified["final_action"] = "EXIT"
+            unified["final_reason"] = "liquidity is critical/dead"
+            unified["size_hint"] = "SKIP"
+
+    return unified
 
 
 def is_in_portfolio_active(row: Dict[str, Any], portfolio_rows: List[Dict[str, Any]]) -> bool:
@@ -1694,7 +1760,7 @@ def build_history_series(hist: List[Dict[str, Any]]) -> Dict[str, List[float]]:
         "price": [parse_float(h.get("price_usd"), 0.0) for h in hist if str(h.get("price_usd", "")).strip()],
         "score": [parse_float(h.get("last_score"), 0.0) for h in hist if str(h.get("last_score", "")).strip()],
         "entry_score": [parse_float(h.get("entry_score"), 0.0) for h in hist if str(h.get("entry_score", "")).strip()],
-        "liq": [parse_float(h.get("liq_usd"), 0.0) for h in hist if str(h.get("liq_usd", "")).strip()],
+        "liquidity": [parse_float(h.get("liq_usd"), 0.0) for h in hist if str(h.get("liq_usd", "")).strip()],
         "vol5": [parse_float(h.get("vol5"), 0.0) for h in hist if str(h.get("vol5", "")).strip()],
         "vol24": [parse_float(h.get("vol24"), 0.0) for h in hist if str(h.get("vol24", "")).strip()],
     }
@@ -1714,7 +1780,7 @@ def render_monitoring_sparklines(hist: List[Dict[str, Any]]) -> None:
     items = [
         ("Price", valid["price"]),
         ("Score", valid["score"] or valid["entry_score"]),
-        ("Liquidity", valid["liq"]),
+        ("Liquidity", valid["liquidity"]),
         ("Vol24", valid["vol24"]),
         ("Vol5", valid["vol5"]),
     ]
@@ -2812,6 +2878,26 @@ def action_badge(action: str) -> str:
       letter-spacing:0.4px;
     ">{action}</span>
     """
+
+
+def portfolio_action_badge(action: str) -> str:
+    action = str(action or "").upper()
+    mapping = {
+        "EXIT": "🔴 EXIT",
+        "TAKE PROFIT": "🟠 TAKE PROFIT",
+        "REDUCE": "🟡 REDUCE",
+        "WATCH CLOSELY": "🟠 WATCH CLOSELY",
+        "HOLD": "🟢 HOLD",
+    }
+    return mapping.get(action, f"⚪ {action or 'HOLD'}")
+
+
+def get_portfolio_entry_price(row: Dict[str, Any]) -> float:
+    for key in ("avg_entry_price", "entry_price", "entry_price_usd", "entry", "price_at_add"):
+        val = parse_float(row.get(key), 0.0)
+        if val > 0:
+            return val
+    return 0.0
 
 
 def filter_pairs_with_debug(
@@ -4372,7 +4458,7 @@ def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]
     for r in active_rows:
         chain = (r.get("chain") or "").strip().lower()
         base_addr = addr_store(chain, (r.get("base_token_address") or "").strip())
-        entry_price = parse_float(r.get("entry_price_usd") or r.get("entry_price") or 0, 0.0)
+        entry_price = get_portfolio_entry_price(r)
 
         best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
         hist = token_history_rows(chain, base_addr, limit=60)
@@ -4897,11 +4983,13 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
     symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
     chain = token_chain(row).upper()
     addr = token_ca(row)
+    source = str(source or "monitoring").lower()
+    unified = compute_unified_recommendation(row, source="monitoring" if source == "monitoring" else "portfolio")
 
     score = parse_float(row.get("entry_score"), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
     timing = normalize_timing_label(str(row.get("timing_label") or "NEUTRAL"))
-    reason = str(row.get("entry_reason") or row.get("signal_reason") or "n/a")
+    reason = str(unified.get("final_reason") or row.get("entry_reason") or row.get("signal_reason") or "n/a")
     horizon = str(row.get("entry_horizon") or signal.get("horizon") or "n/a")
 
     entry_now = parse_float(row.get("entry_now"), 0.0)
@@ -4923,8 +5011,12 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
     else:
         levels_block = "setup: watch only"
 
+    if source == "portfolio":
+        return format_portfolio_signal_message(row)
+
     return (
-        f"<b>{signal['action']}</b> | <b>{symbol}</b>\n"
+        f"<b>{unified['final_action']}</b> | <b>{symbol}</b>\n"
+        f"source: MONITOR\n"
         f"chain: {chain}\n"
         f"score: <b>{score}</b>\n"
         f"risk: <b>{risk}</b>\n"
@@ -4932,6 +5024,20 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
         f"horizon: {horizon}\n"
         f"reason: {reason}\n"
         f"{levels_block}\n\n"
+        f"CA:\n<code>{addr}</code>"
+    )
+
+
+def format_portfolio_signal_message(row: Dict[str, Any]) -> str:
+    symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
+    chain = token_chain(row).upper()
+    addr = token_ca(row)
+    unified = compute_unified_recommendation(row, source="portfolio")
+    return (
+        f"<b>{unified['final_action']}</b> | <b>{symbol}</b>\n"
+        f"source: PORTFOLIO\n"
+        f"chain: {chain}\n"
+        f"reason: {unified['final_reason']}\n\n"
         f"CA:\n<code>{addr}</code>"
     )
 
@@ -5009,6 +5115,8 @@ def build_notification_candidates(
         key = token_addr(row)
         if not key or key in seen_port:
             continue
+        if is_token_suppressed(str(row.get("chain") or ""), str(token_ca(row) or "")):
+            continue
         seen_port.add(key)
         port.append(row)
 
@@ -5074,11 +5182,12 @@ def run_auto_notifications(
             stats["no_token_key"] += 1
             continue
 
+        unified = compute_unified_recommendation(row, source=source)
         current_snapshot = {
-            "entry_action": str(row.get("entry_action") or row.get("entry") or "").upper(),
+            "entry_action": str(unified.get("final_action") or "").upper(),
             "entry_score": parse_float(row.get("entry_score", 0), 0.0),
             "risk_level": str(row.get("risk_level") or row.get("risk") or "").upper(),
-            "timing_label": normalize_timing_label(row.get("timing_label") or ""),
+            "timing_label": str(unified.get("timing") or "NEUTRAL"),
             "source": source,
         }
 
@@ -6981,19 +7090,20 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         sym = extract_name(r).upper()
         name = sym if sym not in {"", "UNKNOWN"} else "UNKNOWN"
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
-        primary = monitoring_primary_decision(r)
+        unified = compute_unified_recommendation(r, source="monitoring")
+        primary = str(unified.get("final_action") or "WAIT")
         secondary = item.get("ui_badge", "INFO")
         header = f"{name} | {primary} | {score:.2f}"
 
         with st.expander(header, expanded=False):
-            timing_label = normalize_timing_label(item.get("timing_label") or r.get("timing_label") or "NEUTRAL")
+            timing_label = unified.get("timing") or normalize_timing_label(item.get("timing_label") or r.get("timing_label") or "NEUTRAL")
             risk_label = str(item.get("risk_level", "UNKNOWN"))
             st.caption(
-                f"{chain.upper()} • {primary} • timing {timing_label} • risk {risk_label}"
+                f"{chain.upper()} • timing {timing_label} • risk {risk_label} • status {secondary}"
             )
             st.markdown(f"**Recommendation: {primary}**")
-            st.caption(f"Suggested size: {suggested_position_size(r)}")
-            st.caption(f"Secondary: {secondary}")
+            st.caption(f"Reason: {unified.get('final_reason', 'n/a')}")
+            st.caption(f"Suggested size: {unified.get('size_hint', 'WATCH ONLY')}")
             st.caption(f"score={score} risk={item.get('risk_level', 'UNKNOWN')}")
             if item.get("is_portfolio_active"):
                 st.caption("In portfolio • still monitored")
@@ -7030,16 +7140,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 if swap_url:
                     link_button("Swap", swap_url, use_container_width=True)
             with c3:
-                if st.button("Promote → Portfolio", key=f"promote_{chain}_{base_addr}", use_container_width=True):
-                    res = promote_to_portfolio(item)
-                    if res == "OK":
-                        st.success("Promoted.")
-                        request_rerun()
-                    elif res == "NO_LIVE_PAIR":
-                        st.error("No live pool found.")
-                    else:
-                        st.caption("In portfolio • still monitored")
-                        request_rerun()
+                if not item.get("is_portfolio_active"):
+                    if st.button("Promote → Portfolio", key=f"promote_{chain}_{base_addr}", use_container_width=True):
+                        res = promote_to_portfolio(item)
+                        if res == "OK":
+                            st.success("Promoted.")
+                            request_rerun()
+                        elif res == "NO_LIVE_PAIR":
+                            st.error("No live pool found.")
+                        else:
+                            request_rerun()
 
             st.code(token_ca(r), language="text")
 
@@ -7079,7 +7189,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     f"TP1: {tp1} • TP2: {tp2}"
                 )
             else:
-                st.caption(f"Horizon: {horizon} • No actionable levels yet.")
+                st.caption(f"Horizon: {horizon} • setup: watch only")
 
             if item["entry_reasons"]:
                 st.info(" • ".join(item["entry_reasons"][:3]))
@@ -7178,7 +7288,7 @@ def portfolio_alert_count() -> int:
         if not best:
             continue
 
-        entry = parse_float(r.get("entry_price_usd"), 0.0)
+        entry = get_portfolio_entry_price(r)
         hist = token_history_rows(chain, base_addr, limit=60)
 
         liq_health = liquidity_health(best)
@@ -7346,12 +7456,8 @@ def page_portfolio():
         base_addr = addr_store(chain, (r.get("base_token_address") or "").strip())
         base_sym = r.get("base_symbol") or "???"
         quote_sym = r.get("quote_symbol") or "???"
-        entry_price_str = r.get("entry_price_usd") or "0"
-
-        try:
-            entry_price = float(entry_price_str)
-        except Exception:
-            entry_price = 0.0
+        entry_price = get_portfolio_entry_price(r)
+        entry_price_str = f"{entry_price:.12f}".rstrip("0").rstrip(".") if entry_price > 0 else "0"
 
         best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
         liq_health = liquidity_health(best)
@@ -7455,6 +7561,20 @@ def page_portfolio():
         if entry_price > 0 and cur_price > 0:
             pnl = (cur_price - entry_price) / entry_price * 100.0
 
+        unified = compute_unified_recommendation(
+            {
+                **r,
+                "pnl_pct": pnl,
+                "reco_model": reco,
+                "exit_signal": level,
+                "trap_score": trap.get("trap_score", 0),
+                "anti_rug": anti_rug.get("level", "SAFE"),
+                "liquidity_health": liq_health.get("level", "OK"),
+                "score": s_live,
+            },
+            source="portfolio",
+        )
+
         c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
 
         with c1:
@@ -7480,14 +7600,12 @@ def page_portfolio():
             if swap_url:
                 link_button("Swap", swap_url, use_container_width=True, key=f"p_sw_{idx}_{hkey(base_addr, chain)}")
 
-            st.caption("Decision")
-            st.markdown(action_badge(decision), unsafe_allow_html=True)
+            st.caption(f"Model decision: {decision}")
 
         with c2:
-            st.markdown(f"### Recommended action: {action_plan['action_label']}")
-            st.caption(f"Exit signal: {level}")
-            st.caption(f"Liquidity health: {liq_health['level']}")
-            st.caption(f"Anti-rug: {anti_rug['level']}")
+            st.markdown(f"### {portfolio_action_badge(unified['final_action'])}")
+            st.markdown(f"**Recommended action: {unified['final_action']}**")
+            st.caption(f"Reason: {unified['final_reason']}")
             with st.expander("Market / position metrics", expanded=False):
                 st.write(f"Score: {s_live:.2f}" if best else f"Score: {r.get('score','n/a')}")
                 st.write(f"Entry: ${entry_price_str}")
@@ -7498,11 +7616,9 @@ def page_portfolio():
                 st.write(f"Vol5: {fmt_usd(vol5)}" if best else "Vol5: n/a")
                 st.write(f"Δ m5: {fmt_pct(pc5)}")
                 st.write(f"Δ h1: {fmt_pct(pc1h)}")
-                st.write(f"Strength: {strength_cls} ({strength_score:.1f})")
-                st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
+                st.write(f"score: {s_live:.2f}")
 
         with c3:
-            st.write(f"Reco model: {reco}")
             if strength_cls == "WEAK":
                 st.caption("⚠ weak position – candidate for rotation")
                 if base_sym in weak_rotation_symbols:
@@ -7511,8 +7627,15 @@ def page_portfolio():
                         rotate_to = best_strong.get("base_symbol") or best_strong.get("symbol") or "?"
                         st.caption(f"→ rotate into {rotate_to}")
             with st.expander("Risk diagnostics", expanded=False):
-                st.write(f"Anti-rug score: {anti_rug['score']}")
-                for rr in explain_reco(reco, liq_health, anti_rug, exit_signal):
+                st.write(f"Reco model: {reco}")
+                st.write(f"Exit signal: {level}")
+                st.write(f"Liquidity health: {liq_health['level']}")
+                st.write(f"Anti-rug: {anti_rug['level']}")
+                st.write(f"Trap: {trap.get('trap_level', 'SAFE')} ({trap.get('trap_score', 0)})")
+                st.write(f"Strength: {strength_cls} ({strength_score:.1f})")
+                notes = explain_reco(reco, liq_health, anti_rug, exit_signal)
+                st.write("Diagnostics notes:")
+                for rr in notes:
                     st.caption(f"– {rr}")
                 for f in anti_rug.get("flags", [])[:4]:
                     st.caption(f"– {f}")
@@ -7541,6 +7664,19 @@ def page_portfolio():
                     )
             note_key = f"note_{idx}_{hkey(base_addr, chain)}"
             note_val = st.text_input("Note", value=r.get("note", ""), key=note_key)
+            avg_key = f"avg_entry_{idx}_{hkey(base_addr, chain)}"
+            avg_entry = st.number_input("Avg entry price", min_value=0.0, value=float(entry_price), format="%.12f", key=avg_key)
+            if st.button("Save entry price", key=f"save_avg_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
+                all_rows = load_portfolio()
+                target_key = addr_key(chain, base_addr)
+                for rr in all_rows:
+                    if addr_key(rr.get("chain", ""), rr.get("base_token_address", "")) == target_key:
+                        rr["avg_entry_price"] = str(avg_entry)
+                        rr["updated_at"] = now_utc_str()
+                        break
+                save_portfolio(all_rows)
+                st.success("Average entry price saved.")
+                request_rerun()
 
         with c4:
             close_key = f"close_{idx}_{hkey(base_addr, chain)}"

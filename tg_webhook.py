@@ -325,14 +325,14 @@ async def tg_webhook(req: Request):
         result_text = "Ignored"
         if action in ("pf", "pf_add", "portfolio", "portfolio_add"):
             add_contract_to_portfolio(chain, ca)
-            result_text = f"Added to portfolio | {token_label}"
+            result_text = "Added to portfolio"
         elif action in ("mn", "mon_add", "monitor", "monitor_add"):
             add_contract_to_monitoring(chain, ca)
-            result_text = f"Added to monitoring | {token_label}"
+            result_text = "Added to monitoring"
         elif action in ("rm", "remove", "delete", "archive"):
             remove_contract_everywhere(chain, ca)
             suppress_token(chain, ca, reason="manual_remove_from_tg", days=30)
-            result_text = f"Removed / archived | {token_label}"
+            result_text = "Removed / archived"
 
         print(f"[TG_WEBHOOK] result={result_text}", flush=True)
 
