@@ -1875,6 +1875,9 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str, hist: Optio
     final_action = "TRACK ONLY"
     final_reason = "watch structure"
     health = detect_position_health(row, hist or [])
+    health_override_active = False
+    health_override_action = ""
+    health_override_reason = ""
 
     if source == "portfolio":
         if reco_model.startswith("CLOSE") or exit_signal in ("EXIT", "CLOSE", "SELL"):
@@ -1892,23 +1895,39 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str, hist: Optio
 
         grace_mode = bool(health.get("health_grace_applied"))
         has_explicit_dead_rug = bool(health.get("explicit_dead_rug"))
+        health_label = str(health.get("health_label", "OK")).upper()
         if health.get("is_dead"):
+            health_override_active = True
             if grace_mode and not has_explicit_dead_rug:
-                final_action, final_reason = "REDUCE", "Grace mode: early weak data, reduce risk instead of full exit"
+                health_override_action = "REDUCE"
+                health_override_reason = "Grace mode: early weak data, reduce risk instead of full exit"
             else:
-                final_action, final_reason = "EXIT", "Token appears dead / non-tradeable"
+                health_override_action = "EXIT"
+                health_override_reason = "Token appears dead / non-tradeable"
         elif health.get("is_untradeable"):
+            health_override_active = True
             if grace_mode and not has_explicit_dead_rug:
-                final_action, final_reason = "WATCH CLOSELY", "Grace mode: insufficient history, monitor before forcing exit"
+                health_override_action = "WATCH CLOSELY"
+                health_override_reason = "Grace mode: insufficient history, monitor before forcing exit"
             else:
-                final_action, final_reason = "EXIT", str(health.get("health_reason") or "Position is not tradeable")
+                health_override_action = "EXIT"
+                health_override_reason = str(health.get("health_reason") or "Position is not tradeable")
         elif health.get("is_stale") and health.get("is_cold"):
+            health_override_active = True
             if grace_mode and not has_explicit_dead_rug:
-                final_action, final_reason = "WATCH CLOSELY", "Grace mode: freshly added position with limited history"
+                health_override_action = "WATCH CLOSELY"
+                health_override_reason = "Grace mode: freshly added position with limited history"
             else:
-                final_action, final_reason = "EXIT", "Position is stale and cold"
+                health_override_action = "EXIT"
+                health_override_reason = "Position is stale and cold"
         elif health.get("is_low_liq") and health.get("is_cold"):
-            final_action, final_reason = "REDUCE", "Liquidity collapsed / weak exit conditions"
+            health_override_active = True
+            health_override_action = "REDUCE"
+            health_override_reason = "Liquidity collapsed / weak exit conditions"
+
+        if health_override_active:
+            final_action = health_override_action
+            final_reason = f"Health override ({health_label}): {health_override_reason}"
     else:
         weak = str(row.get("weak_reason") or "").strip().lower()
         score = parse_float(row.get("score", entry_score), 0.0)
@@ -1944,10 +1963,13 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str, hist: Optio
         "regime": source,
         "confidence": confidence,
         "health": health,
+        "health_override_active": health_override_active,
+        "health_override_action": health_override_action,
+        "health_override_reason": health_override_reason,
     }
     unified["size_hint"] = suggested_position_size(row, unified)
 
-    if liquidity_health in ("DEAD", "CRITICAL"):
+    if liquidity_health in ("DEAD", "CRITICAL") and not health_override_active:
         unified["severity"] = "high"
         if source == "portfolio":
             unified["final_action"] = "EXIT"
@@ -7922,6 +7944,10 @@ def page_portfolio():
                 link_button("DexScreener", r["dexscreener_url"], use_container_width=True, key=f"p_ds_{idx}_{hkey(base_addr)}")
             if str(health.get("health_label", "OK")) in ("DEAD", "UNTRADEABLE"):
                 st.caption(f"⚠ Market health: {health.get('health_label')} — {health.get('health_reason')}")
+            if unified.get("health_override_active"):
+                st.caption(
+                    f"🛡 Health override active: {health.get('health_label', 'OK')} — {unified.get('health_override_reason', '')}"
+                )
             swap_url = r.get("swap_url") or build_swap_url(chain, base_addr)
             if swap_url:
                 link_button("Swap", swap_url, use_container_width=True, key=f"p_sw_{idx}_{hkey(base_addr, chain)}")
@@ -7930,9 +7956,13 @@ def page_portfolio():
             st.markdown(f"### {portfolio_action_badge(unified['final_action'])}")
             st.markdown(f"**Recommended action: {unified['final_action']}**")
             st.caption(f"Reason: {unified['final_reason']}")
-            if str(health.get("health_label", "OK")) != "OK":
+            if unified.get("health_override_active"):
                 health_copy = str(health.get("health_label", "UNKNOWN")).replace("_", " ")
-                st.caption(f"⚠ Health override: {health_copy}")
+                st.caption(f"⚠ Health override: {health_copy} → {unified.get('health_override_action', unified['final_action'])}")
+                st.caption(f"Override reason: {unified.get('health_override_reason', health.get('health_reason', 'n/a'))}")
+            elif str(health.get("health_label", "OK")) != "OK":
+                health_copy = str(health.get("health_label", "UNKNOWN")).replace("_", " ")
+                st.caption(f"⚠ Health: {health_copy}")
             with st.expander("Market / position metrics", expanded=False):
                 st.write(f"Score: {s_live:.2f}" if best else f"Score: {r.get('score','n/a')}")
                 st.write(f"Entry: ${entry_price_str}")
