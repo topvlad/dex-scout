@@ -2083,6 +2083,26 @@ def suppress_token(chain: str, ca: str, reason: str = "manual_remove", days: int
         "updated_at": now_utc_str(),
     }
     save_suppressed_tokens(data)
+    rows = load_monitoring()
+    key = addr_key(chain, ca)
+    changed = False
+    for r in rows:
+        if addr_key(r.get("chain", ""), r.get("base_addr", "")) != key:
+            continue
+        transition = transition_token_state(
+            infer_lifecycle_state(r),
+            "SUPPRESSED_MANUAL",
+            {"reason": reason, "requested_status": "suppressed"},
+        )
+        r.update(transition.get("updated_fields", {}))
+        if transition.get("valid"):
+            r["active"] = "0"
+            r["archived_reason"] = reason
+            r["ts_archived"] = now_utc_str()
+        changed = True
+        break
+    if changed:
+        save_monitoring(rows)
 
 
 def is_token_suppressed(chain: str, ca: str) -> bool:
@@ -3414,6 +3434,16 @@ MON_FIELDS = [
     "toxic_flags",
     "alert_sent",
     "status",
+    "lifecycle_state",
+    "behavior_state",
+    "state_event",
+    "transition_valid",
+    "invalid_transition",
+    "invalid_reason",
+    "invalid_from_state",
+    "invalid_attempted_to",
+    "invalid_event",
+    "updated_at",
     "risk_score",
     "risk_flags",
     "why",
@@ -3441,6 +3471,160 @@ HIST_FIELDS = [
     "timing_label",
     "risk_level",
 ]
+
+
+LIFECYCLE_SCOUT = "SCOUT"
+LIFECYCLE_MONITORING = "MONITORING"
+LIFECYCLE_PORTFOLIO = "PORTFOLIO"
+LIFECYCLE_ARCHIVED = "ARCHIVED"
+LIFECYCLE_SUPPRESSED = "SUPPRESSED"
+LIFECYCLE_REVISIT = "REVISIT"
+
+LIFECYCLE_STATES = {
+    LIFECYCLE_SCOUT,
+    LIFECYCLE_MONITORING,
+    LIFECYCLE_PORTFOLIO,
+    LIFECYCLE_ARCHIVED,
+    LIFECYCLE_SUPPRESSED,
+    LIFECYCLE_REVISIT,
+}
+
+BEHAVIOR_STATE_DEFAULT = "NEW"
+BEHAVIOR_STATE_VOCAB = {
+    "NEW", "BUILDING", "PULLBACK_READY", "ENTRY_READY", "TRACKING", "WEAKENING", "COLD", "DEAD",
+}
+
+STATE_EVENT_VOCAB = {
+    "DISCOVERED",
+    "PROMOTED_TO_MONITORING",
+    "PROMOTED_TO_PORTFOLIO",
+    "ARCHIVED_MANUAL",
+    "ARCHIVED_RULE",
+    "REACTIVATED",
+    "SUPPRESSED_MANUAL",
+    "READY_FOR_REVISIT",
+}
+
+ALLOWED_LIFECYCLE_TRANSITIONS: Dict[str, Set[str]] = {
+    LIFECYCLE_SCOUT: {LIFECYCLE_MONITORING, LIFECYCLE_SUPPRESSED},
+    LIFECYCLE_MONITORING: {LIFECYCLE_PORTFOLIO, LIFECYCLE_ARCHIVED, LIFECYCLE_SUPPRESSED, LIFECYCLE_REVISIT},
+    LIFECYCLE_PORTFOLIO: {LIFECYCLE_ARCHIVED, LIFECYCLE_SUPPRESSED},
+    LIFECYCLE_ARCHIVED: {LIFECYCLE_MONITORING, LIFECYCLE_REVISIT, LIFECYCLE_SUPPRESSED},
+    LIFECYCLE_SUPPRESSED: {LIFECYCLE_MONITORING, LIFECYCLE_ARCHIVED, LIFECYCLE_REVISIT},
+    LIFECYCLE_REVISIT: {LIFECYCLE_MONITORING, LIFECYCLE_ARCHIVED, LIFECYCLE_SUPPRESSED},
+}
+
+EVENT_TO_TARGET_LIFECYCLE: Dict[str, str] = {
+    "DISCOVERED": LIFECYCLE_MONITORING,
+    "PROMOTED_TO_MONITORING": LIFECYCLE_MONITORING,
+    "PROMOTED_TO_PORTFOLIO": LIFECYCLE_PORTFOLIO,
+    "ARCHIVED_MANUAL": LIFECYCLE_ARCHIVED,
+    "ARCHIVED_RULE": LIFECYCLE_ARCHIVED,
+    "REACTIVATED": LIFECYCLE_MONITORING,
+    "SUPPRESSED_MANUAL": LIFECYCLE_SUPPRESSED,
+    "READY_FOR_REVISIT": LIFECYCLE_REVISIT,
+}
+
+
+def infer_lifecycle_state(row: Dict[str, Any]) -> str:
+    explicit = str(row.get("lifecycle_state") or "").strip().upper()
+    if explicit in LIFECYCLE_STATES:
+        return explicit
+    status_u = str(row.get("status") or "").strip().upper()
+    if status_u in LIFECYCLE_STATES:
+        return status_u
+    if str(row.get("portfolio_linked", "0")) == "1":
+        return LIFECYCLE_PORTFOLIO
+    if str(row.get("active", "1")).strip() == "1":
+        return LIFECYCLE_MONITORING
+    return LIFECYCLE_ARCHIVED
+
+
+def derive_state_event(
+    current_lifecycle_state: str,
+    event: str,
+    context_row: Optional[Dict[str, Any]] = None,
+) -> str:
+    event_u = str(event or "").strip().upper()
+    if event_u in STATE_EVENT_VOCAB:
+        return event_u
+    ctx = context_row or {}
+    requested_status = str(ctx.get("requested_status") or ctx.get("status") or "").strip().lower()
+    reason = str(ctx.get("reason") or "").strip().lower()
+    target = str(ctx.get("target_lifecycle_state") or "").strip().upper()
+    if "suppress" in reason or requested_status == "suppressed":
+        return "SUPPRESSED_MANUAL"
+    if requested_status in {"active", "reactivate"}:
+        return "REACTIVATED"
+    if requested_status == "revisit" or target == LIFECYCLE_REVISIT:
+        return "READY_FOR_REVISIT"
+    if requested_status in {"portfolio", "promoted"} or "promoted" in reason or target == LIFECYCLE_PORTFOLIO:
+        return "PROMOTED_TO_PORTFOLIO"
+    if requested_status == "archived":
+        if "manual" in reason:
+            return "ARCHIVED_MANUAL"
+        return "ARCHIVED_RULE"
+    if current_lifecycle_state == LIFECYCLE_SCOUT:
+        return "DISCOVERED"
+    return "PROMOTED_TO_MONITORING"
+
+
+def transition_token_state(
+    current_lifecycle_state: str,
+    event: str,
+    context_row: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    ctx = context_row or {}
+    current = str(current_lifecycle_state or "").strip().upper() or LIFECYCLE_SCOUT
+    if current not in LIFECYCLE_STATES:
+        current = infer_lifecycle_state(ctx)
+    state_event = derive_state_event(current, event, ctx)
+    target_override = str(ctx.get("target_lifecycle_state") or "").strip().upper()
+    if target_override in LIFECYCLE_STATES:
+        target = target_override
+    else:
+        target = EVENT_TO_TARGET_LIFECYCLE.get(state_event, current)
+    allowed = target == current or target in ALLOWED_LIFECYCLE_TRANSITIONS.get(current, set())
+    now_ts = now_utc_str()
+    note = str(ctx.get("transition_note") or ctx.get("note") or "").strip()
+    if not note:
+        note = f"{current} --{state_event}--> {target}"
+    if allowed:
+        return {
+            "next_lifecycle_state": target,
+            "valid": True,
+            "transition_note": note,
+            "state_event": state_event,
+            "updated_fields": {
+                "lifecycle_state": target,
+                "status": target,
+                "state_event": state_event,
+                "transition_valid": "1",
+                "invalid_transition": "0",
+                "invalid_reason": "",
+                "invalid_from_state": "",
+                "invalid_attempted_to": "",
+                "invalid_event": "",
+                "updated_at": now_ts,
+                "note": note,
+            },
+        }
+    invalid_reason = f"transition_not_allowed:{current}->{target} via {state_event}"
+    return {
+        "next_lifecycle_state": current,
+        "valid": False,
+        "transition_note": invalid_reason,
+        "state_event": state_event,
+        "updated_fields": {
+            "transition_valid": "0",
+            "invalid_transition": "1",
+            "invalid_reason": invalid_reason,
+            "invalid_from_state": current,
+            "invalid_attempted_to": target,
+            "invalid_event": state_event,
+            "updated_at": now_ts,
+        },
+    }
 
 
 def load_portfolio() -> List[Dict[str, Any]]:
@@ -3592,6 +3776,12 @@ def load_monitoring() -> List[Dict[str, Any]]:
         for k in MON_FIELDS:
             if k not in r:
                 r[k] = ""
+        if not str(r.get("lifecycle_state") or "").strip():
+            r["lifecycle_state"] = infer_lifecycle_state(r)
+        if not str(r.get("status") or "").strip():
+            r["status"] = r["lifecycle_state"]
+        if not str(r.get("behavior_state") or "").strip():
+            r["behavior_state"] = BEHAVIOR_STATE_DEFAULT
     return rows
 
 
@@ -3832,6 +4022,17 @@ def add_to_monitoring(
             "in_portfolio": "0",
             "toxic_flags": str(p.get("toxic_flags") or ""),
             "alert_sent": str(p.get("alert_sent") or "0"),
+            "lifecycle_state": LIFECYCLE_MONITORING,
+            "behavior_state": BEHAVIOR_STATE_DEFAULT,
+            "state_event": "DISCOVERED",
+            "transition_valid": "1",
+            "invalid_transition": "0",
+            "invalid_reason": "",
+            "invalid_from_state": "",
+            "invalid_attempted_to": "",
+            "invalid_event": "",
+            "updated_at": now_utc_str(),
+            "status": LIFECYCLE_MONITORING,
         }
     )
     save_monitoring(rows)
@@ -3855,6 +4056,19 @@ def archive_monitoring(
     changed = False
     for r in rows:
         if r.get("active") == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
+            requested_status = "revisit" if revisit_days > 0 else "archived"
+            transition = transition_token_state(
+                infer_lifecycle_state(r),
+                derive_state_event(
+                    infer_lifecycle_state(r),
+                    "",
+                    {"requested_status": requested_status, "reason": reason},
+                ),
+                {"requested_status": requested_status, "reason": reason, "note": note},
+            )
+            if not transition.get("valid"):
+                r.update(transition.get("updated_fields", {}))
+                continue
             r["active"] = "0"
             r["ts_archived"] = now_utc_str()
             r["archived_reason"] = reason
@@ -3869,6 +4083,7 @@ def archive_monitoring(
                 r["revisit_after_ts"] = future_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
             else:
                 r["revisit_after_ts"] = ""
+            r.update(transition.get("updated_fields", {}))
             changed = True
     if changed:
         save_monitoring(rows)
@@ -3887,6 +4102,9 @@ def update_monitoring_status(
     note: str = "",
 ) -> bool:
     status_u = str(status or "").strip().lower()
+    if status_u == "suppressed":
+        suppress_token(chain=chain, ca=contract, reason=reason or "manual_suppress")
+        return True
     if status_u == "archived":
         return archive_monitoring(
             chain=chain,
@@ -3900,6 +4118,17 @@ def update_monitoring_status(
         )
     if status_u == "active":
         return reactivate_monitoring(chain=chain, base_addr=contract)
+    if status_u == "revisit":
+        return archive_monitoring(
+            chain=chain,
+            base_addr=contract,
+            reason=reason or "revisit_ready",
+            last_score=last_score,
+            last_decision=last_decision,
+            revisit_days=max(1, int(revisit_days or 1)),
+            portfolio_linked=portfolio_linked,
+            note=note,
+        )
     return False
 
 
@@ -3917,12 +4146,21 @@ def reactivate_monitoring(chain: str, base_addr: str) -> bool:
     changed = False
     for r in rows:
         if (r.get("active") != "1") and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
+            transition = transition_token_state(
+                infer_lifecycle_state(r),
+                "REACTIVATED",
+                {"requested_status": "active"},
+            )
+            if not transition.get("valid"):
+                r.update(transition.get("updated_fields", {}))
+                continue
             r["active"] = "1"
             r["ts_added"] = now_utc_str()
             r["ts_archived"] = ""
             r["archived_reason"] = ""
             r["last_score"] = ""
             r["last_decision"] = ""
+            r.update(transition.get("updated_fields", {}))
             changed = True
             break
     if changed:
@@ -3977,13 +4215,38 @@ def log_to_portfolio(p: Dict[str, Any], score: float, action: str, tags: List[st
 
 
 def mark_monitoring_portfolio_linked(chain: str, base_addr: str, reason: str = "promoted_to_portfolio") -> bool:
-    return update_monitoring_status(
-        contract=base_addr,
-        chain=chain,
-        status="archived",
-        reason=reason,
-        portfolio_linked=True,
-    )
+    if not base_addr:
+        return False
+    key = addr_key(chain, base_addr)
+    rows = load_monitoring()
+    changed = False
+    for r in rows:
+        if addr_key(r.get("chain", ""), r.get("base_addr", "")) != key:
+            continue
+        transition = transition_token_state(
+            infer_lifecycle_state(r),
+            "PROMOTED_TO_PORTFOLIO",
+            {
+                "reason": reason,
+                "requested_status": "portfolio",
+                "target_lifecycle_state": LIFECYCLE_MONITORING,
+                "transition_note": f"portfolio_linked:{reason}",
+            },
+        )
+        if not transition.get("valid"):
+            r.update(transition.get("updated_fields", {}))
+            continue
+        r["portfolio_linked"] = "1"
+        r["in_portfolio"] = "1"
+        r["active"] = "1"
+        r["ts_archived"] = ""
+        r["archived_reason"] = ""
+        r.update(transition.get("updated_fields", {}))
+        changed = True
+        break
+    if changed:
+        save_monitoring(rows)
+    return changed
 
 
 def promote_to_portfolio(item: Dict[str, Any]) -> str:
@@ -3997,24 +4260,12 @@ def promote_to_portfolio(item: Dict[str, Any]) -> str:
     decision = str(item.get("decision") or "WATCH / WAIT")
     res = log_to_portfolio(best, float(item.get("live_score", 0.0) or 0.0), decision, item.get("tags") or [], build_swap_url(chain, base_addr))
     if res == "ALREADY_EXISTS":
-        update_monitoring_status(
-            contract=base_addr,
-            chain=chain,
-            status="archived",
-            reason="duplicate_portfolio",
-            portfolio_linked=True,
-        )
+        mark_monitoring_portfolio_linked(chain=chain, base_addr=base_addr, reason="duplicate_portfolio")
         return res
     if res != "OK":
         return res
 
-    update_monitoring_status(
-        contract=base_addr,
-        chain=chain,
-        status="archived",
-        reason="promoted",
-        portfolio_linked=True,
-    )
+    mark_monitoring_portfolio_linked(chain=chain, base_addr=base_addr, reason="promoted")
     return "OK"
 
 
@@ -5983,6 +6234,14 @@ def auto_reactivate_archived(days: int = 7, max_revisits: int = 3) -> int:
             if last and (now_dt - last).days >= int(days):
                 r["status"] = "ACTIVE"
 
+        transition = transition_token_state(
+            infer_lifecycle_state(r),
+            "REACTIVATED",
+            {"requested_status": "active", "reason": "auto_revisit"},
+        )
+        r.update(transition.get("updated_fields", {}))
+        if not transition.get("valid"):
+            continue
         r["active"] = "1"
         r["ts_added"] = now_utc_str()
         r["ts_archived"] = ""
@@ -6027,6 +6286,14 @@ def revisit_archived(min_days: int = 1, score_threshold: float = 400.0, max_revi
         if live_score <= score_threshold:
             continue
 
+        transition = transition_token_state(
+            infer_lifecycle_state(r),
+            "REACTIVATED",
+            {"requested_status": "active", "reason": "revisit_threshold"},
+        )
+        r.update(transition.get("updated_fields", {}))
+        if not transition.get("valid"):
+            continue
         r["active"] = "1"
         r["ts_added"] = now_utc_str()
         r["ts_archived"] = ""
@@ -7501,6 +7768,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.write(f"weak flags: {str(r.get('weak_reason') or 'none')}")
                     flags = item.get("ui_flags") or []
                     st.write("ui flags: " + (" • ".join(flags) if flags else "none"))
+                    if str(r.get("invalid_transition", "0")) == "1":
+                        st.error("invalid_transition")
+                        st.write(
+                            {
+                                "from_state": r.get("invalid_from_state", ""),
+                                "event": r.get("invalid_event", ""),
+                                "attempted_to": r.get("invalid_attempted_to", ""),
+                                "reason": r.get("invalid_reason", ""),
+                            }
+                        )
                 else:
                     st.caption("Raw internals hidden (debug mode only).")
 
@@ -8298,7 +8575,7 @@ def build_active_monitoring_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, A
     active_rows: List[Dict[str, Any]] = []
     for r in rows:
         status = str(r.get("status", "")).strip().upper()
-        if status in ("ACTIVE", "WATCH", "WAIT", "", "TRACK", "READY"):
+        if status in ("ACTIVE", "WATCH", "WAIT", "", "TRACK", "READY", LIFECYCLE_MONITORING):
             active_rows.append(r)
 
     active_rows = sorted(
