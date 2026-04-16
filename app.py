@@ -7619,6 +7619,147 @@ def portfolio_alert_count() -> int:
     return alerts
 
 
+def _wave_a_build_legacy_portfolio_reco(
+    row: Dict[str, Any],
+    entry_price: float,
+    cur_price: float,
+    liq: float,
+    vol24: float,
+    pc1h: float,
+    pc5: float,
+    score_live: float,
+    best: Dict[str, Any],
+    hist: List[Dict[str, Any]],
+    liq_health: Dict[str, Any],
+) -> str:
+    decision = str(build_trade_hint(best)[0] if best else "NO DATA")
+    exit_signal = exit_before_dump_detector(best, hist, entry_price)
+    trap = liquidity_trap_detector(best, hist) if best else {"trap_level": "SAFE"}
+    persistence = exit_persistence_state(hist, min_points=3)
+    action_plan = action_from_exit_signal(exit_signal, persistence)
+    anti_rug = anti_rug_early_detector(best, hist)
+    level = str(exit_signal.get("exit_level", "")).upper()
+
+    reco = portfolio_reco(entry_price, cur_price, liq, vol24, pc1h, pc5, decision, score_live, best)
+    if trap["trap_level"] == "CRITICAL":
+        reco = "EXIT / RISK"
+    elif trap["trap_level"] == "WARNING" and str(reco).startswith("HOLD"):
+        reco = "HOLD / WATCH CAREFULLY"
+
+    if action_plan["action_code"] == "EXIT_100":
+        reco = "EXIT NOW"
+    elif action_plan["action_code"] == "EXIT_CONFIRM":
+        reco = "EXIT LIKELY"
+    elif action_plan["action_code"] == "REDUCE_50":
+        reco = "REDUCE 50%"
+    elif action_plan["action_code"] == "REDUCE_30":
+        reco = "REDUCE 30%"
+    elif action_plan["action_code"] == "WATCH_TIGHT" and str(reco).startswith("HOLD"):
+        reco = "WATCH CLOSELY"
+
+    if anti_rug["level"] == "CRITICAL":
+        reco = "EXIT NOW / EARLY RUG RISK"
+    elif anti_rug["level"] == "WARNING" and "HOLD" in str(reco).upper():
+        reco = "REDUCE / EARLY RUG RISK"
+
+    reco = apply_liquidity_reco_override(reco, liq_health)
+
+    if level in ("EXIT", "CLOSE", "SELL"):
+        return "EXIT"
+    return str(reco or "").upper()
+
+
+def wave_a_invariant_checks(max_rows: int = 25) -> List[str]:
+    issues: List[str] = []
+    rows = [r for r in load_portfolio() if str(r.get("active", "1")).strip() == "1"][:max_rows]
+    for row in rows:
+        chain = (row.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, (row.get("base_token_address") or "").strip())
+        symbol = str(row.get("base_symbol") or base_addr or "unknown").upper()
+        if not chain or not base_addr:
+            issues.append(f"[{symbol}] missing chain/base address in active portfolio row")
+            continue
+        try:
+            best = best_pair_for_token_cached(chain, base_addr) or {}
+            hist = token_history_rows(chain, base_addr, limit=120)
+            entry_price = get_portfolio_entry_price(row)
+            cur_price = parse_float((best or {}).get("priceUsd"), 0.0)
+            liq = parse_float((best or {}).get("liquidity", {}).get("usd"), 0.0)
+            vol24 = parse_float((best or {}).get("volume", {}).get("h24"), 0.0)
+            vol5 = parse_float((best or {}).get("volume", {}).get("m5"), 0.0)
+            pc1h = parse_float((best or {}).get("priceChange", {}).get("h1"), 0.0)
+            pc5 = parse_float((best or {}).get("priceChange", {}).get("m5"), 0.0)
+            score_live = score_pair(best) if best else parse_float(row.get("score"), 0.0)
+            liq_health = liquidity_health(best) if best else {"level": "UNKNOWN"}
+            legacy_reco = _wave_a_build_legacy_portfolio_reco(
+                row=row,
+                entry_price=entry_price,
+                cur_price=cur_price,
+                liq=liq,
+                vol24=vol24,
+                pc1h=pc1h,
+                pc5=pc5,
+                score_live=score_live,
+                best=best,
+                hist=hist,
+                liq_health=liq_health,
+            )
+
+            pnl = 0.0
+            if entry_price > 0 and cur_price > 0:
+                pnl = (cur_price - entry_price) / entry_price * 100.0
+            unified = compute_unified_recommendation(
+                {
+                    **row,
+                    "pnl_pct": pnl,
+                    "reco_model": legacy_reco,
+                    "exit_signal": "EXIT" if "EXIT" in legacy_reco else "",
+                    "liquidity_health": str(liq_health.get("level", "OK")),
+                    "score": score_live,
+                    "price_usd": cur_price,
+                    "liq_usd": liq,
+                    "vol24": vol24,
+                    "vol5": vol5,
+                },
+                source="portfolio",
+                hist=hist,
+            )
+        except Exception as e:
+            issues.append(f"[{symbol}] invariant check failed: {type(e).__name__}: {e}")
+            continue
+
+        final_action = str(unified.get("final_action") or "").upper()
+        health = dict(unified.get("health") or {})
+        health_label = str(health.get("health_label") or "OK").upper()
+        override_active = bool(unified.get("health_override_active"))
+        override_action = str(unified.get("health_override_action") or "").upper()
+
+        if final_action == "NO ENTRY":
+            issues.append(f"[{symbol}] active portfolio final_action must not be NO ENTRY")
+        if health_label in {"DEAD", "UNTRADEABLE"} and final_action == "HOLD":
+            issues.append(f"[{symbol}] {health_label} cannot result in HOLD")
+        if override_active:
+            if override_action and final_action != override_action:
+                issues.append(f"[{symbol}] health override mismatch: final={final_action}, override={override_action}")
+            if override_action and override_action != "HOLD" and "HOLD" in legacy_reco:
+                issues.append(f"[{symbol}] override conflicts with legacy reco ({legacy_reco})")
+
+        avg_entry = parse_float(row.get("avg_entry_price"), 0.0)
+        legacy_entries = [
+            parse_float(row.get("entry_price_usd"), 0.0),
+            parse_float(row.get("entry_price"), 0.0),
+            parse_float(row.get("price_at_add"), 0.0),
+            parse_float(row.get("entry"), 0.0),
+        ]
+        if avg_entry > 0 and abs(entry_price - avg_entry) > max(1e-12, avg_entry * 1e-6):
+            issues.append(f"[{symbol}] entry source mismatch: avg_entry_price should be authoritative")
+        if avg_entry > 0 and any(v > 0 and abs(v - avg_entry) > max(1e-12, avg_entry * 1e-6) for v in legacy_entries):
+            if abs(entry_price - avg_entry) > max(1e-12, avg_entry * 1e-6):
+                issues.append(f"[{symbol}] legacy entry field overrode avg_entry_price")
+
+    return issues
+
+
 def core_safety_self_check():
     issues: List[str] = []
 
@@ -7645,9 +7786,20 @@ def core_safety_self_check():
     if ".lower()" in inspect.getsource(active_portfolio_addresses):
         issues.append("address lower() regression in active_portfolio_addresses")
 
+    if (
+        "debug_mode = bool(st.session_state.get(\"debug_mode\", False) or st.session_state.get(\"show_debug_raw\", False))" not in src
+        or "Raw internals hidden (debug mode only)." not in src
+    ):
+        issues.append("monitoring normal mode raw internals guard missing")
+
+    wave_a_issues = wave_a_invariant_checks()
+    for wave_issue in wave_a_issues:
+        issues.append(f"Wave A invariant: {wave_issue}")
+
     if issues:
         st.error("CORE SAFETY BROKEN")
-        for i in issues[:8]:
+        st.caption(f"Violations: {len(issues)}")
+        for i in issues[:20]:
             st.write(f"– {i}")
     else:
         st.success("Core safety OK")
