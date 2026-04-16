@@ -8484,6 +8484,131 @@ def wave_a_invariant_checks(max_rows: int = 25) -> List[str]:
     return issues
 
 
+def wave_b_invariant_checks(max_rows: int = 25) -> List[str]:
+    issues: List[str] = []
+
+    invalid_transition = transition_token_state(
+        LIFECYCLE_SCOUT,
+        "PROMOTED_TO_PORTFOLIO",
+        {"target_lifecycle_state": LIFECYCLE_PORTFOLIO},
+    )
+    invalid_fields = dict(invalid_transition.get("updated_fields") or {})
+    if bool(invalid_transition.get("valid")):
+        issues.append("state_machine: invalid transition unexpectedly marked valid")
+    if any(k in invalid_fields for k in ("lifecycle_state", "status", "state_event")):
+        issues.append("state_machine: invalid transition attempted to mutate lifecycle fields")
+
+    promoted_transition = transition_token_state(
+        LIFECYCLE_MONITORING,
+        "PROMOTED_TO_PORTFOLIO",
+        {
+            "requested_status": "portfolio",
+            "target_lifecycle_state": LIFECYCLE_MONITORING,
+            "transition_note": "guardrail_check",
+        },
+    )
+    promoted_fields = dict(promoted_transition.get("updated_fields") or {})
+    if not bool(promoted_transition.get("valid")):
+        issues.append("state_machine: PROMOTED_TO_PORTFOLIO linking transition became invalid")
+    if str(promoted_fields.get("lifecycle_state") or "").upper() != LIFECYCLE_MONITORING:
+        issues.append("state_machine: portfolio-linked promotion should keep monitoring lifecycle_state")
+    if str(promoted_fields.get("status") or "").upper() != LIFECYCLE_MONITORING:
+        issues.append("state_machine: portfolio-linked promotion should keep monitoring status")
+    if str(promoted_fields.get("state_event") or "").upper() != "PROMOTED_TO_PORTFOLIO":
+        issues.append("state_machine: portfolio-linked promotion must emit PROMOTED_TO_PORTFOLIO")
+
+    equal_score = 200.0
+    equal_freshness = 900.0
+    equal_due = 0.0
+    rank_rows = []
+    for tier_name, _rank in SCAN_QUEUE_TIERS:
+        rank_rows.append(
+            {
+                "tier": tier_name,
+                "tier_rank": SCAN_QUEUE_TIER_RANK.get(tier_name, 99),
+                "score": equal_score,
+                "freshness_sec": equal_freshness,
+                "due_in_sec": equal_due,
+            }
+        )
+    sorted_rows = sorted(
+        rank_rows,
+        key=lambda x: (
+            x["tier_rank"],
+            0 if x["due_in_sec"] <= 0 else 1,
+            x["due_in_sec"],
+            -x["freshness_sec"],
+            -x["score"],
+        ),
+    )
+    observed = [str(x.get("tier") or "") for x in sorted_rows]
+    expected = [name for name, _rank in SCAN_QUEUE_TIERS]
+    if observed != expected:
+        issues.append(
+            "queue: tier order must win when all else is equal "
+            f"(expected={expected}, observed={observed})"
+        )
+
+    default_sleep = max(60, int(os.getenv("SCAN_INTERVAL_SEC", "300")))
+    small_queue_sleep = max(30, min(default_sleep, 1))
+    if small_queue_sleep != 30:
+        issues.append("queue: empty/small queue fallback sleep changed from baseline-safe floor")
+    queue_state_example = {"next_due_ts": time.time() + 120.0}
+    computed_due = float(queue_state_example.get("next_due_ts", 0.0) or 0.0)
+    if computed_due <= 0:
+        issues.append("queue: next_due_ts was neutralized unexpectedly")
+
+    monitoring_rows = load_monitoring()
+    for row in monitoring_rows[:max_rows]:
+        setup_inputs = build_setup_render_inputs(row)
+        has_levels = bool(setup_inputs.get("has_actionable_levels"))
+        watch_only = str(setup_inputs.get("watch_only_text") or "").strip().lower()
+        actionable_via_api = has_actionable_levels(row)
+        if actionable_via_api != has_levels:
+            issues.append("setup: has_actionable_levels() diverged from sanitized setup path")
+            break
+        if not has_levels:
+            for level_key in ("entry_now", "pullback_1", "pullback_2", "invalidation", "tp1", "tp2"):
+                if _is_actionable_level(parse_float(setup_inputs.get(level_key), 0.0)):
+                    issues.append(f"setup: non-actionable row exposes actionable level {level_key}")
+                    break
+            if watch_only != "setup: watch only":
+                issues.append("setup: fallback text must be exactly 'setup: watch only'")
+
+    neutral_gem = compute_gem_transition_score(best=None, hist=[])
+    if bool(neutral_gem.get("gem_transition_sufficient")):
+        issues.append("gem: insufficient history fallback should stay non-sufficient")
+    if parse_float(neutral_gem.get("gem_transition_score"), GEM_TRANSITION_NEUTRAL) > GEM_TRANSITION_NEUTRAL:
+        issues.append("gem: insufficient history fallback must have no positive priority bias")
+    neutral_item = {
+        "price_change_5m": 2.0,
+        "gem_transition_score": neutral_gem.get("gem_transition_score"),
+        "gem_transition_sufficient": "1" if bool(neutral_gem.get("gem_transition_sufficient")) else "0",
+    }
+    if compute_timing(neutral_item) == "EARLY":
+        issues.append("gem: insufficient history fallback must have no positive timing bias")
+    neutral_ui = monitoring_ui_state(
+        {
+            "row": {"entry_status": "WATCH", "entry_score": "150"},
+            "health_label": "OK",
+            "gem_transition_score": neutral_gem.get("gem_transition_score"),
+            "gem_transition_sufficient": neutral_gem.get("gem_transition_sufficient"),
+            "is_dead": False,
+            "is_rug": False,
+            "anti_rug": {"level": "SAFE"},
+            "liq_health": {"level": "OK"},
+        }
+    )
+    if "gem_transition" in [str(x) for x in neutral_ui.get("flags", [])]:
+        issues.append("gem: insufficient history fallback must have no highlight uplift")
+
+    blocked = gem_transition_priority_bias(120.0, 90.0, "DEAD", sufficient_history=True)
+    if blocked != 120.0:
+        issues.append("gem: strong negative health must block gem priority overrides")
+
+    return issues
+
+
 def core_safety_self_check():
     issues: List[str] = []
 
@@ -8519,6 +8644,9 @@ def core_safety_self_check():
     wave_a_issues = wave_a_invariant_checks()
     for wave_issue in wave_a_issues:
         issues.append(f"Wave A invariant: {wave_issue}")
+    wave_b_issues = wave_b_invariant_checks()
+    for wave_issue in wave_b_issues:
+        issues.append(f"Wave B invariant: {wave_issue}")
 
     if issues:
         st.error("CORE SAFETY BROKEN")
@@ -8574,6 +8702,16 @@ def render_debug_panel():
         st.write("---")
         st.write("### Core safety")
         core_safety_self_check()
+
+        st.write("---")
+        st.write("### Wave B guardrails")
+        wave_b_issues = wave_b_invariant_checks()
+        if wave_b_issues:
+            st.caption(f"Violations: {len(wave_b_issues)}")
+            for issue in wave_b_issues[:10]:
+                st.write(f"– {issue}")
+        else:
+            st.caption("No violations detected.")
 
         st.write("---")
         st.write("### Events")

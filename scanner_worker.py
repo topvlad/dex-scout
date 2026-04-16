@@ -14,6 +14,51 @@ USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
 BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "10"))
 
 
+def _queue_invariant_telemetry(queue_stats: dict, sleep_for: int, default_sleep_for: int) -> None:
+    """
+    Assertion/telemetry-only hooks for Wave B queue invariants.
+    No scheduling or scanner behavior changes are allowed here.
+    """
+    try:
+        tiers_scanned = [str(x or "") for x in (queue_stats.get("tiers_scanned") or [])]
+        tier_rank = {
+            "portfolio_active": 0,
+            "portfolio_linked_monitoring": 1,
+            "high_priority_monitoring": 2,
+            "review_weak_monitoring": 3,
+            "archive_revisit": 4,
+        }
+        if len(tiers_scanned) >= 2:
+            ranked = [tier_rank.get(t, 99) for t in tiers_scanned]
+            if ranked != sorted(ranked):
+                print(
+                    f"[worker][wave-b] queue_tier_order_violation "
+                    f"(when_all_else_equal_assumption): {tiers_scanned}",
+                    flush=True,
+                )
+    except Exception as exc:
+        print(f"[worker][wave-b] queue_tier_order_telemetry_error: {type(exc).__name__}: {exc}", flush=True)
+
+    try:
+        due_now = int(queue_stats.get("due_now", 0) or 0)
+        queue_size = int(queue_stats.get("queue_size", 0) or 0)
+        if queue_size <= 1 and sleep_for < 30:
+            print(
+                f"[worker][wave-b] small_queue_sleep_floor_violation: sleep_for={sleep_for}, "
+                f"default_sleep_for={default_sleep_for}, due_now={due_now}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[worker][wave-b] small_queue_telemetry_error: {type(exc).__name__}: {exc}", flush=True)
+
+    try:
+        suggested = queue_stats.get("sleep_suggest_sec")
+        if suggested is None:
+            print("[worker][wave-b] sleep_suggest_sec_missing", flush=True)
+    except Exception as exc:
+        print(f"[worker][wave-b] sleep_suggest_telemetry_error: {type(exc).__name__}: {exc}", flush=True)
+
+
 def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False) -> None:
     app.ensure_storage()
 
@@ -60,6 +105,7 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
                 sleep_for = max(30, min(default_sleep_for, suggested))
             else:
                 sleep_for = default_sleep_for
+            _queue_invariant_telemetry(queue_stats, sleep_for=sleep_for, default_sleep_for=default_sleep_for)
 
             monitoring_rows = app.load_monitoring()
             portfolio_rows = app.load_portfolio()
