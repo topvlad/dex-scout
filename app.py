@@ -7424,7 +7424,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             invalidation = parse_float(r.get("invalidation"), 0.0)
             tp1 = parse_float(r.get("tp1"), 0.0)
             tp2 = parse_float(r.get("tp2"), 0.0)
-            with st.expander("Setup / levels", expanded=False):
+            setup_tab, diagnostics_tab, dynamics_tab = st.tabs(
+                ["Setup / levels", "Diagnostics", "Dynamics"]
+            )
+            with setup_tab:
                 if has_actionable_levels(r):
                     level_rows = []
                     for lbl, val in [
@@ -7444,7 +7447,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 else:
                     st.caption("setup: watch only")
 
-            with st.expander("Diagnostics", expanded=False):
+            with diagnostics_tab:
                 st.markdown("**Engine snapshot**")
                 st.write(f"risk: {risk_label}")
                 st.write(f"timing: {timing_label}")
@@ -7467,7 +7470,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.caption("Raw internals hidden (debug mode only).")
 
             hist = item.get("hist", []) or []
-            with st.expander("Dynamics", expanded=False):
+            with dynamics_tab:
                 render_monitoring_sparklines(hist)
 
     st.subheader("Priority watchlist")
