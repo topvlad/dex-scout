@@ -7980,14 +7980,14 @@ def page_portfolio():
                 st.write(f"score: {s_live:.2f}")
 
         with c3:
-            if strength_cls == "WEAK":
-                st.caption("⚠ weak position – candidate for rotation")
-                if base_sym in weak_rotation_symbols:
-                    st.error(f"Sell {int(exit_pct * 100)}% – rotation/exit signal")
-                    if best_strong:
-                        rotate_to = best_strong.get("base_symbol") or best_strong.get("symbol") or "?"
-                        st.caption(f"→ rotate into {rotate_to}")
             with st.expander("Risk diagnostics", expanded=False):
+                if strength_cls == "WEAK":
+                    st.caption("⚠ weak position – candidate for rotation")
+                    if base_sym in weak_rotation_symbols:
+                        st.caption(f"Rotation hint: sell {int(exit_pct * 100)}%")
+                        if best_strong:
+                            rotate_to = best_strong.get("base_symbol") or best_strong.get("symbol") or "?"
+                            st.caption(f"→ rotate into {rotate_to}")
                 st.write(f"Reco model: {reco}")
                 st.write(f"Exit signal: {level}")
                 st.write(f"Health label: {health.get('health_label', 'OK')}")
