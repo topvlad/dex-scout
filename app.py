@@ -6465,7 +6465,234 @@ def scanner_state_load() -> Dict[str, Any]:
         "last_window": "",
         "last_preset": "",
         "last_chain": "",
-        "last_stats": {}
+        "last_stats": {},
+        "queue_state": {},
+        "queue_next_due_ts": 0.0,
+        "queue_last_run_ts": "",
+    }
+
+
+SCAN_QUEUE_TIERS: List[Tuple[str, int]] = [
+    ("portfolio_active", 0),
+    ("portfolio_linked_monitoring", 1),
+    ("high_priority_monitoring", 2),
+    ("review_weak_monitoring", 3),
+    ("archive_revisit", 4),
+]
+SCAN_QUEUE_TIER_RANK = {name: rank for name, rank in SCAN_QUEUE_TIERS}
+
+
+def _scan_queue_token_key(chain: str, base_addr: str) -> str:
+    c = normalize_chain_name(chain or "")
+    a = addr_store(c, base_addr or "")
+    return f"{c}:{a}" if c and a else ""
+
+
+def _scanner_queue_state(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    raw = state.get("queue_state", {})
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, value in raw.items():
+        if isinstance(key, str) and isinstance(value, dict):
+            out[key] = dict(value)
+    return out
+
+
+def _scanner_tier_for_row(row: Dict[str, Any], portfolio_keys: Set[str]) -> str:
+    chain = token_chain(row)
+    ca = token_ca(row)
+    key = _scan_queue_token_key(chain, ca)
+    if key and key in portfolio_keys:
+        return "portfolio_active"
+    if str(row.get("portfolio_linked", "0")).strip() == "1":
+        return "portfolio_linked_monitoring"
+    lifecycle = infer_lifecycle_state(row)
+    if lifecycle == LIFECYCLE_REVISIT or str(row.get("active", "1")).strip() != "1":
+        return "archive_revisit"
+    score = parse_float(row.get("entry_score", row.get("priority_score", 0)), 0.0)
+    weak = str(row.get("weak_reason") or "").strip()
+    low_flag = str(row.get("low_priority_flag", "")).strip().lower() in {"1", "true", "yes"}
+    if score >= 220 and not weak and not low_flag:
+        return "high_priority_monitoring"
+    if score >= 120 and not low_flag:
+        return "high_priority_monitoring"
+    return "review_weak_monitoring"
+
+
+def _scanner_interval_for_tier(tier: str, score: float) -> int:
+    base = {
+        "portfolio_active": 75,
+        "portfolio_linked_monitoring": 120,
+        "high_priority_monitoring": 180,
+        "review_weak_monitoring": 420,
+        "archive_revisit": 900,
+    }.get(tier, 420)
+    if score >= 300:
+        base = int(base * 0.8)
+    elif score <= 80:
+        base = int(base * 1.3)
+    return max(60, base)
+
+
+def _row_last_freshness_sec(row: Dict[str, Any], now_dt: datetime) -> float:
+    ts_candidates = [
+        row.get("ts_last_seen"),
+        row.get("ts_added"),
+        row.get("updated_at"),
+        row.get("ts_utc"),
+    ]
+    best: Optional[datetime] = None
+    for raw in ts_candidates:
+        ts = parse_ts(raw)
+        if ts and (best is None or ts > best):
+            best = ts
+    if best is None:
+        return 10**9
+    return max(0.0, (now_dt - best).total_seconds())
+
+
+def build_priority_scan_queue(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+    state: Optional[Dict[str, Any]] = None,
+    now_ts: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    state = state or {}
+    now_ts = float(now_ts if now_ts is not None else time.time())
+    now_dt = datetime.utcfromtimestamp(now_ts)
+    queue_state = _scanner_queue_state(state)
+    portfolio_keys: Set[str] = set()
+    for row in portfolio_rows:
+        if str(row.get("active", "1")).strip() != "1":
+            continue
+        key = _scan_queue_token_key(token_chain(row), token_ca(row))
+        if key:
+            portfolio_keys.add(key)
+
+    queue: List[Dict[str, Any]] = []
+    for row in monitoring_rows:
+        chain = token_chain(row)
+        ca = token_ca(row)
+        key = _scan_queue_token_key(chain, ca)
+        if not key:
+            continue
+        tier = _scanner_tier_for_row(row, portfolio_keys)
+        score = parse_float(row.get("entry_score", row.get("priority_score", 0)), 0.0)
+        freshness_sec = _row_last_freshness_sec(row, now_dt)
+        prev = queue_state.get(key, {})
+        next_due_ts = float(prev.get("next_due_ts", 0.0) or 0.0)
+        backoff_sec = int(parse_float(prev.get("backoff_sec", 0), 0.0))
+        if next_due_ts <= 0:
+            next_due_ts = now_ts
+        due_in_sec = next_due_ts - now_ts
+        queue.append({
+            "token_key": key,
+            "chain": chain,
+            "base_addr": ca,
+            "tier": tier,
+            "tier_rank": SCAN_QUEUE_TIER_RANK.get(tier, 99),
+            "score": score,
+            "freshness_sec": freshness_sec,
+            "next_due_ts": next_due_ts,
+            "due_in_sec": due_in_sec,
+            "backoff_sec": backoff_sec,
+            "row": row,
+        })
+
+    queue.sort(
+        key=lambda x: (
+            x["tier_rank"],
+            0 if x["due_in_sec"] <= 0 else 1,
+            x["due_in_sec"],
+            -x["freshness_sec"],
+            -x["score"],
+        )
+    )
+    return queue
+
+
+def run_priority_scanner_cycle(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+    max_scans: int = 3,
+) -> Dict[str, Any]:
+    now_ts = time.time()
+    now_dt = datetime.utcfromtimestamp(now_ts)
+    state = scanner_state_load() or {}
+    queue_state = _scanner_queue_state(state)
+    queue = build_priority_scan_queue(monitoring_rows, portfolio_rows, state=state, now_ts=now_ts)
+
+    scanned = 0
+    errors = 0
+    due_items = [item for item in queue if item["due_in_sec"] <= 0]
+    picks = due_items[: max(1, int(max_scans))]
+
+    for item in picks:
+        token_key = str(item.get("token_key") or "")
+        chain = str(item.get("chain") or "")
+        base_addr = str(item.get("base_addr") or "")
+        tier = str(item.get("tier") or "review_weak_monitoring")
+        score = parse_float(item.get("score", 0), 0.0)
+        interval_sec = _scanner_interval_for_tier(tier, score)
+        row_state = dict(queue_state.get(token_key, {}))
+
+        try:
+            pair = best_pair_for_token_cached(chain, base_addr)
+            if pair:
+                score_live = score_pair(pair)
+                normalized = normalize_pair_row(pair)
+                if normalized is not None:
+                    update_existing_token(
+                        normalized,
+                        score_live,
+                        window_name="adaptive_priority_queue",
+                        preset_key=f"adaptive:{tier}",
+                        entry_status=str(item["row"].get("entry_status") or ""),
+                        entry_score=parse_float(item["row"].get("entry_score", score_live), 0.0),
+                        risk_level=str(item["row"].get("risk_level", "MEDIUM")),
+                    )
+                    row_state["last_score"] = score_live
+            row_state["last_error_ts"] = ""
+            row_state["backoff_sec"] = 0
+        except Exception as exc:
+            log_error(exc)
+            errors += 1
+            current_backoff = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
+            row_state["backoff_sec"] = min(1800, max(60, current_backoff * 2 if current_backoff else 90))
+            row_state["last_error_ts"] = now_utc_str()
+
+        backoff_sec = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
+        row_state["tier"] = tier
+        row_state["last_scan_ts"] = now_utc_str()
+        row_state["next_due_ts"] = now_ts + interval_sec + backoff_sec
+        queue_state[token_key] = row_state
+        scanned += 1
+
+    if queue:
+        queue_head = min(
+            (float(queue_state.get(item["token_key"], {}).get("next_due_ts", now_ts)) for item in queue),
+            default=now_ts + 300,
+        )
+    else:
+        queue_head = now_ts + 300
+
+    state["queue_state"] = queue_state
+    state["queue_size"] = len(queue)
+    state["queue_due_now"] = len(due_items)
+    state["queue_next_due_ts"] = float(queue_head)
+    state["queue_last_run_ts"] = now_utc_str()
+    state["queue_last_tiers"] = [item.get("tier") for item in picks]
+    scanner_state_save(state)
+
+    sleep_suggest = max(30, int(queue_head - now_ts))
+    return {
+        "queue_size": len(queue),
+        "due_now": len(due_items),
+        "scanned": scanned,
+        "errors": errors,
+        "sleep_suggest_sec": sleep_suggest,
+        "tiers_scanned": [item.get("tier") for item in picks],
     }
 
 def scanner_state_save(state: Dict[str, Any]):
@@ -6519,6 +6746,8 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
         "last_preset": preset_key,
         "last_chain": chain,
         "last_stats": stats,
+        "queue_next_due_ts": float(time.time() + 300),
+        "queue_last_run_ts": now_utc_str(),
     })
     scanner_state_save(state)
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
@@ -6541,6 +6770,8 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
         "last_preset": preset_key,
         "last_chain": chain,
         "last_stats": stats,
+        "queue_next_due_ts": float(time.time() + 300),
+        "queue_last_run_ts": now_utc_str(),
     })
     scanner_state_save(state)
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
