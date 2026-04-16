@@ -1,4 +1,7 @@
-fastapi
-uvicorn[standard]
-requests
-supabase
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+requests==2.32.3
+supabase==2.15.3
+streamlit==1.44.1
+pandas==2.2.3
+streamlit-autorefresh==1.0.1
