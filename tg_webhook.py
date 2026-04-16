@@ -3,7 +3,7 @@ from html import escape
 from typing import Any, Callable, Dict, List, Tuple
 
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 
 try:
     from app import (
@@ -281,6 +281,11 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.head("/health")
+def health_head():
+    return Response(status_code=200)
 
 
 @app.post("/tg/webhook")
