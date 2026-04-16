@@ -2043,16 +2043,118 @@ def render_monitoring_sparklines(hist: List[Dict[str, Any]]) -> None:
 
 
 def has_actionable_levels(row: Dict[str, Any]) -> bool:
-    return any(
-        [
-            parse_float(row.get("entry_now"), 0.0) > 0,
-            parse_float(row.get("pullback_1"), 0.0) > 0,
-            parse_float(row.get("pullback_2"), 0.0) > 0,
-            parse_float(row.get("invalidation"), 0.0) > 0,
-            parse_float(row.get("tp1"), 0.0) > 0,
-            parse_float(row.get("tp2"), 0.0) > 0,
-        ]
-    )
+    # Single source of truth: sanitized setup payload only.
+    # Do not reintroduce raw `> 0` checks here.
+    prepared = build_setup_render_inputs(row)
+    return bool(prepared.get("has_actionable_levels"))
+
+
+SETUP_LEVEL_ORDER: List[Tuple[str, str]] = [
+    ("entry_now", "entry now"),
+    ("pullback_1", "pullback 1"),
+    ("pullback_2", "pullback 2"),
+    ("invalidation", "invalidation"),
+    ("tp1", "tp1"),
+    ("tp2", "tp2"),
+]
+MIN_ACTIONABLE_LEVEL = 1e-12
+
+
+def _is_actionable_level(value: float) -> bool:
+    v = parse_float(value, 0.0)
+    return bool(v > MIN_ACTIONABLE_LEVEL and round(v, 12) > 0.0)
+
+
+def _round_level(value: float) -> float:
+    if not _is_actionable_level(value):
+        return 0.0
+    return round(parse_float(value, 0.0), 12)
+
+
+def _build_entry_levels_for_action(action: str, price: float) -> Dict[str, float]:
+    levels = {k: 0.0 for k, _ in SETUP_LEVEL_ORDER}
+    if not _is_actionable_level(price):
+        return levels
+
+    action_u = str(action or "").upper()
+    if action_u == "ENTRY_NOW":
+        levels["entry_now"] = _round_level(price)
+        levels["pullback_1"] = _round_level(price * 0.97)
+        levels["pullback_2"] = _round_level(price * 0.93)
+        levels["invalidation"] = _round_level(price * 0.89)
+        levels["tp1"] = _round_level(price * 1.12)
+        levels["tp2"] = _round_level(price * 1.25)
+    elif action_u == "WATCH_PULLBACK":
+        levels["pullback_1"] = _round_level(price * 0.97)
+        levels["pullback_2"] = _round_level(price * 0.93)
+        levels["invalidation"] = _round_level(price * 0.89)
+        levels["tp1"] = _round_level(price * 1.10)
+        levels["tp2"] = _round_level(price * 1.20)
+    elif action_u == "TRACK":
+        levels["pullback_1"] = _round_level(price * 0.96)
+        levels["pullback_2"] = _round_level(price * 0.92)
+        levels["invalidation"] = _round_level(price * 0.88)
+        levels["tp1"] = _round_level(price * 1.08)
+        levels["tp2"] = _round_level(price * 1.16)
+    return levels
+
+
+def _levels_pass_setup_guard(action: str, levels: Dict[str, float]) -> bool:
+    action_u = str(action or "").upper()
+    entry_now = parse_float(levels.get("entry_now"), 0.0)
+    pullback_1 = parse_float(levels.get("pullback_1"), 0.0)
+    pullback_2 = parse_float(levels.get("pullback_2"), 0.0)
+    invalidation = parse_float(levels.get("invalidation"), 0.0)
+    tp1 = parse_float(levels.get("tp1"), 0.0)
+    tp2 = parse_float(levels.get("tp2"), 0.0)
+
+    if action_u == "ENTRY_NOW":
+        if not _is_actionable_level(entry_now):
+            return False
+        anchor = entry_now
+    elif action_u in ("WATCH_PULLBACK", "TRACK"):
+        if not _is_actionable_level(pullback_1):
+            return False
+        anchor = pullback_1
+    else:
+        return False
+
+    if _is_actionable_level(pullback_1) and _is_actionable_level(pullback_2) and pullback_2 >= pullback_1:
+        return False
+    if _is_actionable_level(invalidation) and invalidation >= anchor:
+        return False
+    if _is_actionable_level(tp1) and tp1 <= anchor:
+        return False
+    if _is_actionable_level(tp2) and _is_actionable_level(tp1) and tp2 <= tp1:
+        return False
+    return True
+
+
+def build_setup_render_inputs(row: Dict[str, Any], action_override: str = "") -> Dict[str, Any]:
+    normalized_levels = {k: _round_level(parse_float(row.get(k), 0.0)) for k, _ in SETUP_LEVEL_ORDER}
+    action = str(action_override or row.get("entry_action") or row.get("entry") or "").upper()
+    if not _levels_pass_setup_guard(action, normalized_levels):
+        normalized_levels = {k: 0.0 for k, _ in SETUP_LEVEL_ORDER}
+
+    level_rows: List[Dict[str, float]] = []
+    for key, label in SETUP_LEVEL_ORDER:
+        value = normalized_levels[key]
+        if _is_actionable_level(value):
+            level_rows.append({"level": label, "value": value})
+
+    if not level_rows:
+        return {
+            "level_rows": [],
+            "has_actionable_levels": False,
+            "levels_block": "setup: watch only",
+        }
+
+    lines = [f"{r['level']}: {r['value']}" for r in level_rows]
+    return {
+        "level_rows": level_rows,
+        "has_actionable_levels": True,
+        "levels_block": "\n".join(lines),
+    }
 
 
 def load_suppressed_tokens() -> Dict[str, Dict[str, Any]]:
@@ -2227,33 +2329,10 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
         horizon = "ignore"
         reason = "weak structure"
 
-    entry_now = 0.0
-    pullback_1 = 0.0
-    pullback_2 = 0.0
-    invalidation = 0.0
-    tp1 = 0.0
-    tp2 = 0.0
-
-    if price > 0:
-        if action == "ENTRY_NOW":
-            entry_now = price
-            pullback_1 = price * 0.97
-            pullback_2 = price * 0.93
-            invalidation = price * 0.89
-            tp1 = price * 1.12
-            tp2 = price * 1.25
-        elif action == "WATCH_PULLBACK":
-            pullback_1 = price * 0.97
-            pullback_2 = price * 0.93
-            invalidation = price * 0.89
-            tp1 = price * 1.10
-            tp2 = price * 1.20
-        elif action == "TRACK":
-            pullback_1 = price * 0.96
-            pullback_2 = price * 0.92
-            invalidation = price * 0.88
-            tp1 = price * 1.08
-            tp2 = price * 1.16
+    levels = _build_entry_levels_for_action(action, price)
+    if not _levels_pass_setup_guard(action, levels):
+        levels = {k: 0.0 for k, _ in SETUP_LEVEL_ORDER}
+    setup_inputs = build_setup_render_inputs(levels, action_override=action)
 
     risk_level = "LOW"
     if liq < 15000 or buy_ratio < 0.45 or txns5 < 8:
@@ -2267,12 +2346,15 @@ def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
         "entry_horizon": horizon,
         "timing_label": normalize_timing_label(timing),
         "entry_reason": reason,
-        "entry_now": round(entry_now, 12) if entry_now else 0.0,
-        "pullback_1": round(pullback_1, 12) if pullback_1 else 0.0,
-        "pullback_2": round(pullback_2, 12) if pullback_2 else 0.0,
-        "invalidation": round(invalidation, 12) if invalidation else 0.0,
-        "tp1": round(tp1, 12) if tp1 else 0.0,
-        "tp2": round(tp2, 12) if tp2 else 0.0,
+        "entry_now": levels["entry_now"],
+        "pullback_1": levels["pullback_1"],
+        "pullback_2": levels["pullback_2"],
+        "invalidation": levels["invalidation"],
+        "tp1": levels["tp1"],
+        "tp2": levels["tp2"],
+        "setup_level_rows": setup_inputs["level_rows"],
+        "setup_levels_block": setup_inputs["levels_block"],
+        "setup_watch_only": "1" if not setup_inputs["has_actionable_levels"] else "0",
         "risk_flags": ",".join(risk_flags),
         "risk_level": risk_level,
     }
@@ -5458,10 +5540,8 @@ def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
 def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
     action = str(row.get("entry_action") or row.get("entry") or "").upper()
-    pullback_1 = parse_float(row.get("pullback_1"), 0.0)
-    pullback_2 = parse_float(row.get("pullback_2"), 0.0)
-    entry_now = parse_float(row.get("entry_now"), 0.0)
-    has_levels = any([entry_now, pullback_1, pullback_2])
+    setup_inputs = build_setup_render_inputs(row)
+    has_levels = bool(setup_inputs.get("has_actionable_levels"))
 
     if score <= 0:
         return None
@@ -5561,24 +5641,8 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
     reason = str(unified.get("final_reason") or row.get("entry_reason") or row.get("signal_reason") or "n/a")
     horizon = str(row.get("entry_horizon") or signal.get("horizon") or "n/a")
 
-    entry_now = parse_float(row.get("entry_now"), 0.0)
-    pullback_1 = parse_float(row.get("pullback_1"), 0.0)
-    pullback_2 = parse_float(row.get("pullback_2"), 0.0)
-    invalidation = parse_float(row.get("invalidation"), 0.0)
-    tp1 = parse_float(row.get("tp1"), 0.0)
-    tp2 = parse_float(row.get("tp2"), 0.0)
-
-    if any([entry_now, pullback_1, pullback_2, invalidation, tp1, tp2]):
-        levels_block = (
-            f"entry now: {entry_now}\n"
-            f"pullback 1: {pullback_1}\n"
-            f"pullback 2: {pullback_2}\n"
-            f"invalidation: {invalidation}\n"
-            f"tp1: {tp1}\n"
-            f"tp2: {tp2}"
-        )
-    else:
-        levels_block = "setup: watch only"
+    setup_inputs = build_setup_render_inputs(row)
+    levels_block = str(row.get("setup_levels_block") or setup_inputs.get("levels_block") or "setup: watch only")
 
     if source == "portfolio":
         return format_portfolio_signal_message(row)
@@ -7949,33 +8013,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                             request_rerun()
 
             st.code(token_ca(r), language="text")
-
-            entry_now = parse_float(r.get("entry_now"), 0.0)
-            pullback_1 = parse_float(r.get("pullback_1"), 0.0)
-            pullback_2 = parse_float(r.get("pullback_2"), 0.0)
-            invalidation = parse_float(r.get("invalidation"), 0.0)
-            tp1 = parse_float(r.get("tp1"), 0.0)
-            tp2 = parse_float(r.get("tp2"), 0.0)
+            setup_inputs = build_setup_render_inputs(r)
             setup_tab, diagnostics_tab, dynamics_tab = st.tabs(
                 ["Setup / levels", "Diagnostics", "Dynamics"]
             )
             with setup_tab:
-                if has_actionable_levels(r):
-                    level_rows = []
-                    for lbl, val in [
-                        ("entry_now", entry_now),
-                        ("pullback_1", pullback_1),
-                        ("pullback_2", pullback_2),
-                        ("invalidation", invalidation),
-                        ("tp1", tp1),
-                        ("tp2", tp2),
-                    ]:
-                        if val > 0:
-                            level_rows.append({"level": lbl, "value": val})
-                    if level_rows:
-                        st.table(pd.DataFrame(level_rows))
-                    else:
-                        st.caption("setup: watch only")
+                level_rows = setup_inputs.get("level_rows") or []
+                if level_rows:
+                    st.table(pd.DataFrame(level_rows))
                 else:
                     st.caption("setup: watch only")
 
