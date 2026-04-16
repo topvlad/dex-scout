@@ -10,12 +10,18 @@ try:
         MON_FIELDS,
         PORTFOLIO_FIELDS,
         addr_store,
+        build_active_monitoring_rows,
+        build_notification_candidates,
         load_monitoring,
         load_portfolio,
         normalize_chain_name,
+        normalize_timing_label,
         now_utc_str,
+        parse_float,
         save_monitoring,
         save_portfolio,
+        send_telegram,
+        suppress_token,
     )
 except Exception as e:
     print(f"[tg_webhook] helper import failed: {e}", flush=True)
@@ -46,12 +52,46 @@ except Exception as e:
 
         return datetime.now(timezone.utc).isoformat()
 
+    def parse_float(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    def normalize_timing_label(raw: Any) -> str:
+        return str(raw or "NEUTRAL").upper()
+
+    def build_active_monitoring_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [r for r in rows if str(r.get("active", "1")).strip() == "1"]
+
+    def build_notification_candidates(
+        monitoring_rows: List[Dict[str, Any]],
+        portfolio_rows: List[Dict[str, Any]],
+        limit_monitoring: int = 12,
+        limit_portfolio: int = 8,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        _ = limit_monitoring, limit_portfolio
+        return monitoring_rows, portfolio_rows
+
+    def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Dict[str, Any] = None) -> bool:
+        _ = text, parse_mode, reply_markup
+        return False
+
+    def suppress_token(chain: str, ca: str, reason: str = "manual_remove", days: int = 30) -> None:
+        _ = chain, ca, reason, days
+        return None
+
 
 app = FastAPI()
 
 
 def tg_token() -> str:
     return os.getenv("TG_BOT_TOKEN", "") or os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+
+def summary_key_ok(value: str) -> bool:
+    expected = os.getenv("TG_SUMMARY_KEY", "").strip()
+    return bool(expected) and value == expected
 
 
 def tg_api(method: str, payload: dict) -> dict:
@@ -286,6 +326,7 @@ async def tg_webhook(req: Request):
             result_text = f"Added to monitoring | {token_label}"
         elif action in ("rm", "remove", "delete", "archive"):
             remove_contract_everywhere(chain, ca)
+            suppress_token(chain, ca, reason="manual_remove_from_tg", days=30)
             result_text = f"Removed / archived | {token_label}"
 
         print(f"[TG_WEBHOOK] result={result_text}", flush=True)
@@ -316,7 +357,7 @@ async def tg_webhook(req: Request):
                         f"<b>{result_title}</b>\n"
                         f"chain: {safe_chain}\n"
                         f"token: {safe_label}\n"
-                        f"CA:\n<pre>{safe_ca}</pre>"
+                        f"CA:\n<code>{safe_ca}</code>"
                     ),
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True,
@@ -336,3 +377,35 @@ async def tg_webhook(req: Request):
         print(f"[tg_webhook] error: {type(e).__name__}: {e}", flush=True)
 
     return {"ok": True}
+
+
+@app.get("/tg/summary")
+def tg_summary(key: str):
+    if not summary_key_ok(key):
+        return {"ok": False, "error": "forbidden"}
+
+    portfolio_rows = load_portfolio()
+    monitoring_rows = load_monitoring()
+
+    active_portfolio = [r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"]
+    mon_rows, _ = build_notification_candidates(monitoring_rows, portfolio_rows, limit_monitoring=5, limit_portfolio=5)
+
+    top_mon = mon_rows[:5]
+    top_lines = []
+    for r in top_mon:
+        top_lines.append(
+            f"{str(r.get('base_symbol') or r.get('symbol') or 'TOKEN')}: "
+            f"{parse_float(r.get('entry_score', 0), 0.0)} / "
+            f"{normalize_timing_label(str(r.get('timing_label') or 'NEUTRAL'))}"
+        )
+
+    text = (
+        f"<b>DEX Scout summary</b>\n"
+        f"portfolio active: {len(active_portfolio)}\n"
+        f"monitoring active: {len(build_active_monitoring_rows(monitoring_rows))}\n\n"
+        f"<b>Top monitoring now:</b>\n"
+        + ("\n".join(top_lines) if top_lines else "no active candidates")
+    )
+
+    ok = send_telegram(text, parse_mode="HTML")
+    return {"ok": ok, "sent": ok}

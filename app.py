@@ -110,6 +110,7 @@ MONITORING_CSV = os.path.join(DATA_DIR, "monitoring.csv")
 MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
 TG_STATE_FILE = os.path.join(DATA_DIR, "tg_state.json")
 TG_STATE_KEY = "tg_state.json"
+SUPPRESSED_KEY = "suppressed_tokens.json"
 
 
 def request_rerun() -> None:
@@ -460,6 +461,41 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
 
     st.session_state[f"_storage_source_{key}"] = "empty"
     return []
+
+
+def storage_read_text(key: str, default: str = "") -> str:
+    ensure_storage()
+    key = storage_key_for_path(key)
+
+    if _sb_ok():
+        content = sb_get_storage(key)
+        if content is not None:
+            return str(content)
+
+    fallback = local_fallback_path(os.path.join(DATA_DIR, key))
+    if os.path.exists(fallback):
+        try:
+            return Path(fallback).read_text(encoding="utf-8")
+        except Exception:
+            return str(default)
+    return str(default)
+
+
+def storage_write_text(key: str, text: str) -> None:
+    ensure_storage()
+    key = storage_key_for_path(key)
+    content = str(text or "")
+
+    fallback = local_fallback_path(os.path.join(DATA_DIR, key))
+    try:
+        lockp = fallback + ".lock"
+        with file_lock(lockp):
+            Path(fallback).write_text(content, encoding="utf-8")
+    except Exception as e:
+        debug_log(f"local_fallback_write_failed key={key} err={type(e).__name__}:{e}")
+
+    if _sb_ok():
+        sb_put_storage(key, content)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1612,6 +1648,52 @@ def has_actionable_levels(row: Dict[str, Any]) -> bool:
             parse_float(row.get("tp2"), 0.0) > 0,
         ]
     )
+
+
+def load_suppressed_tokens() -> Dict[str, Dict[str, Any]]:
+    raw = storage_read_text(SUPPRESSED_KEY, "")
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_suppressed_tokens(data: Dict[str, Dict[str, Any]]) -> None:
+    storage_write_text(SUPPRESSED_KEY, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def suppress_token(chain: str, ca: str, reason: str = "manual_remove", days: int = 30) -> None:
+    chain = normalize_chain_name(chain)
+    ca = addr_store(chain, ca)
+    data = load_suppressed_tokens()
+    until_ts = (datetime.utcnow() + timedelta(days=days)).isoformat()
+    data[f"{chain}:{ca}"] = {
+        "chain": chain,
+        "ca": ca,
+        "reason": reason,
+        "suppressed_until": until_ts,
+        "updated_at": now_utc_str(),
+    }
+    save_suppressed_tokens(data)
+
+
+def is_token_suppressed(chain: str, ca: str) -> bool:
+    chain = normalize_chain_name(chain)
+    ca = addr_store(chain, ca)
+    data = load_suppressed_tokens()
+    item = data.get(f"{chain}:{ca}")
+    if not item:
+        return False
+    until_ts = str(item.get("suppressed_until") or "").strip()
+    if not until_ts:
+        return True
+    try:
+        return datetime.utcnow() < datetime.fromisoformat(until_ts)
+    except Exception:
+        return True
 
 
 def build_entry_engine_v2(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -4788,6 +4870,62 @@ def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"inline_keyboard": buttons}
 
 
+def build_notification_candidates(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+    limit_monitoring: int = 12,
+    limit_portfolio: int = 8,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def token_addr(row: Dict[str, Any]) -> str:
+        chain = str(row.get("chain") or "").strip().lower()
+        ca = str(
+            row.get("base_addr")
+            or row.get("base_token_address")
+            or row.get("ca")
+            or row.get("address")
+            or ""
+        ).strip()
+        return f"{chain}:{addr_store(chain, ca)}" if chain and ca else ""
+
+    mon: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    for row in build_active_monitoring_rows(monitoring_rows):
+        key = token_addr(row)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+
+        if is_token_suppressed(str(row.get("chain") or ""), str(row.get("base_addr") or row.get("ca") or "")):
+            continue
+
+        score = parse_float(row.get("entry_score", 0), 0.0)
+        if score <= 0:
+            continue
+
+        mon.append(row)
+
+    mon.sort(key=lambda r: parse_float(r.get("entry_score", 0), 0.0), reverse=True)
+    mon = mon[:limit_monitoring]
+
+    port: List[Dict[str, Any]] = []
+    seen_port: Set[str] = set()
+
+    for row in portfolio_rows:
+        if str(row.get("active", "1")).strip() != "1":
+            continue
+        key = token_addr(row)
+        if not key or key in seen_port:
+            continue
+        seen_port.add(key)
+        port.append(row)
+
+    port.sort(key=lambda r: parse_float(r.get("entry_score", 0), 0.0), reverse=True)
+    port = port[:limit_portfolio]
+
+    return mon, port
+
+
 def run_auto_notifications(
     scan_state: Dict[str, Any],
     monitoring_rows: List[Dict[str, Any]],
@@ -4811,11 +4949,13 @@ def run_auto_notifications(
     sent_now = 0
     max_per_run = 3 if WORKER_FAST_MODE else 5
     new_token_state: Dict[str, Dict[str, Any]] = {}
-    candidates: List[Tuple[float, str, Dict[str, Any]]] = []
 
-    for row in monitoring_rows:
+    mon_rows, port_rows = build_notification_candidates(monitoring_rows, portfolio_rows)
+
+    candidates: List[Tuple[float, str, Dict[str, Any]]] = []
+    for row in mon_rows:
         candidates.append((parse_float(row.get("entry_score", 0), 0.0), "monitoring", row))
-    for row in portfolio_rows:
+    for row in port_rows:
         candidates.append((parse_float(row.get("entry_score", 0), 0.0), "portfolio", row))
 
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -4833,6 +4973,8 @@ def run_auto_notifications(
         chain = token_chain(row)
         ca = token_ca(row)
         if not chain or not ca:
+            continue
+        if is_token_suppressed(chain, ca):
             continue
 
         token_key = build_token_state_key(row)
@@ -5053,7 +5195,7 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
 def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, int]:
     chain = (chain or "solana").strip().lower()
     preset = PRESETS.get(window_name, PRESETS.get("Wide Net (explore)", {}))
-    counts = {"added": 0, "updated_active": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "skipped_wrong_chain": 0, "skipped_major": 0, "errors": 0, "seen": 0}
+    counts = {"added": 0, "updated_active": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "skipped_wrong_chain": 0, "skipped_major": 0, "skipped_suppressed": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     debug_log(f"ingest_pairs_raw={len(pairs)}")
     normalized = [r for r in pairs if r is not None]
@@ -5195,6 +5337,13 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             }
         try:
             contract = addr_store(row.get("chainId", ""), safe_get(row, "baseToken", "address", default=""))
+            chain_norm = normalize_chain_name(row.get("chainId", "") or row.get("chain", ""))
+            base_addr_norm = addr_store(chain_norm, contract)
+
+            if is_token_suppressed(chain_norm, base_addr_norm):
+                counts["skipped_suppressed"] = counts.get("skipped_suppressed", 0) + 1
+                continue
+
             if token_exists(contract):
                 update_existing_token(row, s, window_name=window_name, preset_key=preset_key, entry_status=entry_status, entry_score=entry_score, risk_level=str(row.get("risk_level", "MEDIUM")))
                 counts["updated_active"] += 1
