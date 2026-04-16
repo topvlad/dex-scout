@@ -7381,15 +7381,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         header = f"{name} | {primary} | {score:.2f}"
 
         with st.expander(header, expanded=False):
+            final_reason = str(unified.get("final_reason", "n/a"))
             timing_label = unified.get("timing") or normalize_timing_label(item.get("timing_label") or r.get("timing_label") or "NEUTRAL")
             risk_label = str(item.get("risk_level", "UNKNOWN"))
-            final_reason = str(unified.get("final_reason", "n/a"))
-            st.caption(
-                f"{chain.upper()} • timing {timing_label} • risk {risk_label} • status {secondary}"
-            )
+            short_caption = f"{chain.upper()} • timing {timing_label} • risk {risk_label} • status {secondary}"
             st.markdown(f"**Recommendation: {primary}**")
             st.caption(f"Reason: {final_reason}")
             st.caption(f"Suggested size: {unified.get('size_hint', 'WATCH ONLY')}")
+            st.caption(short_caption)
             if item.get("is_portfolio_active"):
                 st.caption("In portfolio • still monitored")
 
@@ -7448,11 +7447,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.caption("setup: watch only")
 
             with diagnostics_tab:
-                st.markdown("**Engine snapshot**")
+                st.markdown("**Decision diagnostics**")
+                st.write(f"recommendation: {primary}")
+                st.write(f"reason: {final_reason}")
+                st.write(f"size hint: {unified.get('size_hint', 'WATCH ONLY')}")
                 st.write(f"risk: {risk_label}")
                 st.write(f"timing: {timing_label}")
-                st.write(f"status/ui badge: {secondary}")
-                st.write(f"visible score: {float(item.get('ui_visible_score', 0.0)):.2f}")
                 blocker = str(r.get("decision_reason") or r.get("gate_reason") or r.get("gate_blocker") or "").strip()
                 if blocker:
                     st.write(f"gate/blocker: {blocker}")
