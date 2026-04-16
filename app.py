@@ -3118,13 +3118,26 @@ def portfolio_action_badge(action: str) -> str:
 
 
 def get_portfolio_entry_price(row: Dict[str, Any]) -> float:
-    for key in ("avg_entry_price", "entry_price", "entry", "price_at_add"):
-        val = parse_float(row.get(key), 0.0)
-        if val > 0:
-            return val
-    legacy_entry_usd = parse_float(row.get("entry_price_usd"), 0.0)
-    if legacy_entry_usd > 0:
-        return legacy_entry_usd
+    def _parse_portfolio_entry_value(raw: Any) -> float:
+        if raw is None:
+            return 0.0
+        if isinstance(raw, (int, float)):
+            return parse_float(raw, 0.0)
+        text = str(raw).strip().replace("$", "").replace(",", "")
+        if not text:
+            return 0.0
+        return parse_float(text, 0.0)
+
+    avg_entry_price = _parse_portfolio_entry_value(row.get("avg_entry_price"))
+    if avg_entry_price > 0:
+        return avg_entry_price
+
+    # Controlled fallback for legacy data only when avg_entry_price is missing/invalid.
+    for key in ("entry_price_usd", "entry_price", "price_at_add", "entry"):
+        legacy_val = _parse_portfolio_entry_value(row.get(key))
+        if legacy_val > 0:
+            return legacy_val
+
     return 0.0
 
 
@@ -8005,9 +8018,12 @@ def page_portfolio():
             if st.button("Save entry price", key=f"save_avg_{idx}_{hkey(base_addr, chain)}", use_container_width=True):
                 all_rows = load_portfolio()
                 target_key = addr_key(chain, base_addr)
+                avg_entry_str = f"{float(avg_entry):.12f}".rstrip("0").rstrip(".")
                 for rr in all_rows:
                     if addr_key(rr.get("chain", ""), rr.get("base_token_address", "")) == target_key:
-                        rr["avg_entry_price"] = str(avg_entry)
+                        rr["avg_entry_price"] = avg_entry_str
+                        # Keep legacy field synchronized for older flows that still read it.
+                        rr["entry_price_usd"] = avg_entry_str
                         rr["updated_at"] = now_utc_str()
                         break
                 save_portfolio(all_rows)
@@ -8085,9 +8101,11 @@ def page_portfolio():
     if closed_rows:
         with st.expander("Closed / Archived"):
             for r in closed_rows[-50:]:
+                closed_entry_price = get_portfolio_entry_price(r)
                 st.write(
                     f"{r.get('ts_utc','')} – {r.get('base_symbol','')}/{r.get('quote_symbol','')} "
-                    f"– entry ${r.get('entry_price_usd','')} – {r.get('action','')}"
+                    f"– entry ${closed_entry_price:.12f}".rstrip("0").rstrip(".")
+                    + f" – {r.get('action','')}"
                 )
 
 
