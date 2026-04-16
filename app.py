@@ -108,9 +108,27 @@ MEME_KEYWORDS = [
 PORTFOLIO_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 MONITORING_CSV = os.path.join(DATA_DIR, "monitoring.csv")
 MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
+PORTFOLIO_RECO_LOG_CSV = os.path.join(DATA_DIR, "portfolio_reco_log.csv")
 TG_STATE_FILE = os.path.join(DATA_DIR, "tg_state.json")
 TG_STATE_KEY = "tg_state.json"
 SUPPRESSED_KEY = "suppressed_tokens.json"
+
+PORTFOLIO_RECO_LOG_FIELDS = [
+    "event_id",
+    "ts_utc",
+    "token",
+    "chain",
+    "health_label",
+    "health_bucket",
+    "final_action",
+    "final_reason",
+    "liq_usd",
+    "vol24_usd",
+    "snapshot_age_min",
+    "outcome_status",
+    "outcome_ts_utc",
+    "outcome_note",
+]
 
 
 def request_rerun() -> None:
@@ -395,6 +413,12 @@ def ensure_storage():
                     "decision",
                 ],
             )
+            w.writeheader()
+
+    # lightweight sidecar for portfolio recommendation outcomes
+    if not os.path.exists(PORTFOLIO_RECO_LOG_CSV):
+        with open(PORTFOLIO_RECO_LOG_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=PORTFOLIO_RECO_LOG_FIELDS)
             w.writeheader()
 
 
@@ -3571,6 +3595,59 @@ def append_monitoring_history(row: Dict[str, Any]):
     hist_row["risk_level"] = str(row.get("risk_level", ""))
     payload = {k: hist_row.get(k, "") for k in HIST_FIELDS}
     append_csv(MON_HISTORY_CSV, payload, HIST_FIELDS)
+
+
+def classify_health_bucket(health: Dict[str, Any]) -> str:
+    if bool(health.get("is_dead")):
+        return "DEAD"
+    if bool(health.get("is_untradeable")):
+        return "UNTRADEABLE"
+    if bool(health.get("is_low_liq")) and bool(health.get("is_cold")):
+        return "LOW_LIQ+COLD"
+    return "OTHER"
+
+
+def log_portfolio_recommendation_snapshot(
+    token: str,
+    chain: str,
+    unified: Dict[str, Any],
+) -> None:
+    health = dict(unified.get("health") or {})
+    event_id = hashlib.md5(f"{chain}|{token}|{now_utc_str()}".encode("utf-8")).hexdigest()[:16]
+    row = {
+        "event_id": event_id,
+        "ts_utc": now_utc_str(),
+        "token": token,
+        "chain": chain,
+        "health_label": str(health.get("health_label", "OK")),
+        "health_bucket": classify_health_bucket(health),
+        "final_action": str(unified.get("final_action", "")),
+        "final_reason": str(unified.get("final_reason", "")),
+        "liq_usd": str(parse_float(health.get("liq_usd"), 0.0)),
+        "vol24_usd": str(parse_float(health.get("vol24"), 0.0)),
+        "snapshot_age_min": str(parse_float(health.get("snapshot_age_min"), 0.0)),
+        # Sidecar-only placeholders for next stage (outcome tracking),
+        # no changes in primary portfolio/monitoring storage format.
+        "outcome_status": "PENDING",
+        "outcome_ts_utc": "",
+        "outcome_note": "",
+    }
+    append_csv(PORTFOLIO_RECO_LOG_CSV, row, PORTFOLIO_RECO_LOG_FIELDS)
+
+
+def portfolio_reco_health_counts(period_hours: int = 24) -> Dict[str, int]:
+    rows = load_csv(PORTFOLIO_RECO_LOG_CSV, PORTFOLIO_RECO_LOG_FIELDS)
+    now = datetime.utcnow()
+    cutoff = now - timedelta(hours=max(1, int(period_hours)))
+    counts = {"DEAD": 0, "UNTRADEABLE": 0, "LOW_LIQ+COLD": 0}
+    for r in rows:
+        ts = parse_ts(r.get("ts_utc"))
+        if ts is None or ts < cutoff:
+            continue
+        bucket = str(r.get("health_bucket", "")).strip().upper()
+        if bucket in counts:
+            counts[bucket] += 1
+    return counts
 
 
 def token_exists(contract: str) -> bool:
@@ -7570,6 +7647,17 @@ def render_debug_panel():
         st.write(list(st.session_state.keys())[:10])
 
         st.write("---")
+        st.write("### Portfolio health (recent)")
+        period_hours = st.number_input("Window (hours)", min_value=1, max_value=168, value=24, step=1)
+        counts = portfolio_reco_health_counts(period_hours=int(period_hours))
+        st.caption(
+            f"Last {int(period_hours)}h: "
+            f"DEAD={counts['DEAD']} • "
+            f"UNTRADEABLE={counts['UNTRADEABLE']} • "
+            f"LOW_LIQ+COLD={counts['LOW_LIQ+COLD']}"
+        )
+
+        st.write("---")
         st.write("### Core safety")
         core_safety_self_check()
 
@@ -7776,6 +7864,11 @@ def page_portfolio():
             },
             source="portfolio",
             hist=hist,
+        )
+        log_portfolio_recommendation_snapshot(
+            token=base_addr,
+            chain=chain,
+            unified=unified,
         )
         health = dict(unified.get("health") or detect_position_health(
             {
