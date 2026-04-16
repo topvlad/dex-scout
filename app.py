@@ -38,6 +38,7 @@ from contextlib import contextmanager
 import requests
 import streamlit as st
 import pandas as pd
+import config as app_config
 
 
 st.set_page_config(page_title="DEX Scout", layout="wide")
@@ -1671,9 +1672,55 @@ def _series_is_flat(values: List[float], rel_eps: float = 0.01, abs_eps: float =
     return span <= max(abs_eps, baseline * rel_eps)
 
 
+DEFAULT_HEALTH_THRESHOLDS: Dict[str, Any] = {
+    "liq_low_usd": 1_000.0,
+    "vol24_low_usd": 100.0,
+    "stale_minutes": 240.0,
+    "min_history_points": 4,
+    "flat_eps": {
+        "price": 0.003,
+        "liq": 0.01,
+        "vol24": 0.05,
+        "vol5": 0.05,
+    },
+}
+
+
+def get_health_thresholds() -> Dict[str, Any]:
+    cfg = dict(getattr(app_config, "HEALTH_THRESHOLDS", {}) or {})
+    base = dict(DEFAULT_HEALTH_THRESHOLDS)
+    base_flat = dict(DEFAULT_HEALTH_THRESHOLDS.get("flat_eps", {}) or {})
+    base_flat.update(dict(cfg.get("flat_eps", {}) or {}))
+    base.update(cfg)
+    base["flat_eps"] = base_flat
+    return base
+
+
+def health_thresholds_debug_line() -> str:
+    t = get_health_thresholds()
+    flat = dict(t.get("flat_eps", {}) or {})
+    return (
+        "Health thresholds: "
+        f"liq_low={parse_float(t.get('liq_low_usd'), 1000.0):.2f}, "
+        f"vol24_low={parse_float(t.get('vol24_low_usd'), 100.0):.2f}, "
+        f"stale_min={parse_float(t.get('stale_minutes'), 240.0):.1f}, "
+        f"min_hist={int(parse_float(t.get('min_history_points'), 4.0))}, "
+        f"flat_eps(price={parse_float(flat.get('price'), 0.003):.4f}, "
+        f"liq={parse_float(flat.get('liq'), 0.01):.4f}, "
+        f"vol24={parse_float(flat.get('vol24'), 0.05):.4f}, "
+        f"vol5={parse_float(flat.get('vol5'), 0.05):.4f})"
+    )
+
+
+def is_debug_mode_enabled() -> bool:
+    return bool(st.session_state.get("debug_mode", False) or st.session_state.get("show_debug_raw", False))
+
+
 def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> Dict[str, Any]:
+    health_cfg = get_health_thresholds()
+    flat_eps = dict(health_cfg.get("flat_eps", {}) or {})
     grace_age_min = 45.0
-    grace_hist_points = 4
+    grace_hist_points = int(parse_float(health_cfg.get("min_history_points"), 4.0))
     liq_usd = _float_from_any(row, ["liq_usd", "liquidity", "liquidity_usd"], 0.0)
     vol5 = _float_from_any(row, ["vol5", "vol5_usd", "volume_m5", "volume5"], 0.0)
     vol24 = _float_from_any(row, ["vol24", "vol24_usd", "volume_h24", "volume24"], 0.0)
@@ -1695,7 +1742,7 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
     explicit_dead_rug = any(explicit_dead_flags)
     is_dead = explicit_dead_rug or (price <= 0 and liq_usd <= 0 and vol24 <= 0)
 
-    low_liq_threshold = 1000.0
+    low_liq_threshold = parse_float(health_cfg.get("liq_low_usd"), 1000.0)
     is_low_liq = liq_usd < low_liq_threshold
 
     ts_added = (
@@ -1725,7 +1772,7 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
     young_position = position_age_min < grace_age_min
     health_grace_applied = bool(young_position and insufficient_history and not explicit_dead_rug)
     age_min = (datetime.utcnow() - latest_ts).total_seconds() / 60.0 if latest_ts else 10_000.0
-    is_stale = age_min >= 240.0
+    is_stale = age_min >= parse_float(health_cfg.get("stale_minutes"), 240.0)
     if health_grace_applied:
         is_stale = False
 
@@ -1734,11 +1781,12 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
     vol24_hist = [parse_float(h.get("vol24", h.get("vol24_usd", 0)), 0.0) for h in hist or []]
     vol5_hist = [parse_float(h.get("vol5", h.get("vol5_usd", 0)), 0.0) for h in hist or []]
 
-    near_zero = (vol24 < 100.0 and vol5 <= 0.0) or (liq_usd <= 0 and vol24 <= 0 and vol5 <= 0)
-    flat_price = _series_is_flat(price_hist, rel_eps=0.003) if price_hist else False
-    flat_liq = _series_is_flat(liq_hist, rel_eps=0.01) if liq_hist else False
-    flat_vol24 = _series_is_flat(vol24_hist, rel_eps=0.05) if vol24_hist else False
-    flat_vol5 = _series_is_flat(vol5_hist, rel_eps=0.05) if vol5_hist else False
+    low_vol24_threshold = parse_float(health_cfg.get("vol24_low_usd"), 100.0)
+    near_zero = (vol24 < low_vol24_threshold and vol5 <= 0.0) or (liq_usd <= 0 and vol24 <= 0 and vol5 <= 0)
+    flat_price = _series_is_flat(price_hist, rel_eps=parse_float(flat_eps.get("price"), 0.003)) if price_hist else False
+    flat_liq = _series_is_flat(liq_hist, rel_eps=parse_float(flat_eps.get("liq"), 0.01)) if liq_hist else False
+    flat_vol24 = _series_is_flat(vol24_hist, rel_eps=parse_float(flat_eps.get("vol24"), 0.05)) if vol24_hist else False
+    flat_vol5 = _series_is_flat(vol5_hist, rel_eps=parse_float(flat_eps.get("vol5"), 0.05)) if vol5_hist else False
     all_flat_recent = all([flat_price or not price_hist, flat_liq or not liq_hist, flat_vol24 or not vol24_hist, flat_vol5 or not vol5_hist])
     is_cold = bool(near_zero or all_flat_recent)
     if health_grace_applied and is_cold:
@@ -7053,6 +7101,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     st.title("Monitoring")
     st.caption("Manual pipeline: click scanner → save snapshot → render Monitoring.")
     st.caption("Telegram callbacks update storage directly. Use Refresh live data or reload the page to see external changes.")
+    if is_debug_mode_enabled():
+        st.caption(health_thresholds_debug_line())
 
     if "selected_token" not in st.session_state:
         st.session_state.selected_token = None
@@ -7553,6 +7603,8 @@ def explain_reco(
 def page_portfolio():
     st.title("Portfolio / Watchlist")
     st.caption("Entries appear here after clicking Log → Portfolio (I swapped) in Scout or Promote in Monitoring.")
+    if is_debug_mode_enabled():
+        st.caption(health_thresholds_debug_line())
 
     rows = load_portfolio()
     active_rows = [r for r in rows if r.get("active") == "1"]
