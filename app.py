@@ -382,6 +382,9 @@ def ensure_storage():
                     "priority_score",
                     "last_decay_ts",
                     "decay_hits",
+                    "gem_transition_score",
+                    "gem_transition_sufficient",
+                    "gem_transition_reason",
                     "entry_state",
                     "revisit_count",
                     "revisit_after_ts",
@@ -3511,6 +3514,9 @@ MON_FIELDS = [
     "decision_reason",
     "signal_reason",
     "timing_label",
+    "gem_transition_score",
+    "gem_transition_sufficient",
+    "gem_transition_reason",
     "weak_reason",
     "in_portfolio",
     "toxic_flags",
@@ -4009,10 +4015,19 @@ def add_to_monitoring(
     if not base_addr:
         return "NO_ADDR"
 
+    hist = token_history_rows(chain, base_addr, limit=30)
+    gem_data = compute_gem_transition_score(p, hist)
+    gem_score = parse_float(gem_data.get("gem_transition_score"), GEM_TRANSITION_NEUTRAL)
+    gem_sufficient = bool(gem_data.get("gem_transition_sufficient"))
+    health_state = detect_position_health(p, hist)
+    health_label = str(health_state.get("health_label", "OK")).upper()
+    adjusted_priority = gem_transition_priority_bias(score, gem_score, health_label, gem_sufficient)
+
     for r in rows:
         if r.get("active") == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
             # refresh lightweight fields
             r["last_score"] = str(score)
+            r["priority_score"] = str(adjusted_priority)
             r["ts_last_seen"] = now_utc_str()
             if entry_status:
                 r["entry_status"] = entry_status
@@ -4033,7 +4048,10 @@ def add_to_monitoring(
             r["entry"] = entry
             if not r.get("signal_reason"):
                 r["signal_reason"] = signal_reason
-            r["timing_label"] = compute_timing(p)
+            r["gem_transition_score"] = str(gem_score)
+            r["gem_transition_sufficient"] = "1" if gem_sufficient else "0"
+            r["gem_transition_reason"] = str(gem_data.get("gem_transition_reason") or "")
+            r["timing_label"] = compute_timing({**p, **gem_data})
             if window_name:
                 r["source_window"] = _merge_csv_values(r.get("source_window", ""), window_name)
             if preset_key:
@@ -4076,7 +4094,7 @@ def add_to_monitoring(
             "archived_reason": "",
             "last_score": str(score),
             "last_decision": decision,
-            "priority_score": str(score),
+            "priority_score": str(adjusted_priority),
             "last_decay_ts": now_utc_str(),
             "decay_hits": "0",
             "source_window": window_name or "",
@@ -4099,7 +4117,10 @@ def add_to_monitoring(
             "entry": computed_entry,
             "decision_reason": str(p.get("decision_reason") or ""),
             "signal_reason": str(p.get("signal_reason") or computed_signal_reason or ""),
-            "timing_label": compute_timing(p),
+            "timing_label": compute_timing({**p, **gem_data}),
+            "gem_transition_score": str(gem_score),
+            "gem_transition_sufficient": "1" if gem_sufficient else "0",
+            "gem_transition_reason": str(gem_data.get("gem_transition_reason") or ""),
             "weak_reason": str(p.get("weak_reason") or ""),
             "in_portfolio": "0",
             "toxic_flags": str(p.get("toxic_flags") or ""),
@@ -7208,6 +7229,119 @@ def compute_entry_signal(item: Dict[str, Any]) -> Tuple[str, str]:
     return "NO_ENTRY", "no_momentum"
 
 
+GEM_TRANSITION_NEUTRAL = 50.0
+GEM_TRANSITION_MIN_HISTORY = 4
+GEM_TRANSITION_MAX_AGE_MIN = 180.0
+
+
+def _recent_history_for_transition(hist: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    rows = hist or []
+    if not rows:
+        return []
+    now_dt = datetime.utcnow()
+    recent: List[Dict[str, Any]] = []
+    for row in rows[-12:]:
+        ts = parse_ts(row.get("ts_utc"))
+        if ts is None:
+            continue
+        age_min = (now_dt - ts).total_seconds() / 60.0
+        if 0 <= age_min <= GEM_TRANSITION_MAX_AGE_MIN:
+            recent.append(row)
+    return recent
+
+
+def _series_acceleration(values: List[float]) -> float:
+    if len(values) < 4:
+        return 0.0
+    diffs = [values[i] - values[i - 1] for i in range(1, len(values))]
+    if len(diffs) < 3:
+        return 0.0
+    head = sum(diffs[: max(1, len(diffs) // 2)]) / max(1, len(diffs) // 2)
+    tail = sum(diffs[max(1, len(diffs) // 2):]) / max(1, len(diffs) - max(1, len(diffs) // 2))
+    return tail - head
+
+
+def compute_gem_transition_score(
+    best: Optional[Dict[str, Any]],
+    hist: Optional[List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    recent = _recent_history_for_transition(hist)
+    if len(recent) < GEM_TRANSITION_MIN_HISTORY:
+        return {
+            "gem_transition_score": GEM_TRANSITION_NEUTRAL,
+            "gem_transition_sufficient": False,
+            "gem_transition_reason": "insufficient_recent_history",
+            "gem_transition_components": {},
+        }
+
+    prices = [parse_float(x.get("price_usd", 0), 0.0) for x in recent]
+    liqs = [parse_float(x.get("liq_usd", 0), 0.0) for x in recent]
+    vols = [parse_float(x.get("vol5_usd", 0), 0.0) for x in recent]
+    pcs = [parse_float(x.get("pc5", 0), 0.0) for x in recent]
+
+    price_acc = _series_acceleration(prices)
+    liq_acc = _series_acceleration(liqs)
+    vol_acc = _series_acceleration(vols)
+    pc_build = (sum(pcs[-3:]) / 3.0) if len(pcs) >= 3 else pcs[-1]
+
+    liq_now = parse_float(safe_get(best or {}, "liquidity", "usd", default=liqs[-1] if liqs else 0.0), 0.0)
+    vol_now = parse_float(safe_get(best or {}, "volume", "m5", default=vols[-1] if vols else 0.0), 0.0)
+    buys5 = parse_float(safe_get(best or {}, "txns", "m5", "buys", default=0), 0.0)
+    sells5 = parse_float(safe_get(best or {}, "txns", "m5", "sells", default=0), 0.0)
+    txns5 = buys5 + sells5
+    buy_ratio = (buys5 / txns5) if txns5 > 0 else 0.5
+
+    score = GEM_TRANSITION_NEUTRAL
+    score += max(min(price_acc * 8000.0, 14.0), -14.0)
+    score += max(min((liq_acc / max(liq_now, 1.0)) * 900.0, 10.0), -10.0)
+    score += max(min((vol_acc / max(vol_now, 1.0)) * 800.0, 12.0), -12.0)
+    score += max(min(pc_build * 1.1, 10.0), -10.0)
+
+    if liq_now >= 15_000 and vol_now >= 2_000:
+        score += 4.0
+    elif liq_now < 3_000 or vol_now < 200:
+        score -= 8.0
+
+    if buy_ratio >= 0.58 and txns5 >= 8:
+        score += 4.0
+    elif buy_ratio <= 0.40 and txns5 >= 8:
+        score -= 5.0
+
+    score = max(0.0, min(100.0, round(score, 2)))
+    return {
+        "gem_transition_score": score,
+        "gem_transition_sufficient": True,
+        "gem_transition_reason": "ok",
+        "gem_transition_components": {
+            "price_acc": round(price_acc, 8),
+            "liq_acc": round(liq_acc, 4),
+            "vol_acc": round(vol_acc, 4),
+            "pc_build": round(pc_build, 4),
+            "buy_ratio": round(buy_ratio, 4),
+            "txns5": int(txns5),
+        },
+    }
+
+
+def gem_transition_priority_bias(
+    base_priority: float,
+    gem_transition_score: float,
+    health_label: str,
+    sufficient_history: bool,
+) -> float:
+    base = float(base_priority)
+    if not sufficient_history:
+        return round(base, 2)
+    if is_strong_negative_health_state(health_label):
+        return round(base, 2)
+    delta = max(min((gem_transition_score - GEM_TRANSITION_NEUTRAL) * 0.45, 16.0), -12.0)
+    return round(max(base + delta, 0.0), 2)
+
+
+def is_strong_negative_health_state(health_label: str) -> bool:
+    return str(health_label or "").upper() in {"DEAD", "UNTRADEABLE", "LOW_LIQ", "COLD", "STALE", "CRITICAL"}
+
+
 def entry_from_score(score: float) -> str:
     if score >= 300:
         return "READY"
@@ -7218,10 +7352,19 @@ def entry_from_score(score: float) -> str:
 
 def compute_timing(item: Dict[str, Any]) -> str:
     pc = parse_float(item.get("price_change_5m", safe_get(item, "priceChange", "m5", default=0)), 0.0)
+    gem_score = parse_float(item.get("gem_transition_score"), GEM_TRANSITION_NEUTRAL)
+    gem_ok = str(item.get("gem_transition_sufficient", "")).strip().lower() in {"1", "true", "yes"}
+
     if pc > 10:
         return "HOT"
+    if gem_ok and abs(gem_score - GEM_TRANSITION_NEUTRAL) < 1e-9:
+        gem_ok = False
+    if gem_ok and gem_score >= 70 and pc > 1:
+        return "EARLY"
     if pc > 3:
         return "EARLY"
+    if gem_ok and gem_score <= 35 and pc <= 3:
+        return "NEUTRAL"
     if pc < -5:
         return "DUMP"
     return "NEUTRAL"
@@ -7315,6 +7458,12 @@ def hydrate_monitoring_row_defaults(row: Dict[str, Any], item: Dict[str, Any]) -
         row["signal_reason"] = item.get("signal_reason") or ""
     if not row.get("timing_label"):
         row["timing_label"] = normalize_timing_label(item.get("timing_label") or "NEUTRAL")
+    if not str(row.get("gem_transition_score", "")).strip():
+        row["gem_transition_score"] = str(parse_float(item.get("gem_transition_score"), GEM_TRANSITION_NEUTRAL))
+    if not str(row.get("gem_transition_sufficient", "")).strip():
+        row["gem_transition_sufficient"] = "1" if bool(item.get("gem_transition_sufficient")) else "0"
+    if not str(row.get("gem_transition_reason", "")).strip():
+        row["gem_transition_reason"] = str(item.get("gem_transition_reason") or "insufficient_recent_history")
     if row.get("portfolio_linked") == "1" and not row.get("note"):
         row["note"] = "IN PORTFOLIO"
     return row
@@ -7325,6 +7474,7 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     base_addr = addr_store(chain, str(row.get("base_addr") or "").strip())
     best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
     hist = token_history_rows(chain, base_addr, limit=30)
+    gem_data = compute_gem_transition_score(best, hist)
 
     liq_health = liquidity_health(best)
     anti_rug = anti_rug_early_detector(best, hist)
@@ -7356,6 +7506,13 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     if post_rug:
         risk_level = "EXTREME"
 
+    health = detect_position_health(best or row, hist)
+    health_label = str(health.get("health_label", "OK")).upper()
+    if str(liq_health.get("level", "")).upper() == "CRITICAL":
+        health_label = "CRITICAL"
+    gem_score = parse_float(row.get("gem_transition_score", gem_data.get("gem_transition_score", GEM_TRANSITION_NEUTRAL)), GEM_TRANSITION_NEUTRAL)
+    gem_sufficient = str(row.get("gem_transition_sufficient", gem_data.get("gem_transition_sufficient", ""))).strip().lower() in {"1", "true", "yes"}
+
     item = {
         "row": row,
         "best": best,
@@ -7377,6 +7534,10 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "entry_reasons": [entry_reason] if entry_reason else [],
         "risk_level": risk_level,
         "timing_label": timing_label,
+        "gem_transition_score": gem_score,
+        "gem_transition_sufficient": gem_sufficient,
+        "gem_transition_reason": str(row.get("gem_transition_reason") or gem_data.get("gem_transition_reason") or ""),
+        "health_label": health_label,
         "is_dead": dead,
         "is_post_rug": post_rug,
         "is_rug": post_rug,
@@ -7397,6 +7558,9 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
     timing_state = normalize_timing_label(row.get("timing_label") or "")
     anti_level = str(item.get("anti_rug", {}).get("level", "SAFE") or "SAFE").upper()
     liq_level = str(item.get("liq_health", {}).get("level", "UNKNOWN") or "UNKNOWN").upper()
+    health_label = str(item.get("health_label", "OK") or "OK").upper()
+    gem_score = parse_float(item.get("gem_transition_score"), GEM_TRANSITION_NEUTRAL)
+    gem_sufficient = bool(item.get("gem_transition_sufficient"))
     is_dead = bool(item.get("is_dead"))
     is_rug = bool(item.get("is_rug"))
 
@@ -7431,7 +7595,13 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
         penalty += 200
         flags.append("dead")
 
-    visible_score = max(raw_score - penalty, 0.0)
+    gem_bonus = 0.0
+    if gem_sufficient and not is_strong_negative_health_state(health_label) and not is_dead and not is_rug:
+        gem_bonus = max(min((gem_score - GEM_TRANSITION_NEUTRAL) * 0.22, 8.0), -6.0)
+        if gem_bonus >= 3.5:
+            flags.append("gem_transition")
+
+    visible_score = max(raw_score - penalty + gem_bonus, 0.0)
 
     if entry_status == "READY":
         bucket = "tradable"
@@ -7450,6 +7620,7 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
         "bucket": bucket,
         "visible_score": round(visible_score, 2),
         "penalty": penalty,
+        "gem_bonus": round(gem_bonus, 2),
         "flags": flags,
         "badge": badge,
     }
