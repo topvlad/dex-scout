@@ -5558,6 +5558,97 @@ def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
     return True
 
 
+EVENT_TYPE_REGISTRY: Dict[str, str] = {
+    "ENTRY_ALERT": "entry_alert",
+    "PORTFOLIO_ACTION": "portfolio_action",
+    "STATE_TRANSITION": "state_transition",
+    "DIGEST": "digest",
+    "HEALTH_WARNING": "health_warning",
+}
+
+ALERT_TIER_REGISTRY: Dict[str, str] = {
+    "CRITICAL": "critical",
+    "HIGH": "high",
+    "MEDIUM": "medium",
+    "DIGEST_ONLY": "digest_only",
+}
+
+
+def resolve_event_type(name: str, fallback: str = "STATE_TRANSITION") -> str:
+    key = str(name or "").strip().upper()
+    if key in EVENT_TYPE_REGISTRY:
+        return EVENT_TYPE_REGISTRY[key]
+    return EVENT_TYPE_REGISTRY.get(str(fallback).strip().upper(), EVENT_TYPE_REGISTRY["STATE_TRANSITION"])
+
+
+def resolve_alert_tier(name: str, fallback: str = "MEDIUM") -> str:
+    key = str(name or "").strip().upper()
+    if key in ALERT_TIER_REGISTRY:
+        return ALERT_TIER_REGISTRY[key]
+    return ALERT_TIER_REGISTRY.get(str(fallback).strip().upper(), ALERT_TIER_REGISTRY["MEDIUM"])
+
+
+def resolve_tg_alert_classification(
+    source: str,
+    row: Dict[str, Any],
+    signal: Dict[str, str],
+    unified: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    source = str(source or "").strip().lower()
+    action = str((unified or {}).get("final_action") or row.get("entry_action") or row.get("entry") or "").upper()
+    risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+    reason = str((unified or {}).get("final_reason") or row.get("entry_reason") or row.get("signal_reason") or "").lower()
+    signal_bucket = str(signal.get("bucket") or "").upper()
+
+    health_critical_markers = (
+        "anti_rug_critical",
+        "liquidity critical/dead",
+        "critical_trap",
+        "liq_critical",
+    )
+    is_health_critical = any(marker in reason for marker in health_critical_markers) or (
+        source == "monitoring" and risk == "HIGH" and action in ("AVOID", "NO_ENTRY", "EXIT")
+    )
+    if is_health_critical:
+        return {
+            "event_type": resolve_event_type("HEALTH_WARNING"),
+            "alert_tier": resolve_alert_tier("CRITICAL"),
+        }
+
+    if source == "portfolio":
+        tier_key = "MEDIUM"
+        if signal_bucket == "EXIT":
+            tier_key = "HIGH"
+        elif signal_bucket == "ADD":
+            tier_key = "HIGH"
+        return {
+            "event_type": resolve_event_type("PORTFOLIO_ACTION"),
+            "alert_tier": resolve_alert_tier(tier_key),
+        }
+
+    tier_key = "MEDIUM"
+    if signal_bucket in ("ENTRY_NOW", "WATCH"):
+        tier_key = "HIGH"
+    return {
+        "event_type": resolve_event_type("ENTRY_ALERT"),
+        "alert_tier": resolve_alert_tier(tier_key),
+    }
+
+
+def build_emission_key_foundation(
+    source: str,
+    row: Dict[str, Any],
+    signal: Dict[str, str],
+    unified: Optional[Dict[str, Any]] = None,
+) -> str:
+    classification = resolve_tg_alert_classification(source, row, signal, unified=unified)
+    chain = token_chain(row)
+    addr = str(token_ca(row) or row.get("token_address") or "").strip().lower()
+    event_type = classification["event_type"]
+    alert_tier = classification["alert_tier"]
+    return f"{source}|{chain}|{addr}|{event_type}|{alert_tier}"
+
+
 def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
     action = str(row.get("entry_action") or row.get("entry") or "").upper()
@@ -5600,13 +5691,12 @@ def classify_portfolio_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 
 def signal_event_key(source: str, row: Dict[str, Any], signal: Dict[str, str]) -> str:
-    chain = token_chain(row)
-    addr = str(token_ca(row) or row.get("token_address") or "").strip().lower()
+    foundation = build_emission_key_foundation(source, row, signal)
     action = str(row.get("entry_action") or row.get("entry") or "").upper()
     risk = str(row.get("risk_level") or row.get("risk") or "").upper()
     timing = normalize_timing_label(row.get("timing_label") or "")
     score_bucket = int(parse_float(row.get("entry_score"), 0.0) // 25)
-    return f"{source}|{chain}|{addr}|{action}|{risk}|{timing}|{score_bucket}"
+    return f"{foundation}|{action}|{risk}|{timing}|{score_bucket}"
 
 
 def build_token_state_key(row: Dict[str, Any]) -> str:
@@ -5855,6 +5945,16 @@ def run_auto_notifications(
         if not signal:
             stats["no_signal"] += 1
             continue
+
+        alert_classification = resolve_tg_alert_classification(source, row, signal, unified=unified)
+        current_snapshot["event_type"] = alert_classification["event_type"]
+        current_snapshot["alert_tier"] = alert_classification["alert_tier"]
+        current_snapshot["emission_key_foundation"] = build_emission_key_foundation(
+            source,
+            row,
+            signal,
+            unified=unified,
+        )
 
         event_key = signal_event_key(source, row, signal)
 
