@@ -5542,6 +5542,7 @@ def reset_tg_state() -> None:
         "last_signal_run": 0.0,
         "last_scan_ts_processed": "",
         "sent_events": {},
+        "sent_emissions": {},
         "sent_portfolio_events": {},
         "engine_version": "v3",
         "token_state": {},
@@ -5649,6 +5650,77 @@ def build_emission_key_foundation(
     return f"{source}|{chain}|{addr}|{event_type}|{alert_tier}"
 
 
+def normalize_alert_action_bucket(row: Dict[str, Any], unified: Optional[Dict[str, Any]] = None) -> str:
+    action_raw = str(
+        (unified or {}).get("final_action")
+        or row.get("entry_action")
+        or row.get("entry")
+        or "UNKNOWN"
+    ).strip().upper()
+    compact = re.sub(r"[^A-Z0-9]+", "_", action_raw).strip("_")
+    return compact or "UNKNOWN"
+
+
+def normalize_alert_reason_bucket(row: Dict[str, Any], unified: Optional[Dict[str, Any]] = None) -> str:
+    reason_raw = str(
+        (unified or {}).get("final_reason")
+        or row.get("entry_reason")
+        or row.get("signal_reason")
+        or "unknown_reason"
+    ).strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "_", reason_raw).strip("_")
+    if not normalized:
+        return "unknown_reason"
+    parts = [p for p in normalized.split("_") if p]
+    if not parts:
+        return "unknown_reason"
+    return "_".join(parts[:3])
+
+
+def emission_cooldown_bucket(now_ts: float, cooldown_seconds: int) -> int:
+    cooldown_seconds = max(60, int(cooldown_seconds or 0))
+    return int(now_ts // cooldown_seconds)
+
+
+def build_emission_key(
+    source: str,
+    row: Dict[str, Any],
+    signal: Dict[str, str],
+    cooldown_seconds: int,
+    now_ts: Optional[float] = None,
+    unified: Optional[Dict[str, Any]] = None,
+) -> str:
+    classification = resolve_tg_alert_classification(source, row, signal, unified=unified)
+    chain = token_chain(row)
+    addr = str(token_ca(row) or row.get("token_address") or "").strip().lower()
+    event_type = str(classification.get("event_type") or "")
+    action_bucket = normalize_alert_action_bucket(row, unified=unified)
+    reason_bucket = normalize_alert_reason_bucket(row, unified=unified)
+    current_ts = float(now_ts if now_ts is not None else time.time())
+    cooldown_bucket = emission_cooldown_bucket(current_ts, cooldown_seconds)
+    return f"{source}|{chain}|{addr}|{event_type}|{action_bucket}|{reason_bucket}|{cooldown_bucket}"
+
+
+def is_duplicate_emission(state: Dict[str, Any], emission_key: str, now_ts: float, cooldown_seconds: int) -> bool:
+    sent_emissions = state.get("sent_emissions", {})
+    if not isinstance(sent_emissions, dict):
+        sent_emissions = {}
+    state["sent_emissions"] = sent_emissions
+
+    last_ts = float(sent_emissions.get(emission_key, 0.0) or 0.0)
+    if not last_ts:
+        return False
+    return (now_ts - last_ts) < max(60, int(cooldown_seconds or 0))
+
+
+def mark_emission_sent(state: Dict[str, Any], emission_key: str, now_ts: float) -> None:
+    sent_emissions = state.get("sent_emissions", {})
+    if not isinstance(sent_emissions, dict):
+        sent_emissions = {}
+    sent_emissions[emission_key] = float(now_ts)
+    state["sent_emissions"] = sent_emissions
+
+
 def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
     action = str(row.get("entry_action") or row.get("entry") or "").upper()
@@ -5739,12 +5811,12 @@ def is_material_signal_change(prev: Optional[Dict[str, Any]], current: Dict[str,
     return False
 
 
-def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> str:
+def format_entry_alert_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> str:
     symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
     chain = token_chain(row).upper()
     addr = token_ca(row)
     source = str(source or "monitoring").lower()
-    unified = compute_unified_recommendation(row, source="monitoring" if source == "monitoring" else "portfolio")
+    unified = compute_unified_recommendation(row, source="monitoring")
 
     score = parse_float(row.get("entry_score"), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
@@ -5754,9 +5826,6 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
 
     setup_inputs = build_setup_render_inputs(row)
     levels_block = str(row.get("setup_levels_block") or setup_inputs.get("levels_block") or "setup: watch only")
-
-    if source == "portfolio":
-        return format_portfolio_signal_message(row)
 
     return (
         f"<b>{unified['final_action']}</b> | <b>{symbol}</b>\n"
@@ -5772,7 +5841,7 @@ def format_signal_message(row: Dict[str, Any], signal: Dict[str, str], source: s
     )
 
 
-def format_portfolio_signal_message(row: Dict[str, Any]) -> str:
+def format_portfolio_action_message(row: Dict[str, Any]) -> str:
     symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
     chain = token_chain(row).upper()
     addr = token_ca(row)
@@ -5784,6 +5853,70 @@ def format_portfolio_signal_message(row: Dict[str, Any]) -> str:
         f"reason: {unified['final_reason']}\n\n"
         f"CA:\n<code>{addr}</code>"
     )
+
+
+def format_state_transition_message(row: Dict[str, Any], source: str) -> str:
+    symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
+    chain = token_chain(row).upper()
+    addr = token_ca(row)
+    action = str(row.get("entry_action") or row.get("entry") or "UPDATE").upper()
+    return (
+        f"<b>STATE TRANSITION</b> | <b>{symbol}</b>\n"
+        f"source: {str(source or 'monitoring').upper()}\n"
+        f"action: <b>{action}</b>\n"
+        f"chain: {chain}\n\n"
+        f"CA:\n<code>{addr}</code>"
+    )
+
+
+def format_digest_message(row: Dict[str, Any], source: str) -> str:
+    symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
+    chain = token_chain(row).upper()
+    addr = token_ca(row)
+    score = parse_float(row.get("entry_score"), 0.0)
+    return (
+        f"<b>DIGEST</b> | <b>{symbol}</b>\n"
+        f"source: {str(source or 'monitoring').upper()}\n"
+        f"chain: {chain}\n"
+        f"score: <b>{score}</b>\n\n"
+        f"CA:\n<code>{addr}</code>"
+    )
+
+
+def format_health_warning_message(row: Dict[str, Any], source: str, unified: Optional[Dict[str, Any]] = None) -> str:
+    symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
+    chain = token_chain(row).upper()
+    addr = token_ca(row)
+    unified_reco = unified or compute_unified_recommendation(row, source=source)
+    reason = str(unified_reco.get("final_reason") or row.get("entry_reason") or "health_warning")
+    return (
+        f"<b>HEALTH WARNING</b> | <b>{symbol}</b>\n"
+        f"source: {str(source or 'monitoring').upper()}\n"
+        f"chain: {chain}\n"
+        f"reason: {reason}\n\n"
+        f"CA:\n<code>{addr}</code>"
+    )
+
+
+def format_signal_message(
+    row: Dict[str, Any],
+    signal: Dict[str, str],
+    source: str,
+    event_type: str,
+    unified: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    event_type_key = str(event_type or "").strip().lower()
+    formatter_map = {
+        "entry_alert": lambda: format_entry_alert_message(row, signal, source),
+        "portfolio_action": lambda: format_portfolio_action_message(row),
+        "state_transition": lambda: format_state_transition_message(row, source),
+        "digest": lambda: format_digest_message(row, source),
+        "health_warning": lambda: format_health_warning_message(row, source, unified=unified),
+    }
+    formatter = formatter_map.get(event_type_key)
+    if not formatter:
+        return None
+    return formatter()
 
 
 def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -5875,6 +6008,7 @@ def run_auto_notifications(
     monitoring_rows: List[Dict[str, Any]],
     portfolio_rows: List[Dict[str, Any]],
 ) -> None:
+    now_ts = time.time()
     state = load_tg_state()
 
     cooldown_seconds = 900 if WORKER_FAST_MODE else 1800
@@ -5908,6 +6042,8 @@ def run_auto_notifications(
         "total": len(candidates),
         "no_token_key": 0,
         "no_signal": 0,
+        "unknown_event_type": 0,
+        "duplicate_emission_blocked": 0,
         "no_msg": 0,
         "already_sent": 0,
         "sent": 0,
@@ -5957,19 +6093,40 @@ def run_auto_notifications(
         )
 
         event_key = signal_event_key(source, row, signal)
+        emission_key = build_emission_key(
+            source,
+            row,
+            signal,
+            cooldown_seconds=cooldown_seconds,
+            now_ts=now_ts,
+            unified=unified,
+        )
 
         # allow first send even if change is None, unless event already sent
         if not change and event_key in sent_events:
             stats["already_sent"] += 1
             continue
 
-        msg = format_signal_message(row, signal, source)
+        if is_duplicate_emission(state, emission_key, now_ts=now_ts, cooldown_seconds=cooldown_seconds):
+            stats["duplicate_emission_blocked"] += 1
+            continue
+
+        msg = format_signal_message(
+            row,
+            signal,
+            source,
+            event_type=alert_classification["event_type"],
+            unified=unified,
+        )
         if not msg:
+            stats["unknown_event_type"] += 1
             stats["no_msg"] += 1
+            debug_log(f"tg_skip_unknown_event_type event_type={alert_classification['event_type']}")
             continue
 
         if send_telegram(msg, reply_markup=tg_buttons(row)):
             sent_events[event_key] = now_utc_str()
+            mark_emission_sent(state, emission_key, now_ts=now_ts)
             sent_now += 1
             stats["sent"] += 1
 
