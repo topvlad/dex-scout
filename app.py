@@ -5416,101 +5416,190 @@ def classify_position_strength(score: float) -> str:
     return "NEUTRAL"
 
 
-def capital_rotation_engine(active_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    strong: List[Dict[str, Any]] = []
-    weak: List[Dict[str, Any]] = []
-    neutral: List[Dict[str, Any]] = []
-    enriched: List[Dict[str, Any]] = []
+ROTATION_GAP_FLOOR = 25.0
+ROTATION_CONFIDENCE_FLOOR = 0.55
 
-    for r in active_rows:
-        chain = (r.get("chain") or "").strip().lower()
-        base_addr = addr_store(chain, (r.get("base_token_address") or "").strip())
-        entry_price = get_portfolio_entry_price(r)
 
-        best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
-        hist = token_history_rows(chain, base_addr, limit=60)
-        liq_health = liquidity_health(best)
-        anti_rug = anti_rug_early_detector(best, hist)
-        if liq_health.get("level") in ("DEAD", "CRITICAL"):
+def _rotation_score_confidence(rotation_gap: float, in_score: float, out_score: float) -> float:
+    base = 0.5 + (rotation_gap / 120.0)
+    quality_adj = max(0.0, (in_score - 120.0) / 400.0) - max(0.0, (out_score - 80.0) / 500.0)
+    return max(0.0, min(0.99, base + quality_adj))
+
+
+def portfolio_position_score(
+    row: Dict[str, Any],
+    best: Optional[Dict[str, Any]],
+    hist: List[Dict[str, Any]],
+    unified: Dict[str, Any],
+) -> float:
+    entry_price = get_portfolio_entry_price(row)
+    strength = position_strength_score(best or {}, hist, entry_price)
+    entry_component = parse_float(row.get("entry_score", row.get("score", 0)), 0.0) * 0.15
+    trust_component = parse_float(unified.get("trust_score"), 0.0) * 40.0
+    score = strength * 20.0 + entry_component + trust_component
+
+    health_label = str((unified.get("health") or {}).get("health_label") or "").upper()
+    final_action = str(unified.get("final_action") or "").upper()
+    if health_label in {"DEAD", "UNTRADEABLE"}:
+        score -= 200.0
+    elif health_label in {"STALE", "COLD", "LOW_LIQ"}:
+        score -= 30.0
+    if final_action in {"EXIT", "REDUCE"}:
+        score -= 30.0
+    return float(round(score, 2))
+
+
+def monitoring_candidate_score(row: Dict[str, Any], unified: Dict[str, Any]) -> float:
+    entry_score = parse_float(row.get("entry_score", row.get("score", 0)), 0.0)
+    trust_component = parse_float(unified.get("trust_score"), 0.0) * 40.0
+    timing = str(unified.get("timing") or "").upper()
+    action = str(unified.get("final_action") or "").upper()
+
+    score = entry_score + trust_component
+    if action == "ENTER NOW":
+        score += 12.0
+    elif action == "WAIT FOR PULLBACK":
+        score += 5.0
+    if timing in {"GOOD", "EARLY"}:
+        score += 5.0
+    return float(round(score, 2))
+
+
+def build_rotation_advisory(
+    active_portfolio_rows: List[Dict[str, Any]],
+    monitoring_rows: List[Dict[str, Any]],
+    gap_floor: float = ROTATION_GAP_FLOOR,
+    confidence_floor: float = ROTATION_CONFIDENCE_FLOOR,
+) -> Dict[str, Any]:
+    portfolio_positions: List[Dict[str, Any]] = []
+    for row in active_portfolio_rows:
+        if str(row.get("active", "1")).strip() != "1":
             continue
-        if anti_rug.get("level") == "CRITICAL":
-            continue
-
-        score = position_strength_score(best or {}, hist, entry_price)
-        if anti_rug.get("level") == "WARNING":
-            score *= 0.6
-        cls = classify_position_strength(score)
-
-        enriched_row = {
-            "row": r,
-            "class": cls,
-            "score": score,
-            "best": best,
-            "hist": hist,
-            "anti_rug": anti_rug,
-        }
-        enriched.append(enriched_row)
-
-        if cls == "STRONG":
-            if liquidity_health(best).get("level") != "OK":
-                continue
-            strong.append(r)
-        elif cls == "WEAK":
-            weak.append(r)
-        else:
-            neutral.append(r)
-
-    return {
-        "strong": strong,
-        "weak": weak,
-        "neutral": neutral,
-        "enriched": enriched,
-    }
-
-
-def rotation_actions(engine: Dict[str, Any]) -> List[Dict[str, Any]]:
-    actions: List[Dict[str, Any]] = []
-
-    strong = engine["strong"]
-    weak = engine["weak"]
-
-    if not strong or not weak:
-        return actions
-
-    for w in weak[:2]:
-        for s in strong[:2]:
-            actions.append(
+        precomputed_position_score = row.get("portfolio_position_score")
+        if precomputed_position_score not in (None, ""):
+            unified_pre = {
+                "final_action": str(row.get("final_action") or "HOLD"),
+                "health": {"health_label": str(row.get("health_label") or "OK")},
+            }
+            portfolio_positions.append(
                 {
-                    "type": "ROTATE",
-                    "from": w.get("base_symbol") or w.get("symbol") or "?",
-                    "to": s.get("base_symbol") or s.get("symbol") or "?",
-                    "reason": "capital_shift_weak_to_strong",
+                    "symbol": str(row.get("base_symbol") or row.get("symbol") or "").upper() or "?",
+                    "chain": str(row.get("chain") or "").strip().lower(),
+                    "row": row,
+                    "unified": unified_pre,
+                    "portfolio_position_score": parse_float(precomputed_position_score, 0.0),
+                    "health_label": str(row.get("health_label") or "OK").upper(),
                 }
             )
-
-    return actions
-
-
-def rotation_exit_plan(engine: Dict[str, Any]) -> List[Dict[str, Any]]:
-    plans: List[Dict[str, Any]] = []
-
-    strong = engine.get("strong", [])
-    weak = engine.get("weak", [])
-
-    if not strong or not weak:
-        return plans
-
-    for w in weak:
-        plans.append(
+            continue
+        chain = (row.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, (row.get("base_token_address") or "").strip())
+        if not chain or not base_addr:
+            continue
+        best = best_pair_for_token_cached(chain, base_addr)
+        hist = token_history_rows(chain, base_addr, limit=60)
+        unified = compute_unified_recommendation({**row, "liquidity_health": str(liquidity_health(best).get("level", "OK"))}, source="portfolio", hist=hist)
+        score = portfolio_position_score(row, best, hist, unified)
+        portfolio_positions.append(
             {
-                "symbol": w.get("base_symbol") or w.get("symbol") or "?",
-                "action": "PARTIAL_EXIT",
-                "exit_pct": 0.5,
-                "reason": "weak_rotation",
+                "symbol": str(row.get("base_symbol") or row.get("symbol") or "").upper() or "?",
+                "chain": chain,
+                "row": row,
+                "unified": unified,
+                "portfolio_position_score": score,
+                "health_label": str((unified.get("health") or {}).get("health_label") or "OK").upper(),
             }
         )
 
-    return plans
+    eligible_monitoring: List[Dict[str, Any]] = []
+    for row in monitoring_rows:
+        if str(row.get("active", "1")).strip() != "1":
+            continue
+        if is_in_portfolio_active(row, active_portfolio_rows):
+            continue
+        precomputed_candidate_score = row.get("monitoring_candidate_score")
+        if precomputed_candidate_score not in (None, ""):
+            final_action = str(row.get("final_action") or "ENTER NOW").upper()
+            health_label = str(row.get("health_label") or "OK").upper()
+            if final_action not in {"ENTER NOW", "WAIT FOR PULLBACK"} or health_label in {"DEAD", "UNTRADEABLE"}:
+                continue
+            eligible_monitoring.append(
+                {
+                    "symbol": str(row.get("base_symbol") or row.get("symbol") or "").upper() or "?",
+                    "row": row,
+                    "unified": {"final_action": final_action, "health": {"health_label": health_label}},
+                    "monitoring_candidate_score": parse_float(precomputed_candidate_score, 0.0),
+                }
+            )
+            continue
+        unified = compute_unified_recommendation(row, source="monitoring")
+        final_action = str(unified.get("final_action") or "").upper()
+        health_label = str((unified.get("health") or {}).get("health_label") or "OK").upper()
+        if final_action not in {"ENTER NOW", "WAIT FOR PULLBACK"}:
+            continue
+        if health_label in {"DEAD", "UNTRADEABLE"}:
+            continue
+        score = monitoring_candidate_score(row, unified)
+        eligible_monitoring.append(
+            {
+                "symbol": str(row.get("base_symbol") or row.get("symbol") or "").upper() or "?",
+                "row": row,
+                "unified": unified,
+                "monitoring_candidate_score": score,
+            }
+        )
+
+    portfolio_sorted = sorted(portfolio_positions, key=lambda x: x.get("portfolio_position_score", 0.0))
+    candidates_sorted = sorted(eligible_monitoring, key=lambda x: x.get("monitoring_candidate_score", 0.0), reverse=True)
+    best_candidate = candidates_sorted[0] if candidates_sorted else None
+
+    suggestions: List[Dict[str, Any]] = []
+    if best_candidate:
+        in_symbol = str(best_candidate.get("symbol") or "?")
+        in_score = parse_float(best_candidate.get("monitoring_candidate_score"), 0.0)
+        in_action = str((best_candidate.get("unified") or {}).get("final_action") or "").upper()
+        for out in portfolio_sorted:
+            out_symbol = str(out.get("symbol") or "?")
+            out_score = parse_float(out.get("portfolio_position_score"), 0.0)
+            health_label = str(out.get("health_label") or "OK").upper()
+            out_action = str((out.get("unified") or {}).get("final_action") or "").upper()
+            weak_or_dead = (out_score < 90.0) or (health_label in {"DEAD", "UNTRADEABLE"}) or (out_action in {"EXIT", "REDUCE"})
+            if not weak_or_dead:
+                continue
+            gap = round(in_score - out_score, 2)
+            conf = round(_rotation_score_confidence(gap, in_score, out_score), 2)
+            if gap < gap_floor or conf < confidence_floor:
+                continue
+            reason = (
+                f"monitoring candidate {in_symbol} ({in_action}) stronger than "
+                f"portfolio position {out_symbol}; gap={gap:.2f}"
+            )
+            suggestions.append(
+                {
+                    "rotate_out_symbol": out_symbol,
+                    "rotate_in_symbol": in_symbol,
+                    "rotation_reason": reason,
+                    "rotation_confidence": conf,
+                    "rotation_gap": gap,
+                    "portfolio_position_score": out_score,
+                    "monitoring_candidate_score": in_score,
+                    "advisory_only": True,
+                }
+            )
+            break
+
+    return {
+        "suggestions": suggestions,
+        "portfolio_positions": portfolio_positions,
+        "eligible_monitoring_candidates": eligible_monitoring,
+        "comparison_layer": {
+            "portfolio_position_score": [x.get("portfolio_position_score") for x in portfolio_sorted],
+            "monitoring_candidate_score": [x.get("monitoring_candidate_score") for x in candidates_sorted],
+            "rotation_gap": [x.get("rotation_gap") for x in suggestions],
+            "gap_floor": float(gap_floor),
+            "confidence_floor": float(confidence_floor),
+        },
+    }
 
 
 def position_sizing_engine(
@@ -10292,6 +10381,63 @@ def wave_d_pattern_trust_invariant_checks() -> List[str]:
     return issues
 
 
+def wave_d_plus_rotation_invariant_checks() -> List[str]:
+    issues: List[str] = []
+
+    active_rows = [
+        {"active": "1", "chain": "solana", "base_symbol": "DEADPOS", "portfolio_position_score": -120, "health_label": "DEAD", "final_action": "EXIT"},
+        {"active": "1", "chain": "solana", "base_symbol": "WEAKPOS", "portfolio_position_score": 72, "health_label": "OK", "final_action": "REDUCE"},
+    ]
+    monitoring_rows = [
+        {"active": "1", "chain": "solana", "base_symbol": "STRONGIN", "monitoring_candidate_score": 260, "final_action": "ENTER NOW", "health_label": "OK"},
+        {"active": "1", "chain": "solana", "base_symbol": "LOWIN", "monitoring_candidate_score": 120, "final_action": "TRACK ONLY", "health_label": "OK"},
+    ]
+    active_snapshot = json.dumps(active_rows, sort_keys=True)
+    monitoring_snapshot = json.dumps(monitoring_rows, sort_keys=True)
+    advisory = build_rotation_advisory(active_rows, monitoring_rows, gap_floor=10.0, confidence_floor=0.20)
+    suggestions = list(advisory.get("suggestions") or [])
+    if not suggestions:
+        issues.append("rotation advisor: weak portfolio vs strong monitoring should produce suggestion")
+    else:
+        first = suggestions[0]
+        required_fields = (
+            "rotate_out_symbol",
+            "rotate_in_symbol",
+            "rotation_reason",
+            "rotation_confidence",
+            "rotation_gap",
+            "portfolio_position_score",
+            "monitoring_candidate_score",
+        )
+        for field in required_fields:
+            if field not in first:
+                issues.append(f"rotation advisor: missing structured field {field}")
+        if parse_float(first.get("rotation_gap"), 0.0) <= 0:
+            issues.append("rotation advisor: expected positive gap for strong candidate")
+
+    active_strong_rows = [
+        {"active": "1", "chain": "solana", "base_symbol": "HOLDPOS", "portfolio_position_score": 150, "health_label": "OK", "final_action": "HOLD"},
+    ]
+    no_stronger_rows = [
+        {"active": "1", "chain": "solana", "base_symbol": "SAMEIN", "monitoring_candidate_score": 70, "final_action": "ENTER NOW", "health_label": "OK"},
+    ]
+    no_stronger = build_rotation_advisory(active_strong_rows, no_stronger_rows, gap_floor=20.0, confidence_floor=0.20)
+    if no_stronger.get("suggestions"):
+        issues.append("rotation advisor: must not force rotation when stronger candidate is absent")
+
+    low_gap_rows = [
+        {"active": "1", "chain": "solana", "base_symbol": "TINYIN", "monitoring_candidate_score": 82, "final_action": "ENTER NOW", "health_label": "OK"},
+    ]
+    low_gap = build_rotation_advisory(active_strong_rows, low_gap_rows, gap_floor=40.0, confidence_floor=0.80)
+    if low_gap.get("suggestions"):
+        issues.append("rotation advisor: must not force suggestion on low gap/low confidence")
+
+    if active_snapshot != json.dumps(active_rows, sort_keys=True) or monitoring_snapshot != json.dumps(monitoring_rows, sort_keys=True):
+        issues.append("rotation advisor: input state mutated (advisory must be read-only)")
+
+    return issues
+
+
 def core_safety_self_check():
     issues: List[str] = []
 
@@ -10336,6 +10482,9 @@ def core_safety_self_check():
     wave_d_issues = wave_d_pattern_trust_invariant_checks()
     for wave_issue in wave_d_issues:
         issues.append(f"Wave D invariant: {wave_issue}")
+    wave_d_plus_issues = wave_d_plus_rotation_invariant_checks()
+    for wave_issue in wave_d_plus_issues:
+        issues.append(f"Wave D+ invariant: {wave_issue}")
     alert_pipeline_issues = alert_pipeline_reliability_checks()
     for pipeline_issue in alert_pipeline_issues:
         issues.append(f"Alert pipeline reliability: {pipeline_issue}")
@@ -10543,27 +10692,28 @@ def page_portfolio():
         st.info("Portfolio is empty. Use Scout → Log → Portfolio or Monitoring → Promote → Portfolio.")
         return
 
-    rotation_rows = [
-        r for r in active_rows
-        if liquidity_health(
-            best_pair_for_token_cached(
-                (r.get("chain") or "").strip().lower(),
-                addr_store((r.get("chain") or "").strip().lower(), (r.get("base_token_address") or "").strip()),
+    rotation_advisor = build_rotation_advisory(active_rows, load_monitoring())
+    rotation_suggestions = list(rotation_advisor.get("suggestions") or [])
+    weak_rotation_symbols = {
+        str(x.get("rotate_out_symbol") or "").upper()
+        for x in rotation_suggestions
+        if str(x.get("rotate_out_symbol") or "").strip()
+    }
+
+    st.markdown("## 🔁 Rotation advisory (advisory-only)")
+    if rotation_suggestions:
+        for s in rotation_suggestions:
+            st.warning(
+                f"Rotate-out: {s.get('rotate_out_symbol', '?')} → "
+                f"Rotate-into: {s.get('rotate_in_symbol', '?')}"
             )
-        )["level"] not in ("DEAD",)
-    ]
-
-    rot = capital_rotation_engine(rotation_rows)
-    actions = rotation_actions(rot)
-    rotation_plan = rotation_exit_plan(rot)
-    weak_rotation_symbols = {str(p.get("symbol") or "") for p in rotation_plan}
-    best_strong = rot["strong"][0] if rot.get("strong") else None
-
-    if actions:
-        st.markdown("## 🔁 Capital Rotation Signals")
-        for a in actions:
-            st.warning(f"Rotate: {a['from']} → {a['to']}")
-            st.caption(a["reason"])
+            st.caption(
+                f"{s.get('rotation_reason', '')} | "
+                f"confidence={parse_float(s.get('rotation_confidence'), 0.0):.2f} | "
+                f"rotation_gap={parse_float(s.get('rotation_gap'), 0.0):.2f}"
+            )
+    else:
+        st.caption("No forced rotation: stronger eligible candidate absent or gap/confidence below threshold.")
 
     st.subheader("Active positions")
     for idx, r in enumerate(active_rows):
@@ -10774,11 +10924,17 @@ def page_portfolio():
             with st.expander("Risk diagnostics", expanded=False):
                 if strength_cls == "WEAK":
                     st.caption("⚠ weak position – candidate for rotation")
-                    if base_sym in weak_rotation_symbols:
+                    if str(base_sym).upper() in weak_rotation_symbols:
                         st.caption(f"Rotation hint: sell {int(exit_pct * 100)}%")
-                        if best_strong:
-                            rotate_to = best_strong.get("base_symbol") or best_strong.get("symbol") or "?"
-                            st.caption(f"→ rotate into {rotate_to}")
+                        rotate_suggestion = next(
+                            (
+                                s for s in rotation_suggestions
+                                if str(s.get("rotate_out_symbol") or "").upper() == str(base_sym).upper()
+                            ),
+                            None,
+                        )
+                        if rotate_suggestion:
+                            st.caption(f"→ rotate into {rotate_suggestion.get('rotate_in_symbol', '?')}")
                 st.write(f"Reco model: {reco}")
                 st.write(f"Exit signal: {level}")
                 st.write(f"Health label: {health.get('health_label', 'OK')}")
