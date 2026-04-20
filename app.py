@@ -5499,12 +5499,18 @@ def load_tg_state() -> Dict[str, Any]:
         "last_signal_run": 0.0,
         "last_scan_ts_processed": "",
         "sent_events": {},
+        "sent_emissions": {},
+        "sent_digest_emissions": {},
         "sent_portfolio_events": {},
         "engine_version": "v3",
+        "token_state": {},
     }
 
     try:
         raw = sb_get_storage(TG_STATE_KEY) if USE_SUPABASE else None
+        if (not raw) and os.path.exists(TG_STATE_FILE):
+            with open(TG_STATE_FILE, "r", encoding="utf-8") as f:
+                raw = f.read()
         if raw:
             data = json.loads(raw)
             if isinstance(data, dict):
@@ -5543,6 +5549,7 @@ def reset_tg_state() -> None:
         "last_scan_ts_processed": "",
         "sent_events": {},
         "sent_emissions": {},
+        "sent_digest_emissions": {},
         "sent_portfolio_events": {},
         "engine_version": "v3",
         "token_state": {},
@@ -5870,9 +5877,9 @@ def format_state_transition_message(row: Dict[str, Any], source: str) -> str:
 
 
 def format_digest_message(row: Dict[str, Any], source: str) -> str:
-    symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
-    chain = token_chain(row).upper()
-    addr = token_ca(row)
+    symbol = str(row.get("base_symbol") or row.get("symbol") or "MARKET").strip()
+    chain = token_chain(row).upper() or "MULTI"
+    addr = token_ca(row) or "n/a"
     score = parse_float(row.get("entry_score"), 0.0)
     return (
         f"<b>DIGEST</b> | <b>{symbol}</b>\n"
@@ -5881,6 +5888,164 @@ def format_digest_message(row: Dict[str, Any], source: str) -> str:
         f"score: <b>{score}</b>\n\n"
         f"CA:\n<code>{addr}</code>"
     )
+
+
+def _risk_priority_value(row: Dict[str, Any]) -> int:
+    risk = str(row.get("risk_level") or row.get("risk") or "").strip().upper()
+    if risk == "HIGH":
+        return 3
+    if risk == "MEDIUM":
+        return 2
+    if risk == "LOW":
+        return 1
+    return 0
+
+
+def build_digest_summary(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+    top_monitoring_limit: int = 3,
+    top_risk_limit: int = 3,
+) -> Dict[str, Any]:
+    active_monitoring = build_active_monitoring_rows(monitoring_rows)
+    active_portfolio = [r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"]
+    mon_candidates, _ = build_notification_candidates(
+        monitoring_rows,
+        portfolio_rows,
+        limit_monitoring=max(5, int(top_monitoring_limit or 3)),
+        limit_portfolio=5,
+    )
+
+    top_monitoring_now: List[str] = []
+    for row in mon_candidates[: max(1, int(top_monitoring_limit or 3))]:
+        symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
+        score = parse_float(row.get("entry_score", 0), 0.0)
+        timing = normalize_timing_label(str(row.get("timing_label") or "NEUTRAL"))
+        top_monitoring_now.append(f"{symbol}: {score:.1f} / {timing}")
+
+    portfolio_sorted = sorted(
+        active_portfolio,
+        key=lambda r: (
+            _risk_priority_value(r),
+            parse_float(r.get("entry_score", 0), 0.0),
+        ),
+        reverse=True,
+    )
+    top_portfolio_risks: List[str] = []
+    for row in portfolio_sorted[: max(1, int(top_risk_limit or 3))]:
+        symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
+        risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+        action = str(row.get("entry_action") or row.get("entry") or "HOLD").upper()
+        score = parse_float(row.get("entry_score", 0), 0.0)
+        top_portfolio_risks.append(f"{symbol}: risk {risk}, action {action}, score {score:.1f}")
+
+    dead_cold_warnings: List[str] = []
+    for row in active_portfolio + active_monitoring:
+        symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
+        weak_reason = str(row.get("weak_reason") or "").lower()
+        entry_reason = str(row.get("entry_reason") or row.get("signal_reason") or "").lower()
+        risk = str(row.get("risk_level") or row.get("risk") or "").upper()
+        if ("dead" in weak_reason) or ("cold" in weak_reason) or ("dead" in entry_reason) or ("cold" in entry_reason):
+            dead_cold_warnings.append(f"{symbol}: weak={weak_reason or entry_reason}")
+        elif risk == "HIGH" and ("liq" in entry_reason or "rug" in entry_reason):
+            dead_cold_warnings.append(f"{symbol}: {entry_reason}")
+        if len(dead_cold_warnings) >= 3:
+            break
+
+    return {
+        "event_type": resolve_event_type("DIGEST"),
+        "alert_tier": resolve_alert_tier("DIGEST_ONLY"),
+        "active_portfolio_count": len(active_portfolio),
+        "active_monitoring_count": len(active_monitoring),
+        "top_monitoring_now": top_monitoring_now,
+        "top_portfolio_risks": top_portfolio_risks,
+        "dead_cold_warnings": dead_cold_warnings,
+    }
+
+
+def format_digest_summary_message(digest: Dict[str, Any], trigger_source: str = "manual") -> str:
+    top_monitoring = digest.get("top_monitoring_now") or []
+    top_risks = digest.get("top_portfolio_risks") or []
+    warnings = digest.get("dead_cold_warnings") or []
+
+    monitoring_block = "\n".join([f"• {line}" for line in top_monitoring]) if top_monitoring else "• no active candidates yet"
+    risk_block = "\n".join([f"• {line}" for line in top_risks]) if top_risks else "• no active portfolio risks"
+    warning_block = "\n".join([f"• {line}" for line in warnings]) if warnings else "• none"
+
+    return (
+        f"<b>DEX Scout digest</b>\n"
+        f"event_type: <code>{digest.get('event_type', 'digest')}</code>\n"
+        f"trigger: {str(trigger_source or 'manual').upper()}\n"
+        f"portfolio active: {int(digest.get('active_portfolio_count', 0) or 0)}\n"
+        f"monitoring active: {int(digest.get('active_monitoring_count', 0) or 0)}\n\n"
+        f"<b>Top monitoring now</b>\n{monitoring_block}\n\n"
+        f"<b>Top portfolio risks</b>\n{risk_block}\n\n"
+        f"<b>Dead/cold warnings</b>\n{warning_block}"
+    )
+
+
+def build_digest_emission_key(cooldown_seconds: int, now_ts: Optional[float] = None) -> str:
+    ts = float(now_ts if now_ts is not None else time.time())
+    bucket = emission_cooldown_bucket(ts, cooldown_seconds)
+    return f"digest|{bucket}"
+
+
+def is_duplicate_digest_emission(state: Dict[str, Any], emission_key: str, now_ts: float, cooldown_seconds: int) -> bool:
+    sent = state.get("sent_digest_emissions", {})
+    if not isinstance(sent, dict):
+        sent = {}
+    state["sent_digest_emissions"] = sent
+    last_ts = float(sent.get(emission_key, 0.0) or 0.0)
+    if not last_ts:
+        return False
+    return (now_ts - last_ts) < max(60, int(cooldown_seconds or 0))
+
+
+def mark_digest_emission_sent(state: Dict[str, Any], emission_key: str, now_ts: float) -> None:
+    sent = state.get("sent_digest_emissions", {})
+    if not isinstance(sent, dict):
+        sent = {}
+    sent[emission_key] = float(now_ts)
+    state["sent_digest_emissions"] = sent
+
+
+def trigger_digest_notification(
+    trigger_source: str = "manual",
+    cooldown_seconds: int = 3600,
+    force: bool = False,
+) -> Dict[str, Any]:
+    state = load_tg_state()
+    now_ts = time.time()
+    emission_key = build_digest_emission_key(cooldown_seconds=cooldown_seconds, now_ts=now_ts)
+
+    if (not force) and is_duplicate_digest_emission(
+        state,
+        emission_key=emission_key,
+        now_ts=now_ts,
+        cooldown_seconds=cooldown_seconds,
+    ):
+        return {
+            "ok": True,
+            "sent": False,
+            "duplicate": True,
+            "event_type": resolve_event_type("DIGEST"),
+        }
+
+    digest = build_digest_summary(load_monitoring(), load_portfolio())
+    text = format_digest_summary_message(digest, trigger_source=trigger_source)
+    ok = send_telegram(text, parse_mode="HTML")
+    if ok:
+        mark_digest_emission_sent(state, emission_key=emission_key, now_ts=now_ts)
+        state["last_digest_sent_at"] = now_utc_str()
+        save_tg_state(state)
+
+    return {
+        "ok": bool(ok),
+        "sent": bool(ok),
+        "duplicate": False,
+        "event_type": digest.get("event_type", resolve_event_type("DIGEST")),
+        "digest": digest,
+    }
 
 
 def format_health_warning_message(row: Dict[str, Any], source: str, unified: Optional[Dict[str, Any]] = None) -> str:

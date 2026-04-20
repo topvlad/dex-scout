@@ -22,6 +22,7 @@ try:
         save_portfolio,
         send_telegram,
         suppress_token,
+        trigger_digest_notification,
     )
 except Exception as e:
     print(f"[tg_webhook] helper import failed: {e}", flush=True)
@@ -80,6 +81,14 @@ except Exception as e:
     def suppress_token(chain: str, ca: str, reason: str = "manual_remove", days: int = 30) -> None:
         _ = chain, ca, reason, days
         return None
+
+    def trigger_digest_notification(
+        trigger_source: str = "manual",
+        cooldown_seconds: int = 3600,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        _ = trigger_source, cooldown_seconds, force
+        return {"ok": False, "sent": False, "duplicate": False, "event_type": "digest"}
 
 
 app = FastAPI()
@@ -393,29 +402,27 @@ async def tg_webhook_alias(req: Request):
 def tg_summary(key: str):
     if not summary_key_ok(key):
         return {"ok": False, "error": "forbidden"}
+    result = trigger_digest_notification(trigger_source="tg_summary", cooldown_seconds=3600, force=False)
+    return {
+        "ok": bool(result.get("ok")),
+        "sent": bool(result.get("sent")),
+        "duplicate": bool(result.get("duplicate")),
+        "event_type": str(result.get("event_type") or "digest"),
+    }
 
-    portfolio_rows = load_portfolio()
-    monitoring_rows = load_monitoring()
 
-    active_portfolio = [r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"]
-    mon_rows, _ = build_notification_candidates(monitoring_rows, portfolio_rows, limit_monitoring=5, limit_portfolio=5)
-
-    top_mon = mon_rows[:5]
-    top_lines = []
-    for r in top_mon:
-        top_lines.append(
-            f"{str(r.get('base_symbol') or r.get('symbol') or 'TOKEN')}: "
-            f"{parse_float(r.get('entry_score', 0), 0.0)} / "
-            f"{normalize_timing_label(str(r.get('timing_label') or 'NEUTRAL'))}"
-        )
-
-    text = (
-        f"<b>DEX Scout summary</b>\n"
-        f"portfolio active: {len(active_portfolio)}\n"
-        f"monitoring active: {len(build_active_monitoring_rows(monitoring_rows))}\n\n"
-        f"<b>Top monitoring now:</b>\n"
-        + ("\n".join(top_lines) if top_lines else "no active candidates")
+@app.get("/tg/digest")
+def tg_digest(key: str, force: int = 0):
+    if not summary_key_ok(key):
+        return {"ok": False, "error": "forbidden"}
+    result = trigger_digest_notification(
+        trigger_source="tg_digest",
+        cooldown_seconds=3600,
+        force=bool(int(force or 0)),
     )
-
-    ok = send_telegram(text, parse_mode="HTML")
-    return {"ok": ok, "sent": ok}
+    return {
+        "ok": bool(result.get("ok")),
+        "sent": bool(result.get("sent")),
+        "duplicate": bool(result.get("duplicate")),
+        "event_type": str(result.get("event_type") or "digest"),
+    }
