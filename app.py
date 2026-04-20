@@ -6279,7 +6279,11 @@ def run_auto_notifications(
 
     cooldown_seconds = 900 if WORKER_FAST_MODE else 1800
     if not tg_cooldown_ok(state, seconds=cooldown_seconds):
-        print("[TG] cooldown active -> skip", flush=True)
+        print(
+            f"[TG] cooldown active -> skip cooldown_seconds={cooldown_seconds} "
+            f"mode={alert_mode}",
+            flush=True,
+        )
         return
 
     prev_token_state = state.get("token_state", {})
@@ -6295,6 +6299,7 @@ def run_auto_notifications(
     new_token_state: Dict[str, Dict[str, Any]] = {}
 
     mon_rows, port_rows = build_notification_candidates(monitoring_rows, portfolio_rows)
+    eligible_after_candidate_build = len(mon_rows) + len(port_rows)
 
     candidates: List[Tuple[float, str, Dict[str, Any]]] = []
     for row in mon_rows:
@@ -6305,16 +6310,23 @@ def run_auto_notifications(
     candidates.sort(key=lambda x: x[0], reverse=True)
 
     stats = {
-        "total": len(candidates),
+        "candidates_total_pre_filter": len(candidates),
+        "candidates_total_post_candidate_build": eligible_after_candidate_build,
         "mode": alert_mode,
         "no_token_key": 0,
-        "no_signal": 0,
+        "no_actionable_event": 0,
+        "suppressed": 0,
         "mode_filtered": 0,
+        "tier_filtered": 0,
         "unknown_event_type": 0,
-        "duplicate_emission_blocked": 0,
+        "duplicate": 0,
+        "cooldown": 0,
         "no_msg": 0,
         "already_sent": 0,
         "sent": 0,
+        "sent_by_event_type": {},
+        "sent_by_alert_tier": {},
+        "post_filter_candidates": 0,
     }
 
     for _, source, row in candidates:
@@ -6323,6 +6335,7 @@ def run_auto_notifications(
         if not chain or not ca:
             continue
         if is_token_suppressed(chain, ca):
+            stats["suppressed"] += 1
             continue
 
         token_key = build_token_state_key(row)
@@ -6347,7 +6360,7 @@ def run_auto_notifications(
         new_token_state[token_key] = current_snapshot
 
         if not signal:
-            stats["no_signal"] += 1
+            stats["no_actionable_event"] += 1
             continue
 
         alert_classification = resolve_tg_alert_classification(source, row, signal, unified=unified)
@@ -6370,6 +6383,7 @@ def run_auto_notifications(
         ):
             stats["mode_filtered"] += 1
             continue
+        stats["post_filter_candidates"] += 1
 
         event_key = signal_event_key(source, row, signal)
         emission_key = build_emission_key(
@@ -6387,7 +6401,8 @@ def run_auto_notifications(
             continue
 
         if is_duplicate_emission(state, emission_key, now_ts=now_ts, cooldown_seconds=cooldown_seconds):
-            stats["duplicate_emission_blocked"] += 1
+            stats["duplicate"] += 1
+            stats["cooldown"] += 1
             continue
 
         msg = format_signal_message(
@@ -6408,6 +6423,10 @@ def run_auto_notifications(
             mark_emission_sent(state, emission_key, now_ts=now_ts)
             sent_now += 1
             stats["sent"] += 1
+            event_type_key = str(alert_classification.get("event_type") or "unknown")
+            tier_key = str(alert_classification.get("alert_tier") or "unknown")
+            stats["sent_by_event_type"][event_type_key] = int(stats["sent_by_event_type"].get(event_type_key, 0)) + 1
+            stats["sent_by_alert_tier"][tier_key] = int(stats["sent_by_alert_tier"].get(tier_key, 0)) + 1
 
         if sent_now >= max_per_run:
             break

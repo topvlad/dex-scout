@@ -12,6 +12,8 @@ SCANNER_SEEDS = os.getenv("SCANNER_SEEDS", str(app.DEFAULT_SEEDS))
 SCANNER_MAX_ITEMS = int(os.getenv("SCANNER_MAX_ITEMS", "10"))
 USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
 BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "10"))
+WORKER_HEARTBEAT_MINUTES = max(1, int(os.getenv("WORKER_HEARTBEAT_MINUTES", "5")))
+WORKER_HEARTBEAT_SEC = WORKER_HEARTBEAT_MINUTES * 60
 
 
 def _queue_invariant_telemetry(queue_stats: dict, sleep_for: int, default_sleep_for: int) -> None:
@@ -61,10 +63,19 @@ def _queue_invariant_telemetry(queue_stats: dict, sleep_for: int, default_sleep_
 
 def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False) -> None:
     app.ensure_storage()
+    last_heartbeat_ts = 0.0
 
     while True:
         default_sleep_for = max(60, SCAN_INTERVAL_SEC)
         sleep_for = default_sleep_for
+        now_ts = time.time()
+        if (now_ts - last_heartbeat_ts) >= WORKER_HEARTBEAT_SEC:
+            print(
+                f"[worker] heartbeat alive=1 interval_sec={SCAN_INTERVAL_SEC} "
+                f"heartbeat_sec={WORKER_HEARTBEAT_SEC}",
+                flush=True,
+            )
+            last_heartbeat_ts = now_ts
         if stop_event is not None and stop_event.is_set():
             print("[worker] stop requested", flush=True)
             break
