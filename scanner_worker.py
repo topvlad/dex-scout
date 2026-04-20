@@ -2,6 +2,7 @@ import os
 os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
 
 import time
+import socket
 from typing import Optional
 
 import app
@@ -64,6 +65,15 @@ def _queue_invariant_telemetry(queue_stats: dict, sleep_for: int, default_sleep_
 def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False) -> None:
     app.ensure_storage()
     last_heartbeat_ts = 0.0
+    worker_id = f"{socket.gethostname()}:{os.getpid()}"
+    app.update_worker_runtime_state(
+        updates={
+            "worker_id": worker_id,
+            "worker_role": "background_worker",
+            "worker_status": "starting",
+            "last_error_reason": "",
+        }
+    )
 
     while True:
         default_sleep_for = max(60, SCAN_INTERVAL_SEC)
@@ -85,6 +95,9 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
             )
         app.update_worker_runtime_state(
             updates={
+                "worker_id": worker_id,
+                "worker_role": "background_worker",
+                "worker_status": "running",
                 "last_loop_ts": now_utc,
                 "last_loop_epoch": now_ts,
                 "heartbeat_interval_sec": WORKER_HEARTBEAT_SEC,
@@ -97,9 +110,16 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
                 f"heartbeat_sec={WORKER_HEARTBEAT_SEC}",
                 flush=True,
             )
+            app.update_worker_runtime_state(
+                updates={
+                    "last_heartbeat_ts": now_utc,
+                    "last_heartbeat_epoch": now_ts,
+                }
+            )
             last_heartbeat_ts = now_ts
         if stop_event is not None and stop_event.is_set():
             print("[worker] stop requested", flush=True)
+            app.update_worker_runtime_state(updates={"worker_status": "stopped"})
             break
 
         try:
@@ -167,6 +187,7 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
                     "candidate_path": candidate_path,
                     "fallback_reason": fallback_reason,
                 },
+                trigger_model="background_worker",
             )
             print(f"[worker] notifications processed result={notif_result}", flush=True)
             outcome_stats = app.evaluate_outcome_journals()
@@ -191,9 +212,28 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
         while slept < sleep_for:
             if stop_event is not None and stop_event.is_set():
                 print("[worker] stop requested during sleep", flush=True)
+                app.update_worker_runtime_state(updates={"worker_status": "stopped"})
                 return
             time.sleep(1)
             slept += 1
+            now_sleep_ts = time.time()
+            if (now_sleep_ts - last_heartbeat_ts) >= WORKER_HEARTBEAT_SEC:
+                now_sleep_utc = app.now_utc_str()
+                print(
+                    f"[worker] heartbeat alive=1 interval_sec={SCAN_INTERVAL_SEC} "
+                    f"heartbeat_sec={WORKER_HEARTBEAT_SEC}",
+                    flush=True,
+                )
+                app.update_worker_runtime_state(
+                    updates={
+                        "worker_id": worker_id,
+                        "worker_role": "background_worker",
+                        "last_heartbeat_ts": now_sleep_utc,
+                        "last_heartbeat_epoch": now_sleep_ts,
+                        "heartbeat_interval_sec": WORKER_HEARTBEAT_SEC,
+                    }
+                )
+                last_heartbeat_ts = now_sleep_ts
 
 
 if __name__ == "__main__":
