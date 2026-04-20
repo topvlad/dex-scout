@@ -112,6 +112,8 @@ PORTFOLIO_RECO_LOG_CSV = os.path.join(DATA_DIR, "portfolio_reco_log.csv")
 TG_STATE_FILE = os.path.join(DATA_DIR, "tg_state.json")
 TG_STATE_KEY = "tg_state.json"
 SUPPRESSED_KEY = "suppressed_tokens.json"
+DEFAULT_ALERT_MODE = "normal"
+ALERT_MODE_REGISTRY = {"quiet", "normal", "aggressive"}
 
 PORTFOLIO_RECO_LOG_FIELDS = [
     "event_id",
@@ -5504,6 +5506,9 @@ def load_tg_state() -> Dict[str, Any]:
         "sent_portfolio_events": {},
         "engine_version": "v3",
         "token_state": {},
+        "settings": {
+            "alert_mode": DEFAULT_ALERT_MODE,
+        },
     }
 
     try:
@@ -5516,6 +5521,16 @@ def load_tg_state() -> Dict[str, Any]:
             if isinstance(data, dict):
                 for k, v in default.items():
                     data.setdefault(k, v)
+                settings = data.get("settings", {})
+                if not isinstance(settings, dict):
+                    settings = {}
+                legacy_mode = data.get("alert_mode")
+                if legacy_mode and not settings.get("alert_mode"):
+                    settings["alert_mode"] = legacy_mode
+                settings["alert_mode"] = str(settings.get("alert_mode") or DEFAULT_ALERT_MODE).strip().lower()
+                if settings["alert_mode"] not in ALERT_MODE_REGISTRY:
+                    settings["alert_mode"] = DEFAULT_ALERT_MODE
+                data["settings"] = settings
                 if data.get("engine_version") != "v3":
                     data["sent_events"] = {}
                     data["sent_portfolio_events"] = {}
@@ -5553,8 +5568,43 @@ def reset_tg_state() -> None:
         "sent_portfolio_events": {},
         "engine_version": "v3",
         "token_state": {},
+        "settings": {
+            "alert_mode": DEFAULT_ALERT_MODE,
+        },
     }
     save_tg_state(state)
+
+
+def _normalize_alert_mode(mode: Any) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized not in ALERT_MODE_REGISTRY:
+        return DEFAULT_ALERT_MODE
+    return normalized
+
+
+def get_alert_mode(state: Optional[Dict[str, Any]] = None) -> str:
+    state_obj = state if isinstance(state, dict) else load_tg_state()
+    settings = state_obj.get("settings", {})
+    if not isinstance(settings, dict):
+        settings = {}
+    mode = settings.get("alert_mode", state_obj.get("alert_mode"))
+    normalized = _normalize_alert_mode(mode)
+    settings["alert_mode"] = normalized
+    state_obj["settings"] = settings
+    return normalized
+
+
+def set_alert_mode(mode: str, state: Optional[Dict[str, Any]] = None, autosave: bool = True) -> str:
+    state_obj = state if isinstance(state, dict) else load_tg_state()
+    settings = state_obj.get("settings", {})
+    if not isinstance(settings, dict):
+        settings = {}
+    normalized = _normalize_alert_mode(mode)
+    settings["alert_mode"] = normalized
+    state_obj["settings"] = settings
+    if autosave:
+        save_tg_state(state_obj)
+    return normalized
 
 
 def tg_cooldown_ok(state: Dict[str, Any], seconds: int = 3600) -> bool:
@@ -5641,6 +5691,56 @@ def resolve_tg_alert_classification(
         "event_type": resolve_event_type("ENTRY_ALERT"),
         "alert_tier": resolve_alert_tier(tier_key),
     }
+
+
+def _is_portfolio_exit_reduce_alert(
+    source: str,
+    row: Dict[str, Any],
+    unified: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if str(source or "").strip().lower() != "portfolio":
+        return False
+    action = str(
+        (unified or {}).get("final_action")
+        or row.get("entry_action")
+        or row.get("entry")
+        or ""
+    ).strip().upper()
+    return action in ("EXIT", "REDUCE")
+
+
+def should_emit_for_alert_mode(
+    mode: str,
+    source: str,
+    row: Dict[str, Any],
+    signal: Dict[str, str],
+    classification: Dict[str, str],
+    unified: Optional[Dict[str, Any]] = None,
+) -> bool:
+    resolved_mode = _normalize_alert_mode(mode)
+    event_type = str(classification.get("event_type") or "").strip().lower()
+    alert_tier = str(classification.get("alert_tier") or "").strip().lower()
+
+    is_critical = alert_tier == resolve_alert_tier("CRITICAL")
+    is_health_warning = event_type == resolve_event_type("HEALTH_WARNING")
+    is_portfolio_exit_reduce = _is_portfolio_exit_reduce_alert(source, row, unified=unified)
+
+    if resolved_mode == "quiet":
+        # Hard safety overrides: never silence critical / hard health warnings /
+        # portfolio risk actions (EXIT/REDUCE).
+        if is_critical or is_health_warning or is_portfolio_exit_reduce:
+            return True
+        if alert_tier in (resolve_alert_tier("MEDIUM"), resolve_alert_tier("DIGEST_ONLY")):
+            return False
+        return True
+
+    if resolved_mode == "aggressive":
+        # Aggressive mode allows extra state/monitoring flow, but idempotency is
+        # still applied later in pipeline.
+        return True
+
+    # normal (default + safe fallback)
+    return True
 
 
 def build_emission_key_foundation(
@@ -6175,6 +6275,7 @@ def run_auto_notifications(
 ) -> None:
     now_ts = time.time()
     state = load_tg_state()
+    alert_mode = get_alert_mode(state)
 
     cooldown_seconds = 900 if WORKER_FAST_MODE else 1800
     if not tg_cooldown_ok(state, seconds=cooldown_seconds):
@@ -6205,8 +6306,10 @@ def run_auto_notifications(
 
     stats = {
         "total": len(candidates),
+        "mode": alert_mode,
         "no_token_key": 0,
         "no_signal": 0,
+        "mode_filtered": 0,
         "unknown_event_type": 0,
         "duplicate_emission_blocked": 0,
         "no_msg": 0,
@@ -6256,6 +6359,17 @@ def run_auto_notifications(
             signal,
             unified=unified,
         )
+
+        if not should_emit_for_alert_mode(
+            alert_mode,
+            source,
+            row,
+            signal,
+            classification=alert_classification,
+            unified=unified,
+        ):
+            stats["mode_filtered"] += 1
+            continue
 
         event_key = signal_event_key(source, row, signal)
         emission_key = build_emission_key(
