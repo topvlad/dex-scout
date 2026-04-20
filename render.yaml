@@ -15,3 +15,22 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
+  - type: worker
+    name: dex-scout-scanner-worker
+    env: python
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker.py
+    envVars:
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: TG_CHAT_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SCAN_INTERVAL_SEC
+        value: "300"
+      - key: WORKER_HEARTBEAT_MINUTES
+        value: "5"
