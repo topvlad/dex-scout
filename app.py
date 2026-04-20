@@ -109,11 +109,20 @@ PORTFOLIO_CSV = os.path.join(DATA_DIR, "portfolio.csv")
 MONITORING_CSV = os.path.join(DATA_DIR, "monitoring.csv")
 MON_HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
 PORTFOLIO_RECO_LOG_CSV = os.path.join(DATA_DIR, "portfolio_reco_log.csv")
+SIGNAL_JOURNAL_CSV = os.path.join(DATA_DIR, "signal_journal.csv")
+HEALTH_OVERRIDE_JOURNAL_CSV = os.path.join(DATA_DIR, "health_override_journal.csv")
+PORTFOLIO_ACTION_JOURNAL_CSV = os.path.join(DATA_DIR, "portfolio_action_journal.csv")
 TG_STATE_FILE = os.path.join(DATA_DIR, "tg_state.json")
 TG_STATE_KEY = "tg_state.json"
 SUPPRESSED_KEY = "suppressed_tokens.json"
 DEFAULT_ALERT_MODE = "normal"
 ALERT_MODE_REGISTRY = {"quiet", "normal", "aggressive"}
+OUTCOME_HORIZONS_MINUTES: Dict[str, int] = {
+    "15m": 15,
+    "1h": 60,
+    "4h": 240,
+    "24h": 1440,
+}
 
 PORTFOLIO_RECO_LOG_FIELDS = [
     "event_id",
@@ -131,6 +140,57 @@ PORTFOLIO_RECO_LOG_FIELDS = [
     "outcome_ts_utc",
     "outcome_note",
 ]
+
+JOURNAL_BASE_FIELDS = [
+    "event_id",
+    "ts_utc",
+    "token_key",
+    "chain",
+    "token_addr",
+    "source",
+    "event_type",
+    "alert_tier",
+    "signal_bucket",
+    "signal_action",
+    "signal_horizon",
+    "final_action",
+    "final_reason",
+    "health_label",
+    "health_override_active",
+    "health_override_action",
+    "health_override_reason",
+    "entry_score",
+    "timing_label",
+    "risk_level",
+    "reference_price_usd",
+    "emission_key",
+    "event_key",
+    "send_status",
+    "send_note",
+]
+
+JOURNAL_OUTCOME_FIELDS = [
+    "outcome_15m_status",
+    "outcome_15m_ts_utc",
+    "outcome_15m_return_pct",
+    "outcome_15m_price_usd",
+    "outcome_1h_status",
+    "outcome_1h_ts_utc",
+    "outcome_1h_return_pct",
+    "outcome_1h_price_usd",
+    "outcome_4h_status",
+    "outcome_4h_ts_utc",
+    "outcome_4h_return_pct",
+    "outcome_4h_price_usd",
+    "outcome_24h_status",
+    "outcome_24h_ts_utc",
+    "outcome_24h_return_pct",
+    "outcome_24h_price_usd",
+]
+
+SIGNAL_JOURNAL_FIELDS = JOURNAL_BASE_FIELDS + JOURNAL_OUTCOME_FIELDS
+HEALTH_OVERRIDE_JOURNAL_FIELDS = JOURNAL_BASE_FIELDS + JOURNAL_OUTCOME_FIELDS
+PORTFOLIO_ACTION_JOURNAL_FIELDS = JOURNAL_BASE_FIELDS + JOURNAL_OUTCOME_FIELDS
 
 
 def request_rerun() -> None:
@@ -426,6 +486,21 @@ def ensure_storage():
             w = csv.DictWriter(f, fieldnames=PORTFOLIO_RECO_LOG_FIELDS)
             w.writeheader()
 
+    if not os.path.exists(SIGNAL_JOURNAL_CSV):
+        with open(SIGNAL_JOURNAL_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=SIGNAL_JOURNAL_FIELDS)
+            w.writeheader()
+
+    if not os.path.exists(HEALTH_OVERRIDE_JOURNAL_CSV):
+        with open(HEALTH_OVERRIDE_JOURNAL_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=HEALTH_OVERRIDE_JOURNAL_FIELDS)
+            w.writeheader()
+
+    if not os.path.exists(PORTFOLIO_ACTION_JOURNAL_CSV):
+        with open(PORTFOLIO_ACTION_JOURNAL_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=PORTFOLIO_ACTION_JOURNAL_FIELDS)
+            w.writeheader()
+
 
 def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -582,6 +657,43 @@ def append_csv(path: str, row: Dict[str, Any], fieldnames: List[str]):
     rows = load_csv(path)
     rows.append({k: row.get(k, "") for k in fieldnames})
     save_csv(path, rows, fieldnames)
+
+
+def upsert_csv_row(path: str, row: Dict[str, Any], fieldnames: List[str], id_field: str = "event_id") -> None:
+    event_id = str(row.get(id_field) or "").strip()
+    if not event_id:
+        append_csv(path, row, fieldnames)
+        return
+    rows = load_csv(path, fieldnames)
+    replaced = False
+    for idx, existing in enumerate(rows):
+        if str(existing.get(id_field) or "").strip() == event_id:
+            rows[idx] = {k: row.get(k, "") for k in fieldnames}
+            replaced = True
+            break
+    if not replaced:
+        rows.append({k: row.get(k, "") for k in fieldnames})
+    save_csv(path, rows, fieldnames)
+
+
+def get_csv_row_by_id(path: str, fieldnames: List[str], event_id: str, id_field: str = "event_id") -> Optional[Dict[str, Any]]:
+    key = str(event_id or "").strip()
+    if not key:
+        return None
+    for row in load_csv(path, fieldnames):
+        if str(row.get(id_field) or "").strip() == key:
+            return dict(row)
+    return None
+
+
+def _journal_outcome_init() -> Dict[str, str]:
+    payload: Dict[str, str] = {}
+    for horizon in ("15m", "1h", "4h", "24h"):
+        payload[f"outcome_{horizon}_status"] = "PENDING"
+        payload[f"outcome_{horizon}_ts_utc"] = ""
+        payload[f"outcome_{horizon}_return_pct"] = ""
+        payload[f"outcome_{horizon}_price_usd"] = ""
+    return payload
 
 
 
@@ -5891,6 +6003,213 @@ def build_token_state_key(row: Dict[str, Any]) -> str:
     return f"{chain}:{addr}"
 
 
+def _journal_reference_price(row: Dict[str, Any]) -> float:
+    return parse_float(
+        row.get("price_usd")
+        or row.get("priceUsd")
+        or row.get("price")
+        or row.get("entry_price_usd")
+        or 0.0,
+        0.0,
+    )
+
+
+def build_journal_event_id(event_key: str, emission_key: str) -> str:
+    raw = f"{event_key}|{emission_key}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def build_base_journal_row(
+    row: Dict[str, Any],
+    source: str,
+    signal: Dict[str, str],
+    alert_classification: Dict[str, str],
+    unified: Dict[str, Any],
+    event_key: str,
+    emission_key: str,
+    send_status: str,
+    send_note: str = "",
+) -> Dict[str, Any]:
+    token_key = build_token_state_key(row)
+    health = dict(unified.get("health") or {})
+    return {
+        "event_id": build_journal_event_id(event_key, emission_key),
+        "ts_utc": now_utc_str(),
+        "token_key": token_key,
+        "chain": token_chain(row),
+        "token_addr": token_ca(row),
+        "source": str(source or "").strip().lower(),
+        "event_type": str(alert_classification.get("event_type") or ""),
+        "alert_tier": str(alert_classification.get("alert_tier") or ""),
+        "signal_bucket": str(signal.get("bucket") or ""),
+        "signal_action": str(signal.get("action") or ""),
+        "signal_horizon": str(signal.get("horizon") or ""),
+        "final_action": str(unified.get("final_action") or row.get("entry_action") or row.get("entry") or ""),
+        "final_reason": str(unified.get("final_reason") or row.get("entry_reason") or row.get("signal_reason") or ""),
+        "health_label": str(health.get("health_label") or "OK"),
+        "health_override_active": "1" if bool(unified.get("health_override_active")) else "0",
+        "health_override_action": str(unified.get("health_override_action") or ""),
+        "health_override_reason": str(unified.get("health_override_reason") or ""),
+        "entry_score": str(parse_float(row.get("entry_score", 0), 0.0)),
+        "timing_label": str(unified.get("timing") or row.get("timing_label") or ""),
+        "risk_level": str(row.get("risk_level") or row.get("risk") or ""),
+        "reference_price_usd": str(_journal_reference_price(row)),
+        "emission_key": emission_key,
+        "event_key": event_key,
+        "send_status": str(send_status or "").strip().lower(),
+        "send_note": str(send_note or ""),
+    }
+
+
+def journal_actionable_event(
+    row: Dict[str, Any],
+    source: str,
+    signal: Dict[str, str],
+    alert_classification: Dict[str, str],
+    unified: Dict[str, Any],
+    event_key: str,
+    emission_key: str,
+    send_status: str,
+    send_note: str = "",
+) -> None:
+    try:
+        base = build_base_journal_row(
+            row=row,
+            source=source,
+            signal=signal,
+            alert_classification=alert_classification,
+            unified=unified,
+            event_key=event_key,
+            emission_key=emission_key,
+            send_status=send_status,
+            send_note=send_note,
+        )
+        full_row = dict(base)
+        existing_signal = get_csv_row_by_id(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS, base.get("event_id", ""))
+        full_row.update(_journal_outcome_init())
+        if existing_signal:
+            for key in JOURNAL_OUTCOME_FIELDS:
+                if str(existing_signal.get(key) or "").strip() != "":
+                    full_row[key] = existing_signal.get(key, "")
+        upsert_csv_row(SIGNAL_JOURNAL_CSV, full_row, SIGNAL_JOURNAL_FIELDS)
+
+        if str(source or "").strip().lower() == "portfolio":
+            existing_port = get_csv_row_by_id(PORTFOLIO_ACTION_JOURNAL_CSV, PORTFOLIO_ACTION_JOURNAL_FIELDS, base.get("event_id", ""))
+            port_row = dict(full_row)
+            if existing_port:
+                for key in JOURNAL_OUTCOME_FIELDS:
+                    if str(existing_port.get(key) or "").strip() != "":
+                        port_row[key] = existing_port.get(key, "")
+            upsert_csv_row(PORTFOLIO_ACTION_JOURNAL_CSV, port_row, PORTFOLIO_ACTION_JOURNAL_FIELDS)
+
+        if bool(unified.get("health_override_active")):
+            existing_health = get_csv_row_by_id(HEALTH_OVERRIDE_JOURNAL_CSV, HEALTH_OVERRIDE_JOURNAL_FIELDS, base.get("event_id", ""))
+            health_row = dict(full_row)
+            if existing_health:
+                for key in JOURNAL_OUTCOME_FIELDS:
+                    if str(existing_health.get(key) or "").strip() != "":
+                        health_row[key] = existing_health.get(key, "")
+            upsert_csv_row(HEALTH_OVERRIDE_JOURNAL_CSV, health_row, HEALTH_OVERRIDE_JOURNAL_FIELDS)
+    except Exception as exc:
+        debug_log(f"journal_write_failed:{type(exc).__name__}:{exc}")
+
+
+def _resolve_horizon_outcome(event_ts: datetime, horizon_minutes: int, token_key: str, reference_price: float, history_by_key: Dict[str, List[Dict[str, Any]]], now_ts: datetime) -> Dict[str, str]:
+    payload = {"status": "PENDING", "ts_utc": "", "return_pct": "", "price_usd": ""}
+    target_ts = event_ts + timedelta(minutes=max(1, int(horizon_minutes)))
+    if now_ts < target_ts:
+        return payload
+    if reference_price <= 0:
+        payload["status"] = "ERROR"
+        return payload
+    entries = history_by_key.get(token_key, [])
+    if not entries:
+        return payload
+
+    picked: Optional[Dict[str, Any]] = None
+    for item in entries:
+        hist_ts = item.get("_ts")
+        if not isinstance(hist_ts, datetime):
+            continue
+        if hist_ts >= target_ts:
+            picked = item
+            break
+    if picked is None:
+        return payload
+
+    price = parse_float(picked.get("price_usd"), 0.0)
+    if price <= 0:
+        payload["status"] = "ERROR"
+        payload["ts_utc"] = str(picked.get("ts_utc") or "")
+        return payload
+    ret_pct = ((price - reference_price) / reference_price) * 100.0
+    status = "FLAT"
+    if ret_pct >= 1.0:
+        status = "UP"
+    elif ret_pct <= -1.0:
+        status = "DOWN"
+    payload["status"] = status
+    payload["ts_utc"] = str(picked.get("ts_utc") or "")
+    payload["return_pct"] = f"{ret_pct:.4f}"
+    payload["price_usd"] = f"{price:.12g}"
+    return payload
+
+
+def evaluate_outcome_journals() -> Dict[str, int]:
+    now_dt = datetime.utcnow()
+    history_rows = load_monitoring_history(limit_rows=25000)
+    history_by_key: Dict[str, List[Dict[str, Any]]] = {}
+    for h in history_rows:
+        chain = str(h.get("chain") or "").strip().lower()
+        addr = str(h.get("base_addr") or "").strip()
+        if not chain or not addr:
+            continue
+        key = f"{chain}:{addr}"
+        item = dict(h)
+        item["_ts"] = parse_ts(h.get("ts_utc"))
+        history_by_key.setdefault(key, []).append(item)
+    for arr in history_by_key.values():
+        arr.sort(key=lambda x: x.get("_ts") or datetime.min)
+
+    files = [
+        (SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS),
+        (HEALTH_OVERRIDE_JOURNAL_CSV, HEALTH_OVERRIDE_JOURNAL_FIELDS),
+        (PORTFOLIO_ACTION_JOURNAL_CSV, PORTFOLIO_ACTION_JOURNAL_FIELDS),
+    ]
+    stats = {"updated": 0, "rows_scanned": 0}
+    for path, fields in files:
+        rows = load_csv(path, fields)
+        changed = False
+        for row in rows:
+            stats["rows_scanned"] += 1
+            ts = parse_ts(row.get("ts_utc"))
+            token_key = str(row.get("token_key") or "").strip()
+            reference_price = parse_float(row.get("reference_price_usd"), 0.0)
+            if ts is None or not token_key:
+                continue
+            for horizon, minutes in OUTCOME_HORIZONS_MINUTES.items():
+                status_field = f"outcome_{horizon}_status"
+                if str(row.get(status_field) or "").strip().upper() not in {"", "PENDING"}:
+                    continue
+                resolved = _resolve_horizon_outcome(
+                    event_ts=ts,
+                    horizon_minutes=minutes,
+                    token_key=token_key,
+                    reference_price=reference_price,
+                    history_by_key=history_by_key,
+                    now_ts=now_dt,
+                )
+                row[status_field] = resolved["status"]
+                row[f"outcome_{horizon}_ts_utc"] = resolved["ts_utc"]
+                row[f"outcome_{horizon}_return_pct"] = resolved["return_pct"]
+                row[f"outcome_{horizon}_price_usd"] = resolved["price_usd"]
+                changed = True
+                stats["updated"] += 1
+        if changed:
+            save_csv(path, rows, fields)
+    return stats
+
+
 def is_material_signal_change(prev: Optional[Dict[str, Any]], current: Dict[str, Any]) -> bool:
     if not prev:
         return True
@@ -6386,19 +6705,6 @@ def run_auto_notifications(
             signal,
             unified=unified,
         )
-
-        if not should_emit_for_alert_mode(
-            alert_mode,
-            source,
-            row,
-            signal,
-            classification=alert_classification,
-            unified=unified,
-        ):
-            stats["mode_filtered"] += 1
-            continue
-        stats["post_filter_candidates"] += 1
-
         event_key = signal_event_key(source, row, signal)
         emission_key = build_emission_key(
             source,
@@ -6409,12 +6715,45 @@ def run_auto_notifications(
             unified=unified,
         )
 
+        if not should_emit_for_alert_mode(
+            alert_mode,
+            source,
+            row,
+            signal,
+            classification=alert_classification,
+            unified=unified,
+        ):
+            stats["mode_filtered"] += 1
+            journal_actionable_event(
+                row=row,
+                source=source,
+                signal=signal,
+                alert_classification=alert_classification,
+                unified=unified,
+                event_key=event_key,
+                emission_key=emission_key,
+                send_status="mode_filtered",
+                send_note=alert_mode,
+            )
+            continue
+        stats["post_filter_candidates"] += 1
+
         # allow first send even if change is None, unless event already sent
         if not change and event_key in sent_events:
             stats["already_sent"] += 1
             stats["blocked_reasons"]["idempotency_already_sent"] = int(
                 stats["blocked_reasons"].get("idempotency_already_sent", 0)
             ) + 1
+            journal_actionable_event(
+                row=row,
+                source=source,
+                signal=signal,
+                alert_classification=alert_classification,
+                unified=unified,
+                event_key=event_key,
+                emission_key=emission_key,
+                send_status="already_sent",
+            )
             continue
 
         if is_duplicate_emission(state, emission_key, now_ts=now_ts, cooldown_seconds=cooldown_seconds):
@@ -6423,6 +6762,16 @@ def run_auto_notifications(
             stats["blocked_reasons"]["cooldown_duplicate_emission"] = int(
                 stats["blocked_reasons"].get("cooldown_duplicate_emission", 0)
             ) + 1
+            journal_actionable_event(
+                row=row,
+                source=source,
+                signal=signal,
+                alert_classification=alert_classification,
+                unified=unified,
+                event_key=event_key,
+                emission_key=emission_key,
+                send_status="duplicate",
+            )
             continue
 
         msg = format_signal_message(
@@ -6436,6 +6785,16 @@ def run_auto_notifications(
             stats["unknown_event_type"] += 1
             stats["no_msg"] += 1
             debug_log(f"tg_skip_unknown_event_type event_type={alert_classification['event_type']}")
+            journal_actionable_event(
+                row=row,
+                source=source,
+                signal=signal,
+                alert_classification=alert_classification,
+                unified=unified,
+                event_key=event_key,
+                emission_key=emission_key,
+                send_status="no_msg",
+            )
             continue
 
         if send_telegram(msg, reply_markup=tg_buttons(row)):
@@ -6447,8 +6806,28 @@ def run_auto_notifications(
             tier_key = str(alert_classification.get("alert_tier") or "unknown")
             stats["sent_by_event_type"][event_type_key] = int(stats["sent_by_event_type"].get(event_type_key, 0)) + 1
             stats["sent_by_alert_tier"][tier_key] = int(stats["sent_by_alert_tier"].get(tier_key, 0)) + 1
+            journal_actionable_event(
+                row=row,
+                source=source,
+                signal=signal,
+                alert_classification=alert_classification,
+                unified=unified,
+                event_key=event_key,
+                emission_key=emission_key,
+                send_status="sent",
+            )
         else:
             stats["send_fail"] += 1
+            journal_actionable_event(
+                row=row,
+                source=source,
+                signal=signal,
+                alert_classification=alert_classification,
+                unified=unified,
+                event_key=event_key,
+                emission_key=emission_key,
+                send_status="send_fail",
+            )
 
         if sent_now >= max_per_run:
             break
@@ -10123,6 +10502,7 @@ def main():
             active_monitoring_rows,
             active_portfolio_rows
         )
+        evaluate_outcome_journals()
     st.session_state["_preload_counts"] = {
         "portfolio": len(portfolio_rows),
         "monitoring": len(monitoring_rows),
@@ -10212,8 +10592,14 @@ def main():
             st.cache_data.clear()
             request_rerun()
         st.markdown("### Background alerts limitation")
-        st.caption("This Streamlit app does not run alerts in the background when the browser/session is closed.")
-        st.caption("For true background alerts, run scanner_worker.py as a separate worker service.")
+        st.caption("This browser session does not run background alerts by itself when closed.")
+        st.caption("True background alerts require a separate scanner_worker.py service.")
+        runtime = get_worker_runtime_state(state=state)
+        worker_loop_ts = runtime.get("last_loop_ts") or ""
+        if worker_loop_ts:
+            st.caption(f"Worker heartbeat: active (last loop {worker_loop_ts}).")
+        else:
+            st.caption("Worker heartbeat: no loop heartbeat recorded yet.")
         st.caption("TG mode: ENV + Streamlit secrets fallback")
         st.divider()
         st.markdown("### Storage status")

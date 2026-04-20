@@ -169,6 +169,8 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
                 },
             )
             print(f"[worker] notifications processed result={notif_result}", flush=True)
+            outcome_stats = app.evaluate_outcome_journals()
+            print(f"[worker] outcome journals evaluated result={outcome_stats}", flush=True)
 
             if one_pass:
                 print("[worker] one_pass done", flush=True)
