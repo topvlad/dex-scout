@@ -195,6 +195,176 @@ SIGNAL_JOURNAL_FIELDS = JOURNAL_BASE_FIELDS + JOURNAL_OUTCOME_FIELDS
 HEALTH_OVERRIDE_JOURNAL_FIELDS = JOURNAL_BASE_FIELDS + JOURNAL_OUTCOME_FIELDS
 PORTFOLIO_ACTION_JOURNAL_FIELDS = JOURNAL_BASE_FIELDS + JOURNAL_OUTCOME_FIELDS
 
+PATTERN_KEY_SCHEMA_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "pattern-trust-v1": {
+        "required_components": ("setup_class", "health_context", "timing_state_context"),
+        "optional_components": ("market_regime_bucket",),
+    }
+}
+PATTERN_KEY_SCHEMA_VERSION = "pattern-trust-v1"
+TRUST_MIN_SAMPLE_FLOOR = 5
+TRUST_RECENT_WINDOW_DAYS = 3
+TRUST_HISTORY_LOOKBACK_ROWS = 10_000
+TRUST_SCORE_CAP = 0.75
+
+
+def _pattern_component_normalize(value: Any, default: str = "na") -> str:
+    token = str(value or "").strip().lower()
+    if not token:
+        token = default
+    token = re.sub(r"[^a-z0-9_\\-]+", "_", token)
+    token = re.sub(r"_+", "_", token).strip("_")
+    return token or default
+
+
+def get_pattern_key_registry(schema_version: str = PATTERN_KEY_SCHEMA_VERSION) -> Dict[str, Any]:
+    schema = PATTERN_KEY_SCHEMA_REGISTRY.get(schema_version)
+    if not schema:
+        return {"schema_version": schema_version, "required_components": tuple(), "optional_components": tuple()}
+    return {
+        "schema_version": schema_version,
+        "required_components": tuple(schema.get("required_components") or tuple()),
+        "optional_components": tuple(schema.get("optional_components") or tuple()),
+    }
+
+
+def build_pattern_key_components(row: Dict[str, Any]) -> Dict[str, str]:
+    setup_class = (
+        row.get("setup_class")
+        or row.get("setup_context")
+        or row.get("signal_bucket")
+        or row.get("entry_status")
+        or row.get("entry_action")
+        or "unknown_setup"
+    )
+    health_context = row.get("health_label") or row.get("health_bucket") or "unknown_health"
+    timing_state_context = (
+        row.get("timing_label")
+        or row.get("timing")
+        or row.get("entry_state")
+        or row.get("final_action")
+        or "unknown_state"
+    )
+    market_regime_bucket = row.get("market_regime_bucket") or row.get("market_regime") or ""
+
+    payload = {
+        "setup_class": _pattern_component_normalize(setup_class, default="unknown_setup"),
+        "health_context": _pattern_component_normalize(health_context, default="unknown_health"),
+        "timing_state_context": _pattern_component_normalize(timing_state_context, default="unknown_state"),
+    }
+    regime_norm = _pattern_component_normalize(market_regime_bucket, default="")
+    if regime_norm:
+        payload["market_regime_bucket"] = regime_norm
+    return payload
+
+
+def build_pattern_key(row: Dict[str, Any], schema_version: str = PATTERN_KEY_SCHEMA_VERSION) -> str:
+    schema = get_pattern_key_registry(schema_version)
+    components = build_pattern_key_components(row)
+    ordered_bits: List[str] = []
+    for req_key in schema.get("required_components", tuple()):
+        ordered_bits.append(f"{req_key}={components.get(req_key, 'na')}")
+    for opt_key in schema.get("optional_components", tuple()):
+        if components.get(opt_key):
+            ordered_bits.append(f"{opt_key}={components.get(opt_key)}")
+    return f"{schema_version}|{'|'.join(ordered_bits)}"
+
+
+def _extract_resolved_outcome(row: Dict[str, Any]) -> Optional[Tuple[str, float, datetime]]:
+    # Closed/resolved only: explicitly finalized horizons, never PENDING.
+    for horizon in ("24h", "4h", "1h", "15m"):
+        status = str(row.get(f"outcome_{horizon}_status") or "").strip().upper()
+        if status in {"", "PENDING"}:
+            continue
+        ts = parse_ts(row.get(f"outcome_{horizon}_ts_utc")) or parse_ts(row.get("ts_utc"))
+        if ts is None:
+            ts = datetime.utcnow()
+        ret = parse_float(row.get(f"outcome_{horizon}_return_pct"), 0.0)
+        return status, ret, ts
+    return None
+
+
+def _outcome_score(status: str, return_pct: float) -> float:
+    status = str(status or "").upper()
+    if status == "UP":
+        return max(0.1, min(return_pct / 25.0, 1.0))
+    if status == "DOWN":
+        return min(-0.1, max(return_pct / 25.0, -1.0))
+    if status == "FLAT":
+        return 0.0
+    return 0.0
+
+
+def build_pattern_trust_index(rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Dict[str, Any]]:
+    if rows is None:
+        rows = load_csv(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS)[-TRUST_HISTORY_LOOKBACK_ROWS:]
+    grouped: Dict[str, Dict[str, Any]] = {}
+    now_dt = datetime.utcnow()
+    for row in rows:
+        resolved = _extract_resolved_outcome(row)
+        if resolved is None:
+            continue
+        status, ret_pct, resolved_ts = resolved
+        pattern_key = build_pattern_key(row)
+        bucket = grouped.setdefault(pattern_key, {"samples": 0, "sum_score": 0.0, "recent_samples": 0})
+        bucket["samples"] += 1
+        bucket["sum_score"] += _outcome_score(status, ret_pct)
+        age_days = max(0.0, (now_dt - resolved_ts).total_seconds() / 86400.0)
+        if age_days <= TRUST_RECENT_WINDOW_DAYS:
+            bucket["recent_samples"] += 1
+    return grouped
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_pattern_trust_index_cached() -> Dict[str, Dict[str, Any]]:
+    return build_pattern_trust_index()
+
+
+def compute_pattern_trust(row: Dict[str, Any], trust_index: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    pattern_key = build_pattern_key(row)
+    if trust_index is None:
+        trust_index = load_pattern_trust_index_cached()
+    bucket = dict(trust_index.get(pattern_key) or {})
+    sample_size = int(bucket.get("samples", 0))
+    recent_samples = int(bucket.get("recent_samples", 0))
+    mean_score = (parse_float(bucket.get("sum_score"), 0.0) / sample_size) if sample_size > 0 else 0.0
+    bounded_score = max(-TRUST_SCORE_CAP, min(TRUST_SCORE_CAP, mean_score))
+
+    confidence = 0.15
+    reasons: List[str] = []
+    if sample_size < TRUST_MIN_SAMPLE_FLOOR:
+        bounded_score = 0.0
+        reasons.append(f"sample floor: {sample_size}/{TRUST_MIN_SAMPLE_FLOOR}")
+    else:
+        confidence = min(1.0, sample_size / 20.0)
+    if sample_size > 0 and recent_samples >= sample_size:
+        confidence *= 0.6
+        reasons.append("recent-only sample cluster")
+    if sample_size > 0 and abs(bounded_score) >= 0.6:
+        confidence *= 0.85
+    confidence = max(0.05, min(confidence, 1.0))
+    if not reasons:
+        reasons.append("resolved journal outcomes")
+
+    return {
+        "pattern_key_schema_version": PATTERN_KEY_SCHEMA_VERSION,
+        "pattern_key": pattern_key,
+        "trust_score": round(bounded_score, 4),
+        "trust_confidence": round(confidence, 4),
+        "trust_sample_size": sample_size,
+        "trust_reason": "; ".join(reasons),
+        "advisory_only": True,
+    }
+
+
+def advisory_trust_bias(trust_payload: Dict[str, Any]) -> float:
+    score = parse_float(trust_payload.get("trust_score"), 0.0)
+    confidence = parse_float(trust_payload.get("trust_confidence"), 0.0)
+    sample_size = int(parse_float(trust_payload.get("trust_sample_size"), 0.0))
+    if sample_size < TRUST_MIN_SAMPLE_FLOOR:
+        return 0.0
+    return max(-20.0, min(20.0, score * confidence * 25.0))
+
 
 def request_rerun() -> None:
     st.session_state["_rerun_flag"] = True
@@ -1995,6 +2165,7 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str, hist: Optio
     final_action = "TRACK ONLY"
     final_reason = "watch structure"
     health = detect_position_health(row, hist or [])
+    trust_payload = compute_pattern_trust({**row, "health_label": health.get("health_label", row.get("health_label"))})
     health_override_active = False
     health_override_action = ""
     health_override_reason = ""
@@ -2086,6 +2257,13 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str, hist: Optio
         "health_override_active": health_override_active,
         "health_override_action": health_override_action,
         "health_override_reason": health_override_reason,
+        "trust_score": trust_payload.get("trust_score", 0.0),
+        "trust_confidence": trust_payload.get("trust_confidence", 0.0),
+        "trust_sample_size": trust_payload.get("trust_sample_size", 0),
+        "trust_reason": trust_payload.get("trust_reason", ""),
+        "trust_pattern_key": trust_payload.get("pattern_key", ""),
+        "trust_pattern_key_schema_version": trust_payload.get("pattern_key_schema_version", PATTERN_KEY_SCHEMA_VERSION),
+        "trust_advisory_only": True,
     }
     unified["size_hint"] = suggested_position_size(row, unified)
 
@@ -6259,6 +6437,10 @@ def update_journal_outcome_snapshots(
             stats["updated"] += 1
     if changed:
         save_csv(path, rows, fields)
+        try:
+            load_pattern_trust_index_cached.clear()
+        except Exception:
+            pass
     return stats
 
 
@@ -9252,7 +9434,22 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             active_rows.append(r)
     if not active_rows:
         active_rows = rows[:50]
-    active_rows = sorted(active_rows, key=lambda row: parse_float(row.get("priority_score", 0), 0.0), reverse=True)[:50]
+    trust_index = load_pattern_trust_index_cached()
+    for row in active_rows:
+        trust_payload = compute_pattern_trust(row, trust_index=trust_index)
+        row["trust_score"] = trust_payload.get("trust_score", 0.0)
+        row["trust_confidence"] = trust_payload.get("trust_confidence", 0.0)
+        row["trust_sample_size"] = trust_payload.get("trust_sample_size", 0)
+        row["trust_reason"] = trust_payload.get("trust_reason", "")
+        row["trust_pattern_key"] = trust_payload.get("pattern_key", "")
+        row["trust_priority_bias"] = advisory_trust_bias(trust_payload)
+    active_rows = sorted(
+        active_rows,
+        key=lambda row: (
+            parse_float(row.get("priority_score", 0), 0.0) + parse_float(row.get("trust_priority_bias", 0), 0.0)
+        ),
+        reverse=True,
+    )[:50]
     active = list(active_rows)
     archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
     top[0].metric("Active", len(active))
@@ -9999,6 +10196,102 @@ def wave_c_invariant_checks() -> List[str]:
     return issues
 
 
+def wave_d_pattern_trust_invariant_checks() -> List[str]:
+    issues: List[str] = []
+
+    row_key = {
+        "setup_class": "breakout",
+        "health_label": "OK",
+        "timing_label": "EARLY",
+        "market_regime_bucket": "risk_on",
+    }
+    key_one = build_pattern_key(row_key)
+    key_two = build_pattern_key(dict(row_key))
+    if key_one != key_two:
+        issues.append("pattern trust: deterministic key generation regression")
+
+    pending_only_rows = [
+        {
+            "setup_context": "breakout",
+            "health_label": "OK",
+            "timing_label": "EARLY",
+            "outcome_15m_status": "PENDING",
+            "outcome_1h_status": "PENDING",
+            "outcome_4h_status": "PENDING",
+            "outcome_24h_status": "PENDING",
+        }
+    ]
+    pending_index = build_pattern_trust_index(rows=pending_only_rows)
+    pending_payload = compute_pattern_trust(row_key, trust_index=pending_index)
+    if parse_float(pending_payload.get("trust_score"), 0.0) != 0.0:
+        issues.append("pattern trust: pending-only rows should stay neutral")
+
+    low_sample_rows = []
+    for _i in range(3):
+        low_sample_rows.append(
+            {
+                "setup_context": "breakout",
+                "health_label": "OK",
+                "timing_label": "EARLY",
+                "outcome_1h_status": "UP",
+                "outcome_1h_return_pct": "18.0",
+                "outcome_1h_ts_utc": now_utc_str(),
+            }
+        )
+    low_sample_index = build_pattern_trust_index(rows=low_sample_rows)
+    low_sample_payload = compute_pattern_trust(row_key, trust_index=low_sample_index)
+    if parse_float(low_sample_payload.get("trust_score"), 0.0) != 0.0:
+        issues.append("pattern trust: low sample must stay neutral/advisory")
+
+    mixed_rows = []
+    for pct in (20.0, -18.0, 12.0, -11.0, 8.0, -7.0, 6.0, -5.0):
+        mixed_rows.append(
+            {
+                "setup_context": "breakout",
+                "health_label": "OK",
+                "timing_label": "EARLY",
+                "outcome_4h_status": "UP" if pct > 0 else "DOWN",
+                "outcome_4h_return_pct": str(pct),
+                "outcome_4h_ts_utc": "2026-04-01T00:00:00Z",
+            }
+        )
+    mixed_index = build_pattern_trust_index(rows=mixed_rows)
+    mixed_payload = compute_pattern_trust(row_key, trust_index=mixed_index)
+    mixed_score = abs(parse_float(mixed_payload.get("trust_score"), 0.0))
+    if mixed_score >= TRUST_SCORE_CAP:
+        issues.append("pattern trust: conflicting outcomes became extreme instead of bounded")
+
+    dead_row = {
+        "entry_action": "ENTRY_NOW",
+        "entry_score": "260",
+        "risk_level": "LOW",
+        "timing_label": "GOOD",
+        "liquidity_health": "DEAD",
+        "is_dead": True,
+        "setup_class": "breakout",
+        "setup_context": "breakout",
+        "health_label": "DEAD",
+        "reco_model": "HOLD",
+        "score": "260",
+        "pnl_pct": "5",
+    }
+    strong_trust = {
+        build_pattern_key(dead_row): {
+            "samples": 50,
+            "sum_score": 35.0,
+            "recent_samples": 5,
+        }
+    }
+    dead_payload = compute_pattern_trust(dead_row, trust_index=strong_trust)
+    if parse_float(dead_payload.get("trust_score"), 0.0) <= 0:
+        issues.append("pattern trust: synthetic strong trust fixture invalid")
+    dead_unified = compute_unified_recommendation(dead_row, source="portfolio")
+    if str(dead_unified.get("final_action") or "").upper() != "EXIT":
+        issues.append("pattern trust: dead/untradeable candidate was upgraded by trust")
+
+    return issues
+
+
 def core_safety_self_check():
     issues: List[str] = []
 
@@ -10040,6 +10333,9 @@ def core_safety_self_check():
     wave_c_issues = wave_c_invariant_checks()
     for wave_issue in wave_c_issues:
         issues.append(f"Wave C invariant: {wave_issue}")
+    wave_d_issues = wave_d_pattern_trust_invariant_checks()
+    for wave_issue in wave_d_issues:
+        issues.append(f"Wave D invariant: {wave_issue}")
     alert_pipeline_issues = alert_pipeline_reliability_checks()
     for pipeline_issue in alert_pipeline_issues:
         issues.append(f"Alert pipeline reliability: {pipeline_issue}")
