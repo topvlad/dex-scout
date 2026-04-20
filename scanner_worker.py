@@ -69,6 +69,28 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
         default_sleep_for = max(60, SCAN_INTERVAL_SEC)
         sleep_for = default_sleep_for
         now_ts = time.time()
+        now_utc = app.now_utc_str()
+        runtime = app.get_worker_runtime_state()
+        prev_loop_epoch = float(runtime.get("last_loop_epoch", 0.0) or 0.0)
+        stale_threshold_sec = max(WORKER_HEARTBEAT_SEC * 2, SCAN_INTERVAL_SEC * 2, 600)
+        if prev_loop_epoch > 0 and (now_ts - prev_loop_epoch) > stale_threshold_sec:
+            stale_reason = f"stale_loop_gap_sec>{stale_threshold_sec}"
+            print(
+                f"[worker] stale loop detected gap_sec={int(now_ts - prev_loop_epoch)} "
+                f"threshold_sec={stale_threshold_sec}",
+                flush=True,
+            )
+            app.update_worker_runtime_state(
+                updates={"last_error_ts": now_utc, "last_error_reason": stale_reason}
+            )
+        app.update_worker_runtime_state(
+            updates={
+                "last_loop_ts": now_utc,
+                "last_loop_epoch": now_ts,
+                "heartbeat_interval_sec": WORKER_HEARTBEAT_SEC,
+            },
+            increments={"loop_iterations": 1},
+        )
         if (now_ts - last_heartbeat_ts) >= WORKER_HEARTBEAT_SEC:
             print(
                 f"[worker] heartbeat alive=1 interval_sec={SCAN_INTERVAL_SEC} "
@@ -117,6 +139,16 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
             else:
                 sleep_for = default_sleep_for
             _queue_invariant_telemetry(queue_stats, sleep_for=sleep_for, default_sleep_for=default_sleep_for)
+            fallback_reason = ""
+            if int(queue_stats.get("scanned", 0) or 0) <= 0:
+                fallback_reason = "adaptive_no_scans"
+            elif int(queue_stats.get("errors", 0) or 0) >= int(queue_stats.get("scanned", 0) or 0):
+                fallback_reason = "adaptive_all_scans_failed"
+            candidate_path = "adaptive_queue"
+            if fallback_reason:
+                candidate_path = "baseline_fallback"
+                print(f"[worker] baseline fallback enabled reason={fallback_reason}", flush=True)
+                app.update_worker_runtime_state(updates={"last_empty_reason": fallback_reason})
 
             monitoring_rows = app.load_monitoring()
             portfolio_rows = app.load_portfolio()
@@ -127,12 +159,16 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
             ]
             scan_state = app.scanner_state_load() or {}
 
-            app.run_auto_notifications(
+            notif_result = app.run_auto_notifications(
                 scan_state,
                 active_monitoring_rows,
                 active_portfolio_rows,
+                cycle_context={
+                    "candidate_path": candidate_path,
+                    "fallback_reason": fallback_reason,
+                },
             )
-            print("[worker] notifications processed", flush=True)
+            print(f"[worker] notifications processed result={notif_result}", flush=True)
 
             if one_pass:
                 print("[worker] one_pass done", flush=True)
@@ -140,6 +176,13 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
         except Exception as exc:
             import traceback
             print(f"[worker] error: {type(exc).__name__}: {exc}", flush=True)
+            app.update_worker_runtime_state(
+                updates={
+                    "last_error_ts": app.now_utc_str(),
+                    "last_error_reason": f"worker_exception:{type(exc).__name__}:{exc}",
+                },
+                increments={"notification_failed_cycles": 1},
+            )
             traceback.print_exc()
 
         slept = 0

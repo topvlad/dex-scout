@@ -6272,19 +6272,31 @@ def run_auto_notifications(
     scan_state: Dict[str, Any],
     monitoring_rows: List[Dict[str, Any]],
     portfolio_rows: List[Dict[str, Any]],
-) -> None:
+    cycle_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     now_ts = time.time()
+    cycle_context = cycle_context if isinstance(cycle_context, dict) else {}
     state = load_tg_state()
     alert_mode = get_alert_mode(state)
 
     cooldown_seconds = 900 if WORKER_FAST_MODE else 1800
     if not tg_cooldown_ok(state, seconds=cooldown_seconds):
+        block_reason = f"cooldown_active:{cooldown_seconds}s"
+        update_worker_runtime_state(
+            updates={
+                "last_notifications_ts": now_utc_str(),
+                "last_notifications_epoch": now_ts,
+                "last_block_reason": block_reason,
+                "last_candidate_path": str(cycle_context.get("candidate_path") or "baseline"),
+            },
+            increments={"notification_runs": 1, "notification_blocked_cycles": 1},
+        )
         print(
             f"[TG] cooldown active -> skip cooldown_seconds={cooldown_seconds} "
             f"mode={alert_mode}",
             flush=True,
         )
-        return
+        return {"status": "blocked", "block_reason": block_reason, "stats": {"sent": 0}}
 
     prev_token_state = state.get("token_state", {})
     if not isinstance(prev_token_state, dict):
@@ -6327,6 +6339,8 @@ def run_auto_notifications(
         "sent_by_event_type": {},
         "sent_by_alert_tier": {},
         "post_filter_candidates": 0,
+        "send_fail": 0,
+        "blocked_reasons": {},
     }
 
     for _, source, row in candidates:
@@ -6398,11 +6412,17 @@ def run_auto_notifications(
         # allow first send even if change is None, unless event already sent
         if not change and event_key in sent_events:
             stats["already_sent"] += 1
+            stats["blocked_reasons"]["idempotency_already_sent"] = int(
+                stats["blocked_reasons"].get("idempotency_already_sent", 0)
+            ) + 1
             continue
 
         if is_duplicate_emission(state, emission_key, now_ts=now_ts, cooldown_seconds=cooldown_seconds):
             stats["duplicate"] += 1
             stats["cooldown"] += 1
+            stats["blocked_reasons"]["cooldown_duplicate_emission"] = int(
+                stats["blocked_reasons"].get("cooldown_duplicate_emission", 0)
+            ) + 1
             continue
 
         msg = format_signal_message(
@@ -6427,16 +6447,82 @@ def run_auto_notifications(
             tier_key = str(alert_classification.get("alert_tier") or "unknown")
             stats["sent_by_event_type"][event_type_key] = int(stats["sent_by_event_type"].get(event_type_key, 0)) + 1
             stats["sent_by_alert_tier"][tier_key] = int(stats["sent_by_alert_tier"].get(tier_key, 0)) + 1
+        else:
+            stats["send_fail"] += 1
 
         if sent_now >= max_per_run:
             break
 
     print(f"[TG] notification stats: {stats}", flush=True)
 
+    cycle_status = "sent" if stats["sent"] > 0 else "empty"
+    if stats["send_fail"] > 0 and stats["sent"] == 0:
+        cycle_status = "failed"
+    elif stats["sent"] == 0:
+        blocked_total = (
+            int(stats["duplicate"])
+            + int(stats["already_sent"])
+            + int(stats["mode_filtered"])
+            + int(stats["suppressed"])
+            + int(stats["cooldown"])
+        )
+        if blocked_total > 0:
+            cycle_status = "blocked"
+
+    empty_reason = ""
+    block_reason = ""
+    error_reason = ""
+    if eligible_after_candidate_build <= 0:
+        empty_reason = "empty_candidates"
+    elif stats["post_filter_candidates"] <= 0:
+        empty_reason = "post_filter_empty"
+    if cycle_status == "blocked":
+        blocked = sorted(
+            [
+                (k, v)
+                for k, v in stats["blocked_reasons"].items()
+                if int(v or 0) > 0
+            ],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        if blocked:
+            block_reason = str(blocked[0][0])
+        elif stats["mode_filtered"] > 0:
+            block_reason = "mode_filtered"
+        elif stats["suppressed"] > 0:
+            block_reason = "suppressed"
+    if stats["send_fail"] > 0:
+        error_reason = f"send_fail:{stats['send_fail']}"
+
+    runtime_snapshot = get_worker_runtime_state()
+    update_worker_runtime_state(
+        updates={
+            "last_notifications_ts": now_utc_str(),
+            "last_notifications_epoch": now_ts,
+            "last_send_success_ts": now_utc_str() if stats["sent"] > 0 else runtime_snapshot.get("last_send_success_ts", ""),
+            "last_send_success_epoch": now_ts if stats["sent"] > 0 else runtime_snapshot.get("last_send_success_epoch", 0.0),
+            "last_error_ts": now_utc_str() if error_reason else runtime_snapshot.get("last_error_ts", ""),
+            "last_error_reason": error_reason or runtime_snapshot.get("last_error_reason", ""),
+            "last_empty_reason": empty_reason,
+            "last_block_reason": block_reason,
+            "last_candidate_path": str(cycle_context.get("candidate_path") or "baseline"),
+        },
+        increments={
+            "notification_runs": 1,
+            "notification_sent": int(stats["sent"]),
+            "notification_empty_cycles": 1 if cycle_status == "empty" else 0,
+            "notification_blocked_cycles": 1 if cycle_status == "blocked" else 0,
+            "notification_failed_cycles": 1 if cycle_status == "failed" else 0,
+            "notification_send_failures": int(stats["send_fail"]),
+        },
+    )
+
     state["token_state"] = new_token_state
     state["sent_events"] = sent_events
     state["last_scan_ts_processed"] = str(scan_state.get("last_run_ts") or now_utc_str())
     save_tg_state(state)
+    return {"status": cycle_status, "stats": stats}
 
 
 def reset_monitoring():
@@ -7109,7 +7195,57 @@ def scanner_state_load() -> Dict[str, Any]:
         "queue_state": {},
         "queue_next_due_ts": 0.0,
         "queue_last_run_ts": "",
+        "worker_runtime": {},
     }
+
+
+def worker_runtime_defaults() -> Dict[str, Any]:
+    return {
+        "last_loop_ts": "",
+        "last_loop_epoch": 0.0,
+        "last_notifications_ts": "",
+        "last_notifications_epoch": 0.0,
+        "last_send_success_ts": "",
+        "last_send_success_epoch": 0.0,
+        "last_error_ts": "",
+        "last_error_reason": "",
+        "last_empty_reason": "",
+        "last_block_reason": "",
+        "last_candidate_path": "",
+        "heartbeat_interval_sec": 0,
+        "loop_iterations": 0,
+        "notification_runs": 0,
+        "notification_sent": 0,
+        "notification_empty_cycles": 0,
+        "notification_blocked_cycles": 0,
+        "notification_failed_cycles": 0,
+        "notification_send_failures": 0,
+    }
+
+
+def get_worker_runtime_state(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    src = state if isinstance(state, dict) else (scanner_state_load() or {})
+    runtime = src.get("worker_runtime", {})
+    if not isinstance(runtime, dict):
+        runtime = {}
+    out = worker_runtime_defaults()
+    out.update(runtime)
+    return out
+
+
+def update_worker_runtime_state(
+    updates: Dict[str, Any],
+    increments: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    state = scanner_state_load() or {}
+    runtime = get_worker_runtime_state(state=state)
+    for k, v in (updates or {}).items():
+        runtime[k] = v
+    for k, delta in (increments or {}).items():
+        runtime[k] = int(parse_float(runtime.get(k, 0), 0.0)) + int(delta or 0)
+    state["worker_runtime"] = runtime
+    scanner_state_save(state)
+    return runtime
 
 
 SCAN_QUEUE_TIERS: List[Tuple[str, int]] = [
@@ -9355,6 +9491,9 @@ def core_safety_self_check():
     wave_c_issues = wave_c_invariant_checks()
     for wave_issue in wave_c_issues:
         issues.append(f"Wave C invariant: {wave_issue}")
+    alert_pipeline_issues = alert_pipeline_reliability_checks()
+    for pipeline_issue in alert_pipeline_issues:
+        issues.append(f"Alert pipeline reliability: {pipeline_issue}")
 
     if issues:
         st.error("CORE SAFETY BROKEN")
@@ -9363,6 +9502,30 @@ def core_safety_self_check():
             st.write(f"– {i}")
     else:
         st.success("Core safety OK")
+
+
+def alert_pipeline_reliability_checks() -> List[str]:
+    issues: List[str] = []
+    state = scanner_state_load() or {}
+    runtime = get_worker_runtime_state(state=state)
+    required_runtime_keys = [
+        "last_loop_ts",
+        "last_notifications_ts",
+        "last_send_success_ts",
+        "last_error_ts",
+        "last_error_reason",
+        "last_empty_reason",
+    ]
+    for key in required_runtime_keys:
+        if key not in runtime:
+            issues.append(f"runtime key missing: {key}")
+    try:
+        worker_src = Path(os.path.join(os.path.dirname(__file__), "scanner_worker.py")).read_text(encoding="utf-8")
+    except Exception:
+        worker_src = ""
+    if "run_auto_notifications(" not in worker_src:
+        issues.append("worker loop does not call run_auto_notifications")
+    return issues
 
 
 def render_debug_panel():
@@ -9395,6 +9558,29 @@ def render_debug_panel():
         st.write("### Runtime")
         st.write(f"Session keys: {len(st.session_state.keys())}")
         st.write(list(st.session_state.keys())[:10])
+        runtime = get_worker_runtime_state()
+        st.caption(
+            f"Worker loop: {runtime.get('last_loop_ts') or '—'} | "
+            f"notifications: {runtime.get('last_notifications_ts') or '—'} | "
+            f"last send: {runtime.get('last_send_success_ts') or '—'}"
+        )
+        st.caption(
+            f"last_error: {runtime.get('last_error_ts') or '—'} "
+            f"reason={runtime.get('last_error_reason') or '—'}"
+        )
+        st.caption(
+            f"last_empty_reason={runtime.get('last_empty_reason') or '—'} | "
+            f"last_block_reason={runtime.get('last_block_reason') or '—'} | "
+            f"path={runtime.get('last_candidate_path') or '—'}"
+        )
+        st.caption(
+            f"loops={runtime.get('loop_iterations', 0)} | "
+            f"notif_runs={runtime.get('notification_runs', 0)} | "
+            f"sent={runtime.get('notification_sent', 0)} | "
+            f"empty={runtime.get('notification_empty_cycles', 0)} | "
+            f"blocked={runtime.get('notification_blocked_cycles', 0)} | "
+            f"failed={runtime.get('notification_failed_cycles', 0)}"
+        )
 
         st.write("---")
         st.write("### Portfolio health (recent)")
@@ -9410,6 +9596,16 @@ def render_debug_panel():
         st.write("---")
         st.write("### Core safety")
         core_safety_self_check()
+
+        st.write("---")
+        st.write("### Alert pipeline reliability")
+        pipeline_issues = alert_pipeline_reliability_checks()
+        if pipeline_issues:
+            st.caption(f"Violations: {len(pipeline_issues)}")
+            for issue in pipeline_issues[:10]:
+                st.write(f"– {issue}")
+        else:
+            st.caption("No violations detected.")
 
         st.write("---")
         st.write("### Wave B guardrails")
