@@ -143,6 +143,8 @@ PORTFOLIO_RECO_LOG_FIELDS = [
 
 JOURNAL_BASE_FIELDS = [
     "event_id",
+    "journal_type",
+    "source_event_id",
     "ts_utc",
     "token_key",
     "chain",
@@ -162,6 +164,7 @@ JOURNAL_BASE_FIELDS = [
     "entry_score",
     "timing_label",
     "risk_level",
+    "setup_context",
     "reference_price_usd",
     "emission_key",
     "event_key",
@@ -6034,6 +6037,8 @@ def build_base_journal_row(
     health = dict(unified.get("health") or {})
     return {
         "event_id": build_journal_event_id(event_key, emission_key),
+        "journal_type": "signal",
+        "source_event_id": str(event_key or ""),
         "ts_utc": now_utc_str(),
         "token_key": token_key,
         "chain": token_chain(row),
@@ -6053,12 +6058,60 @@ def build_base_journal_row(
         "entry_score": str(parse_float(row.get("entry_score", 0), 0.0)),
         "timing_label": str(unified.get("timing") or row.get("timing_label") or ""),
         "risk_level": str(row.get("risk_level") or row.get("risk") or ""),
+        "setup_context": safe_json({
+            "entry_action": str(row.get("entry_action") or row.get("entry") or ""),
+            "entry_reason": str(row.get("entry_reason") or row.get("signal_reason") or ""),
+            "setup_watch_only": str(row.get("setup_watch_only") or ""),
+        }),
         "reference_price_usd": str(_journal_reference_price(row)),
         "emission_key": emission_key,
         "event_key": event_key,
         "send_status": str(send_status or "").strip().lower(),
         "send_note": str(send_note or ""),
     }
+
+
+def _carry_forward_outcomes(base_row: Dict[str, Any], existing_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    row = dict(base_row)
+    row.update(_journal_outcome_init())
+    if existing_row:
+        for key in JOURNAL_OUTCOME_FIELDS:
+            if str(existing_row.get(key) or "").strip() != "":
+                row[key] = existing_row.get(key, "")
+    return row
+
+
+def write_signal_journal_row(base_row: Dict[str, Any]) -> None:
+    signal_row = dict(base_row)
+    signal_row["journal_type"] = "monitoring_signal" if str(base_row.get("source") or "") == "monitoring" else "portfolio_signal"
+    existing = get_csv_row_by_id(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS, base_row.get("event_id", ""))
+    upsert_csv_row(
+        SIGNAL_JOURNAL_CSV,
+        _carry_forward_outcomes(signal_row, existing),
+        SIGNAL_JOURNAL_FIELDS,
+    )
+
+
+def write_portfolio_action_journal_row(base_row: Dict[str, Any]) -> None:
+    port_row = dict(base_row)
+    port_row["journal_type"] = "portfolio_action"
+    existing = get_csv_row_by_id(PORTFOLIO_ACTION_JOURNAL_CSV, PORTFOLIO_ACTION_JOURNAL_FIELDS, base_row.get("event_id", ""))
+    upsert_csv_row(
+        PORTFOLIO_ACTION_JOURNAL_CSV,
+        _carry_forward_outcomes(port_row, existing),
+        PORTFOLIO_ACTION_JOURNAL_FIELDS,
+    )
+
+
+def write_health_override_journal_row(base_row: Dict[str, Any]) -> None:
+    health_row = dict(base_row)
+    health_row["journal_type"] = "health_override"
+    existing = get_csv_row_by_id(HEALTH_OVERRIDE_JOURNAL_CSV, HEALTH_OVERRIDE_JOURNAL_FIELDS, base_row.get("event_id", ""))
+    upsert_csv_row(
+        HEALTH_OVERRIDE_JOURNAL_CSV,
+        _carry_forward_outcomes(health_row, existing),
+        HEALTH_OVERRIDE_JOURNAL_FIELDS,
+    )
 
 
 def journal_actionable_event(
@@ -6084,32 +6137,13 @@ def journal_actionable_event(
             send_status=send_status,
             send_note=send_note,
         )
-        full_row = dict(base)
-        existing_signal = get_csv_row_by_id(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS, base.get("event_id", ""))
-        full_row.update(_journal_outcome_init())
-        if existing_signal:
-            for key in JOURNAL_OUTCOME_FIELDS:
-                if str(existing_signal.get(key) or "").strip() != "":
-                    full_row[key] = existing_signal.get(key, "")
-        upsert_csv_row(SIGNAL_JOURNAL_CSV, full_row, SIGNAL_JOURNAL_FIELDS)
+        write_signal_journal_row(base)
 
         if str(source or "").strip().lower() == "portfolio":
-            existing_port = get_csv_row_by_id(PORTFOLIO_ACTION_JOURNAL_CSV, PORTFOLIO_ACTION_JOURNAL_FIELDS, base.get("event_id", ""))
-            port_row = dict(full_row)
-            if existing_port:
-                for key in JOURNAL_OUTCOME_FIELDS:
-                    if str(existing_port.get(key) or "").strip() != "":
-                        port_row[key] = existing_port.get(key, "")
-            upsert_csv_row(PORTFOLIO_ACTION_JOURNAL_CSV, port_row, PORTFOLIO_ACTION_JOURNAL_FIELDS)
+            write_portfolio_action_journal_row(base)
 
         if bool(unified.get("health_override_active")):
-            existing_health = get_csv_row_by_id(HEALTH_OVERRIDE_JOURNAL_CSV, HEALTH_OVERRIDE_JOURNAL_FIELDS, base.get("event_id", ""))
-            health_row = dict(full_row)
-            if existing_health:
-                for key in JOURNAL_OUTCOME_FIELDS:
-                    if str(existing_health.get(key) or "").strip() != "":
-                        health_row[key] = existing_health.get(key, "")
-            upsert_csv_row(HEALTH_OVERRIDE_JOURNAL_CSV, health_row, HEALTH_OVERRIDE_JOURNAL_FIELDS)
+            write_health_override_journal_row(base)
     except Exception as exc:
         debug_log(f"journal_write_failed:{type(exc).__name__}:{exc}")
 
@@ -6178,35 +6212,53 @@ def evaluate_outcome_journals() -> Dict[str, int]:
     ]
     stats = {"updated": 0, "rows_scanned": 0}
     for path, fields in files:
-        rows = load_csv(path, fields)
-        changed = False
-        for row in rows:
-            stats["rows_scanned"] += 1
-            ts = parse_ts(row.get("ts_utc"))
-            token_key = str(row.get("token_key") or "").strip()
-            reference_price = parse_float(row.get("reference_price_usd"), 0.0)
-            if ts is None or not token_key:
+        partial = update_journal_outcome_snapshots(
+            path=path,
+            fields=fields,
+            history_by_key=history_by_key,
+            now_dt=now_dt,
+        )
+        stats["updated"] += int(partial.get("updated", 0))
+        stats["rows_scanned"] += int(partial.get("rows_scanned", 0))
+    return stats
+
+
+def update_journal_outcome_snapshots(
+    path: str,
+    fields: List[str],
+    history_by_key: Dict[str, List[Dict[str, Any]]],
+    now_dt: datetime,
+) -> Dict[str, int]:
+    rows = load_csv(path, fields)
+    changed = False
+    stats = {"updated": 0, "rows_scanned": 0}
+    for row in rows:
+        stats["rows_scanned"] += 1
+        ts = parse_ts(row.get("ts_utc"))
+        token_key = str(row.get("token_key") or "").strip()
+        reference_price = parse_float(row.get("reference_price_usd"), 0.0)
+        if ts is None or not token_key:
+            continue
+        for horizon, minutes in OUTCOME_HORIZONS_MINUTES.items():
+            status_field = f"outcome_{horizon}_status"
+            if str(row.get(status_field) or "").strip().upper() not in {"", "PENDING"}:
                 continue
-            for horizon, minutes in OUTCOME_HORIZONS_MINUTES.items():
-                status_field = f"outcome_{horizon}_status"
-                if str(row.get(status_field) or "").strip().upper() not in {"", "PENDING"}:
-                    continue
-                resolved = _resolve_horizon_outcome(
-                    event_ts=ts,
-                    horizon_minutes=minutes,
-                    token_key=token_key,
-                    reference_price=reference_price,
-                    history_by_key=history_by_key,
-                    now_ts=now_dt,
-                )
-                row[status_field] = resolved["status"]
-                row[f"outcome_{horizon}_ts_utc"] = resolved["ts_utc"]
-                row[f"outcome_{horizon}_return_pct"] = resolved["return_pct"]
-                row[f"outcome_{horizon}_price_usd"] = resolved["price_usd"]
-                changed = True
-                stats["updated"] += 1
-        if changed:
-            save_csv(path, rows, fields)
+            resolved = _resolve_horizon_outcome(
+                event_ts=ts,
+                horizon_minutes=minutes,
+                token_key=token_key,
+                reference_price=reference_price,
+                history_by_key=history_by_key,
+                now_ts=now_dt,
+            )
+            row[status_field] = resolved["status"]
+            row[f"outcome_{horizon}_ts_utc"] = resolved["ts_utc"]
+            row[f"outcome_{horizon}_return_pct"] = resolved["return_pct"]
+            row[f"outcome_{horizon}_price_usd"] = resolved["price_usd"]
+            changed = True
+            stats["updated"] += 1
+    if changed:
+        save_csv(path, rows, fields)
     return stats
 
 
