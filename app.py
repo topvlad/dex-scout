@@ -6592,9 +6592,11 @@ def run_auto_notifications(
     monitoring_rows: List[Dict[str, Any]],
     portfolio_rows: List[Dict[str, Any]],
     cycle_context: Optional[Dict[str, Any]] = None,
+    trigger_model: str = "ui_scan_sync",
 ) -> Dict[str, Any]:
     now_ts = time.time()
     cycle_context = cycle_context if isinstance(cycle_context, dict) else {}
+    trigger_model = str(trigger_model or "unknown").strip().lower() or "unknown"
     state = load_tg_state()
     alert_mode = get_alert_mode(state)
 
@@ -6605,10 +6607,17 @@ def run_auto_notifications(
             updates={
                 "last_notifications_ts": now_utc_str(),
                 "last_notifications_epoch": now_ts,
+                "last_notification_trigger_model": trigger_model,
                 "last_block_reason": block_reason,
                 "last_candidate_path": str(cycle_context.get("candidate_path") or "baseline"),
             },
-            increments={"notification_runs": 1, "notification_blocked_cycles": 1},
+            increments={
+                "notification_runs": 1,
+                "notification_blocked_cycles": 1,
+                "notification_runs_background": 1 if trigger_model == "background_worker" else 0,
+                "notification_runs_ui": 1 if trigger_model.startswith("ui_") else 0,
+                "notification_runs_manual": 1 if trigger_model.startswith("manual") else 0,
+            },
         )
         print(
             f"[TG] cooldown active -> skip cooldown_seconds={cooldown_seconds} "
@@ -6879,6 +6888,7 @@ def run_auto_notifications(
         updates={
             "last_notifications_ts": now_utc_str(),
             "last_notifications_epoch": now_ts,
+            "last_notification_trigger_model": trigger_model,
             "last_send_success_ts": now_utc_str() if stats["sent"] > 0 else runtime_snapshot.get("last_send_success_ts", ""),
             "last_send_success_epoch": now_ts if stats["sent"] > 0 else runtime_snapshot.get("last_send_success_epoch", 0.0),
             "last_error_ts": now_utc_str() if error_reason else runtime_snapshot.get("last_error_ts", ""),
@@ -6889,6 +6899,9 @@ def run_auto_notifications(
         },
         increments={
             "notification_runs": 1,
+            "notification_runs_background": 1 if trigger_model == "background_worker" else 0,
+            "notification_runs_ui": 1 if trigger_model.startswith("ui_") else 0,
+            "notification_runs_manual": 1 if trigger_model.startswith("manual") else 0,
             "notification_sent": int(stats["sent"]),
             "notification_empty_cycles": 1 if cycle_status == "empty" else 0,
             "notification_blocked_cycles": 1 if cycle_status == "blocked" else 0,
@@ -6902,6 +6915,27 @@ def run_auto_notifications(
     state["last_scan_ts_processed"] = str(scan_state.get("last_run_ts") or now_utc_str())
     save_tg_state(state)
     return {"status": cycle_status, "stats": stats}
+
+
+def ui_notification_emission_enabled() -> bool:
+    raw = os.getenv("DEX_SCOUT_UI_EMIT_NOTIFICATIONS", "0")
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def runtime_liveness(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    now_ts = time.time()
+    last_heartbeat_epoch = float(parse_float(runtime.get("last_heartbeat_epoch", 0.0), 0.0))
+    heartbeat_interval_sec = max(1.0, float(parse_float(runtime.get("heartbeat_interval_sec", 0), 0.0)))
+    if last_heartbeat_epoch <= 0:
+        return {"status": "unknown", "age_sec": None, "stale_threshold_sec": int(heartbeat_interval_sec * 2)}
+    age_sec = max(0.0, now_ts - last_heartbeat_epoch)
+    stale_threshold_sec = max(120.0, heartbeat_interval_sec * 2.0)
+    status = "alive" if age_sec <= stale_threshold_sec else "stale"
+    return {
+        "status": status,
+        "age_sec": int(age_sec),
+        "stale_threshold_sec": int(stale_threshold_sec),
+    }
 
 
 def reset_monitoring():
@@ -7580,10 +7614,24 @@ def scanner_state_load() -> Dict[str, Any]:
 
 def worker_runtime_defaults() -> Dict[str, Any]:
     return {
+        "worker_id": "",
+        "worker_role": "",
+        "worker_status": "unknown",
+        "worker_boot_count": 0,
+        "worker_process_started_ts": "",
+        "worker_process_started_epoch": 0.0,
+        "worker_last_restart_ts": "",
+        "worker_last_restart_reason": "",
+        "worker_consecutive_crashes": 0,
+        "worker_last_crash_ts": "",
+        "worker_last_crash_reason": "",
         "last_loop_ts": "",
         "last_loop_epoch": 0.0,
+        "last_heartbeat_ts": "",
+        "last_heartbeat_epoch": 0.0,
         "last_notifications_ts": "",
         "last_notifications_epoch": 0.0,
+        "last_notification_trigger_model": "",
         "last_send_success_ts": "",
         "last_send_success_epoch": 0.0,
         "last_error_ts": "",
@@ -7594,6 +7642,9 @@ def worker_runtime_defaults() -> Dict[str, Any]:
         "heartbeat_interval_sec": 0,
         "loop_iterations": 0,
         "notification_runs": 0,
+        "notification_runs_background": 0,
+        "notification_runs_ui": 0,
+        "notification_runs_manual": 0,
         "notification_sent": 0,
         "notification_empty_cycles": 0,
         "notification_blocked_cycles": 0,
@@ -9888,8 +9939,12 @@ def alert_pipeline_reliability_checks() -> List[str]:
     state = scanner_state_load() or {}
     runtime = get_worker_runtime_state(state=state)
     required_runtime_keys = [
+        "worker_status",
+        "worker_boot_count",
         "last_loop_ts",
+        "last_heartbeat_ts",
         "last_notifications_ts",
+        "last_notification_trigger_model",
         "last_send_success_ts",
         "last_error_ts",
         "last_error_reason",
@@ -10496,12 +10551,13 @@ def main():
     ]
     if st.session_state.get("last_scan_ts") != scan_state.get("last_run_ts"):
         st.session_state["last_scan_ts"] = scan_state.get("last_run_ts")
-
-        run_auto_notifications(
-            scan_state,
-            active_monitoring_rows,
-            active_portfolio_rows
-        )
+        if ui_notification_emission_enabled():
+            run_auto_notifications(
+                scan_state,
+                active_monitoring_rows,
+                active_portfolio_rows,
+                trigger_model="ui_scan_sync",
+            )
         evaluate_outcome_journals()
     st.session_state["_preload_counts"] = {
         "portfolio": len(portfolio_rows),
@@ -10591,15 +10647,29 @@ def main():
         if st.button("Clear cache", use_container_width=True):
             st.cache_data.clear()
             request_rerun()
-        st.markdown("### Background alerts limitation")
-        st.caption("This browser session does not run background alerts by itself when closed.")
-        st.caption("True background alerts require a separate scanner_worker.py service.")
+        st.markdown("### Background runtime")
+        st.caption("Alerts/notifications are emitted by scanner_worker.py (background service), not by this UI tab.")
         runtime = get_worker_runtime_state(state=state)
+        liveness = runtime_liveness(runtime)
+        st.caption(
+            f"Worker status: {runtime.get('worker_status') or 'unknown'} | "
+            f"boots={runtime.get('worker_boot_count', 0)} | "
+            f"consecutive_crashes={runtime.get('worker_consecutive_crashes', 0)}"
+        )
         worker_loop_ts = runtime.get("last_loop_ts") or ""
         if worker_loop_ts:
             st.caption(f"Worker heartbeat: active (last loop {worker_loop_ts}).")
         else:
             st.caption("Worker heartbeat: no loop heartbeat recorded yet.")
+        st.caption(
+            f"Liveness: {liveness.get('status')} | "
+            f"age_sec={liveness.get('age_sec') if liveness.get('age_sec') is not None else '—'} | "
+            f"stale_threshold_sec={liveness.get('stale_threshold_sec')}"
+        )
+        st.caption(
+            "Last notification trigger model: "
+            f"{runtime.get('last_notification_trigger_model') or '—'}"
+        )
         st.caption("TG mode: ENV + Streamlit secrets fallback")
         st.divider()
         st.markdown("### Storage status")

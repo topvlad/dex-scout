@@ -1,5 +1,20 @@
 # DEX Scout
 
+## Runtime roles (operational separation)
+
+- **UI/Web** (`streamlit run app.py`): visualization and operator controls.
+- **Webhook** (`uvicorn tg_webhook:app ...`): Telegram callback handling only.
+- **Background worker** (`python worker.py`): autonomous scanner + notification emission loop.
+
+By default, notification emission is expected from the background worker. UI-triggered notification emission is disabled unless explicitly enabled with:
+
+`DEX_SCOUT_UI_EMIT_NOTIFICATIONS=1`
+
+Worker startup is explicit/reproducible through `python worker.py` (used by deploy worker service). If the loop crashes, bootstrap restarts it with:
+
+- `WORKER_RESTART_DELAY_SEC` (default `15`)
+- `WORKER_MAX_RESTARTS` (default `100`)
+
 ## Dependencies
 
 ### UI (Streamlit)
