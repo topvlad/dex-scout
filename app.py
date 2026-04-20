@@ -6610,6 +6610,16 @@ def run_auto_notifications(
                 "last_notification_trigger_model": trigger_model,
                 "last_block_reason": block_reason,
                 "last_candidate_path": str(cycle_context.get("candidate_path") or "baseline"),
+                "last_cycle_status": "blocked",
+                "last_fallback_reason": str(cycle_context.get("fallback_reason") or ""),
+                "last_notification_counters": {
+                    "before_filter": 0,
+                    "after_filter": 0,
+                    "sent": 0,
+                    "blocked": 1,
+                    "send_fail": 0,
+                },
+                "last_notification_block_reasons": {"cooldown": 1},
             },
             increments={
                 "notification_runs": 1,
@@ -6678,6 +6688,9 @@ def run_auto_notifications(
             continue
         if is_token_suppressed(chain, ca):
             stats["suppressed"] += 1
+            stats["blocked_reasons"]["suppressed"] = int(
+                stats["blocked_reasons"].get("suppressed", 0)
+            ) + 1
             continue
 
         token_key = build_token_state_key(row)
@@ -6703,6 +6716,9 @@ def run_auto_notifications(
 
         if not signal:
             stats["no_actionable_event"] += 1
+            stats["blocked_reasons"]["no_actionable_event"] = int(
+                stats["blocked_reasons"].get("no_actionable_event", 0)
+            ) + 1
             continue
 
         alert_classification = resolve_tg_alert_classification(source, row, signal, unified=unified)
@@ -6732,7 +6748,22 @@ def run_auto_notifications(
             classification=alert_classification,
             unified=unified,
         ):
-            stats["mode_filtered"] += 1
+            alert_tier_lower = str(alert_classification.get("alert_tier") or "").strip().lower()
+            if (
+                _normalize_alert_mode(alert_mode) == "quiet"
+                and alert_tier_lower in (resolve_alert_tier("MEDIUM"), resolve_alert_tier("DIGEST_ONLY"))
+            ):
+                stats["tier_filtered"] += 1
+                stats["blocked_reasons"]["tier_filtered"] = int(
+                    stats["blocked_reasons"].get("tier_filtered", 0)
+                ) + 1
+                send_status = "tier_filtered"
+            else:
+                stats["mode_filtered"] += 1
+                stats["blocked_reasons"]["mode_filtered"] = int(
+                    stats["blocked_reasons"].get("mode_filtered", 0)
+                ) + 1
+                send_status = "mode_filtered"
             journal_actionable_event(
                 row=row,
                 source=source,
@@ -6741,7 +6772,7 @@ def run_auto_notifications(
                 unified=unified,
                 event_key=event_key,
                 emission_key=emission_key,
-                send_status="mode_filtered",
+                send_status=send_status,
                 send_note=alert_mode,
             )
             continue
@@ -6750,8 +6781,8 @@ def run_auto_notifications(
         # allow first send even if change is None, unless event already sent
         if not change and event_key in sent_events:
             stats["already_sent"] += 1
-            stats["blocked_reasons"]["idempotency_already_sent"] = int(
-                stats["blocked_reasons"].get("idempotency_already_sent", 0)
+            stats["blocked_reasons"]["duplicate"] = int(
+                stats["blocked_reasons"].get("duplicate", 0)
             ) + 1
             journal_actionable_event(
                 row=row,
@@ -6768,8 +6799,8 @@ def run_auto_notifications(
         if is_duplicate_emission(state, emission_key, now_ts=now_ts, cooldown_seconds=cooldown_seconds):
             stats["duplicate"] += 1
             stats["cooldown"] += 1
-            stats["blocked_reasons"]["cooldown_duplicate_emission"] = int(
-                stats["blocked_reasons"].get("cooldown_duplicate_emission", 0)
+            stats["blocked_reasons"]["cooldown"] = int(
+                stats["blocked_reasons"].get("cooldown", 0)
             ) + 1
             journal_actionable_event(
                 row=row,
@@ -6851,8 +6882,10 @@ def run_auto_notifications(
             int(stats["duplicate"])
             + int(stats["already_sent"])
             + int(stats["mode_filtered"])
+            + int(stats["tier_filtered"])
             + int(stats["suppressed"])
             + int(stats["cooldown"])
+            + int(stats["no_actionable_event"])
         )
         if blocked_total > 0:
             cycle_status = "blocked"
@@ -6876,10 +6909,18 @@ def run_auto_notifications(
         )
         if blocked:
             block_reason = str(blocked[0][0])
-        elif stats["mode_filtered"] > 0:
-            block_reason = "mode_filtered"
+        elif stats["duplicate"] > 0:
+            block_reason = "duplicate"
+        elif stats["cooldown"] > 0:
+            block_reason = "cooldown"
         elif stats["suppressed"] > 0:
             block_reason = "suppressed"
+        elif stats["mode_filtered"] > 0:
+            block_reason = "mode_filtered"
+        elif stats["tier_filtered"] > 0:
+            block_reason = "tier_filtered"
+        elif stats["no_actionable_event"] > 0:
+            block_reason = "no_actionable_event"
     if stats["send_fail"] > 0:
         error_reason = f"send_fail:{stats['send_fail']}"
 
@@ -6896,6 +6937,28 @@ def run_auto_notifications(
             "last_empty_reason": empty_reason,
             "last_block_reason": block_reason,
             "last_candidate_path": str(cycle_context.get("candidate_path") or "baseline"),
+            "last_cycle_status": cycle_status,
+            "last_fallback_reason": str(cycle_context.get("fallback_reason") or ""),
+            "last_notification_counters": {
+                "before_filter": int(stats.get("candidates_total_pre_filter", 0) or 0),
+                "after_filter": int(stats.get("post_filter_candidates", 0) or 0),
+                "sent": int(stats.get("sent", 0) or 0),
+                "blocked": int(
+                    int(stats.get("duplicate", 0) or 0)
+                    + int(stats.get("already_sent", 0) or 0)
+                    + int(stats.get("mode_filtered", 0) or 0)
+                    + int(stats.get("tier_filtered", 0) or 0)
+                    + int(stats.get("suppressed", 0) or 0)
+                    + int(stats.get("cooldown", 0) or 0)
+                    + int(stats.get("no_actionable_event", 0) or 0)
+                ),
+                "send_fail": int(stats.get("send_fail", 0) or 0),
+            },
+            "last_notification_block_reasons": {
+                k: int(v or 0)
+                for k, v in stats.get("blocked_reasons", {}).items()
+                if int(v or 0) > 0
+            },
         },
         increments={
             "notification_runs": 1,
@@ -7639,6 +7702,10 @@ def worker_runtime_defaults() -> Dict[str, Any]:
         "last_empty_reason": "",
         "last_block_reason": "",
         "last_candidate_path": "",
+        "last_cycle_status": "",
+        "last_fallback_reason": "",
+        "last_notification_counters": {},
+        "last_notification_block_reasons": {},
         "heartbeat_interval_sec": 0,
         "loop_iterations": 0,
         "notification_runs": 0,
@@ -10005,8 +10072,22 @@ def render_debug_panel():
         st.caption(
             f"last_empty_reason={runtime.get('last_empty_reason') or '—'} | "
             f"last_block_reason={runtime.get('last_block_reason') or '—'} | "
-            f"path={runtime.get('last_candidate_path') or '—'}"
+            f"path={runtime.get('last_candidate_path') or '—'} | "
+            f"fallback={runtime.get('last_fallback_reason') or '—'} | "
+            f"cycle_status={runtime.get('last_cycle_status') or '—'}"
         )
+        counters = runtime.get("last_notification_counters") or {}
+        if isinstance(counters, dict):
+            st.caption(
+                f"last_counters: before={int(parse_float(counters.get('before_filter', 0), 0.0))} | "
+                f"after={int(parse_float(counters.get('after_filter', 0), 0.0))} | "
+                f"sent={int(parse_float(counters.get('sent', 0), 0.0))} | "
+                f"blocked={int(parse_float(counters.get('blocked', 0), 0.0))} | "
+                f"send_fail={int(parse_float(counters.get('send_fail', 0), 0.0))}"
+            )
+        blocked_reasons = runtime.get("last_notification_block_reasons") or {}
+        if isinstance(blocked_reasons, dict) and blocked_reasons:
+            st.caption(f"last_block_reasons={safe_json(blocked_reasons)}")
         st.caption(
             f"loops={runtime.get('loop_iterations', 0)} | "
             f"notif_runs={runtime.get('notification_runs', 0)} | "
@@ -10670,6 +10751,24 @@ def main():
             "Last notification trigger model: "
             f"{runtime.get('last_notification_trigger_model') or '—'}"
         )
+        st.caption(
+            f"Last cycle status: {runtime.get('last_cycle_status') or '—'} | "
+            f"path={runtime.get('last_candidate_path') or '—'} | "
+            f"fallback={runtime.get('last_fallback_reason') or '—'}"
+        )
+        counters = runtime.get("last_notification_counters") or {}
+        if isinstance(counters, dict):
+            st.caption(
+                "Last counters: "
+                f"before={int(parse_float(counters.get('before_filter', 0), 0.0))} | "
+                f"after={int(parse_float(counters.get('after_filter', 0), 0.0))} | "
+                f"sent={int(parse_float(counters.get('sent', 0), 0.0))} | "
+                f"blocked={int(parse_float(counters.get('blocked', 0), 0.0))} | "
+                f"send_fail={int(parse_float(counters.get('send_fail', 0), 0.0))}"
+            )
+        blocked_reasons = runtime.get("last_notification_block_reasons") or {}
+        if isinstance(blocked_reasons, dict) and blocked_reasons:
+            st.caption(f"Last block reasons: {safe_json(blocked_reasons)}")
         st.caption("TG mode: ENV + Streamlit secrets fallback")
         st.divider()
         st.markdown("### Storage status")

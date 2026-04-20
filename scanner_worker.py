@@ -159,16 +159,46 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
             else:
                 sleep_for = default_sleep_for
             _queue_invariant_telemetry(queue_stats, sleep_for=sleep_for, default_sleep_for=default_sleep_for)
+
+            monitoring_rows = app.load_monitoring()
+            portfolio_rows = app.load_portfolio()
+            active_monitoring_rows = app.build_active_monitoring_rows(monitoring_rows)
+            active_portfolio_rows = [
+                r for r in portfolio_rows
+                if str(r.get("active", "1")).strip() == "1"
+            ]
+            adaptive_mon_candidates, adaptive_port_candidates = app.build_notification_candidates(
+                active_monitoring_rows,
+                active_portfolio_rows,
+            )
+            adaptive_usable_candidates = len(adaptive_mon_candidates) + len(adaptive_port_candidates)
+
             fallback_reason = ""
-            if int(queue_stats.get("scanned", 0) or 0) <= 0:
-                fallback_reason = "adaptive_no_scans"
-            elif int(queue_stats.get("errors", 0) or 0) >= int(queue_stats.get("scanned", 0) or 0):
-                fallback_reason = "adaptive_all_scans_failed"
             candidate_path = "adaptive_queue"
-            if fallback_reason:
+            if adaptive_usable_candidates <= 0:
+                if int(queue_stats.get("scanned", 0) or 0) <= 0:
+                    fallback_reason = "adaptive_empty"
+                elif int(queue_stats.get("errors", 0) or 0) >= int(queue_stats.get("scanned", 0) or 0):
+                    fallback_reason = "adaptive_unusable_all_failed"
+                else:
+                    fallback_reason = "adaptive_unusable_candidates"
                 candidate_path = "baseline_fallback"
-                print(f"[worker] baseline fallback enabled reason={fallback_reason}", flush=True)
-                app.update_worker_runtime_state(updates={"last_empty_reason": fallback_reason})
+                print(
+                    f"[worker] baseline fallback enabled reason={fallback_reason} "
+                    f"adaptive_usable={adaptive_usable_candidates}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[worker] adaptive path usable candidates={adaptive_usable_candidates}; fallback skipped",
+                    flush=True,
+                )
+            app.update_worker_runtime_state(
+                updates={
+                    "last_candidate_path": candidate_path,
+                    "last_fallback_reason": fallback_reason,
+                }
+            )
 
             monitoring_rows = app.load_monitoring()
             portfolio_rows = app.load_portfolio()
