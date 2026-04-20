@@ -9164,6 +9164,156 @@ def wave_b_invariant_checks(max_rows: int = 25) -> List[str]:
     return issues
 
 
+def wave_c_invariant_checks() -> List[str]:
+    issues: List[str] = []
+
+    mock_row = {
+        "chain": "solana",
+        "base_addr": "So11111111111111111111111111111111111111112",
+        "base_token_address": "So11111111111111111111111111111111111111112",
+        "base_symbol": "WAVEC",
+        "entry_action": "ENTRY_NOW",
+        "entry_score": "180",
+        "risk_level": "MEDIUM",
+        "timing_label": "EARLY",
+    }
+    mock_signal = {"bucket": "ENTRY_NOW", "horizon": "0-30m", "action": "Entry now"}
+    now_ts = time.time()
+    cooldown_seconds = 1800
+
+    # Unknown event type must be surfaced by missing formatter routing.
+    unknown_event_type = "__wave_c_unknown_event_type__"
+    unknown_event_msg = format_signal_message(
+        mock_row,
+        mock_signal,
+        source="monitoring",
+        event_type=unknown_event_type,
+        unified=None,
+    )
+    if unknown_event_msg is not None:
+        issues.append("guardrail: unknown event_type did not surface as missing formatter")
+
+    # Unknown tier must remain detectable (i.e. never normalized into known registry values).
+    unknown_tier = "__wave_c_unknown_tier__"
+    if unknown_tier in ALERT_TIER_REGISTRY.values():
+        issues.append("guardrail: unknown tier unexpectedly normalized into registry")
+
+    # Template routing must remain valid for every known event type.
+    formatter_src = inspect.getsource(format_signal_message)
+    for event_type in EVENT_TYPE_REGISTRY.values():
+        if f"\"{event_type}\"" not in formatter_src:
+            issues.append(f"guardrail: missing formatter route for event_type={event_type}")
+
+    # Digest must stay isolated from operational alert classification/emission keys.
+    mon_classification = resolve_tg_alert_classification("monitoring", mock_row, mock_signal, unified=None)
+    if str(mon_classification.get("event_type") or "").strip().lower() == resolve_event_type("DIGEST"):
+        issues.append("guardrail: monitoring operational alert leaked into digest event_type")
+    portfolio_row = dict(mock_row)
+    portfolio_row["entry_action"] = "ENTRY_NOW"
+    portfolio_signal = {"bucket": "ADD", "horizon": "0-2h", "action": "Consider add"}
+    port_classification = resolve_tg_alert_classification("portfolio", portfolio_row, portfolio_signal, unified=None)
+    if str(port_classification.get("event_type") or "").strip().lower() == resolve_event_type("DIGEST"):
+        issues.append("guardrail: portfolio operational alert leaked into digest event_type")
+
+    digest_state = {"sent_emissions": {}, "sent_digest_emissions": {}}
+    emission_key = build_emission_key(
+        "monitoring",
+        mock_row,
+        mock_signal,
+        cooldown_seconds=cooldown_seconds,
+        now_ts=now_ts,
+        unified=None,
+    )
+    mark_emission_sent(digest_state, emission_key=emission_key, now_ts=now_ts)
+    digest_emission_key = build_digest_emission_key(cooldown_seconds=cooldown_seconds, now_ts=now_ts)
+    if is_duplicate_digest_emission(
+        digest_state,
+        emission_key=digest_emission_key,
+        now_ts=now_ts,
+        cooldown_seconds=cooldown_seconds,
+    ):
+        issues.append("guardrail: digest duplicate state leaked from operational sent_emissions")
+
+    # Mode filtering order in quiet mode: critical/health/portfolio-exit-reduce overrides must win.
+    quiet = "quiet"
+    critical_classification = {
+        "event_type": resolve_event_type("ENTRY_ALERT"),
+        "alert_tier": resolve_alert_tier("CRITICAL"),
+    }
+    if not should_emit_for_alert_mode(quiet, "monitoring", mock_row, mock_signal, critical_classification, unified=None):
+        issues.append("guardrail: quiet mode must not suppress critical alerts")
+
+    medium_classification = {
+        "event_type": resolve_event_type("ENTRY_ALERT"),
+        "alert_tier": resolve_alert_tier("MEDIUM"),
+    }
+    if should_emit_for_alert_mode(quiet, "monitoring", mock_row, mock_signal, medium_classification, unified=None):
+        issues.append("guardrail: quiet mode medium filtering regression")
+
+    health_classification = {
+        "event_type": resolve_event_type("HEALTH_WARNING"),
+        "alert_tier": resolve_alert_tier("MEDIUM"),
+    }
+    if not should_emit_for_alert_mode(quiet, "monitoring", mock_row, mock_signal, health_classification, unified=None):
+        issues.append("guardrail: quiet mode must not suppress health warnings")
+
+    exit_row = dict(mock_row)
+    exit_row["entry_action"] = "EXIT"
+    portfolio_medium_classification = {
+        "event_type": resolve_event_type("PORTFOLIO_ACTION"),
+        "alert_tier": resolve_alert_tier("MEDIUM"),
+    }
+    if not should_emit_for_alert_mode(
+        quiet,
+        "portfolio",
+        exit_row,
+        {"bucket": "EXIT", "horizon": "now", "action": "Consider exit"},
+        portfolio_medium_classification,
+        unified={"final_action": "EXIT"},
+    ):
+        issues.append("guardrail: quiet mode must not suppress portfolio EXIT/REDUCE")
+
+    # Duplicate checks: same token + same event/key in cooldown => blocked.
+    duplicate_state = {"sent_emissions": {}}
+    key_same = build_emission_key(
+        "monitoring",
+        mock_row,
+        mock_signal,
+        cooldown_seconds=cooldown_seconds,
+        now_ts=now_ts,
+        unified=None,
+    )
+    mark_emission_sent(duplicate_state, emission_key=key_same, now_ts=now_ts)
+    if not is_duplicate_emission(
+        duplicate_state,
+        emission_key=key_same,
+        now_ts=now_ts + 10.0,
+        cooldown_seconds=cooldown_seconds,
+    ):
+        issues.append("guardrail: same token + same event/key should be blocked in cooldown")
+
+    # Duplicate checks: same token + different event_type => allowed.
+    key_different_event = build_emission_key(
+        "portfolio",
+        mock_row,
+        {"bucket": "ADD", "horizon": "0-2h", "action": "Consider add"},
+        cooldown_seconds=cooldown_seconds,
+        now_ts=now_ts,
+        unified={"final_action": "ENTRY_NOW", "final_reason": "wave_c"},
+    )
+    if key_different_event == key_same:
+        issues.append("guardrail: different event type unexpectedly produced identical emission key")
+    elif is_duplicate_emission(
+        duplicate_state,
+        emission_key=key_different_event,
+        now_ts=now_ts + 10.0,
+        cooldown_seconds=cooldown_seconds,
+    ):
+        issues.append("guardrail: same token + different event_type should remain allowed")
+
+    return issues
+
+
 def core_safety_self_check():
     issues: List[str] = []
 
@@ -9202,6 +9352,9 @@ def core_safety_self_check():
     wave_b_issues = wave_b_invariant_checks()
     for wave_issue in wave_b_issues:
         issues.append(f"Wave B invariant: {wave_issue}")
+    wave_c_issues = wave_c_invariant_checks()
+    for wave_issue in wave_c_issues:
+        issues.append(f"Wave C invariant: {wave_issue}")
 
     if issues:
         st.error("CORE SAFETY BROKEN")
@@ -9264,6 +9417,16 @@ def render_debug_panel():
         if wave_b_issues:
             st.caption(f"Violations: {len(wave_b_issues)}")
             for issue in wave_b_issues[:10]:
+                st.write(f"– {issue}")
+        else:
+            st.caption("No violations detected.")
+
+        st.write("---")
+        st.write("### Wave C guardrails")
+        wave_c_issues = wave_c_invariant_checks()
+        if wave_c_issues:
+            st.caption(f"Violations: {len(wave_c_issues)}")
+            for issue in wave_c_issues[:10]:
                 st.write(f"– {issue}")
         else:
             st.caption("No violations detected.")
