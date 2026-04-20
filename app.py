@@ -5602,6 +5602,239 @@ def build_rotation_advisory(
     }
 
 
+CALIBRATION_MIN_JOURNAL_SAMPLES = 12
+CALIBRATION_MIN_REVIEW_SAMPLES = 8
+CALIBRATION_ALLOWED_SCOPE_TYPES = ("threshold", "weight", "window")
+CALIBRATION_SAFETY_CRITICAL_PARAMS = {
+    "health.liq_low_usd",
+    "health.vol24_low_usd",
+    "health.stale_minutes",
+    "health.min_history_points",
+}
+
+
+def _calibration_outcome_snapshot(journal_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    resolved_rows: List[Dict[str, Any]] = []
+    returns_1h: List[float] = []
+    returns_4h: List[float] = []
+    positive_1h = 0
+    negative_1h = 0
+
+    for row in journal_rows:
+        status_1h = str(row.get("outcome_1h_status") or "").upper()
+        ret_1h = parse_float(row.get("outcome_1h_return_pct"), 0.0)
+        ret_4h = parse_float(row.get("outcome_4h_return_pct"), 0.0)
+        has_1h = status_1h in {"UP", "DOWN"}
+        has_4h = str(row.get("outcome_4h_status") or "").upper() in {"UP", "DOWN"}
+        if not has_1h and not has_4h:
+            continue
+        resolved_rows.append(row)
+        if has_1h:
+            returns_1h.append(ret_1h)
+            if ret_1h >= 0:
+                positive_1h += 1
+            else:
+                negative_1h += 1
+        if has_4h:
+            returns_4h.append(ret_4h)
+
+    resolved_count = len(resolved_rows)
+    sample_1h = len(returns_1h)
+    avg_1h = sum(returns_1h) / sample_1h if sample_1h else 0.0
+    avg_4h = sum(returns_4h) / len(returns_4h) if returns_4h else 0.0
+    win_rate_1h = (positive_1h / sample_1h) if sample_1h else 0.0
+    return {
+        "resolved_count": resolved_count,
+        "sample_1h": sample_1h,
+        "win_rate_1h": round(win_rate_1h, 4),
+        "avg_return_1h_pct": round(avg_1h, 4),
+        "avg_return_4h_pct": round(avg_4h, 4),
+        "negative_1h": negative_1h,
+        "journal_slice_used": {
+            "last_rows_considered": min(len(journal_rows), 200),
+            "resolved_rows_used": resolved_count,
+            "horizons": ["1h", "4h"],
+        },
+    }
+
+
+def _calibration_trust_snapshot(trust_index: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    if not trust_index:
+        return {
+            "patterns": 0,
+            "avg_samples": 0.0,
+            "high_confidence_patterns": 0,
+            "trust_slice_used": {"top_patterns_used": 0},
+        }
+    items = list(trust_index.values())
+    samples = [int(parse_float(x.get("samples"), 0.0)) for x in items]
+    high_conf = [x for x in items if int(parse_float(x.get("samples"), 0.0)) >= 10]
+    avg_samples = (sum(samples) / len(samples)) if samples else 0.0
+    return {
+        "patterns": len(items),
+        "avg_samples": round(avg_samples, 2),
+        "high_confidence_patterns": len(high_conf),
+        "trust_slice_used": {
+            "top_patterns_used": min(len(items), 25),
+            "min_samples_for_high_confidence": 10,
+        },
+    }
+
+
+def _calibration_review_snapshot(review_findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    weak_items = 0
+    severe_items = 0
+    for item in review_findings:
+        score = parse_float(item.get("ui_visible_score"), 0.0)
+        badge = str(item.get("ui_badge") or "").upper()
+        if score < 90.0:
+            weak_items += 1
+        if badge in {"REVIEW", "WARNING"}:
+            severe_items += 1
+    total = len(review_findings)
+    weak_ratio = (weak_items / total) if total else 0.0
+    return {
+        "review_count": total,
+        "weak_items": weak_items,
+        "severe_items": severe_items,
+        "weak_ratio": round(weak_ratio, 4),
+        "review_finding_used": {
+            "weak_score_threshold": 90.0,
+            "rows_used": total,
+        },
+    }
+
+
+def _is_suggestion_scope_allowed(parameter: str, explicit_whitelist: Optional[List[str]] = None) -> bool:
+    if parameter in CALIBRATION_SAFETY_CRITICAL_PARAMS:
+        if not explicit_whitelist:
+            return False
+        return parameter in set(explicit_whitelist)
+    return True
+
+
+def build_manual_calibration_suggestions(
+    journal_rows: List[Dict[str, Any]],
+    trust_index: Dict[str, Dict[str, Any]],
+    review_findings: List[Dict[str, Any]],
+    explicit_safety_whitelist: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    journal_snapshot = _calibration_outcome_snapshot(journal_rows[-200:])
+    trust_snapshot = _calibration_trust_snapshot(trust_index)
+    review_snapshot = _calibration_review_snapshot(review_findings)
+
+    if journal_snapshot.get("resolved_count", 0) < CALIBRATION_MIN_JOURNAL_SAMPLES or review_snapshot.get("review_count", 0) < CALIBRATION_MIN_REVIEW_SAMPLES:
+        return {
+            "status": "not_enough_evidence",
+            "message": "not enough evidence",
+            "suggestions": [],
+            "scope": {
+                "allowed_types": list(CALIBRATION_ALLOWED_SCOPE_TYPES),
+                "safety_critical_excluded": sorted(CALIBRATION_SAFETY_CRITICAL_PARAMS),
+            },
+            "evidence_meta": {
+                "journal_slice_used": journal_snapshot.get("journal_slice_used", {}),
+                "trust_slice_used": trust_snapshot.get("trust_slice_used", {}),
+                "review_finding_used": review_snapshot.get("review_finding_used", {}),
+            },
+        }
+
+    suggestions: List[Dict[str, Any]] = []
+
+    weak_ratio = parse_float(review_snapshot.get("weak_ratio"), 0.0)
+    win_rate_1h = parse_float(journal_snapshot.get("win_rate_1h"), 0.0)
+    avg_samples = parse_float(trust_snapshot.get("avg_samples"), 0.0)
+
+    suggested_review_threshold = 95.0 if weak_ratio > 0.6 else 85.0
+    review_threshold_confidence = min(0.9, max(0.3, 0.45 + weak_ratio * 0.5))
+    suggestions.append(
+        {
+            "proposed_change": {
+                "scope_type": "threshold",
+                "parameter": "review.score_visibility_cutoff",
+                "current_value": 90.0,
+                "suggested_value": suggested_review_threshold,
+                "change_note": "Adjust review scoring cutoff for manual triage only.",
+            },
+            "evidence": {
+                "journal_slice_used": journal_snapshot.get("journal_slice_used", {}),
+                "trust_slice_used": trust_snapshot.get("trust_slice_used", {}),
+                "review_finding_used": review_snapshot.get("review_finding_used", {}),
+            },
+            "confidence": round(review_threshold_confidence, 2),
+            "risk_note": "Higher cutoff can increase review backlog; validate on a short dry-run before manual apply.",
+            "manual_apply_required": True,
+        }
+    )
+
+    trust_weight_value = 1.15 if (win_rate_1h > 0.58 and avg_samples >= 10) else 0.9
+    trust_weight_confidence = min(0.88, max(0.35, 0.4 + (avg_samples / 40.0)))
+    suggestions.append(
+        {
+            "proposed_change": {
+                "scope_type": "weight",
+                "parameter": "scoring.trust_priority_bias_multiplier",
+                "current_value": 1.0,
+                "suggested_value": round(trust_weight_value, 2),
+                "change_note": "Tune trust bias contribution without changing trust logic.",
+            },
+            "evidence": {
+                "journal_slice_used": journal_snapshot.get("journal_slice_used", {}),
+                "trust_slice_used": trust_snapshot.get("trust_slice_used", {}),
+                "review_finding_used": review_snapshot.get("review_finding_used", {}),
+            },
+            "confidence": round(trust_weight_confidence, 2),
+            "risk_note": "Overweighting trust can under-react to fresh signals; keep manual review in loop.",
+            "manual_apply_required": True,
+        }
+    )
+
+    window_days = 5 if avg_samples >= 12 else 3
+    suggestions.append(
+        {
+            "proposed_change": {
+                "scope_type": "window",
+                "parameter": "trust.recent_window_days",
+                "current_value": TRUST_RECENT_WINDOW_DAYS,
+                "suggested_value": window_days,
+                "change_note": "Window sizing for trust recency smoothing.",
+            },
+            "evidence": {
+                "journal_slice_used": journal_snapshot.get("journal_slice_used", {}),
+                "trust_slice_used": trust_snapshot.get("trust_slice_used", {}),
+                "review_finding_used": review_snapshot.get("review_finding_used", {}),
+            },
+            "confidence": round(min(0.85, 0.4 + avg_samples / 30.0), 2),
+            "risk_note": "Longer windows reduce noise but may delay adaptation after market regime shifts.",
+            "manual_apply_required": True,
+        }
+    )
+
+    filtered_suggestions: List[Dict[str, Any]] = []
+    for suggestion in suggestions:
+        proposal = suggestion.get("proposed_change") or {}
+        parameter = str(proposal.get("parameter") or "")
+        if not _is_suggestion_scope_allowed(parameter, explicit_whitelist=explicit_safety_whitelist):
+            continue
+        filtered_suggestions.append(suggestion)
+
+    return {
+        "status": "ok",
+        "message": "manual suggestions generated",
+        "suggestions": filtered_suggestions,
+        "scope": {
+            "allowed_types": list(CALIBRATION_ALLOWED_SCOPE_TYPES),
+            "safety_critical_excluded": sorted(CALIBRATION_SAFETY_CRITICAL_PARAMS),
+            "explicit_whitelist": list(explicit_safety_whitelist or []),
+        },
+        "evidence_meta": {
+            "journal_slice_used": journal_snapshot.get("journal_slice_used", {}),
+            "trust_slice_used": trust_snapshot.get("trust_slice_used", {}),
+            "review_finding_used": review_snapshot.get("review_finding_used", {}),
+        },
+    }
+
+
 def position_sizing_engine(
     pair: Optional[Dict[str, Any]],
     portfolio_value_usd: float = 1000.0,
@@ -9776,6 +10009,37 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     for item in review_cards:
         render_monitoring_card(item)
 
+    st.markdown("---")
+    st.subheader("🧭 Manual calibration assistant (suggestions only)")
+    journal_rows = load_csv(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS)
+    trust_index = load_pattern_trust_index_cached()
+    calibration_output = build_manual_calibration_suggestions(
+        journal_rows=journal_rows,
+        trust_index=trust_index,
+        review_findings=review_cards,
+        explicit_safety_whitelist=[],
+    )
+    if calibration_output.get("status") != "ok":
+        st.info(str(calibration_output.get("message") or "not enough evidence"))
+    else:
+        st.caption("Manual apply required for every change. No automatic mutation path in this assistant.")
+        for idx, suggestion in enumerate(calibration_output.get("suggestions") or [], start=1):
+            proposed = suggestion.get("proposed_change") or {}
+            evidence = suggestion.get("evidence") or {}
+            st.markdown(f"**Suggestion {idx}: {proposed.get('parameter', 'n/a')}**")
+            st.json(
+                {
+                    "proposed_change": proposed,
+                    "evidence": evidence,
+                    "confidence": suggestion.get("confidence"),
+                    "risk_note": suggestion.get("risk_note"),
+                    "manual_apply_required": suggestion.get("manual_apply_required", True),
+                }
+            )
+        st.caption(
+            "Safety-critical parameters remain excluded unless explicitly whitelisted for manual review."
+        )
+
     with st.expander("Auto-archived / Dead candidates", expanded=False):
         if not dead_cards:
             st.caption("No dead candidates.")
@@ -10438,6 +10702,72 @@ def wave_d_plus_rotation_invariant_checks() -> List[str]:
     return issues
 
 
+def wave_d_plus_manual_calibration_invariant_checks() -> List[str]:
+    issues: List[str] = []
+
+    journal_rows = []
+    for idx in range(16):
+        journal_rows.append(
+            {
+                "outcome_1h_status": "UP" if idx % 3 != 0 else "DOWN",
+                "outcome_1h_return_pct": "12.0" if idx % 3 != 0 else "-8.0",
+                "outcome_4h_status": "UP" if idx % 4 != 0 else "DOWN",
+                "outcome_4h_return_pct": "18.0" if idx % 4 != 0 else "-10.0",
+            }
+        )
+    trust_index = {
+        "p1": {"samples": 12, "sum_score": 6.0},
+        "p2": {"samples": 14, "sum_score": 7.0},
+    }
+    review_findings = [{"ui_visible_score": 84.0, "ui_badge": "REVIEW"} for _i in range(10)]
+
+    output = build_manual_calibration_suggestions(
+        journal_rows=journal_rows,
+        trust_index=trust_index,
+        review_findings=review_findings,
+    )
+    if output.get("status") != "ok":
+        issues.append("manual calibration: expected suggestions on sufficient evidence")
+    suggestions = list(output.get("suggestions") or [])
+    if not suggestions:
+        issues.append("manual calibration: no suggestions generated on sufficient evidence")
+    else:
+        first = suggestions[0]
+        required_fields = ("proposed_change", "evidence", "confidence", "risk_note", "manual_apply_required")
+        for field in required_fields:
+            if field not in first:
+                issues.append(f"manual calibration: missing structured field {field}")
+        if first.get("manual_apply_required") is not True:
+            issues.append("manual calibration: manual_apply_required must stay true")
+        evidence = first.get("evidence") or {}
+        for evidence_field in ("journal_slice_used", "trust_slice_used", "review_finding_used"):
+            if evidence_field not in evidence:
+                issues.append(f"manual calibration: missing evidence trail field {evidence_field}")
+
+    low_evidence = build_manual_calibration_suggestions(
+        journal_rows=[{"outcome_1h_status": "PENDING"}],
+        trust_index={},
+        review_findings=[],
+    )
+    if low_evidence.get("status") != "not_enough_evidence":
+        issues.append("manual calibration: sparse input must return not_enough_evidence")
+
+    blocked = build_manual_calibration_suggestions(
+        journal_rows=journal_rows,
+        trust_index=trust_index,
+        review_findings=review_findings,
+        explicit_safety_whitelist=[],
+    )
+    blocked_params = {
+        str((x.get("proposed_change") or {}).get("parameter") or "")
+        for x in (blocked.get("suggestions") or [])
+    }
+    if blocked_params.intersection(CALIBRATION_SAFETY_CRITICAL_PARAMS):
+        issues.append("manual calibration: safety-critical params leaked without whitelist")
+
+    return issues
+
+
 def core_safety_self_check():
     issues: List[str] = []
 
@@ -10485,6 +10815,9 @@ def core_safety_self_check():
     wave_d_plus_issues = wave_d_plus_rotation_invariant_checks()
     for wave_issue in wave_d_plus_issues:
         issues.append(f"Wave D+ invariant: {wave_issue}")
+    wave_d_plus_manual_calibration_issues = wave_d_plus_manual_calibration_invariant_checks()
+    for wave_issue in wave_d_plus_manual_calibration_issues:
+        issues.append(f"Wave D+ PR6 invariant: {wave_issue}")
     alert_pipeline_issues = alert_pipeline_reliability_checks()
     for pipeline_issue in alert_pipeline_issues:
         issues.append(f"Alert pipeline reliability: {pipeline_issue}")
