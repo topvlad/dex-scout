@@ -5720,12 +5720,10 @@ def should_emit_for_alert_mode(
     resolved_mode = _normalize_alert_mode(mode)
     event_type = str(classification.get("event_type") or "").strip().lower()
     alert_tier = str(classification.get("alert_tier") or "").strip().lower()
-    source_key = str(source or "").strip().lower()
-    signal_bucket = str(signal.get("bucket") or "").strip().upper()
 
     is_critical = alert_tier == resolve_alert_tier("CRITICAL")
     is_health_warning = event_type == resolve_event_type("HEALTH_WARNING")
-    is_portfolio_exit_reduce = _is_portfolio_exit_reduce_alert(source_key, row, unified=unified)
+    is_portfolio_exit_reduce = _is_portfolio_exit_reduce_alert(source, row, unified=unified)
 
     if resolved_mode == "quiet":
         # Hard safety overrides: never silence critical / hard health warnings /
@@ -5742,10 +5740,6 @@ def should_emit_for_alert_mode(
         return True
 
     # normal (default + safe fallback)
-    if alert_tier == resolve_alert_tier("DIGEST_ONLY"):
-        return False
-    if source_key == "monitoring" and signal_bucket == "TRACK":
-        return False
     return True
 
 
