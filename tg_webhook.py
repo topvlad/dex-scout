@@ -12,6 +12,8 @@ try:
         addr_store,
         build_active_monitoring_rows,
         build_notification_candidates,
+        get_job_heartbeats_snapshot,
+        get_worker_runtime_state,
         load_monitoring,
         load_portfolio,
         normalize_chain_name,
@@ -89,6 +91,13 @@ except Exception as e:
     ) -> Dict[str, Any]:
         _ = trigger_source, cooldown_seconds, force
         return {"ok": False, "sent": False, "duplicate": False, "event_type": "digest"}
+
+    def get_worker_runtime_state(state: Dict[str, Any] = None) -> Dict[str, Any]:
+        _ = state
+        return {}
+
+    def get_job_heartbeats_snapshot() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+        return {}, {"ok": False, "code": "helper_unavailable"}
 
 
 app = FastAPI()
@@ -295,6 +304,39 @@ def health():
 @app.head("/health")
 def health_head():
     return Response(status_code=200)
+
+
+@app.get("/runtime")
+def runtime():
+    try:
+        runtime_state = get_worker_runtime_state() or {}
+        if not isinstance(runtime_state, dict):
+            runtime_state = {}
+    except Exception as e:
+        runtime_state = {"_runtime_error": f"{type(e).__name__}:{e}"}
+
+    try:
+        heartbeats, hb_status = get_job_heartbeats_snapshot()
+        if not isinstance(heartbeats, dict):
+            heartbeats = {}
+    except Exception as e:
+        heartbeats = {}
+        hb_status = {"ok": False, "code": "heartbeat_read_exception", "detail": f"{type(e).__name__}:{e}"}
+
+    return {
+        "ok": True,
+        "runtime": {
+            "last_loop_ts": runtime_state.get("last_loop_ts") or "",
+            "last_notifications_ts": runtime_state.get("last_notifications_ts") or "",
+            "last_send_success_ts": runtime_state.get("last_send_success_ts") or "",
+            "last_error_ts": runtime_state.get("last_error_ts") or "",
+            "last_error_reason": runtime_state.get("last_error_reason") or "",
+            "last_empty_reason": runtime_state.get("last_empty_reason") or "",
+            "worker_status": runtime_state.get("worker_status") or "",
+        },
+        "job_heartbeats": heartbeats,
+        "job_heartbeats_status": hb_status if isinstance(hb_status, dict) else {"ok": False, "code": "bad_status_payload"},
+    }
 
 
 @app.post("/tg_webhook")
