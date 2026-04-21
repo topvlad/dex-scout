@@ -1,0 +1,119 @@
+name: Runtime Jobs
+
+on:
+  schedule:
+    # Regular autonomous backend runtime (UTC)
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      job_mode:
+        description: "Run a single JOB_MODE or all"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - scan_cycle
+          - monitor_cycle
+          - notify_cycle
+          - digest_cycle
+          - outcome_cycle
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-jobs-${{ github.ref }}-${{ github.event_name }}-${{ github.event.inputs.job_mode || 'all' }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set JOB_MODE matrix
+        id: set-matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          EVENT_NAME="${{ github.event_name }}"
+          INPUT_MODE="${{ github.event.inputs.job_mode || 'all' }}"
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_MODE" != "all" ]]; then
+            MATRIX_JSON=$(printf '{"job_mode":["%s"]}' "$INPUT_MODE")
+          else
+            MATRIX_JSON='{"job_mode":["scan_cycle","monitor_cycle","notify_cycle","digest_cycle","outcome_cycle"]}'
+          fi
+
+          echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
+          echo "[runtime-jobs][plan] event=$EVENT_NAME input_mode=$INPUT_MODE matrix=$MATRIX_JSON"
+
+  run:
+    name: Run ${{ matrix.job_mode }}
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    timeout-minutes: 20
+    env:
+      PYTHONUNBUFFERED: "1"
+      JOB_MODE: ${{ matrix.job_mode }}
+
+      # Required runtime secrets
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+      # Optional runtime tuning (repo vars)
+      SCANNER_SEEDS: ${{ vars.SCANNER_SEEDS }}
+      SCANNER_MAX_ITEMS: ${{ vars.SCANNER_MAX_ITEMS }}
+      USE_BIRDEYE_TRENDING: ${{ vars.USE_BIRDEYE_TRENDING }}
+      BIRDEYE_LIMIT: ${{ vars.BIRDEYE_LIMIT }}
+      JOB_LOCK_TTL_SEC: ${{ vars.JOB_LOCK_TTL_SEC }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Runtime start/heartbeat/finish/fail logs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "[runtime-jobs] start mode=${JOB_MODE} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          heartbeat() {
+            while true; do
+              sleep 30
+              echo "[runtime-jobs] heartbeat mode=${JOB_MODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            done
+          }
+
+          heartbeat &
+          HB_PID=$!
+
+          cleanup() {
+            kill "$HB_PID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          if python worker.py; then
+            echo "[runtime-jobs] finish mode=${JOB_MODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          else
+            CODE=$?
+            echo "[runtime-jobs] fail mode=${JOB_MODE} exit_code=${CODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            exit "$CODE"
+          fi
