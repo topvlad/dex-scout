@@ -117,6 +117,9 @@ TG_STATE_KEY = "tg_state.json"
 SUPPRESSED_KEY = "suppressed_tokens.json"
 DEFAULT_ALERT_MODE = "normal"
 ALERT_MODE_REGISTRY = {"quiet", "normal", "aggressive"}
+DIGEST_SOURCE_MODE_DEFAULT = "ui_truth"
+DIGEST_SOURCE_MODES = {"ui_truth", "backend_candidates"}
+DIGEST_BACKEND_REUSE_TTL_SEC = max(300, int(os.getenv("DIGEST_BACKEND_REUSE_TTL_SEC", "7200")))
 OUTCOME_HORIZONS_MINUTES: Dict[str, int] = {
     "15m": 15,
     "1h": 60,
@@ -7296,20 +7299,210 @@ def _risk_priority_value(row: Dict[str, Any]) -> int:
     return 0
 
 
-def build_digest_summary(
+def digest_source_mode() -> str:
+    raw = str(os.getenv("DIGEST_SOURCE_MODE", DIGEST_SOURCE_MODE_DEFAULT) or "").strip().lower()
+    if raw in DIGEST_SOURCE_MODES:
+        return raw
+    return DIGEST_SOURCE_MODE_DEFAULT
+
+
+def canonical_token_key(row: Dict[str, Any]) -> str:
+    chain = token_chain(row)
+    ca = token_ca(row)
+    if not chain or not ca:
+        return ""
+    return f"{chain}|{addr_store(chain, ca)}"
+
+
+def _ui_monitoring_source_rows(monitoring_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    clean_rows: List[Dict[str, Any]] = []
+    for r in monitoring_rows:
+        chain = str(r.get("chain") or "").lower().strip()
+        symbol = str(r.get("base_symbol") or "").upper().strip()
+        if chain not in ALLOWED_CHAINS:
+            continue
+        if symbol in HARD_BLOCK_SYMBOLS:
+            continue
+        clean_rows.append(r)
+
+    normalized_rows: List[Dict[str, Any]] = []
+    for raw in clean_rows:
+        row = dict(raw)
+        for k in MON_FIELDS:
+            if k not in row:
+                row[k] = ""
+        if "symbol" not in row:
+            row["symbol"] = row.get("base_symbol", "NA")
+        if "address" not in row:
+            row["address"] = row.get("base_addr", "")
+        if "price" not in row:
+            row["price"] = ""
+        if "status" not in row:
+            row["status"] = row.get("entry_status", "watch")
+        normalized_rows.append(row)
+
+    _mon_set, active_set = active_base_sets()
+    active_rows: List[Dict[str, Any]] = []
+    for r in normalized_rows:
+        chain = (r.get("chain") or "").strip().lower()
+        base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
+        r["in_portfolio"] = "1" if addr_key(chain, base_addr) in active_set else "0"
+        if r["in_portfolio"] == "1":
+            r["status"] = "PORTFOLIO"
+        status_raw = r.get("status", "")
+        status = str(status_raw).strip().upper() if status_raw is not None else ""
+        if status in ("ACTIVE", "WATCH", "WAIT", "PORTFOLIO", ""):
+            active_rows.append(r)
+    if not active_rows:
+        active_rows = normalized_rows[:50]
+    return active_rows
+
+
+def _ui_monitoring_visible_rows(active_rows: List[Dict[str, Any]], chain_filter: str = "all") -> List[Dict[str, Any]]:
+    if chain_filter != "all":
+        filtered = [r for r in active_rows if (r.get("chain") or "").strip().lower() == chain_filter]
+    else:
+        filtered = list(active_rows)
+
+    best_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for t in filtered:
+        symbol = str(t.get("symbol") or t.get("base_symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        score = parse_float(t.get("score", t.get("priority_score", 0)), 0.0)
+        prev = best_by_symbol.get(symbol)
+        if prev is None:
+            best_by_symbol[symbol] = t
+            continue
+        prev_score = parse_float(prev.get("score", prev.get("priority_score", 0)), 0.0)
+        if score > prev_score:
+            best_by_symbol[symbol] = t
+    return list(best_by_symbol.values())
+
+
+def _ui_portfolio_source_rows(portfolio_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"]
+
+
+def _extract_recent_token_keys_from_tg_state(state: Dict[str, Any], now_ts: float, ttl_seconds: int) -> Set[str]:
+    out: Set[str] = set()
+    sent_emissions = state.get("sent_emissions", {})
+    if not isinstance(sent_emissions, dict):
+        return out
+    for emission_key, ts_val in sent_emissions.items():
+        try:
+            ts_float = float(ts_val or 0.0)
+        except Exception:
+            continue
+        if ts_float <= 0 or (now_ts - ts_float) > ttl_seconds:
+            continue
+        emission_text = str(emission_key or "")
+        parts = emission_text.split("|")
+        if len(parts) >= 2 and parts[1]:
+            out.add(parts[1])
+    return out
+
+
+def build_digest_sources(
     monitoring_rows: List[Dict[str, Any]],
     portfolio_rows: List[Dict[str, Any]],
-    top_monitoring_limit: int = 3,
-    top_risk_limit: int = 3,
+    top_monitoring_limit: int,
 ) -> Dict[str, Any]:
-    active_monitoring = build_active_monitoring_rows(monitoring_rows)
-    active_portfolio = [r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"]
+    mode = digest_source_mode()
+    ui_monitoring_source_rows = _ui_monitoring_source_rows(monitoring_rows)
+    ui_portfolio_source_rows = _ui_portfolio_source_rows(portfolio_rows)
+    ui_source_rows = ui_monitoring_source_rows + ui_portfolio_source_rows
+    ui_visible_rows = _ui_monitoring_visible_rows(ui_monitoring_source_rows) + ui_portfolio_source_rows
+    ui_source_keys = {canonical_token_key(r) for r in ui_source_rows if canonical_token_key(r)}
+    ui_visible_keys = {canonical_token_key(r) for r in ui_visible_rows if canonical_token_key(r)}
+
+    now_ts = time.time()
+    state = load_tg_state()
+    scan_state = scanner_state_load()
     mon_candidates, _ = build_notification_candidates(
         monitoring_rows,
         portfolio_rows,
         limit_monitoring=max(5, int(top_monitoring_limit or 3)),
         limit_portfolio=5,
     )
+    backend_candidate_keys = {canonical_token_key(r) for r in mon_candidates if canonical_token_key(r)}
+    monitoring_active_keys = {canonical_token_key(r) for r in build_active_monitoring_rows(monitoring_rows) if canonical_token_key(r)}
+    portfolio_active_keys = {canonical_token_key(r) for r in ui_portfolio_source_rows if canonical_token_key(r)}
+    tg_recent_keys = _extract_recent_token_keys_from_tg_state(state, now_ts=now_ts, ttl_seconds=DIGEST_BACKEND_REUSE_TTL_SEC)
+    scan_runtime = scan_state.get("worker_runtime", {}) if isinstance(scan_state.get("worker_runtime"), dict) else {}
+    scan_state_keys = set(scan_runtime.get("last_candidate_keys", []) or []) if isinstance(scan_runtime, dict) else set()
+    scan_state_keys = {str(k) for k in scan_state_keys if str(k)}
+
+    digest_source_keys: Set[str] = set(ui_source_keys) if mode == "ui_truth" else set(
+        monitoring_active_keys | portfolio_active_keys | backend_candidate_keys | tg_recent_keys | scan_state_keys
+    )
+    origin_map: Dict[str, str] = {}
+    for key in digest_source_keys:
+        if key in ui_source_keys:
+            if key in portfolio_active_keys:
+                origin_map[key] = "portfolio_active"
+            else:
+                origin_map[key] = "monitoring_active"
+        elif key in backend_candidate_keys:
+            origin_map[key] = "backend_candidate_recent"
+        elif key in scan_state_keys:
+            origin_map[key] = "scan_state_only"
+        elif key in tg_recent_keys:
+            origin_map[key] = "tg_state_reused"
+        else:
+            origin_map[key] = "unknown"
+
+    only_in_digest = sorted(digest_source_keys - ui_source_keys)
+    only_in_ui = sorted(ui_source_keys - digest_source_keys)
+    debug_payload = {
+        "digest_source_mode": mode,
+        "digest_source_keys": sorted(digest_source_keys),
+        "ui_source_keys": sorted(ui_source_keys),
+        "ui_visible_keys": sorted(ui_visible_keys),
+        "only_in_digest": only_in_digest,
+        "only_in_ui": only_in_ui,
+        "digest_token_origins": {k: origin_map.get(k, "unknown") for k in sorted(digest_source_keys)},
+        "tg_state_recent_keys": sorted(tg_recent_keys),
+        "scan_state_candidate_keys": sorted(scan_state_keys),
+        "scan_state_last_run_ts": str(scan_state.get("last_run_ts") or ""),
+        "tg_state_last_digest_sent_at": str(state.get("last_digest_sent_at") or ""),
+    }
+    debug_log(f"digest_source_compare {safe_json(debug_payload)}")
+    update_worker_runtime_state(updates={"last_digest_source_compare": debug_payload})
+    return {
+        "mode": mode,
+        "digest_source_keys": digest_source_keys,
+        "ui_source_keys": ui_source_keys,
+        "ui_visible_keys": ui_visible_keys,
+        "only_in_digest": only_in_digest,
+        "only_in_ui": only_in_ui,
+        "origin_map": origin_map,
+        "debug_payload": debug_payload,
+    }
+
+
+def build_digest_summary(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+    top_monitoring_limit: int = 3,
+    top_risk_limit: int = 3,
+) -> Dict[str, Any]:
+    source_snapshot = build_digest_sources(
+        monitoring_rows,
+        portfolio_rows,
+        top_monitoring_limit=top_monitoring_limit,
+    )
+    active_monitoring = build_active_monitoring_rows(monitoring_rows)
+    active_portfolio = _ui_portfolio_source_rows(portfolio_rows)
+    mon_candidates, _ = build_notification_candidates(
+        monitoring_rows,
+        portfolio_rows,
+        limit_monitoring=max(5, int(top_monitoring_limit or 3)),
+        limit_portfolio=5,
+    )
+    allowed_keys = source_snapshot.get("ui_source_keys", set()) if source_snapshot.get("mode") == "ui_truth" else source_snapshot.get("digest_source_keys", set())
+    mon_candidates = [row for row in mon_candidates if canonical_token_key(row) in allowed_keys]
+    active_monitoring = [row for row in active_monitoring if canonical_token_key(row) in allowed_keys]
 
     top_monitoring_now: List[str] = []
     for row in mon_candidates[: max(1, int(top_monitoring_limit or 3))]:
@@ -7350,11 +7543,14 @@ def build_digest_summary(
     return {
         "event_type": resolve_event_type("DIGEST"),
         "alert_tier": resolve_alert_tier("DIGEST_ONLY"),
+        "digest_source_mode": source_snapshot.get("mode"),
         "active_portfolio_count": len(active_portfolio),
         "active_monitoring_count": len(active_monitoring),
         "top_monitoring_now": top_monitoring_now,
         "top_portfolio_risks": top_portfolio_risks,
         "dead_cold_warnings": dead_cold_warnings,
+        "digest_debug": source_snapshot.get("debug_payload", {}),
+        "digest_token_origins": source_snapshot.get("origin_map", {}),
     }
 
 
@@ -7366,16 +7562,34 @@ def format_digest_summary_message(digest: Dict[str, Any], trigger_source: str = 
     monitoring_block = "\n".join([f"• {line}" for line in top_monitoring]) if top_monitoring else "• no active candidates yet"
     risk_block = "\n".join([f"• {line}" for line in top_risks]) if top_risks else "• no active portfolio risks"
     warning_block = "\n".join([f"• {line}" for line in warnings]) if warnings else "• none"
+    source_mode = str(digest.get("digest_source_mode") or DIGEST_SOURCE_MODE_DEFAULT)
+    debug_payload = digest.get("digest_debug", {}) if isinstance(digest.get("digest_debug"), dict) else {}
+    only_in_digest = list(debug_payload.get("only_in_digest", []) or [])
+    only_in_digest_block = ""
+    if only_in_digest:
+        origins = digest.get("digest_token_origins", {}) if isinstance(digest.get("digest_token_origins"), dict) else {}
+        lines = []
+        for token_key in only_in_digest[:6]:
+            lines.append(f"• {token_key} ({origins.get(token_key, 'non_ui_origin')})")
+        only_in_digest_block = "\n\n<b>Non-UI digest tokens</b>\n" + "\n".join(lines)
+    backend_disclaimer = ""
+    if source_mode == "backend_candidates":
+        backend_disclaimer = (
+            "⚠ backend candidates, not current UI list\n"
+        )
 
     return (
         f"<b>DEX Scout digest</b>\n"
         f"event_type: <code>{digest.get('event_type', 'digest')}</code>\n"
         f"trigger: {str(trigger_source or 'manual').upper()}\n"
+        f"source_mode: {source_mode}\n"
+        f"{backend_disclaimer}"
         f"portfolio active: {int(digest.get('active_portfolio_count', 0) or 0)}\n"
         f"monitoring active: {int(digest.get('active_monitoring_count', 0) or 0)}\n\n"
         f"<b>Top monitoring now</b>\n{monitoring_block}\n\n"
         f"<b>Top portfolio risks</b>\n{risk_block}\n\n"
         f"<b>Dead/cold warnings</b>\n{warning_block}"
+        f"{only_in_digest_block}"
     )
 
 
@@ -10198,50 +10412,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     scan_state = scanner_state_load()
     top = st.columns([2,2,3,3])
 
-    # Source of truth for Monitoring page UI: monitoring.csv only.
+    # Source of truth for Monitoring page UI: monitoring.csv filtered through _ui_monitoring_source_rows.
     monitoring_rows = load_monitoring_rows_cached()
-    clean_rows: List[Dict[str, Any]] = []
-    for r in monitoring_rows:
-        chain = str(r.get("chain") or "").lower().strip()
-        symbol = str(r.get("base_symbol") or "").upper().strip()
-        if chain not in ALLOWED_CHAINS:
-            continue
-        if symbol in HARD_BLOCK_SYMBOLS:
-            continue
-        clean_rows.append(r)
-    monitoring_rows = clean_rows
     mon_source = st.session_state.get("_storage_source_monitoring.csv", "unknown")
     st.caption(f"MONITORING FROM DB: {len(monitoring_rows)} (source: {mon_source})")
-    rows: List[Dict[str, Any]] = []
-    for raw in monitoring_rows:
-        row = dict(raw)
-        for k in MON_FIELDS:
-            if k not in row:
-                row[k] = ""
-        if "symbol" not in row:
-            row["symbol"] = row.get("base_symbol", "NA")
-        if "address" not in row:
-            row["address"] = row.get("base_addr", "")
-        if "price" not in row:
-            row["price"] = ""
-        if "status" not in row:
-            row["status"] = row.get("entry_status", "watch")
-        rows.append(row)
-
-    active_rows = []
-    _mon_set, active_set = active_base_sets()
-    for r in rows:
-        chain = (r.get("chain") or "").strip().lower()
-        base_addr = addr_store(chain, (r.get("base_addr") or "").strip())
-        r["in_portfolio"] = "1" if addr_key(chain, base_addr) in active_set else "0"
-        if r["in_portfolio"] == "1":
-            r["status"] = "PORTFOLIO"
-        status_raw = r.get("status", "")
-        status = str(status_raw).strip().upper() if status_raw is not None else ""
-        if status in ("ACTIVE", "WATCH", "WAIT", "PORTFOLIO", ""):
-            active_rows.append(r)
-    if not active_rows:
-        active_rows = rows[:50]
+    active_rows = _ui_monitoring_source_rows(monitoring_rows)
+    rows = list(monitoring_rows)
     trust_index = load_pattern_trust_index_cached()
     for row in active_rows:
         trust_payload = compute_pattern_trust(row, trust_index=trust_index)
@@ -10309,25 +10485,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         return
 
     chain_filter = st.selectbox("Chain filter", ["all", "bsc", "solana"], index=0)
-    if chain_filter != "all":
-        active = [r for r in active_rows if (r.get("chain") or "").strip().lower() == chain_filter]
-    else:
-        active = list(active_rows)
-
-    # --- DEDUP BY SYMBOL WITH BEST SCORE ---
-    best_by_symbol: Dict[str, Dict[str, Any]] = {}
-    for t in active:
-        symbol = str(t.get("symbol") or t.get("base_symbol") or "").upper().strip()
-        score = parse_float(t.get("score", t.get("priority_score", 0)), 0.0)
-
-        if symbol not in best_by_symbol:
-            best_by_symbol[symbol] = t
-        else:
-            prev_score = parse_float(best_by_symbol[symbol].get("score", best_by_symbol[symbol].get("priority_score", 0)), 0.0)
-            if score > prev_score:
-                best_by_symbol[symbol] = t
-
-    active = list(best_by_symbol.values())
+    active = _ui_monitoring_visible_rows(active_rows, chain_filter=chain_filter)
 
     cards_raw = [monitoring_row_to_card(r) for r in active]
     cards_all = []
@@ -10588,7 +10746,8 @@ def page_archive():
 
 def portfolio_alert_count() -> int:
     rows = load_portfolio()
-    active_rows = [r for r in rows if r.get("active") == "1"]
+    # Source of truth for Portfolio page UI: load_portfolio() + active flag filter.
+    active_rows = _ui_portfolio_source_rows(rows)
 
     alerts = 0
     for r in active_rows:
@@ -11503,7 +11662,8 @@ def page_portfolio():
         st.caption(health_thresholds_debug_line())
 
     rows = load_portfolio()
-    active_rows = [r for r in rows if r.get("active") == "1"]
+    # Source of truth for Portfolio page UI: load_portfolio() + active flag filter.
+    active_rows = _ui_portfolio_source_rows(rows)
     closed_rows = [r for r in rows if r.get("active") != "1"]
 
     topbar = st.columns([2, 2, 3])
