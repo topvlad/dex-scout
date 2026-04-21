@@ -13,7 +13,6 @@ SCANNER_MAX_ITEMS = int(os.getenv("SCANNER_MAX_ITEMS", "10"))
 USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
 BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "10"))
 JOB_LOCK_TTL_SEC = max(60, int(os.getenv("JOB_LOCK_TTL_SEC", "900")))
-JOB_HEARTBEAT_NAME = "job_dispatch"
 
 
 def _run_scan_cycle() -> Dict[str, Any]:
@@ -84,11 +83,11 @@ def run_job_mode(job_mode: str) -> int:
                 "last_error_ts": app.now_utc_str(),
                 "last_error_reason": reason,
                 "last_job_mode": mode,
-                "last_job_status": "invalid_mode",
+                "last_job_status": "invalid",
             }
         )
         app.update_job_heartbeat(
-            job_name=JOB_HEARTBEAT_NAME,
+            job_name="job_dispatch",
             job_mode=mode,
             status="invalid_mode",
             meta={"reason": reason, "allowed_modes": list(JOB_DISPATCH.keys())},
@@ -112,7 +111,7 @@ def run_job_mode(job_mode: str) -> int:
             }
         )
         app.update_job_heartbeat(
-            job_name=JOB_HEARTBEAT_NAME,
+            job_name="job_dispatch",
             job_mode=mode,
             status="skipped_locked",
             meta={"lock_key": lock_key, "owner": owner, "lock_status": lock_status},
@@ -135,7 +134,7 @@ def run_job_mode(job_mode: str) -> int:
         }
     )
     app.update_job_heartbeat(
-        job_name=JOB_HEARTBEAT_NAME,
+        job_name="job_dispatch",
         job_mode=mode,
         status="started",
         meta={"lock_key": lock_key, "owner": owner},
@@ -156,7 +155,7 @@ def run_job_mode(job_mode: str) -> int:
             }
         )
         app.update_job_heartbeat(
-            job_name=JOB_HEARTBEAT_NAME,
+            job_name="job_dispatch",
             job_mode=mode,
             status="finished",
             meta={"duration_sec": duration_sec, "result": result},
@@ -176,7 +175,7 @@ def run_job_mode(job_mode: str) -> int:
             }
         )
         app.update_job_heartbeat(
-            job_name=JOB_HEARTBEAT_NAME,
+            job_name="job_dispatch",
             job_mode=mode,
             status="failed",
             meta={"reason": reason},
@@ -201,8 +200,8 @@ def main() -> int:
             }
         )
         app.update_job_heartbeat(
-            job_name=JOB_HEARTBEAT_NAME,
-            job_mode="dispatch_init",
+            job_name="job_dispatch",
+            job_mode="bootstrap",
             status="runtime_contract_error",
             meta={"detail": contract.get("failures")},
         )
