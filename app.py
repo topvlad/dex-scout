@@ -6326,6 +6326,55 @@ def update_job_heartbeat(job_name: str, job_mode: str, status: str = "alive", me
     except Exception as e:
         return _runtime_status(False, "local_write_exception", detail=f"{type(e).__name__}:{e}", **payload)
 
+
+def get_job_heartbeats_snapshot() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    if _sb_ok():
+        rows, status = _sb_select_rows(table=JOB_HEARTBEATS_TABLE, limit=2000)
+        if not status.get("ok"):
+            return {}, status
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("job_name") or "").strip()
+            if not name:
+                continue
+            out[name] = {
+                "job_name": name,
+                "job_mode": str(row.get("job_mode") or "").strip(),
+                "status": str(row.get("status") or "").strip(),
+                "heartbeat_ts": str(row.get("heartbeat_ts") or "").strip(),
+                "heartbeat_epoch": parse_float(row.get("heartbeat_epoch"), 0.0),
+                "meta_json": row.get("meta_json") if isinstance(row.get("meta_json"), dict) else {},
+            }
+        return out, _runtime_status(True, "ok", jobs=len(out))
+
+    ensure_storage()
+    path = os.path.join(DATA_DIR, "job_heartbeats.json")
+    if not os.path.exists(path):
+        return {}, _runtime_status(True, "not_found_local", jobs=0)
+    try:
+        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            return {}, _runtime_status(False, "bad_local_payload", jobs=0)
+        out: Dict[str, Dict[str, Any]] = {}
+        for raw_name, raw_payload in loaded.items():
+            name = str(raw_name or "").strip()
+            payload = raw_payload if isinstance(raw_payload, dict) else {}
+            if not name:
+                continue
+            out[name] = {
+                "job_name": name,
+                "job_mode": str(payload.get("job_mode") or "").strip(),
+                "status": str(payload.get("status") or "").strip(),
+                "heartbeat_ts": str(payload.get("heartbeat_ts") or "").strip(),
+                "heartbeat_epoch": parse_float(payload.get("heartbeat_epoch"), 0.0),
+                "meta_json": payload.get("meta_json") if isinstance(payload.get("meta_json"), dict) else {},
+            }
+        return out, _runtime_status(True, "ok_local", jobs=len(out))
+    except Exception as e:
+        return {}, _runtime_status(False, "local_read_exception", detail=f"{type(e).__name__}:{e}", jobs=0)
+
 def scanner_acquire_lock(slot: int, ttl_sec: int = 240) -> bool:
     """
     Prevent multiple tabs running the scanner simultaneously.
