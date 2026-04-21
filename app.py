@@ -461,6 +461,18 @@ SUPABASE_ANON_KEY = _get_secret("SUPABASE_ANON_KEY", "").strip()
 
 USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
+RUNTIME_STATE_TABLE = "runtime_state"
+LOCKS_TABLE = "locks"
+TG_STATE_TABLE = "tg_state"
+JOB_HEARTBEATS_TABLE = "job_heartbeats"
+JOB_RUNS_TABLE = "job_runs"
+RUNTIME_REQUIRED_TABLES: Tuple[str, ...] = (
+    RUNTIME_STATE_TABLE,
+    LOCKS_TABLE,
+    TG_STATE_TABLE,
+    JOB_HEARTBEATS_TABLE,
+)
+
 def _sb_ok() -> bool:
     return bool(USE_SUPABASE)
 
@@ -477,6 +489,65 @@ def _sb_headers() -> Dict[str, str]:
 
 def _sb_table_url(table: str) -> str:
     return f"{SUPABASE_URL}/rest/v1/{table}"
+
+
+def _runtime_status(ok: bool, code: str, message: str = "", **extra: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "ok": bool(ok),
+        "code": str(code or "unknown"),
+        "message": str(message or ""),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _sb_select_rows(
+    table: str,
+    filters: Optional[Dict[str, str]] = None,
+    select: str = "*",
+    limit: int = 1,
+) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any]]:
+    if not _sb_ok():
+        return [], _runtime_status(True, "supabase_disabled")
+    try:
+        params: Dict[str, str] = {"select": select, "limit": str(max(1, int(limit)))}
+        for k, v in (filters or {}).items():
+            params[str(k)] = str(v)
+        resp = requests.get(_sb_table_url(table), headers=_sb_headers(), params=params, timeout=12)
+        if resp.status_code >= 400:
+            body = (resp.text or "").replace("\n", " ").strip()[:240]
+            status = _runtime_status(False, "supabase_read_failed", f"{table} read failed", table=table, http_status=resp.status_code, detail=body)
+            debug_log(f"runtime_select_failed table={table} status={resp.status_code} detail={body}")
+            return None, status
+        data = resp.json() or []
+        if not isinstance(data, list):
+            data = []
+        return data, _runtime_status(True, "ok", table=table, rows=len(data))
+    except Exception as e:
+        status = _runtime_status(False, "supabase_read_exception", f"{table} read exception", table=table, detail=f"{type(e).__name__}:{e}")
+        debug_log(f"runtime_select_exception table={table} err={type(e).__name__}:{e}")
+        return None, status
+
+
+def _sb_upsert_row(table: str, payload: Dict[str, Any], on_conflict: str) -> Dict[str, Any]:
+    if not _sb_ok():
+        return _runtime_status(True, "supabase_disabled")
+    try:
+        headers = _sb_headers()
+        headers["Prefer"] = "resolution=merge-duplicates"
+        params = {"on_conflict": on_conflict}
+        resp = requests.post(_sb_table_url(table), headers=headers, params=params, json=payload, timeout=12)
+        if resp.status_code >= 400:
+            body = (resp.text or "").replace("\n", " ").strip()[:240]
+            status = _runtime_status(False, "supabase_upsert_failed", f"{table} upsert failed", table=table, http_status=resp.status_code, detail=body)
+            debug_log(f"runtime_upsert_failed table={table} status={resp.status_code} detail={body}")
+            return status
+        return _runtime_status(True, "ok", table=table)
+    except Exception as e:
+        status = _runtime_status(False, "supabase_upsert_exception", f"{table} upsert exception", table=table, detail=f"{type(e).__name__}:{e}")
+        debug_log(f"runtime_upsert_exception table={table} err={type(e).__name__}:{e}")
+        return status
 
 def sb_get_storage(key: str) -> Optional[str]:
     """
@@ -5995,37 +6066,262 @@ def position_sizing_engine(
 # v0.6.0 – automation / scheduler helpers
 # =============================
 
+def get_runtime_contract_sql() -> str:
+    return """
+create table if not exists public.runtime_state (
+  state_key text primary key,
+  state_json jsonb not null default '{}'::jsonb,
+  updated_ts text not null default '',
+  updated_epoch double precision not null default 0
+);
+
+create table if not exists public.locks (
+  lock_key text primary key,
+  owner text not null default '',
+  expires_epoch double precision not null default 0,
+  updated_epoch double precision not null default 0
+);
+
+create table if not exists public.tg_state (
+  state_key text primary key,
+  state_json jsonb not null default '{}'::jsonb,
+  updated_epoch double precision not null default 0
+);
+
+create table if not exists public.job_heartbeats (
+  job_name text primary key,
+  job_mode text not null default '',
+  heartbeat_ts text not null default '',
+  heartbeat_epoch double precision not null default 0,
+  status text not null default '',
+  meta_json jsonb not null default '{}'::jsonb
+);
+
+create table if not exists public.job_runs (
+  run_id text primary key,
+  job_name text not null,
+  job_mode text not null default '',
+  started_ts text not null default '',
+  ended_ts text not null default '',
+  status text not null default '',
+  note text not null default ''
+);
+""".strip()
+
+
+def check_runtime_contract(required_tables: Optional[List[str]] = None) -> Dict[str, Any]:
+    tables = required_tables or list(RUNTIME_REQUIRED_TABLES)
+    if not _sb_ok():
+        return _runtime_status(True, "supabase_disabled", "runtime contract check skipped (supabase disabled)", tables=tables)
+    failures: List[Dict[str, Any]] = []
+    for table in tables:
+        rows, status = _sb_select_rows(table=table, select="*", limit=1)
+        if rows is None or not status.get("ok"):
+            failures.append({
+                "table": table,
+                "code": status.get("code"),
+                "detail": status.get("detail") or status.get("message"),
+                "http_status": status.get("http_status"),
+            })
+    if failures:
+        return _runtime_status(False, "runtime_contract_missing", "required runtime tables are missing or unreadable", failures=failures, sql_contract=get_runtime_contract_sql())
+    return _runtime_status(True, "ok", "runtime contract ready", tables=tables)
+
+
+def read_runtime_state(state_key: str = "worker_runtime") -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    key = str(state_key or "worker_runtime").strip()
+    default: Dict[str, Any] = {}
+    if _sb_ok():
+        rows, status = _sb_select_rows(
+            table=RUNTIME_STATE_TABLE,
+            filters={"state_key": f"eq.{key}"},
+            select="state_json,updated_ts,updated_epoch",
+            limit=1,
+        )
+        if rows is None:
+            return default, status
+        if not rows:
+            return default, _runtime_status(True, "not_found", table=RUNTIME_STATE_TABLE, state_key=key)
+        payload = rows[0].get("state_json")
+        if isinstance(payload, dict):
+            return dict(payload), _runtime_status(True, "ok", table=RUNTIME_STATE_TABLE, state_key=key)
+        return default, _runtime_status(False, "bad_state_payload", "runtime state payload is not an object", table=RUNTIME_STATE_TABLE, state_key=key)
+    path = os.path.join(DATA_DIR, f"{key}.runtime.json")
+    if os.path.exists(path):
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data, _runtime_status(True, "ok_local", state_key=key)
+            return default, _runtime_status(False, "bad_local_state_payload", state_key=key)
+        except Exception as e:
+            return default, _runtime_status(False, "local_read_exception", detail=f"{type(e).__name__}:{e}", state_key=key)
+    return default, _runtime_status(True, "not_found_local", state_key=key)
+
+
+def update_runtime_state(
+    updates: Dict[str, Any],
+    increments: Optional[Dict[str, int]] = None,
+    state_key: str = "worker_runtime",
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    current, read_status = read_runtime_state(state_key=state_key)
+    payload = dict(current if isinstance(current, dict) else {})
+    for k, v in (updates or {}).items():
+        payload[k] = v
+    for k, delta in (increments or {}).items():
+        payload[k] = int(parse_float(payload.get(k, 0), 0.0)) + int(delta or 0)
+    now_ts = now_utc_str()
+    now_epoch = time.time()
+    key = str(state_key or "worker_runtime").strip()
+    if _sb_ok():
+        status = _sb_upsert_row(
+            table=RUNTIME_STATE_TABLE,
+            on_conflict="state_key",
+            payload={
+                "state_key": key,
+                "state_json": payload,
+                "updated_ts": now_ts,
+                "updated_epoch": now_epoch,
+            },
+        )
+        return payload, status
+    ensure_storage()
+    path = os.path.join(DATA_DIR, f"{key}.runtime.json")
+    try:
+        Path(path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return payload, _runtime_status(True, "ok_local", state_key=key)
+    except Exception as e:
+        return payload, _runtime_status(False, "local_write_exception", detail=f"{type(e).__name__}:{e}", state_key=key, read_status=read_status)
+
+
+def acquire_lock(lock_key: str, owner: str, ttl_sec: int = 240) -> Dict[str, Any]:
+    lk = str(lock_key or "").strip()
+    if not lk:
+        return _runtime_status(False, "lock_key_required", "lock_key is required")
+    owner = str(owner or "unknown").strip() or "unknown"
+    now_epoch = time.time()
+    expires_epoch = now_epoch + max(1, int(ttl_sec or 0))
+    if _sb_ok():
+        rows, status = _sb_select_rows(
+            table=LOCKS_TABLE,
+            filters={"lock_key": f"eq.{lk}"},
+            select="owner,expires_epoch",
+            limit=1,
+        )
+        if rows is None:
+            return status
+        if rows:
+            holder = str(rows[0].get("owner") or "")
+            held_until = float(parse_float(rows[0].get("expires_epoch", 0), 0.0))
+            if held_until > now_epoch and holder and holder != owner:
+                return _runtime_status(False, "lock_held", f"lock already held by {holder}", lock_key=lk, holder=holder, expires_epoch=held_until)
+        upsert_status = _sb_upsert_row(
+            table=LOCKS_TABLE,
+            on_conflict="lock_key",
+            payload={"lock_key": lk, "owner": owner, "expires_epoch": expires_epoch, "updated_epoch": now_epoch},
+        )
+        if not upsert_status.get("ok"):
+            return upsert_status
+        return _runtime_status(True, "ok", lock_key=lk, owner=owner, expires_epoch=expires_epoch)
+    ensure_storage()
+    lock_file = os.path.join(DATA_DIR, f"{lk}.lock.json")
+    try:
+        payload = {"owner": owner, "expires_epoch": expires_epoch, "updated_epoch": now_epoch}
+        Path(lock_file).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return _runtime_status(True, "ok_local", lock_key=lk, owner=owner, expires_epoch=expires_epoch)
+    except Exception as e:
+        return _runtime_status(False, "local_lock_write_exception", detail=f"{type(e).__name__}:{e}", lock_key=lk)
+
+
+def release_lock(lock_key: str, owner: str) -> Dict[str, Any]:
+    lk = str(lock_key or "").strip()
+    owner = str(owner or "").strip()
+    if not lk:
+        return _runtime_status(False, "lock_key_required", "lock_key is required")
+    if _sb_ok():
+        rows, status = _sb_select_rows(
+            table=LOCKS_TABLE,
+            filters={"lock_key": f"eq.{lk}"},
+            select="owner",
+            limit=1,
+        )
+        if rows is None:
+            return status
+        if rows and owner and str(rows[0].get("owner") or "") not in ("", owner):
+            return _runtime_status(False, "lock_owner_mismatch", "cannot release lock owned by another worker", lock_key=lk, owner=rows[0].get("owner"))
+        try:
+            resp = requests.delete(
+                _sb_table_url(LOCKS_TABLE),
+                headers=_sb_headers(),
+                params={"lock_key": f"eq.{lk}"},
+                timeout=12,
+            )
+            if resp.status_code >= 400:
+                body = (resp.text or "").replace("\n", " ").strip()[:240]
+                return _runtime_status(False, "supabase_delete_failed", "lock release failed", lock_key=lk, http_status=resp.status_code, detail=body)
+            return _runtime_status(True, "ok", lock_key=lk)
+        except Exception as e:
+            return _runtime_status(False, "supabase_delete_exception", "lock release exception", lock_key=lk, detail=f"{type(e).__name__}:{e}")
+    ensure_storage()
+    lock_file = os.path.join(DATA_DIR, f"{lk}.lock.json")
+    try:
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+        return _runtime_status(True, "ok_local", lock_key=lk)
+    except Exception as e:
+        return _runtime_status(False, "local_lock_delete_exception", detail=f"{type(e).__name__}:{e}", lock_key=lk)
+
+
+def update_job_heartbeat(job_name: str, job_mode: str, status: str = "alive", meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    name = str(job_name or "").strip()
+    if not name:
+        return _runtime_status(False, "job_name_required", "job_name is required")
+    now_ts = now_utc_str()
+    now_epoch = time.time()
+    payload = {
+        "job_name": name,
+        "job_mode": str(job_mode or "").strip(),
+        "heartbeat_ts": now_ts,
+        "heartbeat_epoch": now_epoch,
+        "status": str(status or "").strip() or "alive",
+        "meta_json": dict(meta or {}),
+    }
+    if _sb_ok():
+        status_payload = _sb_upsert_row(
+            table=JOB_HEARTBEATS_TABLE,
+            on_conflict="job_name",
+            payload=payload,
+        )
+        if status_payload.get("ok"):
+            return _runtime_status(True, "ok", **payload)
+        return status_payload
+    ensure_storage()
+    path = os.path.join(DATA_DIR, "job_heartbeats.json")
+    data: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+    data[name] = payload
+    try:
+        Path(path).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return _runtime_status(True, "ok_local", **payload)
+    except Exception as e:
+        return _runtime_status(False, "local_write_exception", detail=f"{type(e).__name__}:{e}", **payload)
+
 def scanner_acquire_lock(slot: int, ttl_sec: int = 240) -> bool:
     """
     Prevent multiple tabs running the scanner simultaneously.
-    Uses Supabase app_storage as a distributed lock.
+    Uses persistent lock storage (Supabase locks table or local fallback).
     """
-    if not _sb_ok():
-        return True
-
     key = f"scanner_lock_{slot}"
-
-    try:
-        blob = sb_get_storage(key)
-
-        if blob:
-            data = json.loads(blob)
-            ts = float(data.get("ts", 0))
-
-            if ts and time.time() - ts < ttl_sec:
-                return False
-
-        payload = json.dumps({
-            "ts": time.time(),
-            "host": os.getenv("HOSTNAME", "local"),
-            "version": VERSION
-        })
-        sb_put_storage(key, payload)
-
-        return True
-
-    except Exception:
-        return True
+    owner = f"{os.getenv('HOSTNAME', 'local')}:{os.getpid()}"
+    status = acquire_lock(lock_key=key, owner=owner, ttl_sec=ttl_sec)
+    if not status.get("ok"):
+        debug_log(f"scanner_acquire_lock_failed key={key} code={status.get('code')} detail={status.get('detail') or status.get('message')}")
+    return bool(status.get("ok"))
 
 SCOUT_WINDOWS = [
     ("Ultra Early (safer)", "ultra"),
@@ -6127,7 +6423,27 @@ def load_tg_state() -> Dict[str, Any]:
     }
 
     try:
-        raw = sb_get_storage(TG_STATE_KEY) if USE_SUPABASE else None
+        raw = None
+        if USE_SUPABASE:
+            rows, status = _sb_select_rows(
+                table=TG_STATE_TABLE,
+                filters={"state_key": "eq.default"},
+                select="state_json",
+                limit=1,
+            )
+            if rows is None:
+                debug_log(f"tg_state_read_failed code={status.get('code')} detail={status.get('detail') or status.get('message')}")
+                return {
+                    **default,
+                    "_runtime_error": {
+                        "code": status.get("code"),
+                        "message": status.get("detail") or status.get("message"),
+                    },
+                }
+            if rows and isinstance(rows[0].get("state_json"), dict):
+                raw = json.dumps(rows[0].get("state_json") or {}, ensure_ascii=False)
+            else:
+                raw = sb_get_storage(TG_STATE_KEY)
         if (not raw) and os.path.exists(TG_STATE_FILE):
             with open(TG_STATE_FILE, "r", encoding="utf-8") as f:
                 raw = f.read()
@@ -6164,6 +6480,17 @@ def save_tg_state(state: Dict[str, Any]) -> None:
     try:
         payload = json.dumps(state, ensure_ascii=False)
         if USE_SUPABASE:
+            status = _sb_upsert_row(
+                table=TG_STATE_TABLE,
+                on_conflict="state_key",
+                payload={
+                    "state_key": "default",
+                    "state_json": state,
+                    "updated_epoch": time.time(),
+                },
+            )
+            if not status.get("ok"):
+                debug_log(f"tg_state_write_failed code={status.get('code')} detail={status.get('detail') or status.get('message')}")
             sb_put_storage(TG_STATE_KEY, payload)
         else:
             os.makedirs(DATA_DIR, exist_ok=True)
@@ -8278,8 +8605,22 @@ def worker_runtime_defaults() -> Dict[str, Any]:
 
 
 def get_worker_runtime_state(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    src = state if isinstance(state, dict) else (scanner_state_load() or {})
-    runtime = src.get("worker_runtime", {})
+    runtime: Dict[str, Any] = {}
+    if state is None:
+        persisted, persisted_status = read_runtime_state("worker_runtime")
+        if persisted_status.get("ok") and isinstance(persisted, dict) and persisted:
+            runtime = persisted
+        else:
+            src = scanner_state_load() or {}
+            runtime = src.get("worker_runtime", {}) if isinstance(src, dict) else {}
+            if not persisted_status.get("ok"):
+                runtime["_runtime_error"] = {
+                    "code": persisted_status.get("code"),
+                    "message": persisted_status.get("detail") or persisted_status.get("message"),
+                }
+    else:
+        src = state if isinstance(state, dict) else {}
+        runtime = src.get("worker_runtime", {})
     if not isinstance(runtime, dict):
         runtime = {}
     out = worker_runtime_defaults()
@@ -8291,15 +8632,28 @@ def update_worker_runtime_state(
     updates: Dict[str, Any],
     increments: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
+    runtime, status = update_runtime_state(
+        updates=updates,
+        increments=increments,
+        state_key="worker_runtime",
+    )
     state = scanner_state_load() or {}
-    runtime = get_worker_runtime_state(state=state)
-    for k, v in (updates or {}).items():
-        runtime[k] = v
-    for k, delta in (increments or {}).items():
-        runtime[k] = int(parse_float(runtime.get(k, 0), 0.0)) + int(delta or 0)
-    state["worker_runtime"] = runtime
+    if not isinstance(state, dict):
+        state = {}
+    state["worker_runtime"] = dict(runtime)
     scanner_state_save(state)
-    return runtime
+    merged = worker_runtime_defaults()
+    merged.update(runtime)
+    if not status.get("ok"):
+        merged["_runtime_error"] = {
+            "code": status.get("code"),
+            "message": status.get("detail") or status.get("message"),
+        }
+        debug_log(
+            f"worker_runtime_update_failed code={status.get('code')} "
+            f"detail={status.get('detail') or status.get('message')}"
+        )
+    return merged
 
 
 SCAN_QUEUE_TIERS: List[Tuple[str, int]] = [

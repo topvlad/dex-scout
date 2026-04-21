@@ -64,6 +64,22 @@ def _queue_invariant_telemetry(queue_stats: dict, sleep_for: int, default_sleep_
 
 def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False) -> None:
     app.ensure_storage()
+    contract = app.check_runtime_contract()
+    if not contract.get("ok"):
+        now_utc = app.now_utc_str()
+        app.update_worker_runtime_state(
+            updates={
+                "worker_status": "runtime_contract_error",
+                "last_error_ts": now_utc,
+                "last_error_reason": f"runtime_contract_error:{contract.get('code')}",
+            }
+        )
+        print(
+            f"[worker] runtime contract missing code={contract.get('code')} "
+            f"detail={contract.get('failures')}",
+            flush=True,
+        )
+        return
     last_heartbeat_ts = 0.0
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
     app.update_worker_runtime_state(
@@ -104,6 +120,31 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
             },
             increments={"loop_iterations": 1},
         )
+        hb_status = app.update_job_heartbeat(
+            job_name="background_worker",
+            job_mode="loop",
+            status="running",
+            meta={
+                "worker_id": worker_id,
+                "scan_interval_sec": SCAN_INTERVAL_SEC,
+                "heartbeat_interval_sec": WORKER_HEARTBEAT_SEC,
+            },
+        )
+        if not hb_status.get("ok"):
+            app.update_worker_runtime_state(
+                updates={
+                    "worker_status": "degraded",
+                    "last_error_ts": now_utc,
+                    "last_error_reason": f"job_heartbeat_failed:{hb_status.get('code')}",
+                }
+            )
+            print(
+                f"[worker] heartbeat persistence failed code={hb_status.get('code')} "
+                f"detail={hb_status.get('detail') or hb_status.get('message')}",
+                flush=True,
+            )
+            if app.USE_SUPABASE:
+                return
         if (now_ts - last_heartbeat_ts) >= WORKER_HEARTBEAT_SEC:
             print(
                 f"[worker] heartbeat alive=1 interval_sec={SCAN_INTERVAL_SEC} "
@@ -115,6 +156,12 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
                     "last_heartbeat_ts": now_utc,
                     "last_heartbeat_epoch": now_ts,
                 }
+            )
+            app.update_job_heartbeat(
+                job_name="background_worker",
+                job_mode="heartbeat",
+                status="alive",
+                meta={"worker_id": worker_id},
             )
             last_heartbeat_ts = now_ts
         if stop_event is not None and stop_event.is_set():
@@ -262,6 +309,12 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
                         "last_heartbeat_epoch": now_sleep_ts,
                         "heartbeat_interval_sec": WORKER_HEARTBEAT_SEC,
                     }
+                )
+                app.update_job_heartbeat(
+                    job_name="background_worker",
+                    job_mode="sleep_heartbeat",
+                    status="alive",
+                    meta={"worker_id": worker_id},
                 )
                 last_heartbeat_ts = now_sleep_ts
 
