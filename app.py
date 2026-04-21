@@ -6225,6 +6225,21 @@ def acquire_lock(lock_key: str, owner: str, ttl_sec: int = 240) -> Dict[str, Any
     ensure_storage()
     lock_file = os.path.join(DATA_DIR, f"{lk}.lock.json")
     try:
+        if os.path.exists(lock_file):
+            current_raw = Path(lock_file).read_text(encoding="utf-8")
+            current = json.loads(current_raw) if current_raw else {}
+            if isinstance(current, dict):
+                holder = str(current.get("owner") or "")
+                held_until = float(parse_float(current.get("expires_epoch", 0), 0.0))
+                if held_until > now_epoch and holder and holder != owner:
+                    return _runtime_status(
+                        False,
+                        "lock_held",
+                        f"lock already held by {holder}",
+                        lock_key=lk,
+                        holder=holder,
+                        expires_epoch=held_until,
+                    )
         payload = {"owner": owner, "expires_epoch": expires_epoch, "updated_epoch": now_epoch}
         Path(lock_file).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return _runtime_status(True, "ok_local", lock_key=lk, owner=owner, expires_epoch=expires_epoch)
