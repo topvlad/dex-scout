@@ -46,12 +46,34 @@ def _missing_required_env() -> list[str]:
 
 app: Optional[Any] = None
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 SCANNER_SEEDS = os.getenv("SCANNER_SEEDS", "")
-SCANNER_MAX_ITEMS = int(os.getenv("SCANNER_MAX_ITEMS", "10"))
-USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
-BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "10"))
-JOB_LOCK_TTL_SEC = max(60, int(os.getenv("JOB_LOCK_TTL_SEC", "900")))
-JOB_STALE_RUN_SEC = max(JOB_LOCK_TTL_SEC, int(os.getenv("JOB_STALE_RUN_SEC", str(JOB_LOCK_TTL_SEC * 2))))
+SCANNER_MAX_ITEMS = _env_int("SCANNER_MAX_ITEMS", 10)
+USE_BIRDEYE_TRENDING = _env_bool("USE_BIRDEYE_TRENDING", True)
+BIRDEYE_LIMIT = _env_int("BIRDEYE_LIMIT", 10)
+JOB_LOCK_TTL_SEC = max(60, _env_int("JOB_LOCK_TTL_SEC", 900))
+JOB_STALE_RUN_SEC = max(JOB_LOCK_TTL_SEC, _env_int("JOB_STALE_RUN_SEC", JOB_LOCK_TTL_SEC * 2))
 
 
 def _run_scan_cycle() -> Dict[str, Any]:
