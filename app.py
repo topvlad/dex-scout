@@ -6214,6 +6214,11 @@ def acquire_lock(lock_key: str, owner: str, ttl_sec: int = 240) -> Dict[str, Any
             held_until = float(parse_float(rows[0].get("expires_epoch", 0), 0.0))
             if held_until > now_epoch and holder and holder != owner:
                 return _runtime_status(False, "lock_held", f"lock already held by {holder}", lock_key=lk, holder=holder, expires_epoch=held_until)
+            stale_replaced = bool(held_until > 0 and held_until <= now_epoch and holder and holder != owner)
+            stale_age_sec = int(max(0.0, now_epoch - held_until)) if stale_replaced else 0
+        else:
+            stale_replaced = False
+            stale_age_sec = 0
         upsert_status = _sb_upsert_row(
             table=LOCKS_TABLE,
             on_conflict="lock_key",
@@ -6221,7 +6226,15 @@ def acquire_lock(lock_key: str, owner: str, ttl_sec: int = 240) -> Dict[str, Any
         )
         if not upsert_status.get("ok"):
             return upsert_status
-        return _runtime_status(True, "ok", lock_key=lk, owner=owner, expires_epoch=expires_epoch)
+        return _runtime_status(
+            True,
+            "ok",
+            lock_key=lk,
+            owner=owner,
+            expires_epoch=expires_epoch,
+            stale_replaced=stale_replaced,
+            stale_age_sec=stale_age_sec,
+        )
     ensure_storage()
     lock_file = os.path.join(DATA_DIR, f"{lk}.lock.json")
     try:
@@ -6240,9 +6253,25 @@ def acquire_lock(lock_key: str, owner: str, ttl_sec: int = 240) -> Dict[str, Any
                         holder=holder,
                         expires_epoch=held_until,
                     )
+                stale_replaced = bool(held_until > 0 and held_until <= now_epoch and holder and holder != owner)
+                stale_age_sec = int(max(0.0, now_epoch - held_until)) if stale_replaced else 0
+            else:
+                stale_replaced = False
+                stale_age_sec = 0
+        else:
+            stale_replaced = False
+            stale_age_sec = 0
         payload = {"owner": owner, "expires_epoch": expires_epoch, "updated_epoch": now_epoch}
         Path(lock_file).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        return _runtime_status(True, "ok_local", lock_key=lk, owner=owner, expires_epoch=expires_epoch)
+        return _runtime_status(
+            True,
+            "ok_local",
+            lock_key=lk,
+            owner=owner,
+            expires_epoch=expires_epoch,
+            stale_replaced=stale_replaced,
+            stale_age_sec=stale_age_sec,
+        )
     except Exception as e:
         return _runtime_status(False, "local_lock_write_exception", detail=f"{type(e).__name__}:{e}", lock_key=lk)
 
@@ -7534,6 +7563,27 @@ def build_notification_candidates(
     return mon, port
 
 
+def _compact_notification_diagnostics(stats: Dict[str, Any]) -> Dict[str, Any]:
+    blocked_map = stats.get("blocked_reasons") if isinstance(stats.get("blocked_reasons"), dict) else {}
+    blocked_sorted = sorted(
+        [
+            (str(k), int(parse_float(v, 0.0)))
+            for k, v in blocked_map.items()
+            if int(parse_float(v, 0.0)) > 0
+        ],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return {
+        "pre": int(parse_float(stats.get("candidates_total_pre_filter", 0), 0.0)),
+        "post": int(parse_float(stats.get("post_filter_candidates", 0), 0.0)),
+        "sent": int(parse_float(stats.get("sent", 0), 0.0)),
+        "send_fail": int(parse_float(stats.get("send_fail", 0), 0.0)),
+        "duplicate": int(parse_float(stats.get("duplicate", 0), 0.0)),
+        "top_blocked": [{k: v} for k, v in blocked_sorted[:3]],
+    }
+
+
 def run_auto_notifications(
     scan_state: Dict[str, Any],
     monitoring_rows: List[Dict[str, Any]],
@@ -7871,6 +7921,11 @@ def run_auto_notifications(
             block_reason = "no_actionable_event"
     if stats["send_fail"] > 0:
         error_reason = f"send_fail:{stats['send_fail']}"
+    diag = _compact_notification_diagnostics(stats)
+    diag_reason = (
+        f"pre={diag['pre']} post={diag['post']} sent={diag['sent']} "
+        f"fail={diag['send_fail']} dup={diag['duplicate']}"
+    )
 
     runtime_snapshot = get_worker_runtime_state()
     update_worker_runtime_state(
@@ -7884,9 +7939,12 @@ def run_auto_notifications(
             "last_error_reason": error_reason or runtime_snapshot.get("last_error_reason", ""),
             "last_empty_reason": empty_reason,
             "last_block_reason": block_reason,
+            "last_duplicate_reason": "duplicate_emission" if int(stats.get("duplicate", 0) or 0) > 0 else "",
+            "last_send_failure_reason": error_reason if error_reason else "",
             "last_candidate_path": str(cycle_context.get("candidate_path") or "baseline"),
             "last_cycle_status": cycle_status,
             "last_fallback_reason": str(cycle_context.get("fallback_reason") or ""),
+            "last_diag_summary": diag_reason,
             "last_notification_counters": {
                 "before_filter": int(stats.get("candidates_total_pre_filter", 0) or 0),
                 "after_filter": int(stats.get("post_filter_candidates", 0) or 0),
@@ -7907,6 +7965,7 @@ def run_auto_notifications(
                 for k, v in stats.get("blocked_reasons", {}).items()
                 if int(v or 0) > 0
             },
+            "last_notification_diag": diag,
         },
         increments={
             "notification_runs": 1,
@@ -8647,11 +8706,19 @@ def worker_runtime_defaults() -> Dict[str, Any]:
         "last_send_success_epoch": 0.0,
         "last_error_ts": "",
         "last_error_reason": "",
+        "last_send_failure_reason": "",
+        "last_duplicate_reason": "",
         "last_empty_reason": "",
         "last_block_reason": "",
         "last_candidate_path": "",
         "last_cycle_status": "",
         "last_fallback_reason": "",
+        "last_job_reason": "",
+        "last_lock_code": "",
+        "last_stale_lock_ts": "",
+        "last_stale_run_ts": "",
+        "last_diag_summary": "",
+        "last_notification_diag": {},
         "last_notification_counters": {},
         "last_notification_block_reasons": {},
         "heartbeat_interval_sec": 0,
@@ -11319,11 +11386,22 @@ def render_debug_panel():
             f"reason={runtime.get('last_error_reason') or '—'}"
         )
         st.caption(
+            f"send_failure_reason={runtime.get('last_send_failure_reason') or '—'} | "
+            f"duplicate_reason={runtime.get('last_duplicate_reason') or '—'} | "
+            f"job_reason={runtime.get('last_job_reason') or '—'} | "
+            f"lock_code={runtime.get('last_lock_code') or '—'}"
+        )
+        st.caption(
             f"last_empty_reason={runtime.get('last_empty_reason') or '—'} | "
             f"last_block_reason={runtime.get('last_block_reason') or '—'} | "
             f"path={runtime.get('last_candidate_path') or '—'} | "
             f"fallback={runtime.get('last_fallback_reason') or '—'} | "
             f"cycle_status={runtime.get('last_cycle_status') or '—'}"
+        )
+        st.caption(
+            f"stale_lock_ts={runtime.get('last_stale_lock_ts') or '—'} | "
+            f"stale_run_ts={runtime.get('last_stale_run_ts') or '—'} | "
+            f"diag={runtime.get('last_diag_summary') or '—'}"
         )
         counters = runtime.get("last_notification_counters") or {}
         if isinstance(counters, dict):
@@ -12011,6 +12089,12 @@ def main():
             f"Last cycle status: {runtime.get('last_cycle_status') or '—'} | "
             f"path={runtime.get('last_candidate_path') or '—'} | "
             f"fallback={runtime.get('last_fallback_reason') or '—'}"
+        )
+        st.caption(
+            f"Last job reason: {runtime.get('last_job_reason') or '—'} | "
+            f"lock_code={runtime.get('last_lock_code') or '—'} | "
+            f"stale_lock_ts={runtime.get('last_stale_lock_ts') or '—'} | "
+            f"stale_run_ts={runtime.get('last_stale_run_ts') or '—'}"
         )
         counters = runtime.get("last_notification_counters") or {}
         if isinstance(counters, dict):
