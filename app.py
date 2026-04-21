@@ -12229,6 +12229,9 @@ def main():
         if not isinstance(tg_state, dict):
             tg_state = {}
             st.warning("Telegram state data unavailable.")
+        # Backward-compatible alias for older debug snippets that may still
+        # reference `state` directly. Keep this local to the panel scope.
+        state = tg_state
         runtime_snapshot = scanner_state_load()
         if not isinstance(runtime_snapshot, dict):
             runtime_snapshot = {}
