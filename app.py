@@ -7279,11 +7279,14 @@ def format_digest_message(row: Dict[str, Any], source: str) -> str:
     chain = token_chain(row).upper() or "MULTI"
     addr = token_ca(row) or "n/a"
     score = parse_float(row.get("entry_score"), 0.0)
+    dex_url = dex_url_for_token(token_chain(row), token_ca(row))
+    dex_line = f"dex: {dex_url}\n" if dex_url else ""
     return (
         f"<b>DIGEST</b> | <b>{symbol}</b>\n"
         f"source: {str(source or 'monitoring').upper()}\n"
         f"chain: {chain}\n"
         f"score: <b>{score}</b>\n\n"
+        f"{dex_line}"
         f"CA:\n<code>{addr}</code>"
     )
 
@@ -7593,6 +7596,102 @@ def format_digest_summary_message(digest: Dict[str, Any], trigger_source: str = 
     )
 
 
+def _token_key_from_parts(chain: str, ca: str) -> str:
+    chain_norm = normalize_chain_name(chain)
+    ca_norm = addr_store(chain_norm, ca)
+    if not chain_norm or not ca_norm:
+        return ""
+    return f"{chain_norm}|{ca_norm}"
+
+
+def _build_token_state_sets(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+) -> Tuple[Set[str], Set[str]]:
+    monitoring_keys: Set[str] = set()
+    portfolio_keys: Set[str] = set()
+    for row in build_active_monitoring_rows(monitoring_rows):
+        key = _token_key_from_parts(token_chain(row), token_ca(row))
+        if key:
+            monitoring_keys.add(key)
+    for row in portfolio_rows:
+        if str(row.get("active", "1")).strip() != "1":
+            continue
+        key = _token_key_from_parts(token_chain(row), token_ca(row))
+        if key:
+            portfolio_keys.add(key)
+    return monitoring_keys, portfolio_keys
+
+
+def build_digest_token_blocks(
+    digest: Dict[str, Any],
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+    top_monitoring_limit: int = 3,
+    top_risk_limit: int = 3,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    source_snapshot = digest.get("digest_debug", {}) if isinstance(digest.get("digest_debug"), dict) else {}
+    source_mode = str(digest.get("digest_source_mode") or DIGEST_SOURCE_MODE_DEFAULT)
+    allowed_keys = set(source_snapshot.get("ui_source_keys", []) or []) if source_mode == "ui_truth" else set(source_snapshot.get("digest_source_keys", []) or [])
+
+    mon_candidates, _ = build_notification_candidates(
+        monitoring_rows,
+        portfolio_rows,
+        limit_monitoring=max(5, int(top_monitoring_limit or 3)),
+        limit_portfolio=5,
+    )
+    portfolio_sorted = sorted(
+        [r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"],
+        key=lambda r: (
+            _risk_priority_value(r),
+            parse_float(r.get("entry_score", 0), 0.0),
+        ),
+        reverse=True,
+    )
+
+    monitoring_state_keys, portfolio_state_keys = _build_token_state_sets(monitoring_rows, portfolio_rows)
+    blocks: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    skipped_missing_identity = 0
+    skipped_not_allowed = 0
+
+    def append_block(row: Dict[str, Any], source: str) -> None:
+        nonlocal skipped_missing_identity, skipped_not_allowed
+        chain = normalize_chain_name(token_chain(row))
+        ca = addr_store(chain, token_ca(row))
+        if not chain or not ca:
+            skipped_missing_identity += 1
+            return
+        token_key = f"{chain}|{ca}"
+        if allowed_keys and token_key not in allowed_keys:
+            skipped_not_allowed += 1
+            return
+        if token_key in seen:
+            return
+        seen.add(token_key)
+
+        row_norm = dict(row)
+        row_norm["chain"] = chain
+        row_norm["base_addr"] = ca
+        row_norm["ca"] = ca
+        row_norm["in_portfolio"] = "1" if token_key in portfolio_state_keys else "0"
+        row_norm["in_monitoring"] = "1" if token_key in monitoring_state_keys else "0"
+        row_norm["digest_source"] = source
+        blocks.append(row_norm)
+
+    for row in mon_candidates[: max(1, int(top_monitoring_limit or 3))]:
+        append_block(row, "monitoring")
+    for row in portfolio_sorted[: max(1, int(top_risk_limit or 3))]:
+        append_block(row, "portfolio")
+
+    stats = {
+        "token_blocks": len(blocks),
+        "skipped_missing_identity": skipped_missing_identity,
+        "skipped_not_allowed": skipped_not_allowed,
+    }
+    return blocks, stats
+
+
 def build_digest_emission_key(cooldown_seconds: int, now_ts: Optional[float] = None) -> str:
     ts = float(now_ts if now_ts is not None else time.time())
     bucket = emission_cooldown_bucket(ts, cooldown_seconds)
@@ -7624,6 +7723,8 @@ def trigger_digest_notification(
     force: bool = False,
 ) -> Dict[str, Any]:
     state = load_tg_state()
+    monitoring_rows = load_monitoring()
+    portfolio_rows = load_portfolio()
     now_ts = time.time()
     emission_key = build_digest_emission_key(cooldown_seconds=cooldown_seconds, now_ts=now_ts)
 
@@ -7640,9 +7741,27 @@ def trigger_digest_notification(
             "event_type": resolve_event_type("DIGEST"),
         }
 
-    digest = build_digest_summary(load_monitoring(), load_portfolio())
+    digest = build_digest_summary(monitoring_rows, portfolio_rows)
     text = format_digest_summary_message(digest, trigger_source=trigger_source)
-    ok = send_telegram(text, parse_mode="HTML")
+    summary_ok = send_telegram(text, parse_mode="HTML")
+    token_blocks, block_stats = build_digest_token_blocks(
+        digest=digest,
+        monitoring_rows=monitoring_rows,
+        portfolio_rows=portfolio_rows,
+    )
+    block_sent = 0
+    for row in token_blocks:
+        msg = format_digest_message(row, source=str(row.get("digest_source") or "monitoring"))
+        if send_telegram(msg, parse_mode="HTML", reply_markup=tg_buttons(row)):
+            block_sent += 1
+    ok = bool(summary_ok and (block_sent == len(token_blocks)))
+    digest["delivery_debug"] = {
+        **block_stats,
+        "summary_sent": bool(summary_ok),
+        "token_blocks_sent": int(block_sent),
+        "chunk_messages": int(block_sent),
+    }
+    update_worker_runtime_state(updates={"last_digest_delivery_debug": digest.get("delivery_debug", {})})
     if ok:
         mark_digest_emission_sent(state, emission_key=emission_key, now_ts=now_ts)
         state["last_digest_sent_at"] = now_utc_str()
@@ -7694,22 +7813,25 @@ def format_signal_message(
 
 
 def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
-    chain = token_chain(row)
-    ca = token_ca(row)
+    chain = normalize_chain_name(token_chain(row))
+    ca = addr_store(chain, token_ca(row))
     dex_url = dex_url_for_token(chain, ca)
 
     if not chain or not ca:
         return {"inline_keyboard": []}
 
-    buttons = [
-        [
-            {"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"},
-            {"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"},
-        ],
-        [
-            {"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}
-        ],
-    ]
+    in_portfolio = str(row.get("in_portfolio", "0")).strip() == "1"
+    in_monitoring = str(row.get("in_monitoring", "0")).strip() == "1"
+    action_row: List[Dict[str, str]] = []
+    if not in_portfolio:
+        action_row.append({"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"})
+    if not in_monitoring:
+        action_row.append({"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"})
+
+    buttons: List[List[Dict[str, str]]] = []
+    if action_row:
+        buttons.append(action_row)
+    buttons.append([{"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}])
 
     if dex_url:
         buttons.append([
