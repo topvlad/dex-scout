@@ -12225,6 +12225,29 @@ def main():
                 st.success("TG SENT")
             else:
                 st.error("TG FAILED")
+        tg_state = load_tg_state()
+        if not isinstance(tg_state, dict):
+            tg_state = {}
+            st.warning("Telegram state data unavailable.")
+        runtime_snapshot = scanner_state_load()
+        if not isinstance(runtime_snapshot, dict):
+            runtime_snapshot = {}
+            st.caption("Runtime state data unavailable.")
+        runtime_debug = get_worker_runtime_state(state=runtime_snapshot)
+        delivery_debug = runtime_debug.get("last_digest_delivery_debug")
+        if isinstance(delivery_debug, dict) and delivery_debug:
+            st.caption(
+                f"Digest delivery: ok={delivery_debug.get('ok', '—')} | "
+                f"trigger={delivery_debug.get('trigger_source', '—')} | "
+                f"chunks={delivery_debug.get('chunks_sent', '—')}"
+            )
+        else:
+            st.caption("Digest delivery debug data unavailable.")
+        last_digest_sent = str(tg_state.get("last_digest_sent_at") or "")
+        if last_digest_sent:
+            st.caption(f"Last digest sent at: {last_digest_sent}")
+        else:
+            st.caption("Last digest sent at: data unavailable.")
 
     if st.session_state.get("_rerun_flag"):
         st.session_state["_rerun_flag"] = False
@@ -12239,7 +12262,9 @@ def main():
     portfolio_rows = load_csv(PORTFOLIO_CSV, PORTFOLIO_FIELDS)
     monitoring_rows = load_csv(MONITORING_CSV, MON_FIELDS)
     monitoring_history_rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
-    scan_state = scanner_state_load()
+    scan_state = scanner_state_load() or {}
+    if not isinstance(scan_state, dict):
+        scan_state = {}
     active_monitoring_rows = build_active_monitoring_rows(monitoring_rows)
     active_portfolio_rows = [
         row
@@ -12346,7 +12371,7 @@ def main():
             request_rerun()
         st.markdown("### Background runtime")
         st.caption("Alerts/notifications are emitted by scanner_worker.py (background service), not by this UI tab.")
-        runtime = get_worker_runtime_state(state=state)
+        runtime = get_worker_runtime_state(state=scan_state)
         liveness = runtime_liveness(runtime)
         st.caption(
             f"Worker status: {runtime.get('worker_status') or 'unknown'} | "
