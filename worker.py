@@ -13,6 +13,7 @@ SCANNER_MAX_ITEMS = int(os.getenv("SCANNER_MAX_ITEMS", "10"))
 USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
 BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "10"))
 JOB_LOCK_TTL_SEC = max(60, int(os.getenv("JOB_LOCK_TTL_SEC", "900")))
+JOB_STALE_RUN_SEC = max(JOB_LOCK_TTL_SEC, int(os.getenv("JOB_STALE_RUN_SEC", str(JOB_LOCK_TTL_SEC * 2))))
 
 
 def _run_scan_cycle() -> Dict[str, Any]:
@@ -96,8 +97,64 @@ def run_job_mode(job_mode: str) -> int:
         return 2
 
     owner = f"{socket.gethostname()}:{os.getpid()}"
+    runtime = app.get_worker_runtime_state()
+    prev_status = str(runtime.get("last_job_status") or "").strip().lower()
+    prev_mode = str(runtime.get("last_job_mode") or "").strip().lower()
+    prev_started_epoch = float(app.parse_float(runtime.get("last_job_started_epoch", 0.0), 0.0))
+    age_sec = max(0.0, time.time() - prev_started_epoch) if prev_started_epoch > 0 else 0.0
+    stale_run = bool(prev_status == "running" and prev_mode == mode and age_sec >= JOB_STALE_RUN_SEC)
+    if prev_status == "running" and prev_mode == mode and age_sec < JOB_STALE_RUN_SEC:
+        reason = f"duplicate_run_guard:mode={mode}:age_sec={int(age_sec)}"
+        app.update_worker_runtime_state(
+            updates={
+                "worker_status": "job_skipped_duplicate_run",
+                "last_error_ts": app.now_utc_str(),
+                "last_error_reason": reason,
+                "last_job_mode": mode,
+                "last_job_status": "skipped_duplicate_run",
+                "last_job_reason": reason,
+                "last_lock_code": "duplicate_run_guard",
+            }
+        )
+        app.update_job_heartbeat(
+            job_name="job_dispatch",
+            job_mode=mode,
+            status="duplicate_run",
+            meta={"reason": reason, "age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
+        )
+        print(f"[worker] duplicate run blocked mode={mode} age_sec={int(age_sec)}", flush=True)
+        return 3
+    if stale_run:
+        app.update_worker_runtime_state(
+            updates={
+                "last_stale_run_ts": app.now_utc_str(),
+                "last_job_reason": f"stale_run_detected:mode={mode}:age_sec={int(age_sec)}",
+            }
+        )
+        app.update_job_heartbeat(
+            job_name="job_dispatch",
+            job_mode=mode,
+            status="stale_run_detected",
+            meta={"age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
+        )
+
     lock_key = f"job_mode:{mode}"
     lock_status = app.acquire_lock(lock_key=lock_key, owner=owner, ttl_sec=JOB_LOCK_TTL_SEC)
+    if lock_status.get("ok") and bool(lock_status.get("stale_replaced")):
+        app.update_worker_runtime_state(
+            updates={
+                "last_stale_lock_ts": app.now_utc_str(),
+                "last_job_reason": (
+                    f"stale_lock_replaced:{lock_key}:age_sec={int(app.parse_float(lock_status.get('stale_age_sec'), 0.0))}"
+                ),
+            }
+        )
+        app.update_job_heartbeat(
+            job_name="job_dispatch",
+            job_mode=mode,
+            status="stale_lock_replaced",
+            meta={"lock_key": lock_key, "lock_status": lock_status},
+        )
     if not lock_status.get("ok"):
         code = str(lock_status.get("code") or "lock_failed")
         reason = f"{code}:{lock_status.get('detail') or lock_status.get('message') or ''}".strip(":")
@@ -108,6 +165,8 @@ def run_job_mode(job_mode: str) -> int:
                 "last_error_reason": reason,
                 "last_job_mode": mode,
                 "last_job_status": "skipped_locked",
+                "last_job_reason": reason,
+                "last_lock_code": code,
             }
         )
         app.update_job_heartbeat(
@@ -128,6 +187,8 @@ def run_job_mode(job_mode: str) -> int:
             "worker_role": "job_dispatch",
             "last_job_mode": mode,
             "last_job_status": "running",
+            "last_job_reason": "",
+            "last_lock_code": "",
             "last_job_started_ts": start_ts,
             "last_job_started_epoch": start_epoch,
             "last_error_reason": "",
@@ -149,6 +210,7 @@ def run_job_mode(job_mode: str) -> int:
                 "worker_status": "job_finished",
                 "last_job_mode": mode,
                 "last_job_status": "finished",
+                "last_job_reason": "ok",
                 "last_job_finished_ts": app.now_utc_str(),
                 "last_job_finished_epoch": end_epoch,
                 "last_job_duration_sec": duration_sec,
@@ -171,6 +233,7 @@ def run_job_mode(job_mode: str) -> int:
                 "last_error_reason": reason,
                 "last_job_mode": mode,
                 "last_job_status": "failed",
+                "last_job_reason": reason,
                 "last_job_finished_ts": app.now_utc_str(),
             }
         )
