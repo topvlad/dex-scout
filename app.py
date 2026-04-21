@@ -7157,40 +7157,6 @@ def run_auto_notifications(
     alert_mode = get_alert_mode(state)
 
     cooldown_seconds = 900 if WORKER_FAST_MODE else 1800
-    if not tg_cooldown_ok(state, seconds=cooldown_seconds):
-        block_reason = f"cooldown_active:{cooldown_seconds}s"
-        update_worker_runtime_state(
-            updates={
-                "last_notifications_ts": now_utc_str(),
-                "last_notifications_epoch": now_ts,
-                "last_notification_trigger_model": trigger_model,
-                "last_block_reason": block_reason,
-                "last_candidate_path": str(cycle_context.get("candidate_path") or "baseline"),
-                "last_cycle_status": "blocked",
-                "last_fallback_reason": str(cycle_context.get("fallback_reason") or ""),
-                "last_notification_counters": {
-                    "before_filter": 0,
-                    "after_filter": 0,
-                    "sent": 0,
-                    "blocked": 1,
-                    "send_fail": 0,
-                },
-                "last_notification_block_reasons": {"cooldown": 1},
-            },
-            increments={
-                "notification_runs": 1,
-                "notification_blocked_cycles": 1,
-                "notification_runs_background": 1 if trigger_model == "background_worker" else 0,
-                "notification_runs_ui": 1 if trigger_model.startswith("ui_") else 0,
-                "notification_runs_manual": 1 if trigger_model.startswith("manual") else 0,
-            },
-        )
-        print(
-            f"[TG] cooldown active -> skip cooldown_seconds={cooldown_seconds} "
-            f"mode={alert_mode}",
-            flush=True,
-        )
-        return {"status": "blocked", "block_reason": block_reason, "stats": {"sent": 0}}
 
     prev_token_state = state.get("token_state", {})
     if not isinstance(prev_token_state, dict):
@@ -7214,6 +7180,41 @@ def run_auto_notifications(
         candidates.append((parse_float(row.get("entry_score", 0), 0.0), "portfolio", row))
 
     candidates.sort(key=lambda x: x[0], reverse=True)
+    if candidates and not tg_cooldown_ok(state, seconds=cooldown_seconds):
+        block_reason = f"cooldown_active:{cooldown_seconds}s"
+        update_worker_runtime_state(
+            updates={
+                "last_notifications_ts": now_utc_str(),
+                "last_notifications_epoch": now_ts,
+                "last_notification_trigger_model": trigger_model,
+                "last_block_reason": block_reason,
+                "last_candidate_path": str(cycle_context.get("candidate_path") or "baseline"),
+                "last_cycle_status": "blocked",
+                "last_fallback_reason": str(cycle_context.get("fallback_reason") or ""),
+                "last_notification_counters": {
+                    "before_filter": len(candidates),
+                    "after_filter": 0,
+                    "sent": 0,
+                    "blocked": 1,
+                    "send_fail": 0,
+                },
+                "last_notification_block_reasons": {"cooldown": 1},
+            },
+            increments={
+                "notification_runs": 1,
+                "notification_blocked_cycles": 1,
+                "notification_runs_background": 1 if trigger_model == "background_worker" else 0,
+                "notification_runs_ui": 1 if trigger_model.startswith("ui_") else 0,
+                "notification_runs_manual": 1 if trigger_model.startswith("manual") else 0,
+            },
+        )
+        print(
+            f"[TG] cooldown active -> skip cooldown_seconds={cooldown_seconds} "
+            f"mode={alert_mode} before_filter={len(candidates)}",
+            flush=True,
+        )
+        return {"status": "blocked", "block_reason": block_reason, "stats": {"sent": 0}}
+
 
     stats = {
         "candidates_total_pre_filter": len(candidates),
