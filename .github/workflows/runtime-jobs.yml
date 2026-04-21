@@ -88,8 +88,87 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Runtime preflight
+        shell: bash
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+
+          echo "[runtime-jobs][preflight] mode=${JOB_MODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "[runtime-jobs][preflight] env JOB_MODE_set=$([[ -n "${JOB_MODE:-}" ]] && echo true || echo false)"
+          echo "[runtime-jobs][preflight] env SUPABASE_URL_set=$([[ -n "${SUPABASE_URL:-}" ]] && echo true || echo false)"
+          echo "[runtime-jobs][preflight] env SUPABASE_SERVICE_ROLE_KEY_set=$([[ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]] && echo true || echo false)"
+          echo "[runtime-jobs][preflight] env TG_BOT_TOKEN_set=$([[ -n "${TG_BOT_TOKEN:-}" ]] && echo true || echo false)"
+          echo "[runtime-jobs][preflight] env TG_CHAT_ID_set=$([[ -n "${TG_CHAT_ID:-}" ]] && echo true || echo false)"
+
+          python -m py_compile worker.py app.py
+
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          print("[runtime-jobs][preflight] import_app:start", flush=True)
+          try:
+              import app
+          except Exception as e:
+              print(f"::error::[runtime-jobs][preflight] import_error:{type(e).__name__}:{e}", flush=True)
+              sys.exit(11)
+          print("[runtime-jobs][preflight] import_app:ok", flush=True)
+
+          required_env = [
+              "JOB_MODE",
+              "SUPABASE_URL",
+              "SUPABASE_SERVICE_ROLE_KEY",
+              "TG_BOT_TOKEN",
+              "TG_CHAT_ID",
+          ]
+          missing_env = [k for k in required_env if not str(os.getenv(k, "")).strip()]
+          if missing_env:
+              print(f"::error::[runtime-jobs][preflight] missing_env:{','.join(missing_env)}", flush=True)
+              sys.exit(12)
+
+          try:
+              contract = app.check_runtime_contract()
+          except Exception as e:
+              print(f"::error::[runtime-jobs][preflight] runtime_contract_error:{type(e).__name__}:{e}", flush=True)
+              sys.exit(13)
+
+          failures = contract.get("failures")
+          failure_tables = []
+          if isinstance(failures, list):
+              for item in failures:
+                  if isinstance(item, dict):
+                      table = str(item.get("table") or "").strip()
+                      if table:
+                          failure_tables.append(table)
+          expected_entities = ["runtime_state", "locks", "tg_state", "job_heartbeats", "job_runs"]
+          missing_entities = [name for name in expected_entities if name in set(failure_tables)]
+          safe_contract = {
+              "ok": bool(contract.get("ok")),
+              "code": str(contract.get("code") or ""),
+              "detail": str(contract.get("detail") or contract.get("message") or ""),
+              "missing_entities": missing_entities,
+              "failures": failures if isinstance(failures, (list, dict, str)) else str(failures or ""),
+          }
+          print("[runtime-jobs][preflight] runtime_contract=" + json.dumps(safe_contract, ensure_ascii=False), flush=True)
+
+          if not contract.get("ok"):
+              print(
+                  "::error::[runtime-jobs][preflight] runtime_contract_error:"
+                  + str(contract.get("code") or "unknown")
+                  + ":"
+                  + ",".join(missing_entities or ["unknown"]),
+                  flush=True,
+              )
+              sys.exit(14)
+
+          print("[runtime-jobs][preflight] ok", flush=True)
+          PY
+
       - name: Runtime start/heartbeat/finish/fail logs
         shell: bash
+        continue-on-error: false
         run: |
           set -euo pipefail
 

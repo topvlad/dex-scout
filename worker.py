@@ -2,13 +2,51 @@ import os
 import socket
 import time
 import traceback
-from typing import Any, Callable, Dict
+from importlib import import_module
+from typing import Any, Callable, Dict, Optional
 
 os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
 
-import app
+REQUIRED_ENV_VARS = (
+    "JOB_MODE",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "TG_BOT_TOKEN",
+    "TG_CHAT_ID",
+)
 
-SCANNER_SEEDS = os.getenv("SCANNER_SEEDS", str(app.DEFAULT_SEEDS))
+RUNTIME_REQUIRED_ENTITIES = (
+    "runtime_state",
+    "locks",
+    "tg_state",
+    "job_heartbeats",
+)
+RUNTIME_OPTIONAL_ENTITIES = ("job_runs",)
+
+
+def _fail_fast(reason: str, exit_code: int) -> int:
+    print(f"[worker] fail-fast: {reason}", flush=True)
+    return int(exit_code)
+
+
+def _load_app():
+    try:
+        return import_module("app")
+    except Exception as exc:
+        raise RuntimeError(f"import_error:{type(exc).__name__}:{exc}") from exc
+
+
+def _missing_required_env() -> list[str]:
+    missing = []
+    for key in REQUIRED_ENV_VARS:
+        if not str(os.getenv(key, "")).strip():
+            missing.append(key)
+    return missing
+
+
+app: Optional[Any] = None
+
+SCANNER_SEEDS = os.getenv("SCANNER_SEEDS", "")
 SCANNER_MAX_ITEMS = int(os.getenv("SCANNER_MAX_ITEMS", "10"))
 USE_BIRDEYE_TRENDING = os.getenv("USE_BIRDEYE_TRENDING", "1") != "0"
 BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "10"))
@@ -17,8 +55,10 @@ JOB_STALE_RUN_SEC = max(JOB_LOCK_TTL_SEC, int(os.getenv("JOB_STALE_RUN_SEC", str
 
 
 def _run_scan_cycle() -> Dict[str, Any]:
+    assert app is not None
+    seeds_raw = SCANNER_SEEDS or str(app.DEFAULT_SEEDS)
     return app.maybe_run_rotating_scanner(
-        seeds_raw=SCANNER_SEEDS,
+        seeds_raw=seeds_raw,
         max_items=SCANNER_MAX_ITEMS,
         use_birdeye_trending=USE_BIRDEYE_TRENDING,
         birdeye_limit=BIRDEYE_LIMIT,
@@ -26,6 +66,7 @@ def _run_scan_cycle() -> Dict[str, Any]:
 
 
 def _run_monitor_cycle() -> Dict[str, Any]:
+    assert app is not None
     monitoring_rows = app.load_monitoring()
     portfolio_rows = [
         r for r in app.load_portfolio()
@@ -39,6 +80,7 @@ def _run_monitor_cycle() -> Dict[str, Any]:
 
 
 def _run_notify_cycle() -> Dict[str, Any]:
+    assert app is not None
     monitoring_rows = app.load_monitoring()
     portfolio_rows = app.load_portfolio()
     active_monitoring_rows = app.build_active_monitoring_rows(monitoring_rows)
@@ -57,10 +99,12 @@ def _run_notify_cycle() -> Dict[str, Any]:
 
 
 def _run_digest_cycle() -> Dict[str, Any]:
+    assert app is not None
     return app.trigger_digest_notification(trigger_source="job_digest_cycle")
 
 
 def _run_outcome_cycle() -> Dict[str, Any]:
+    assert app is not None
     return app.evaluate_outcome_journals()
 
 
@@ -74,6 +118,7 @@ JOB_DISPATCH: Dict[str, Callable[[], Dict[str, Any]]] = {
 
 
 def run_job_mode(job_mode: str) -> int:
+    assert app is not None
     mode = str(job_mode or "").strip().lower()
     runner = JOB_DISPATCH.get(mode)
     if runner is None:
@@ -251,10 +296,35 @@ def run_job_mode(job_mode: str) -> int:
 
 
 def main() -> int:
+    global app
+    app = _load_app()
+
+    missing_env = _missing_required_env()
+    if missing_env:
+        return _fail_fast(f"missing_env:{','.join(missing_env)}", 12)
+
     app.ensure_storage()
     contract = app.check_runtime_contract()
     if not contract.get("ok"):
-        reason = f"runtime_contract_error:{contract.get('code')}"
+        failures = contract.get("failures")
+        failure_tables = set()
+        if isinstance(failures, list):
+            for failure in failures:
+                if isinstance(failure, dict):
+                    failure_tables.add(str(failure.get("table") or "").strip())
+        required_entities = set(RUNTIME_REQUIRED_ENTITIES)
+        missing_entities = sorted(entity for entity in required_entities if entity in failure_tables)
+        missing_entities.extend(
+            sorted(
+                entity for entity in failure_tables
+                if entity and entity not in required_entities and entity not in RUNTIME_OPTIONAL_ENTITIES
+            )
+        )
+        optional_missing = sorted(entity for entity in RUNTIME_OPTIONAL_ENTITIES if entity in failure_tables)
+        if optional_missing:
+            missing_entities.extend(optional_missing)
+        entities_detail = ",".join(missing_entities) or "unknown"
+        reason = f"runtime_contract_error:{contract.get('code')}:{entities_detail}"
         app.update_worker_runtime_state(
             updates={
                 "worker_status": "runtime_contract_error",
@@ -270,14 +340,20 @@ def main() -> int:
         )
         print(
             "[worker] runtime contract missing; refusing to start "
-            f"code={contract.get('code')} detail={contract.get('failures')}",
+            f"code={contract.get('code')} missing_entities={missing_entities} detail={contract.get('failures')}",
             flush=True,
         )
-        return 1
+        return 14
 
     job_mode = os.getenv("JOB_MODE", "").strip().lower()
     return run_job_mode(job_mode=job_mode)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        msg = str(exc)
+        if msg.startswith("import_error:"):
+            raise SystemExit(_fail_fast(msg, 11))
+        raise
