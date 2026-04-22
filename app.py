@@ -10605,41 +10605,76 @@ def _pulse_card_summary_line(best: Optional[Dict[str, Any]], row: Dict[str, Any]
     )
 
 
-def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Optional[Dict[str, Any]]:
+def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict[str, Any]:
     chain = token_chain(row)
     base_addr = token_ca(row)
+    empty_payload = {
+        "series": "score",
+        "values": [],
+        "points": 0,
+        "reason": "no_history",
+        "source": "token_history",
+    }
     if not chain or not base_addr:
-        return {
-            "series": "score",
-            "values": [],
-            "source": "token_unresolved",
-            "reason": "sparkline unavailable",
-        }
+        return empty_payload
 
     hist = token_history_rows(chain, base_addr, limit=40)
     if not hist:
-        return {
-            "series": "score",
-            "values": [],
-            "source": "history_empty",
-            "reason": "no history yet",
-        }
+        return empty_payload
 
     series = build_history_series(hist)
-    score_values = [x for x in (series.get("score") or series.get("entry_score") or []) if x > 0]
-    if len(score_values) >= min_points:
-        return {"series": "score", "values": score_values[-24:], "source": "history_score"}
 
-    price_values = [x for x in (series.get("price") or []) if x > 0]
-    if len(price_values) >= min_points:
-        return {"series": "price", "values": price_values[-24:], "source": "history_price"}
+    def _series_values(raw_values: Any) -> List[float]:
+        return [parse_float(v, 0.0) for v in list(raw_values or []) if parse_float(v, 0.0) > 0]
 
-    fallback_values = score_values or price_values
+    fallback_chain: List[Tuple[str, List[float], str]] = [
+        ("score", _series_values(series.get("score")), "history_series.score"),
+        ("entry_score", _series_values(series.get("entry_score")), "history_series.entry_score"),
+        ("price", _series_values(series.get("price")), "history_series.price"),
+        (
+            "last_score",
+            _series_values([h.get("last_score") for h in hist if str(h.get("last_score", "")).strip()]),
+            "history_raw.last_score",
+        ),
+        (
+            "price_usd",
+            _series_values([h.get("price_usd") for h in hist if str(h.get("price_usd", "")).strip()]),
+            "history_raw.price_usd",
+        ),
+    ]
+
+    best_partial: Optional[Tuple[str, List[float], str]] = None
+    for series_name, values, source in fallback_chain:
+        points = len(values)
+        if points >= min_points:
+            trimmed = values[-24:]
+            return {
+                "series": series_name,
+                "values": trimmed,
+                "points": len(trimmed),
+                "reason": "",
+                "source": source,
+            }
+        if points > 0 and best_partial is None:
+            best_partial = (series_name, values, source)
+
+    if best_partial:
+        series_name, values, source = best_partial
+        trimmed = values[-24:]
+        return {
+            "series": series_name,
+            "values": trimmed,
+            "points": len(trimmed),
+            "reason": "not_enough_points",
+            "source": source,
+        }
+
     return {
-        "series": "score" if score_values else "price",
-        "values": fallback_values[-24:],
-        "source": "history_insufficient",
-        "reason": "sparkline unavailable",
+        "series": "score",
+        "values": [],
+        "points": 0,
+        "reason": "no_score_or_price_series",
+        "source": "token_history",
     }
 
 
@@ -11349,8 +11384,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 st.line_chart(pd.DataFrame({"value": spark_values}), height=80, use_container_width=True)
             else:
                 fallback_reason = str(mini_sparkline.get("reason") or "").strip().lower() if mini_sparkline else ""
-                if fallback_reason not in {"sparkline unavailable", "no history yet"}:
-                    fallback_reason = "sparkline unavailable"
+                if not fallback_reason:
+                    fallback_reason = "no_score_or_price_series"
                 st.caption(fallback_reason)
             st.caption(f"sparkline source: {spark_source}")
             st.caption(f"points: {spark_points}")
