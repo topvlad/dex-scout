@@ -10585,18 +10585,22 @@ def _pulse_status_marker(row: Dict[str, Any]) -> str:
     return "speculative"
 
 
-def _pulse_card_metrics_line(best: Optional[Dict[str, Any]], row: Dict[str, Any]) -> str:
+def _pulse_card_summary_line(best: Optional[Dict[str, Any]], row: Dict[str, Any]) -> str:
+    """Compact one-line snapshot for pulse cards (important metrics only)."""
     if not best:
         liq = parse_float(row.get("liq_init"), 0.0)
         vol24 = parse_float(row.get("vol24_init"), 0.0)
-        return f"metrics: liq {fmt_usd(liq)} • vol24 {fmt_usd(vol24)} • live pair pending"
+        score = parse_float(row.get("entry_score", row.get("score", 0.0)), 0.0)
+        return f"snapshot: score {score:.1f} • liq {fmt_usd(liq)} • vol24 {fmt_usd(vol24)} • live pair pending"
+
     liq = parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0)
     vol24 = parse_float(safe_get(best, "volume", "h24", default=0), 0.0)
     chg_h1 = parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0)
     buys = int(safe_get(best, "txns", "m5", "buys", default=0) or 0)
     sells = int(safe_get(best, "txns", "m5", "sells", default=0) or 0)
+    score = parse_float(row.get("entry_score", row.get("score", 0.0)), 0.0)
     return (
-        f"metrics: liq {fmt_usd(liq)} • vol24 {fmt_usd(vol24)} • "
+        f"snapshot: score {score:.1f} • liq {fmt_usd(liq)} • vol24 {fmt_usd(vol24)} • "
         f"Δ1h {chg_h1:+.1f}% • m5 txns {buys + sells}"
     )
 
@@ -10701,7 +10705,7 @@ def build_market_pulse_cards(
                 "freshness_min": round(freshness_min, 1),
                 "pulse_sort": round(pulse_sort, 3),
                 "best": best,
-                "metrics_line": _pulse_card_metrics_line(best, row),
+                "summary_line": _pulse_card_summary_line(best, row),
             }
         )
     pulse_cards.sort(
@@ -11293,7 +11297,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             with dynamics_tab:
                 render_monitoring_sparklines(hist)
 
-    st.subheader("Market pulse")
+    st.subheader("Live pulse candidates")
     st.caption("Live candidates behind glass (read-only layer). Confirmed Monitoring below remains the settled active layer.")
     if not pulse_cards:
         st.caption("No pulse candidates right now.")
@@ -11318,7 +11322,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         header = f"{symbol} • {chain.upper()} • score {score:.1f}"
         with st.expander(header, expanded=False):
             st.caption(f"timing: {timing} • stage: {stage} • status: {status_marker} • freshness: {freshness_min:.1f}m")
-            st.caption(str(pulse.get("metrics_line") or "metrics: n/a"))
+            st.caption(str(pulse.get("summary_line") or "snapshot: n/a"))
             mini_sparkline = pulse.get("mini_sparkline") if isinstance(pulse.get("mini_sparkline"), dict) else None
             spark_values = list(mini_sparkline.get("values", [])) if mini_sparkline else []
             if len(spark_values) >= 3:
