@@ -10605,6 +10605,12 @@ def _pulse_card_summary_line(best: Optional[Dict[str, Any]], row: Dict[str, Any]
     )
 
 
+def _log_pulse_sparkline_missing(reason: str) -> None:
+    normalized = str(reason or "").strip().lower()
+    if normalized in {"no_history", "not_enough_points", "no_score_or_price_series"}:
+        debug_log(f"pulse_sparkline_missing reason={normalized}")
+
+
 def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict[str, Any]:
     chain = token_chain(row)
     base_addr = token_ca(row)
@@ -10616,10 +10622,12 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict
         "source": "token_history",
     }
     if not chain or not base_addr:
+        _log_pulse_sparkline_missing("no_history")
         return empty_payload
 
     hist = token_history_rows(chain, base_addr, limit=40)
     if not hist:
+        _log_pulse_sparkline_missing("no_history")
         return empty_payload
 
     series = build_history_series(hist)
@@ -10661,6 +10669,7 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict
     if best_partial:
         series_name, values, source = best_partial
         trimmed = values[-24:]
+        _log_pulse_sparkline_missing("not_enough_points")
         return {
             "series": series_name,
             "values": trimmed,
@@ -10669,6 +10678,7 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict
             "source": source,
         }
 
+    _log_pulse_sparkline_missing("no_score_or_price_series")
     return {
         "series": "score",
         "values": [],
@@ -11386,6 +11396,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 fallback_reason = str(mini_sparkline.get("reason") or "").strip().lower() if mini_sparkline else ""
                 if not fallback_reason:
                     fallback_reason = "no_score_or_price_series"
+                _log_pulse_sparkline_missing(fallback_reason)
                 st.caption(fallback_reason)
             st.caption(f"sparkline source: {spark_source}")
             st.caption(f"points: {spark_points}")
