@@ -10589,16 +10589,38 @@ def _pulse_card_metrics_line(best: Optional[Dict[str, Any]], row: Dict[str, Any]
     if not best:
         liq = parse_float(row.get("liq_init"), 0.0)
         vol24 = parse_float(row.get("vol24_init"), 0.0)
-        return f"skyline: liq {fmt_usd(liq)} • vol24 {fmt_usd(vol24)} • live pair pending"
+        return f"metrics: liq {fmt_usd(liq)} • vol24 {fmt_usd(vol24)} • live pair pending"
     liq = parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0)
     vol24 = parse_float(safe_get(best, "volume", "h24", default=0), 0.0)
     chg_h1 = parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0)
     buys = int(safe_get(best, "txns", "m5", "buys", default=0) or 0)
     sells = int(safe_get(best, "txns", "m5", "sells", default=0) or 0)
     return (
-        f"skyline: liq {fmt_usd(liq)} • vol24 {fmt_usd(vol24)} • "
+        f"metrics: liq {fmt_usd(liq)} • vol24 {fmt_usd(vol24)} • "
         f"Δ1h {chg_h1:+.1f}% • m5 txns {buys + sells}"
     )
+
+
+def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Optional[Dict[str, Any]]:
+    chain = token_chain(row)
+    base_addr = token_ca(row)
+    if not chain or not base_addr:
+        return None
+
+    hist = token_history_rows(chain, base_addr, limit=40)
+    if not hist:
+        return None
+
+    series = build_history_series(hist)
+    score_values = [x for x in (series.get("score") or series.get("entry_score") or []) if x > 0]
+    if len(score_values) >= min_points:
+        return {"series": "score", "values": score_values[-24:]}
+
+    price_values = [x for x in (series.get("price") or []) if x > 0]
+    if len(price_values) >= min_points:
+        return {"series": "price", "values": price_values[-24:]}
+
+    return None
 
 
 def _pulse_pair_payload(row: Dict[str, Any], best: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -10690,7 +10712,11 @@ def build_market_pulse_cards(
         ),
         reverse=True,
     )
-    return pulse_cards[: max(1, int(limit or 8))]
+    selected_cards = pulse_cards[: max(1, int(limit or 8))]
+    for card in selected_cards:
+        row = card.get("row", {}) or {}
+        card["mini_sparkline"] = _pulse_card_mini_sparkline(row)
+    return selected_cards
 
 
 # =============================
@@ -11292,7 +11318,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         header = f"{symbol} • {chain.upper()} • score {score:.1f}"
         with st.expander(header, expanded=False):
             st.caption(f"timing: {timing} • stage: {stage} • status: {status_marker} • freshness: {freshness_min:.1f}m")
-            st.caption(str(pulse.get("metrics_line") or "skyline: n/a"))
+            st.caption(str(pulse.get("metrics_line") or "metrics: n/a"))
+            mini_sparkline = pulse.get("mini_sparkline") if isinstance(pulse.get("mini_sparkline"), dict) else None
+            spark_values = list(mini_sparkline.get("values", [])) if mini_sparkline else []
+            if len(spark_values) >= 3:
+                spark_series = str(mini_sparkline.get("series") or "score")
+                st.caption(f"mini-sparkline: {spark_series}")
+                st.line_chart(pd.DataFrame({"value": spark_values}), height=80, use_container_width=True)
             c1, c2 = st.columns(2)
             with c1:
                 if dex_url:
