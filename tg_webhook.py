@@ -10,6 +10,7 @@ try:
         MON_FIELDS,
         PORTFOLIO_FIELDS,
         addr_store,
+        canonical_entity_key,
         build_active_monitoring_rows,
         build_notification_candidates,
         get_job_heartbeats_snapshot,
@@ -49,6 +50,11 @@ except Exception as e:
     def addr_store(chain: str, addr: str) -> str:
         _ = chain
         return str(addr or "").strip()
+
+    def canonical_entity_key(chain: str, ca: str) -> str:
+        chain_norm = normalize_chain_name(chain or "")
+        ca_norm = addr_store(chain_norm, ca or "")
+        return f"{chain_norm}|{ca_norm}" if chain_norm and ca_norm else ""
 
     def now_utc_str() -> str:
         from datetime import datetime, timezone
@@ -367,17 +373,18 @@ async def tg_webhook(req: Request):
         action, chain, ca = parts[0].strip(), parts[1].strip(), parts[2].strip()
         chain = normalize_chain_name(chain)
         ca = addr_store(chain, ca)
-        print(f"[TG_WEBHOOK] callback raw={raw} action={action} chain={chain} ca={ca}", flush=True)
+        entity_key = canonical_entity_key(chain, ca)
+        print(f"[TG_WEBHOOK] callback raw={raw} action={action} chain={chain} ca={ca} entity_key={entity_key}", flush=True)
 
         meta = find_token_meta(chain, ca)
         token_label = meta.get("symbol") or meta.get("name") or ca[:8]
         print(f"[TG_WEBHOOK] token_label={token_label}", flush=True)
 
         result_text = "Ignored"
-        if action in ("pf", "pf_add", "portfolio", "portfolio_add"):
+        if action in ("pf", "pf_add", "portfolio", "portfolio_add", "discovery_pf_add"):
             add_contract_to_portfolio(chain, ca)
             result_text = "Added to portfolio"
-        elif action in ("mn", "mon_add", "monitor", "monitor_add"):
+        elif action in ("mn", "mon_add", "monitor", "monitor_add", "discovery_mon_add"):
             add_contract_to_monitoring(chain, ca)
             result_text = "Added to monitoring"
         elif action in ("rm", "remove", "delete", "archive"):
