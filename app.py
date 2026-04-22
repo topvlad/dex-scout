@@ -7349,13 +7349,24 @@ def format_digest_message(row: Dict[str, Any], source: str) -> str:
     chain = token_chain(row).upper() or "MULTI"
     addr = token_ca(row) or "n/a"
     semantics = build_notification_semantics(row, source_context=source)
-    dex_url = dex_url_for_token(token_chain(row), token_ca(row))
+    dex_url = str(row.get("dex_url") or row.get("dexscreener_url") or dex_url_for_token(token_chain(row), token_ca(row))).strip()
     dex_line = f"dex: {dex_url}\n" if dex_url else ""
+    provenance_block = ""
+    if str(source or "").lower() == "discovery":
+        origin_label = str(row.get("origin_label") or row.get("source") or "scanner_candidate")
+        reason_short = str(row.get("reason_short") or row.get("entry_reason") or "discovery candidate")
+        timing = normalize_timing_label(str(row.get("timing") or row.get("timing_label") or "NEUTRAL"))
+        provenance_block = (
+            f"origin: {origin_label}\n"
+            f"reason: {reason_short}\n"
+            f"timing: {timing}\n"
+        )
     return (
         f"<b>DIGEST</b> | <b>{symbol}</b>\n"
         f"source: {str(source or 'monitoring').upper()}\n"
         f"chain: {chain}\n"
         f"score: <b>{semantics['score_display']}</b>\n\n"
+        f"{provenance_block}"
         f"{dex_line}"
         f"CA:\n<code>{addr}</code>"
     )
@@ -7385,6 +7396,50 @@ def canonical_token_key(row: Dict[str, Any]) -> str:
     if not chain or not ca:
         return ""
     return f"{chain}|{addr_store(chain, ca)}"
+
+
+def canonical_entity_key(chain: str, ca: str) -> str:
+    norm_chain = normalize_chain_name(chain)
+    norm_ca = addr_store(norm_chain, ca)
+    if not norm_chain or not norm_ca:
+        return ""
+    return f"{norm_chain}|{norm_ca}"
+
+
+def _discovery_candidate_eligible(
+    row: Dict[str, Any],
+    seen_keys: Set[str],
+    monitoring_state_keys: Set[str],
+    portfolio_state_keys: Set[str],
+    recent_emitted_keys: Set[str],
+) -> Tuple[bool, str, str]:
+    chain = normalize_chain_name(token_chain(row))
+    ca = addr_store(chain, token_ca(row))
+    entity_key = canonical_entity_key(chain, ca)
+    if not chain:
+        return False, "invalid_chain", entity_key
+    if not ca:
+        return False, "invalid_ca", entity_key
+    dex_url = str(row.get("dex_url") or row.get("dexscreener_url") or dex_url_for_token(chain, ca)).strip()
+    if not dex_url:
+        return False, "missing_dex_url", entity_key
+    if is_token_suppressed(chain, ca):
+        return False, "suppressed", entity_key
+
+    weak_reason = str(row.get("weak_reason") or row.get("entry_reason") or "").strip().lower()
+    lifecycle = str(row.get("lifecycle_state") or row.get("status") or "").strip().lower()
+    if any(flag in weak_reason for flag in ("dead", "cold", "archived")):
+        return False, "dead_or_cold", entity_key
+    if any(flag in lifecycle for flag in ("dead", "cold", "archived")):
+        return False, "dead_or_cold", entity_key
+
+    if entity_key in seen_keys:
+        return False, "dedup", entity_key
+    if entity_key in monitoring_state_keys or entity_key in portfolio_state_keys:
+        return False, "already_in_ui_truth", entity_key
+    if entity_key in recent_emitted_keys:
+        return False, "cooldown", entity_key
+    return True, "ok", entity_key
 
 
 def _ui_monitoring_source_rows(monitoring_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -7480,8 +7535,9 @@ def build_digest_sources(
     monitoring_rows: List[Dict[str, Any]],
     portfolio_rows: List[Dict[str, Any]],
     top_monitoring_limit: int,
+    digest_path: str,
 ) -> Dict[str, Any]:
-    mode = digest_source_mode()
+    mode = "ui_truth" if digest_path == "digest_ui" else "backend_candidates"
     ui_monitoring_source_rows = _ui_monitoring_source_rows(monitoring_rows)
     ui_portfolio_source_rows = _ui_portfolio_source_rows(portfolio_rows)
     ui_source_rows = ui_monitoring_source_rows + ui_portfolio_source_rows
@@ -7506,9 +7562,11 @@ def build_digest_sources(
     scan_state_keys = set(scan_runtime.get("last_candidate_keys", []) or []) if isinstance(scan_runtime, dict) else set()
     scan_state_keys = {str(k) for k in scan_state_keys if str(k)}
 
-    digest_source_keys: Set[str] = set(ui_source_keys) if mode == "ui_truth" else set(
-        monitoring_active_keys | portfolio_active_keys | backend_candidate_keys | tg_recent_keys | scan_state_keys
-    )
+    digest_source_keys: Set[str]
+    if mode == "ui_truth":
+        digest_source_keys = set(ui_source_keys)
+    else:
+        digest_source_keys = set(backend_candidate_keys | tg_recent_keys | scan_state_keys)
     origin_map: Dict[str, str] = {}
     for key in digest_source_keys:
         if key in ui_source_keys:
@@ -7557,6 +7615,7 @@ def build_digest_sources(
 def build_digest_summary(
     monitoring_rows: List[Dict[str, Any]],
     portfolio_rows: List[Dict[str, Any]],
+    digest_path: str = "digest_ui",
     top_monitoring_limit: int = 3,
     top_risk_limit: int = 3,
 ) -> Dict[str, Any]:
@@ -7564,6 +7623,7 @@ def build_digest_summary(
         monitoring_rows,
         portfolio_rows,
         top_monitoring_limit=top_monitoring_limit,
+        digest_path=digest_path,
     )
     active_monitoring = build_active_monitoring_rows(monitoring_rows)
     active_portfolio = _ui_portfolio_source_rows(portfolio_rows)
@@ -7615,6 +7675,7 @@ def build_digest_summary(
 
     return {
         "event_type": resolve_event_type("DIGEST"),
+        "digest_path": digest_path,
         "alert_tier": resolve_alert_tier("DIGEST_ONLY"),
         "digest_source_mode": source_snapshot.get("mode"),
         "active_portfolio_count": len(active_portfolio),
@@ -7651,8 +7712,10 @@ def format_digest_summary_message(digest: Dict[str, Any], trigger_source: str = 
             "⚠ backend candidates, not current UI list\n"
         )
 
+    digest_path = str(digest.get("digest_path") or "digest_ui")
+    digest_label = "digest_ui" if digest_path == "digest_ui" else "digest_discovery"
     return (
-        f"<b>DEX Scout digest</b>\n"
+        f"<b>DEX Scout {digest_label}</b>\n"
         f"event_type: <code>{digest.get('event_type', 'digest')}</code>\n"
         f"trigger: {str(trigger_source or 'manual').upper()}\n"
         f"source_mode: {source_mode}\n"
@@ -7667,11 +7730,7 @@ def format_digest_summary_message(digest: Dict[str, Any], trigger_source: str = 
 
 
 def _token_key_from_parts(chain: str, ca: str) -> str:
-    chain_norm = normalize_chain_name(chain)
-    ca_norm = addr_store(chain_norm, ca)
-    if not chain_norm or not ca_norm:
-        return ""
-    return f"{chain_norm}|{ca_norm}"
+    return canonical_entity_key(chain, ca)
 
 
 def _build_token_state_sets(
@@ -7697,6 +7756,7 @@ def build_digest_token_blocks(
     digest: Dict[str, Any],
     monitoring_rows: List[Dict[str, Any]],
     portfolio_rows: List[Dict[str, Any]],
+    digest_path: str = "digest_ui",
     top_monitoring_limit: int = 3,
     top_risk_limit: int = 3,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
@@ -7720,6 +7780,12 @@ def build_digest_token_blocks(
     )
 
     monitoring_state_keys, portfolio_state_keys = _build_token_state_sets(monitoring_rows, portfolio_rows)
+    tg_state = load_tg_state()
+    recent_emitted_keys = _extract_recent_token_keys_from_tg_state(
+        tg_state if isinstance(tg_state, dict) else {},
+        now_ts=time.time(),
+        ttl_seconds=DIGEST_BACKEND_REUSE_TTL_SEC,
+    )
     blocks: List[Dict[str, Any]] = []
     seen: Set[str] = set()
     skipped_missing_identity = 0
@@ -7748,6 +7814,36 @@ def build_digest_token_blocks(
         row_norm["in_monitoring"] = "1" if token_key in monitoring_state_keys else "0"
         row_norm["digest_source"] = source
         blocks.append(row_norm)
+
+    if digest_path == "digest_discovery":
+        eligible_rejects = 0
+        for row in monitoring_rows:
+            ok, reason, entity_key = _discovery_candidate_eligible(
+                row,
+                seen_keys=seen,
+                monitoring_state_keys=monitoring_state_keys,
+                portfolio_state_keys=portfolio_state_keys,
+                recent_emitted_keys=recent_emitted_keys,
+            )
+            if not ok:
+                eligible_rejects += 1
+                continue
+            candidate = dict(row)
+            candidate["entity_key"] = entity_key
+            candidate["origin_label"] = str(row.get("origin_label") or row.get("source") or "scanner_candidate")
+            candidate["reason_short"] = str(row.get("reason_short") or row.get("entry_reason") or "scanner discovery")
+            candidate["timing"] = normalize_timing_label(str(row.get("timing") or row.get("timing_label") or "NEUTRAL"))
+            candidate["dex_url"] = str(row.get("dex_url") or row.get("dexscreener_url") or dex_url_for_token(token_chain(row), token_ca(row)))
+            candidate["source_marker"] = "digest_discovery"
+            append_block(candidate, "discovery")
+            if len(blocks) >= max(1, int(top_monitoring_limit or 3)):
+                break
+        stats = {
+            "token_blocks": len(blocks),
+            "skipped_missing_identity": skipped_missing_identity,
+            "skipped_not_allowed": skipped_not_allowed + eligible_rejects,
+        }
+        return blocks, stats
 
     for row in mon_candidates[: max(1, int(top_monitoring_limit or 3))]:
         append_block(row, "monitoring")
@@ -7809,8 +7905,8 @@ def _digest_fingerprint(payload: Dict[str, Any]) -> str:
 def _resolve_digest_path(trigger_source: str) -> str:
     source = str(trigger_source or "").strip().lower()
     if "summary" in source or source.startswith("ui_") or source.endswith("_ui"):
-        return "ui"
-    return "discovery"
+        return "digest_ui"
+    return "digest_discovery"
 
 
 def _build_ui_digest_fingerprint_payload(digest: Dict[str, Any]) -> Dict[str, Any]:
@@ -7898,20 +7994,21 @@ def trigger_digest_notification(
             "event_type": resolve_event_type("DIGEST"),
         }
 
-    digest = build_digest_summary(monitoring_rows, portfolio_rows)
     digest_path = _resolve_digest_path(trigger_source)
-    fingerprint_field = "last_ui_digest_fingerprint" if digest_path == "ui" else "last_discovery_digest_fingerprint"
-    last_ts_field = "last_ui_digest_ts" if digest_path == "ui" else "last_discovery_digest_ts"
-    heartbeat_hours = DIGEST_UI_HEARTBEAT_HOURS if digest_path == "ui" else DIGEST_DISCOVERY_HEARTBEAT_HOURS
+    digest = build_digest_summary(monitoring_rows, portfolio_rows, digest_path=digest_path)
+    fingerprint_field = "last_ui_digest_fingerprint" if digest_path == "digest_ui" else "last_discovery_digest_fingerprint"
+    last_ts_field = "last_ui_digest_ts" if digest_path == "digest_ui" else "last_discovery_digest_ts"
+    heartbeat_hours = DIGEST_UI_HEARTBEAT_HOURS if digest_path == "digest_ui" else DIGEST_DISCOVERY_HEARTBEAT_HOURS
 
     token_blocks, block_stats = build_digest_token_blocks(
         digest=digest,
         monitoring_rows=monitoring_rows,
         portfolio_rows=portfolio_rows,
+        digest_path=digest_path,
     )
     fingerprint_payload = (
         _build_ui_digest_fingerprint_payload(digest)
-        if digest_path == "ui"
+        if digest_path == "digest_ui"
         else _build_discovery_digest_fingerprint_payload(digest, token_blocks)
     )
     new_fingerprint = _digest_fingerprint(fingerprint_payload)
@@ -8017,7 +8114,7 @@ def format_signal_message(
 def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
     chain = normalize_chain_name(token_chain(row))
     ca = addr_store(chain, token_ca(row))
-    dex_url = dex_url_for_token(chain, ca)
+    dex_url = str(row.get("dex_url") or row.get("dexscreener_url") or dex_url_for_token(chain, ca)).strip()
 
     if not chain or not ca:
         return {"inline_keyboard": []}
@@ -8026,14 +8123,15 @@ def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
     in_monitoring = str(row.get("in_monitoring", "0")).strip() == "1"
     action_row: List[Dict[str, str]] = []
     if not in_portfolio:
-        action_row.append({"text": "➕ Portfolio", "callback_data": f"pf_add|{chain}|{ca}"})
+        action_row.append({"text": "➕ Add to Portfolio", "callback_data": f"pf_add|{chain}|{ca}"})
     if not in_monitoring:
         action_row.append({"text": "👀 Monitor", "callback_data": f"mon_add|{chain}|{ca}"})
 
     buttons: List[List[Dict[str, str]]] = []
     if action_row:
         buttons.append(action_row)
-    buttons.append([{"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}])
+    if str(row.get("digest_source") or "").strip().lower() != "discovery":
+        buttons.append([{"text": "➖ Remove", "callback_data": f"remove|{chain}|{ca}"}])
 
     if dex_url:
         buttons.append([
