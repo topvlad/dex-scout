@@ -10609,22 +10609,38 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Opti
     chain = token_chain(row)
     base_addr = token_ca(row)
     if not chain or not base_addr:
-        return None
+        return {
+            "series": "score",
+            "values": [],
+            "source": "token_unresolved",
+            "reason": "sparkline unavailable",
+        }
 
     hist = token_history_rows(chain, base_addr, limit=40)
     if not hist:
-        return None
+        return {
+            "series": "score",
+            "values": [],
+            "source": "history_empty",
+            "reason": "no history yet",
+        }
 
     series = build_history_series(hist)
     score_values = [x for x in (series.get("score") or series.get("entry_score") or []) if x > 0]
     if len(score_values) >= min_points:
-        return {"series": "score", "values": score_values[-24:]}
+        return {"series": "score", "values": score_values[-24:], "source": "history_score"}
 
     price_values = [x for x in (series.get("price") or []) if x > 0]
     if len(price_values) >= min_points:
-        return {"series": "price", "values": price_values[-24:]}
+        return {"series": "price", "values": price_values[-24:], "source": "history_price"}
 
-    return None
+    fallback_values = score_values or price_values
+    return {
+        "series": "score" if score_values else "price",
+        "values": fallback_values[-24:],
+        "source": "history_insufficient",
+        "reason": "sparkline unavailable",
+    }
 
 
 def _pulse_pair_payload(row: Dict[str, Any], best: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -11325,10 +11341,19 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption(str(pulse.get("summary_line") or "snapshot: n/a"))
             mini_sparkline = pulse.get("mini_sparkline") if isinstance(pulse.get("mini_sparkline"), dict) else None
             spark_values = list(mini_sparkline.get("values", [])) if mini_sparkline else []
+            spark_source = str(mini_sparkline.get("source") or "unavailable") if mini_sparkline else "unavailable"
+            spark_points = len(spark_values)
             if len(spark_values) >= 3:
                 spark_series = str(mini_sparkline.get("series") or "score")
                 st.caption(f"mini-sparkline: {spark_series}")
                 st.line_chart(pd.DataFrame({"value": spark_values}), height=80, use_container_width=True)
+            else:
+                fallback_reason = str(mini_sparkline.get("reason") or "").strip().lower() if mini_sparkline else ""
+                if fallback_reason not in {"sparkline unavailable", "no history yet"}:
+                    fallback_reason = "sparkline unavailable"
+                st.caption(fallback_reason)
+            st.caption(f"sparkline source: {spark_source}")
+            st.caption(f"points: {spark_points}")
             c1, c2 = st.columns(2)
             with c1:
                 if dex_url:
