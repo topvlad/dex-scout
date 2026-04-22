@@ -121,6 +121,8 @@ ALERT_MODE_REGISTRY = {"quiet", "normal", "aggressive"}
 DIGEST_SOURCE_MODE_DEFAULT = "ui_truth"
 DIGEST_SOURCE_MODES = {"ui_truth", "backend_candidates"}
 DIGEST_BACKEND_REUSE_TTL_SEC = max(300, int(os.getenv("DIGEST_BACKEND_REUSE_TTL_SEC", "7200")))
+DIGEST_UI_HEARTBEAT_HOURS = max(1, int(os.getenv("DIGEST_UI_HEARTBEAT_HOURS", "12") or 12))
+DIGEST_DISCOVERY_HEARTBEAT_HOURS = max(1, int(os.getenv("DIGEST_DISCOVERY_HEARTBEAT_HOURS", "12") or 12))
 OUTCOME_HORIZONS_MINUTES: Dict[str, int] = {
     "15m": 15,
     "1h": 60,
@@ -6511,6 +6513,10 @@ def load_tg_state() -> Dict[str, Any]:
         "sent_events": {},
         "sent_emissions": {},
         "sent_digest_emissions": {},
+        "last_ui_digest_fingerprint": "",
+        "last_discovery_digest_fingerprint": "",
+        "last_ui_digest_ts": "",
+        "last_discovery_digest_ts": "",
         "sent_portfolio_events": {},
         "engine_version": "v3",
         "token_state": {},
@@ -6564,6 +6570,12 @@ def load_tg_state() -> Dict[str, Any]:
                     data["sent_portfolio_events"] = {}
                     data["last_scan_ts_processed"] = ""
                     data["engine_version"] = "v3"
+                legacy_digest_ts = str(data.get("last_digest_sent_at") or "")
+                if legacy_digest_ts:
+                    if not str(data.get("last_ui_digest_ts") or "").strip():
+                        data["last_ui_digest_ts"] = legacy_digest_ts
+                    if not str(data.get("last_discovery_digest_ts") or "").strip():
+                        data["last_discovery_digest_ts"] = legacy_digest_ts
                 return data
     except Exception as e:
         print(f"[TG] load state fallback {type(e).__name__}: {e}", flush=True)
@@ -6604,6 +6616,10 @@ def reset_tg_state() -> None:
         "sent_events": {},
         "sent_emissions": {},
         "sent_digest_emissions": {},
+        "last_ui_digest_fingerprint": "",
+        "last_discovery_digest_fingerprint": "",
+        "last_ui_digest_ts": "",
+        "last_discovery_digest_ts": "",
         "sent_portfolio_events": {},
         "engine_version": "v3",
         "token_state": {},
@@ -7771,6 +7787,93 @@ def mark_digest_emission_sent(state: Dict[str, Any], emission_key: str, now_ts: 
     state["sent_digest_emissions"] = sent
 
 
+def _stable_digest_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _stable_digest_value(value[k]) for k in sorted(value.keys(), key=lambda x: str(x))}
+    if isinstance(value, list):
+        normalized = [_stable_digest_value(v) for v in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+    if isinstance(value, tuple):
+        return _stable_digest_value(list(value))
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _digest_fingerprint(payload: Dict[str, Any]) -> str:
+    normalized = _stable_digest_value(payload)
+    raw = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _resolve_digest_path(trigger_source: str) -> str:
+    source = str(trigger_source or "").strip().lower()
+    if "summary" in source or source.startswith("ui_") or source.endswith("_ui"):
+        return "ui"
+    return "discovery"
+
+
+def _build_ui_digest_fingerprint_payload(digest: Dict[str, Any]) -> Dict[str, Any]:
+    debug_payload = digest.get("digest_debug", {}) if isinstance(digest.get("digest_debug"), dict) else {}
+    only_in_digest = list(debug_payload.get("only_in_digest", []) or [])
+    origins = digest.get("digest_token_origins", {}) if isinstance(digest.get("digest_token_origins"), dict) else {}
+    return {
+        "event_type": str(digest.get("event_type") or resolve_event_type("DIGEST")),
+        "source_mode": str(digest.get("digest_source_mode") or DIGEST_SOURCE_MODE_DEFAULT),
+        "active_portfolio_count": int(digest.get("active_portfolio_count", 0) or 0),
+        "active_monitoring_count": int(digest.get("active_monitoring_count", 0) or 0),
+        "top_monitoring_now": sorted([str(x).strip() for x in list(digest.get("top_monitoring_now") or []) if str(x).strip()]),
+        "top_portfolio_risks": sorted([str(x).strip() for x in list(digest.get("top_portfolio_risks") or []) if str(x).strip()]),
+        "dead_cold_warnings": sorted([str(x).strip() for x in list(digest.get("dead_cold_warnings") or []) if str(x).strip()]),
+        "warning_blocks": sorted([str(x).strip() for x in list(digest.get("dead_cold_warnings") or []) if str(x).strip()]),
+        "only_in_digest": sorted([str(x).strip() for x in only_in_digest if str(x).strip()]),
+        "only_in_digest_origins": {str(k): str(origins.get(k, "")) for k in sorted(origins.keys(), key=lambda x: str(x)) if str(k) in only_in_digest},
+    }
+
+
+def _build_discovery_digest_fingerprint_payload(
+    digest: Dict[str, Any],
+    token_blocks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    items: List[Dict[str, Any]] = []
+    for row in token_blocks:
+        chain = normalize_chain_name(token_chain(row))
+        ca = addr_store(chain, token_ca(row))
+        if not chain or not ca:
+            continue
+        semantics = build_notification_semantics(row, source_context="digest_fingerprint_discovery")
+        items.append(
+            {
+                "token_key": f"{chain}|{ca}",
+                "symbol": str(row.get("base_symbol") or row.get("symbol") or "").strip().upper(),
+                "source": str(row.get("digest_source") or "").strip().lower(),
+                "score": str(semantics.get("score_display") or "N/A"),
+                "risk": str(row.get("risk_level") or row.get("risk") or "UNKNOWN").strip().upper(),
+                "action": str(row.get("entry_action") or row.get("entry") or "HOLD").strip().upper(),
+                "timing": normalize_timing_label(str(row.get("timing_label") or "NEUTRAL")),
+                "in_portfolio": "1" if str(row.get("in_portfolio", "0")).strip() == "1" else "0",
+                "in_monitoring": "1" if str(row.get("in_monitoring", "0")).strip() == "1" else "0",
+            }
+        )
+
+    return {
+        "event_type": str(digest.get("event_type") or resolve_event_type("DIGEST")),
+        "source_mode": str(digest.get("digest_source_mode") or DIGEST_SOURCE_MODE_DEFAULT),
+        "active_portfolio_count": int(digest.get("active_portfolio_count", 0) or 0),
+        "active_monitoring_count": int(digest.get("active_monitoring_count", 0) or 0),
+        "normalized_top_items": items,
+        "warning_blocks": sorted([str(x).strip() for x in list(digest.get("dead_cold_warnings") or []) if str(x).strip()]),
+    }
+
+
+def _heartbeat_due(last_ts_raw: Any, now_ts: float, heartbeat_hours: int) -> bool:
+    heartbeat_seconds = max(3600, int(heartbeat_hours or 0) * 3600)
+    last_dt = parse_ts(last_ts_raw)
+    if not last_dt:
+        return False
+    return (now_ts - last_dt.timestamp()) >= heartbeat_seconds
+
+
 def trigger_digest_notification(
     trigger_source: str = "manual",
     cooldown_seconds: int = 3600,
@@ -7796,13 +7899,47 @@ def trigger_digest_notification(
         }
 
     digest = build_digest_summary(monitoring_rows, portfolio_rows)
-    text = format_digest_summary_message(digest, trigger_source=trigger_source)
-    summary_ok = send_telegram(text, parse_mode="HTML")
+    digest_path = _resolve_digest_path(trigger_source)
+    fingerprint_field = "last_ui_digest_fingerprint" if digest_path == "ui" else "last_discovery_digest_fingerprint"
+    last_ts_field = "last_ui_digest_ts" if digest_path == "ui" else "last_discovery_digest_ts"
+    heartbeat_hours = DIGEST_UI_HEARTBEAT_HOURS if digest_path == "ui" else DIGEST_DISCOVERY_HEARTBEAT_HOURS
+
     token_blocks, block_stats = build_digest_token_blocks(
         digest=digest,
         monitoring_rows=monitoring_rows,
         portfolio_rows=portfolio_rows,
     )
+    fingerprint_payload = (
+        _build_ui_digest_fingerprint_payload(digest)
+        if digest_path == "ui"
+        else _build_discovery_digest_fingerprint_payload(digest, token_blocks)
+    )
+    new_fingerprint = _digest_fingerprint(fingerprint_payload)
+    prev_fingerprint = str(state.get(fingerprint_field) or "")
+    heartbeat_due = _heartbeat_due(state.get(last_ts_field), now_ts=now_ts, heartbeat_hours=heartbeat_hours)
+    fingerprint_changed = new_fingerprint != prev_fingerprint
+    emit_reason = ""
+    if fingerprint_changed:
+        emit_reason = "fingerprint_changed"
+    elif heartbeat_due:
+        emit_reason = "forced_heartbeat"
+    else:
+        debug_log(
+            f"digest_{digest_path}_suppressed reason=no_meaningful_change "
+            f"path={digest_path} trigger={trigger_source} "
+            f"fingerprint={new_fingerprint} prev_fingerprint={prev_fingerprint}"
+        )
+        return {
+            "ok": True,
+            "sent": False,
+            "duplicate": False,
+            "event_type": resolve_event_type("DIGEST"),
+            "suppressed_reason": "no_meaningful_change",
+            "digest_path": digest_path,
+        }
+
+    text = format_digest_summary_message(digest, trigger_source=trigger_source)
+    summary_ok = send_telegram(text, parse_mode="HTML")
     block_sent = 0
     for row in token_blocks:
         msg = format_digest_message(row, source=str(row.get("digest_source") or "monitoring"))
@@ -7814,12 +7951,23 @@ def trigger_digest_notification(
         "summary_sent": bool(summary_ok),
         "token_blocks_sent": int(block_sent),
         "chunk_messages": int(block_sent),
+        "digest_path": digest_path,
+        "emit_reason": emit_reason,
+        "fingerprint": new_fingerprint,
+        "heartbeat_due": bool(heartbeat_due),
     }
     update_worker_runtime_state(updates={"last_digest_delivery_debug": digest.get("delivery_debug", {})})
     if ok:
         mark_digest_emission_sent(state, emission_key=emission_key, now_ts=now_ts)
         state["last_digest_sent_at"] = now_utc_str()
+        state[fingerprint_field] = new_fingerprint
+        state[last_ts_field] = now_utc_str()
         save_tg_state(state)
+        debug_log(
+            f"digest_{digest_path}_emitted reason={emit_reason} "
+            f"path={digest_path} trigger={trigger_source} "
+            f"fingerprint={new_fingerprint} prev_fingerprint={prev_fingerprint}"
+        )
 
     return {
         "ok": bool(ok),
