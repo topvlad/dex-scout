@@ -10555,6 +10555,144 @@ def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _pulse_freshness_minutes(row: Dict[str, Any], queue_row: Optional[Dict[str, Any]] = None) -> float:
+    ts_candidates = [
+        row.get("ts_last_seen"),
+        row.get("updated_at"),
+        row.get("last_seen"),
+        row.get("ts_added"),
+        row.get("last_scan_ts"),
+        (queue_row or {}).get("last_scan_ts"),
+    ]
+    parsed = [parse_ts(ts) for ts in ts_candidates]
+    parsed = [x for x in parsed if x is not None]
+    if not parsed:
+        return 9_999.0
+    age_min = (datetime.utcnow() - max(parsed)).total_seconds() / 60.0
+    return max(0.0, age_min)
+
+
+def _pulse_status_marker(row: Dict[str, Any]) -> str:
+    risk = str(row.get("risk_level") or row.get("risk") or "").strip().upper()
+    timing = normalize_timing_label(row.get("timing_label") or row.get("timing") or row.get("entry_status") or "NEUTRAL")
+    score = parse_float(row.get("entry_score", row.get("priority_score", row.get("score", 0))), 0.0)
+    if risk in {"HIGH", "EXTREME"}:
+        return "high risk"
+    if timing in {"EARLY", "VERY_EARLY"}:
+        return "early"
+    if score >= 220:
+        return "watch"
+    return "speculative"
+
+
+def _pulse_card_metrics_line(best: Optional[Dict[str, Any]], row: Dict[str, Any]) -> str:
+    if not best:
+        liq = parse_float(row.get("liq_init"), 0.0)
+        vol24 = parse_float(row.get("vol24_init"), 0.0)
+        return f"skyline: liq {fmt_usd(liq)} • vol24 {fmt_usd(vol24)} • live pair pending"
+    liq = parse_float(safe_get(best, "liquidity", "usd", default=0), 0.0)
+    vol24 = parse_float(safe_get(best, "volume", "h24", default=0), 0.0)
+    chg_h1 = parse_float(safe_get(best, "priceChange", "h1", default=0), 0.0)
+    buys = int(safe_get(best, "txns", "m5", "buys", default=0) or 0)
+    sells = int(safe_get(best, "txns", "m5", "sells", default=0) or 0)
+    return (
+        f"skyline: liq {fmt_usd(liq)} • vol24 {fmt_usd(vol24)} • "
+        f"Δ1h {chg_h1:+.1f}% • m5 txns {buys + sells}"
+    )
+
+
+def _pulse_pair_payload(row: Dict[str, Any], best: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    chain = token_chain(row)
+    ca = token_ca(row)
+    symbol = str(row.get("base_symbol") or row.get("symbol") or extract_name(row) or "").strip().upper()
+    payload: Dict[str, Any] = {
+        "chainId": chain,
+        "pairAddress": str(row.get("pair_addr") or row.get("pairAddress") or ""),
+        "baseToken": {
+            "address": ca,
+            "symbol": symbol,
+            "name": str(row.get("base_name") or row.get("name") or symbol),
+        },
+    }
+    if best:
+        payload["url"] = best.get("url") or ""
+        payload["liquidity"] = {"usd": safe_get(best, "liquidity", "usd", default=0)}
+        payload["volume"] = {
+            "h24": safe_get(best, "volume", "h24", default=0),
+            "m5": safe_get(best, "volume", "m5", default=0),
+        }
+        payload["priceChange"] = {
+            "h1": safe_get(best, "priceChange", "h1", default=0),
+            "m5": safe_get(best, "priceChange", "m5", default=0),
+        }
+        payload["txns"] = {"m5": safe_get(best, "txns", "m5", default={})}
+    return payload
+
+
+def build_market_pulse_cards(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+    active_monitoring_keys: Set[str],
+    chain_filter: str = "all",
+    limit: int = 8,
+) -> List[Dict[str, Any]]:
+    scan_state = scanner_state_load() or {}
+    queue_state = scan_state.get("queue_state", {}) if isinstance(scan_state.get("queue_state"), dict) else {}
+    runtime = scan_state.get("worker_runtime", {}) if isinstance(scan_state.get("worker_runtime"), dict) else {}
+    runtime_keys = {str(k or "").replace(":", "|") for k in list(runtime.get("last_candidate_keys", []) or []) if str(k or "").strip()}
+    queue_keys = {str(k or "").replace(":", "|") for k in queue_state.keys() if str(k or "").strip()}
+    discovery_pool = build_discovery_candidate_pool(
+        monitoring_rows=monitoring_rows,
+        portfolio_rows=portfolio_rows,
+        limit=max(30, int(limit) * 8),
+    )
+    pulse_cards: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for row in discovery_pool:
+        key = canonical_token_key(row)
+        chain = token_chain(row)
+        if not key or key in seen:
+            continue
+        if key in active_monitoring_keys:
+            continue
+        if chain_filter in {"bsc", "solana"} and chain != chain_filter:
+            continue
+        seen.add(key)
+        queue_row = queue_state.get(key.replace("|", ":"), {}) if isinstance(queue_state, dict) else {}
+        freshness_min = _pulse_freshness_minutes(row, queue_row if isinstance(queue_row, dict) else {})
+        score = parse_float(row.get("entry_score", row.get("priority_score", row.get("score", 0))), 0.0)
+        timing_label = normalize_timing_label(row.get("timing_label") or row.get("entry_status") or row.get("status") or "NEUTRAL")
+        timing_bonus = 6.0 if timing_label in {"EARLY", "READY"} else (2.0 if timing_label == "NEUTRAL" else 0.0)
+        freshness_bonus = max(0.0, 18.0 - min(freshness_min, 180.0) / 10.0)
+        novelty_bonus = (8.0 if key in runtime_keys else 0.0) + (4.0 if key in queue_keys else 0.0)
+        pulse_sort = score + freshness_bonus + novelty_bonus + timing_bonus
+        best = best_pair_for_token_cached(chain, token_ca(row)) if chain and token_ca(row) else None
+        pulse_cards.append(
+            {
+                "row": row,
+                "key": key,
+                "chain": chain,
+                "score": round(score, 2),
+                "timing": timing_label,
+                "stage": str(row.get("entry_status") or row.get("entry") or row.get("status") or "candidate").upper(),
+                "status_marker": _pulse_status_marker(row),
+                "freshness_min": round(freshness_min, 1),
+                "pulse_sort": round(pulse_sort, 3),
+                "best": best,
+                "metrics_line": _pulse_card_metrics_line(best, row),
+            }
+        )
+    pulse_cards.sort(
+        key=lambda x: (
+            float(x.get("pulse_sort", 0.0)),
+            float(x.get("score", 0.0)),
+            -float(x.get("freshness_min", 9_999.0)),
+        ),
+        reverse=True,
+    )
+    return pulse_cards[: max(1, int(limit or 8))]
+
+
 # =============================
 # Pages
 # =============================
@@ -11016,6 +11154,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 best_by_symbol[sym] = c
         return list(best_by_symbol.values())
 
+    active_monitoring_keys = {canonical_token_key(r) for r in active_rows if canonical_token_key(r)}
+    pulse_cards = build_market_pulse_cards(
+        monitoring_rows=rows,
+        portfolio_rows=portfolio_rows,
+        active_monitoring_keys=active_monitoring_keys,
+        chain_filter=chain_filter,
+        limit=8,
+    )
+
     priority_cards = render_dedupe(priority_cards)
     portfolio_linked_cards = render_dedupe(portfolio_linked_cards)
     review_cards = render_dedupe(review_cards)
@@ -11120,6 +11267,61 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             with dynamics_tab:
                 render_monitoring_sparklines(hist)
 
+    st.subheader("Market pulse")
+    st.caption("Live candidates behind glass (read-only layer). Confirmed Monitoring below remains the settled active layer.")
+    if not pulse_cards:
+        st.caption("No pulse candidates right now.")
+    for idx, pulse in enumerate(pulse_cards, start=1):
+        row = pulse.get("row", {}) or {}
+        chain = str(pulse.get("chain") or token_chain(row) or "").strip().lower()
+        base_addr = token_ca(row)
+        symbol = str(row.get("base_symbol") or row.get("symbol") or extract_name(row) or "UNKNOWN").strip().upper()
+        if not symbol:
+            symbol = "UNKNOWN"
+        score = float(pulse.get("score", 0.0))
+        timing = str(pulse.get("timing") or "NEUTRAL").upper()
+        stage = str(pulse.get("stage") or "CANDIDATE").upper()
+        status_marker = str(pulse.get("status_marker") or "speculative")
+        freshness_min = float(pulse.get("freshness_min", 9_999.0))
+        card_key = str(pulse.get("key") or canonical_entity_key(chain, base_addr))
+        in_monitoring = card_key in active_monitoring_keys
+        dex_url = dex_url_for_token(chain, base_addr)
+        best = pulse.get("best")
+        if not dex_url and isinstance(best, dict):
+            dex_url = str(best.get("url") or "")
+        header = f"{symbol} • {chain.upper()} • score {score:.1f}"
+        with st.expander(header, expanded=False):
+            st.caption(f"timing: {timing} • stage: {stage} • status: {status_marker} • freshness: {freshness_min:.1f}m")
+            st.caption(str(pulse.get("metrics_line") or "skyline: n/a"))
+            c1, c2 = st.columns(2)
+            with c1:
+                if dex_url:
+                    link_button("Dex", dex_url, use_container_width=True, key=f"pulse_dex_{idx}_{hkey(card_key)}")
+                else:
+                    st.button("Dex", disabled=True, use_container_width=True, key=f"pulse_dex_disabled_{idx}_{hkey(card_key)}")
+            with c2:
+                if in_monitoring:
+                    st.button("Already in Monitoring", disabled=True, use_container_width=True, key=f"pulse_in_mon_{idx}_{hkey(card_key)}")
+                else:
+                    if st.button("+ Monitor", use_container_width=True, key=f"pulse_add_{idx}_{hkey(card_key)}"):
+                        payload = _pulse_pair_payload(row, best if isinstance(best, dict) else None)
+                        add_res = add_to_monitoring(
+                            payload,
+                            float(score),
+                            entry_status=str(row.get("entry_status") or row.get("entry") or ""),
+                            entry_score=float(parse_float(row.get("entry_score", score), score)),
+                            risk_level=str(row.get("risk_level") or row.get("risk") or ""),
+                        )
+                        if add_res in {"OK", "EXISTS_ACTIVE"}:
+                            st.success("Added to Monitoring.")
+                        elif add_res == "EXISTS_ARCHIVED":
+                            st.info("Token already archived. Re-activate from Archive if needed.")
+                        else:
+                            st.warning(f"Monitor action: {add_res}")
+                        load_monitoring_rows_cached.clear()
+                        request_rerun()
+
+    st.markdown("---")
     st.subheader("Priority watchlist")
     if not priority_cards:
         st.info("No items in priority watchlist yet.")
