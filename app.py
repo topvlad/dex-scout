@@ -7442,6 +7442,58 @@ def _discovery_candidate_eligible(
     return True, "ok", entity_key
 
 
+def build_discovery_candidate_pool(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+    limit: int = 60,
+) -> List[Dict[str, Any]]:
+    _ = portfolio_rows
+    ui_truth_rows = _ui_monitoring_source_rows(monitoring_rows) + _ui_portfolio_source_rows(portfolio_rows)
+    ui_truth_keys = {canonical_token_key(r) for r in ui_truth_rows if canonical_token_key(r)}
+
+    key_to_row: Dict[str, Dict[str, Any]] = {}
+    for row in monitoring_rows:
+        key = canonical_token_key(row)
+        if key:
+            key_to_row[key] = row
+
+    scan_state = scanner_state_load() or {}
+    queue_state = scan_state.get("queue_state", {}) if isinstance(scan_state.get("queue_state"), dict) else {}
+    runtime = scan_state.get("worker_runtime", {}) if isinstance(scan_state.get("worker_runtime"), dict) else {}
+    ordered_keys: List[str] = []
+    for key in list(runtime.get("last_candidate_keys", []) or []):
+        key_str = str(key or "").strip()
+        if key_str:
+            ordered_keys.append(key_str.replace(":", "|"))
+    for key in queue_state.keys():
+        key_str = str(key or "").strip()
+        if key_str:
+            ordered_keys.append(key_str.replace(":", "|"))
+
+    # Backfill from backend rows (not UI truth) sorted by score freshness.
+    backend_rows = sorted(
+        [r for r in monitoring_rows if canonical_token_key(r) and canonical_token_key(r) not in ui_truth_keys],
+        key=lambda r: parse_float(r.get("entry_score", r.get("score", 0)), 0.0),
+        reverse=True,
+    )
+    for row in backend_rows:
+        ordered_keys.append(canonical_token_key(row))
+
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for key in ordered_keys:
+        if key in seen or key in ui_truth_keys:
+            continue
+        row = key_to_row.get(key)
+        if not row:
+            continue
+        seen.add(key)
+        out.append(dict(row))
+        if len(out) >= max(1, int(limit or 60)):
+            break
+    return out
+
+
 def _ui_monitoring_source_rows(monitoring_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     clean_rows: List[Dict[str, Any]] = []
     for r in monitoring_rows:
@@ -7548,13 +7600,12 @@ def build_digest_sources(
     now_ts = time.time()
     state = load_tg_state()
     scan_state = scanner_state_load()
-    mon_candidates, _ = build_notification_candidates(
-        monitoring_rows,
-        portfolio_rows,
-        limit_monitoring=max(5, int(top_monitoring_limit or 3)),
-        limit_portfolio=5,
+    discovery_pool = build_discovery_candidate_pool(
+        monitoring_rows=monitoring_rows,
+        portfolio_rows=portfolio_rows,
+        limit=max(30, int(top_monitoring_limit or 3) * 10),
     )
-    backend_candidate_keys = {canonical_token_key(r) for r in mon_candidates if canonical_token_key(r)}
+    backend_candidate_keys = {canonical_token_key(r) for r in discovery_pool if canonical_token_key(r)}
     monitoring_active_keys = {canonical_token_key(r) for r in build_active_monitoring_rows(monitoring_rows) if canonical_token_key(r)}
     portfolio_active_keys = {canonical_token_key(r) for r in ui_portfolio_source_rows if canonical_token_key(r)}
     tg_recent_keys = _extract_recent_token_keys_from_tg_state(state, now_ts=now_ts, ttl_seconds=DIGEST_BACKEND_REUSE_TTL_SEC)
@@ -7627,12 +7678,19 @@ def build_digest_summary(
     )
     active_monitoring = build_active_monitoring_rows(monitoring_rows)
     active_portfolio = _ui_portfolio_source_rows(portfolio_rows)
-    mon_candidates, _ = build_notification_candidates(
-        monitoring_rows,
-        portfolio_rows,
-        limit_monitoring=max(5, int(top_monitoring_limit or 3)),
-        limit_portfolio=5,
-    )
+    if digest_path == "digest_discovery":
+        mon_candidates = build_discovery_candidate_pool(
+            monitoring_rows=monitoring_rows,
+            portfolio_rows=portfolio_rows,
+            limit=max(20, int(top_monitoring_limit or 3) * 8),
+        )
+    else:
+        mon_candidates, _ = build_notification_candidates(
+            monitoring_rows,
+            portfolio_rows,
+            limit_monitoring=max(5, int(top_monitoring_limit or 3)),
+            limit_portfolio=5,
+        )
     allowed_keys = source_snapshot.get("ui_source_keys", set()) if source_snapshot.get("mode") == "ui_truth" else source_snapshot.get("digest_source_keys", set())
     mon_candidates = [row for row in mon_candidates if canonical_token_key(row) in allowed_keys]
     active_monitoring = [row for row in active_monitoring if canonical_token_key(row) in allowed_keys]
@@ -7817,7 +7875,12 @@ def build_digest_token_blocks(
 
     if digest_path == "digest_discovery":
         eligible_rejects = 0
-        for row in monitoring_rows:
+        discovery_pool = build_discovery_candidate_pool(
+            monitoring_rows=monitoring_rows,
+            portfolio_rows=portfolio_rows,
+            limit=max(20, int(top_monitoring_limit or 3) * 8),
+        )
+        for row in discovery_pool:
             ok, reason, entity_key = _discovery_candidate_eligible(
                 row,
                 seen_keys=seen,
