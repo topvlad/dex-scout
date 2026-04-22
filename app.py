@@ -27,6 +27,7 @@ import io
 import time
 import json
 import random
+import math
 import hashlib
 import inspect
 from pathlib import Path
@@ -7216,6 +7217,59 @@ def is_material_signal_change(prev: Optional[Dict[str, Any]], current: Dict[str,
     return False
 
 
+
+
+def _parse_numeric_score_value(raw: Any) -> Optional[float]:
+    if raw is None:
+        return None
+    if isinstance(raw, str) and not raw.strip():
+        return None
+    try:
+        val = float(raw)
+    except Exception:
+        return None
+    if not math.isfinite(val):
+        return None
+    return val
+
+
+def _format_notification_score_display(score_value: Optional[float], score_available: bool) -> str:
+    if not score_available or score_value is None:
+        return "n/a"
+    return f"{score_value:.2f}"
+
+
+def build_notification_semantics(row: Dict[str, Any], source_context: Optional[str] = None) -> Dict[str, Any]:
+    score_sources: List[Tuple[str, Any]] = [
+        ("entry_score", row.get("entry_score")),
+        ("composite_score", row.get("composite_score")),
+        ("final_score", row.get("final_score")),
+        ("priority_score", row.get("priority_score")),
+        ("scanner_score", row.get("scanner_score")),
+    ]
+
+    score_value: Optional[float] = None
+    score_kind = "missing"
+    for kind, raw_value in score_sources:
+        parsed = _parse_numeric_score_value(raw_value)
+        if parsed is None:
+            continue
+        score_value = parsed
+        score_kind = kind
+        break
+
+    score_available = score_value is not None
+    score_display = _format_notification_score_display(score_value, score_available)
+
+    return {
+        "source_context": str(source_context or ""),
+        "score_value": score_value,
+        "score_available": bool(score_available),
+        "score_display": score_display,
+        "score_kind": score_kind,
+    }
+
+
 def format_entry_alert_message(row: Dict[str, Any], signal: Dict[str, str], source: str) -> str:
     symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
     chain = token_chain(row).upper()
@@ -7223,7 +7277,7 @@ def format_entry_alert_message(row: Dict[str, Any], signal: Dict[str, str], sour
     source = str(source or "monitoring").lower()
     unified = compute_unified_recommendation(row, source="monitoring")
 
-    score = parse_float(row.get("entry_score"), 0.0)
+    semantics = build_notification_semantics(row, source_context=source)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
     timing = normalize_timing_label(str(row.get("timing_label") or "NEUTRAL"))
     reason = str(unified.get("final_reason") or row.get("entry_reason") or row.get("signal_reason") or "n/a")
@@ -7236,7 +7290,7 @@ def format_entry_alert_message(row: Dict[str, Any], signal: Dict[str, str], sour
         f"<b>{unified['final_action']}</b> | <b>{symbol}</b>\n"
         f"source: MONITOR\n"
         f"chain: {chain}\n"
-        f"score: <b>{score}</b>\n"
+        f"score: <b>{semantics['score_display']}</b>\n"
         f"risk: <b>{risk}</b>\n"
         f"timing: <b>{timing}</b>\n"
         f"horizon: {horizon}\n"
@@ -7278,14 +7332,14 @@ def format_digest_message(row: Dict[str, Any], source: str) -> str:
     symbol = str(row.get("base_symbol") or row.get("symbol") or "MARKET").strip()
     chain = token_chain(row).upper() or "MULTI"
     addr = token_ca(row) or "n/a"
-    score = parse_float(row.get("entry_score"), 0.0)
+    semantics = build_notification_semantics(row, source_context=source)
     dex_url = dex_url_for_token(token_chain(row), token_ca(row))
     dex_line = f"dex: {dex_url}\n" if dex_url else ""
     return (
         f"<b>DIGEST</b> | <b>{symbol}</b>\n"
         f"source: {str(source or 'monitoring').upper()}\n"
         f"chain: {chain}\n"
-        f"score: <b>{score}</b>\n\n"
+        f"score: <b>{semantics['score_display']}</b>\n\n"
         f"{dex_line}"
         f"CA:\n<code>{addr}</code>"
     )
@@ -7510,9 +7564,9 @@ def build_digest_summary(
     top_monitoring_now: List[str] = []
     for row in mon_candidates[: max(1, int(top_monitoring_limit or 3))]:
         symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
-        score = parse_float(row.get("entry_score", 0), 0.0)
+        semantics = build_notification_semantics(row, source_context="digest_summary_monitoring")
         timing = normalize_timing_label(str(row.get("timing_label") or "NEUTRAL"))
-        top_monitoring_now.append(f"{symbol}: {score:.1f} / {timing}")
+        top_monitoring_now.append(f"{symbol}: {semantics['score_display']} / {timing}")
 
     portfolio_sorted = sorted(
         active_portfolio,
@@ -7527,8 +7581,8 @@ def build_digest_summary(
         symbol = str(row.get("base_symbol") or row.get("symbol") or "TOKEN").strip()
         risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
         action = str(row.get("entry_action") or row.get("entry") or "HOLD").upper()
-        score = parse_float(row.get("entry_score", 0), 0.0)
-        top_portfolio_risks.append(f"{symbol}: risk {risk}, action {action}, score {score:.1f}")
+        semantics = build_notification_semantics(row, source_context="digest_summary_portfolio")
+        top_portfolio_risks.append(f"{symbol}: risk {risk}, action {action}, score {semantics['score_display']}")
 
     dead_cold_warnings: List[str] = []
     for row in active_portfolio + active_monitoring:
