@@ -34,3 +34,23 @@ Worker startup is explicit/reproducible through `python worker.py` (used by depl
 - `supabase==2.15.3`
 
 > Усі залежності зафіксовані (pinning) у `requirements.txt`, щоб мінімізувати дрейф поведінки між деплоями.
+
+
+## Emergency runtime reset + workflow dispatch
+
+For stuck runtime state/locks incidents, run:
+
+```bash
+SUPABASE_URL=https://PROJECT.supabase.co \
+SUPABASE_SERVICE_ROLE_KEY=... \
+GITHUB_TOKEN=ghp_... \
+GITHUB_REPOSITORY=OWNER/REPO \
+python scripts/emergency_runtime_reset_and_dispatch.py
+```
+
+The helper will:
+- detect the effective JSON column in `public.runtime_state` (prefers `state_json`, but adapts if schema differs);
+- set `last_job_status` to `finished` for `worker_runtime`;
+- remove `job_mode:%` locks;
+- dispatch `workflow_dispatch` for `scan_cycle`, then `all`;
+- download run logs and fail if `exit code 3` / `duplicate run blocked` / `skipped by lock` are still present.
