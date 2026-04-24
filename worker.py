@@ -315,8 +315,8 @@ def run_job_mode(job_mode: str) -> int:
         traceback.print_exc()
         return 1
     finally:
-        # Lock may be missing in skip scenarios where we return before acquisition.
-        if lock_key:
+        # Lock may be absent in skip paths (unknown mode / duplicate run) before acquisition.
+        if lock_key is not None:
             app.release_lock(lock_key=lock_key, owner=owner)
 
 
