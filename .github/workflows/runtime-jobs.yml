@@ -111,14 +111,21 @@ jobs:
           lock_ttl_sec="${lock_ttl_sec_raw:-900}"
           stale_run_sec="${stale_run_sec_raw:-$(( lock_ttl_sec * 2 ))}"
           timeout_sec="$(( timeout_min_raw * 60 ))"
+          stale_source="$([[ -n "$stale_run_sec_raw" ]] && echo repo_var || echo derived_default)"
 
           if ! [[ "$lock_ttl_sec" =~ ^[0-9]+$ ]] || ! [[ "$stale_run_sec" =~ ^[0-9]+$ ]] || ! [[ "$timeout_min_raw" =~ ^[0-9]+$ ]]; then
             echo "::error::[runtime-jobs][preflight] lock/stale/timeout must be integers lock=${lock_ttl_sec} stale=${stale_run_sec} timeout_min=${timeout_min_raw}"
             exit 21
           fi
 
+          if [[ -z "$stale_run_sec_raw" ]] && (( stale_run_sec >= timeout_sec )); then
+            stale_run_sec="$(( timeout_sec - 60 ))"
+            stale_source="derived_default_adjusted"
+            echo "[runtime-jobs][preflight] auto_adjusted JOB_STALE_RUN_SEC=${stale_run_sec} source=${stale_source} reason=stale_ge_timeout fallback=timeout_minus_60"
+          fi
+
           echo "[runtime-jobs][preflight] effective JOB_LOCK_TTL_SEC=${lock_ttl_sec} source=$([[ -n \"$lock_ttl_sec_raw\" ]] && echo repo_var || echo default)"
-          echo "[runtime-jobs][preflight] effective JOB_STALE_RUN_SEC=${stale_run_sec} source=$([[ -n \"$stale_run_sec_raw\" ]] && echo repo_var || echo derived_default)"
+          echo "[runtime-jobs][preflight] effective JOB_STALE_RUN_SEC=${stale_run_sec} source=${stale_source}"
           echo "[runtime-jobs][preflight] effective WORKFLOW_TIMEOUT_MINUTES=${timeout_min_raw} timeout_sec=${timeout_sec}"
 
           if (( lock_ttl_sec >= stale_run_sec )); then
