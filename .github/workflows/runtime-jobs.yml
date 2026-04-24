@@ -190,10 +190,40 @@ jobs:
           }
           trap cleanup EXIT
 
-          if python worker.py; then
-            echo "[runtime-jobs] finish mode=${JOB_MODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          else
-            CODE=$?
-            echo "[runtime-jobs] fail mode=${JOB_MODE} exit_code=${CODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            exit "$CODE"
-          fi
+          set +e
+          python worker.py
+          CODE=$?
+          set -e
+
+          case "$CODE" in
+            0)
+              echo "[runtime-jobs] finish mode=${JOB_MODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              {
+                echo "### Runtime job result"
+                echo "- mode: ${JOB_MODE}"
+                echo "- status: ✅ success"
+                echo "- exit_code: ${CODE}"
+              } >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            3)
+              echo "[runtime-jobs] skip mode=${JOB_MODE} reason=duplicate_or_lock exit_code=${CODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "skipped (duplicate/lock)"
+              {
+                echo "### Runtime job result"
+                echo "- mode: ${JOB_MODE}"
+                echo "- status: ℹ️ skipped (duplicate/lock)"
+                echo "- exit_code: ${CODE}"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+              ;;
+            *)
+              echo "[runtime-jobs] fail mode=${JOB_MODE} exit_code=${CODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              {
+                echo "### Runtime job result"
+                echo "- mode: ${JOB_MODE}"
+                echo "- status: ❌ error"
+                echo "- exit_code: ${CODE}"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit "$CODE"
+              ;;
+          esac
