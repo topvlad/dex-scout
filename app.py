@@ -11458,10 +11458,22 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     st.caption("Live candidates behind glass (read-only layer). Confirmed Monitoring below remains the settled active layer.")
     if not pulse_cards:
         st.caption("No pulse candidates right now.")
+    pulse_symbol_counts: Dict[str, int] = {}
+    for pulse in pulse_cards:
+        pulse_row = pulse.get("row", {}) or {}
+        pulse_symbol = str(
+            pulse_row.get("base_symbol")
+            or pulse_row.get("symbol")
+            or extract_name(pulse_row)
+            or "UNKNOWN"
+        ).strip().upper()
+        pulse_symbol_counts[pulse_symbol] = pulse_symbol_counts.get(pulse_symbol, 0) + 1
+    rendered_symbol_group_label: Set[str] = set()
     for idx, pulse in enumerate(pulse_cards, start=1):
         row = pulse.get("row", {}) or {}
         chain = str(pulse.get("chain") or token_chain(row) or "").strip().lower()
         base_addr = token_ca(row)
+        pair_addr = str(row.get("pair_addr") or row.get("pair_address") or row.get("pairAddress") or "").strip()
         symbol = str(row.get("base_symbol") or row.get("symbol") or extract_name(row) or "UNKNOWN").strip().upper()
         if not symbol:
             symbol = "UNKNOWN"
@@ -11479,8 +11491,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         low_liq_for_monitor = liq_usd < pulse_min_liq_usd
         if not dex_url and isinstance(best, dict):
             dex_url = str(best.get("url") or "")
-        header = f"{symbol} • {chain.upper()} • score {score:.1f}"
+        ticker_group_count = int(pulse_symbol_counts.get(symbol, 0))
+        if ticker_group_count > 1 and symbol not in rendered_symbol_group_label:
+            st.caption(f"same ticker, different contracts: {symbol} ({ticker_group_count})")
+            rendered_symbol_group_label.add(symbol)
+        header = f"{symbol} • {chain.upper()} • score {score:.1f} • ca: {short_addr(base_addr)}"
         with st.expander(header, expanded=False):
+            st.caption(f"token_ca: {base_addr or 'n/a'}")
+            st.caption(f"pair_addr: {pair_addr or 'n/a'}")
             st.caption(f"timing: {timing} • stage: {stage} • status: {status_marker} • freshness: {freshness_min:.1f}m")
             st.caption(str(pulse.get("summary_line") or "snapshot: n/a"))
             mini_sparkline = pulse.get("mini_sparkline") if isinstance(pulse.get("mini_sparkline"), dict) else None
