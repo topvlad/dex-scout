@@ -790,16 +790,35 @@ def _csv_to_string(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
 
 
 def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """
+    Load CSV rows from Supabase storage (if configured) with local fallback.
+
+    Args:
+        path: CSV path/key used by storage backends.
+        fields: Optional schema projection for returned rows.
+            - If provided, every returned row is normalized to exactly these keys
+              and in this exact order.
+            - Missing columns are filled with "".
+            - Extra CSV columns are dropped in the returned payload.
+            - If omitted, rows are returned as-is from csv.DictReader.
+    """
     ensure_storage()
     key = storage_key_for_path(path)
-    del fields  # compatibility
+
+    def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not fields:
+            return rows
+        normalized: List[Dict[str, Any]] = []
+        for row in rows:
+            normalized.append({name: row.get(name, "") for name in fields})
+        return normalized
 
     if _sb_ok():
         content = sb_get_storage(key)
         if content:
             try:
                 st.session_state[f"_storage_source_{key}"] = "supabase"
-                return _csv_from_string(content)
+                return _normalize_rows(_csv_from_string(content))
             except Exception:
                 debug_log(f"corrupt_supabase_csv key={key}")
 
@@ -809,7 +828,7 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
             with open(fallback, "r", newline="", encoding="utf-8") as f:
                 debug_log(f"using_local_fallback key={key}")
                 st.session_state[f"_storage_source_{key}"] = "local_fallback"
-                return list(csv.DictReader(f))
+                return _normalize_rows(list(csv.DictReader(f)))
         except Exception as e:
             debug_log(f"local_fallback_read_failed key={key} err={type(e).__name__}:{e}")
 
