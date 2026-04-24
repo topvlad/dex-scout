@@ -21,6 +21,7 @@ RUNTIME_REQUIRED_ENTITIES = (
     "tg_state",
     "job_heartbeats",
 )
+
 RUNTIME_OPTIONAL_ENTITIES = ("job_runs",)
 
 
@@ -143,6 +144,7 @@ def run_job_mode(job_mode: str) -> int:
     assert app is not None
     mode = str(job_mode or "").strip().lower()
     runner = JOB_DISPATCH.get(mode)
+
     if runner is None:
         reason = f"unknown_job_mode:{mode or 'empty'}"
         app.update_worker_runtime_state(
@@ -170,6 +172,7 @@ def run_job_mode(job_mode: str) -> int:
     prev_started_epoch = float(app.parse_float(runtime.get("last_job_started_epoch", 0.0), 0.0))
     age_sec = max(0.0, time.time() - prev_started_epoch) if prev_started_epoch > 0 else 0.0
     stale_run = bool(prev_status == "running" and prev_mode == mode and age_sec >= JOB_STALE_RUN_SEC)
+
     if prev_status == "running" and prev_mode == mode and age_sec < JOB_STALE_RUN_SEC:
         reason = f"duplicate_run_guard:mode={mode}:age_sec={int(age_sec)}"
         app.update_worker_runtime_state(
@@ -191,7 +194,19 @@ def run_job_mode(job_mode: str) -> int:
         )
         print(f"[worker] duplicate run blocked mode={mode} age_sec={int(age_sec)}", flush=True)
         return 3
+
+    # FIX #1: initialise lock_key to None before any branching so the
+    # finally block never hits NameError on early returns.
+    lock_key: Optional[str] = None
+
+    lock_key = f"job_mode:{mode}"
+
+    # FIX #6: only write stale_run heartbeat AFTER we know we will attempt
+    # the lock — avoids misleading "stale_run_detected" when lock then fails.
+    lock_status = app.acquire_lock(lock_key=lock_key, owner=owner, ttl_sec=JOB_LOCK_TTL_SEC)
+
     if stale_run:
+        # Write the stale-run note now that we've attempted the lock.
         app.update_worker_runtime_state(
             updates={
                 "last_stale_run_ts": app.now_utc_str(),
@@ -205,8 +220,6 @@ def run_job_mode(job_mode: str) -> int:
             meta={"age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
         )
 
-    lock_key = f"job_mode:{mode}"
-    lock_status = app.acquire_lock(lock_key=lock_key, owner=owner, ttl_sec=JOB_LOCK_TTL_SEC)
     if lock_status.get("ok") and bool(lock_status.get("stale_replaced")):
         app.update_worker_runtime_state(
             updates={
@@ -222,6 +235,7 @@ def run_job_mode(job_mode: str) -> int:
             status="stale_lock_replaced",
             meta={"lock_key": lock_key, "lock_status": lock_status},
         )
+
     if not lock_status.get("ok"):
         code = str(lock_status.get("code") or "lock_failed")
         reason = f"{code}:{lock_status.get('detail') or lock_status.get('message') or ''}".strip(":")
@@ -291,6 +305,7 @@ def run_job_mode(job_mode: str) -> int:
         )
         print(f"[worker] mode={mode} finished result={result}", flush=True)
         return 0
+
     except Exception as exc:
         reason = f"job_mode_exception:{mode}:{type(exc).__name__}:{exc}"
         app.update_worker_runtime_state(
@@ -313,8 +328,12 @@ def run_job_mode(job_mode: str) -> int:
         print(f"[worker] mode={mode} failed reason={reason}", flush=True)
         traceback.print_exc()
         return 1
+
     finally:
-        app.release_lock(lock_key=lock_key, owner=owner)
+        # FIX #1: guard release — lock_key is None if we returned before
+        # acquiring (unknown mode, duplicate run guard, etc.).
+        if lock_key is not None:
+            app.release_lock(lock_key=lock_key, owner=owner)
 
 
 def main() -> int:
@@ -326,6 +345,7 @@ def main() -> int:
         return _fail_fast(f"missing_env:{','.join(missing_env)}", 12)
 
     app.ensure_storage()
+
     contract = app.check_runtime_contract()
     if not contract.get("ok"):
         failures = contract.get("failures")
@@ -334,6 +354,7 @@ def main() -> int:
             for failure in failures:
                 if isinstance(failure, dict):
                     failure_tables.add(str(failure.get("table") or "").strip())
+
         required_entities = set(RUNTIME_REQUIRED_ENTITIES)
         missing_entities = sorted(entity for entity in required_entities if entity in failure_tables)
         missing_entities.extend(
@@ -345,6 +366,7 @@ def main() -> int:
         optional_missing = sorted(entity for entity in RUNTIME_OPTIONAL_ENTITIES if entity in failure_tables)
         if optional_missing:
             missing_entities.extend(optional_missing)
+
         entities_detail = ",".join(missing_entities) or "unknown"
         reason = f"runtime_contract_error:{contract.get('code')}:{entities_detail}"
         app.update_worker_runtime_state(
