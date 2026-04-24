@@ -1,10 +1,13 @@
 # alerts.py
+
 import time
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
+
 from config import WATCH_TTL_MINUTES, WATCH_MAX_ITEMS, ALERT_COOLDOWN_SECONDS
 
 Key = Tuple[str, str]  # (chain, pairAddress)
+
 
 @dataclass
 class WatchItem:
@@ -13,11 +16,14 @@ class WatchItem:
     last_alert: float
     data: dict
 
+
 def _now() -> float:
     return time.time()
 
+
 def make_key(row: dict) -> Key:
     return (row.get("chain") or "", row.get("pairAddress") or "")
+
 
 def purge_expired(store: Dict[Key, WatchItem]) -> None:
     """Drop items older than TTL."""
@@ -27,12 +33,16 @@ def purge_expired(store: Dict[Key, WatchItem]) -> None:
     for k in dead:
         store.pop(k, None)
 
-    # Hard cap
-    if len(store) > WATCH_MAX_ITEMS:
-        # remove oldest by last_seen
-        oldest = sorted(store.items(), key=lambda kv: kv[1].last_seen)[: max(0, len(store) - WATCH_MAX_ITEMS)]
+    # FIX #4: use >= so the cap is enforced even when len == WATCH_MAX_ITEMS.
+    # Previously `> WATCH_MAX_ITEMS` meant the store could sit exactly at the
+    # limit indefinitely without ever evicting the oldest entry.
+    if len(store) >= WATCH_MAX_ITEMS:
+        # Remove oldest entries until we are below the cap.
+        excess = len(store) - WATCH_MAX_ITEMS + 1  # +1 to make room for next upsert
+        oldest = sorted(store.items(), key=lambda kv: kv[1].last_seen)[:excess]
         for k, _ in oldest:
             store.pop(k, None)
+
 
 def upsert_watchlist(store: Dict[Key, WatchItem], rows: List[dict]) -> None:
     """Update store with new rows; keep last seen snapshot."""
@@ -47,6 +57,7 @@ def upsert_watchlist(store: Dict[Key, WatchItem], rows: List[dict]) -> None:
             item = store[k]
             item.last_seen = t
             item.data = r  # overwrite snapshot
+
 
 def build_alerts(store: Dict[Key, WatchItem], min_score: float) -> List[dict]:
     """Return rows that should alert now (cooldown respected)."""
@@ -63,9 +74,11 @@ def build_alerts(store: Dict[Key, WatchItem], min_score: float) -> List[dict]:
         # mark alert and emit
         item.last_alert = t
         out.append(item.data)
+
     # sort high score first
     out.sort(key=lambda r: r.get("score", -1e9), reverse=True)
     return out
+
 
 def snapshot_watchlist(store: Dict[Key, WatchItem]) -> List[dict]:
     """Return current watchlist data as list of dict, sorted by score."""
