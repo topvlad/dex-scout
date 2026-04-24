@@ -331,12 +331,6 @@ def run_job_mode(job_mode: str) -> int:
         return 1
 
     finally:
-        codex/update-worker.py-lock-handling
-        # Lock may be absent in skip paths (unknown mode / duplicate run) before acquisition.
-
-        # FIX #1: guard release — lock_key is None if we returned before
-        # acquiring (unknown mode, duplicate run guard, etc.).
-        main
         if lock_key is not None:
             app.release_lock(lock_key=lock_key, owner=owner)
 
