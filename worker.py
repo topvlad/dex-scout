@@ -206,21 +206,6 @@ def run_job_mode(job_mode: str) -> int:
     # the lock — avoids misleading "stale_run_detected" when lock then fails.
     lock_status = app.acquire_lock(lock_key=lock_key, owner=owner, ttl_sec=JOB_LOCK_TTL_SEC)
 
-    if stale_run:
-        # Write the stale-run note now that we've attempted the lock.
-        app.update_worker_runtime_state(
-            updates={
-                "last_stale_run_ts": app.now_utc_str(),
-                "last_job_reason": f"stale_run_detected:mode={mode}:age_sec={int(age_sec)}",
-            }
-        )
-        app.update_job_heartbeat(
-            job_name="job_dispatch",
-            job_mode=mode,
-            status="stale_run_detected",
-            meta={"age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
-        )
-
     if lock_status.get("ok") and bool(lock_status.get("stale_replaced")):
         app.update_worker_runtime_state(
             updates={
@@ -259,6 +244,21 @@ def run_job_mode(job_mode: str) -> int:
         )
         print(f"[worker] skipped by lock mode={mode} code={code}", flush=True)
         return 3
+
+    if stale_run and lock_status.get("ok"):
+        # Write the stale-run note only when lock acquisition succeeded.
+        app.update_worker_runtime_state(
+            updates={
+                "last_stale_run_ts": app.now_utc_str(),
+                "last_job_reason": f"stale_run_detected:mode={mode}:age_sec={int(age_sec)}",
+            }
+        )
+        app.update_job_heartbeat(
+            job_name="job_dispatch",
+            job_mode=mode,
+            status="stale_run_detected",
+            meta={"age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
+        )
 
     start_epoch = time.time()
     start_ts = app.now_utc_str()
