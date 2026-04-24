@@ -567,7 +567,8 @@ def _sb_upsert_row(table: str, payload: Dict[str, Any], on_conflict: str) -> Dic
 
 def sb_get_storage(key: str) -> Optional[str]:
     """
-    Returns content for key from public.app_storage, or None if not found.
+    Returns content for key from public.app_storage, or None if not found/readable.
+    Reliability refactor: HTTP 4xx/5xx responses degrade to None instead of bubbling up.
     """
     if not USE_SUPABASE:
         return None
@@ -578,7 +579,9 @@ def sb_get_storage(key: str) -> Optional[str]:
         if r.status_code == 404:
             debug_log(f"supabase_read_404 key={key}")
             return None
-        r.raise_for_status()
+        if r.status_code >= 400:
+            debug_log(f"supabase_read_http_error key={key} status={r.status_code}")
+            return None
         data = r.json() or []
         if not data:
             debug_log(f"supabase_read_empty key={key}")

@@ -139,3 +139,6 @@
 # WHY: raise_for_status() on a 429 or 503 propagates an uncaught exception
 # up through load_csv() and save_csv(), potentially breaking persistence
 # for the entire request cycle rather than degrading gracefully.
+#
+# STATUS: done. sb_get_storage() already returns None for 500/429 via try/except.
+# This is tracked as a reliability refactor (graceful degradation), not a crash-fix.
