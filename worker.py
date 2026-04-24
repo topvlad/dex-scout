@@ -76,7 +76,13 @@ SCANNER_MAX_ITEMS = _env_int("SCANNER_MAX_ITEMS", 10)
 USE_BIRDEYE_TRENDING = _env_bool("USE_BIRDEYE_TRENDING", True)
 BIRDEYE_LIMIT = _env_int("BIRDEYE_LIMIT", 10)
 JOB_LOCK_TTL_SEC = max(60, _env_int("JOB_LOCK_TTL_SEC", 900))
-JOB_STALE_RUN_SEC = max(JOB_LOCK_TTL_SEC, _env_int("JOB_STALE_RUN_SEC", JOB_LOCK_TTL_SEC * 2))
+JOB_STALE_RUN_SEC = max(JOB_LOCK_TTL_SEC + 1, _env_int("JOB_STALE_RUN_SEC", JOB_LOCK_TTL_SEC * 2))
+
+if JOB_LOCK_TTL_SEC >= JOB_STALE_RUN_SEC:
+    raise RuntimeError(
+        f"invalid_runtime_config: JOB_LOCK_TTL_SEC({JOB_LOCK_TTL_SEC}) must be < "
+        f"JOB_STALE_RUN_SEC({JOB_STALE_RUN_SEC})"
+    )
 
 
 class _TerminatedSignal(RuntimeError):

@@ -54,3 +54,22 @@ The helper will:
 - remove `job_mode:%` locks;
 - dispatch `workflow_dispatch` for `scan_cycle`, then `all`;
 - download run logs and fail if `exit code 3` / `duplicate run blocked` / `skipped by lock` are still present.
+
+## Runtime Jobs repo vars (recommended)
+
+For `.github/workflows/runtime-jobs.yml`, define these **Repository Variables**:
+
+- `JOB_LOCK_TTL_SEC` (recommended: `600`)
+- `JOB_STALE_RUN_SEC` (recommended: `1200`)
+
+Workflow timeout is `30m` (`1800s`) now, so keep this invariant valid:
+
+`JOB_LOCK_TTL_SEC < JOB_STALE_RUN_SEC < workflow timeout`
+
+Recommended ops values:
+
+- `JOB_LOCK_TTL_SEC=600`
+- `JOB_STALE_RUN_SEC=1200`
+- workflow `timeout-minutes=30` (or any value above `20m`, so `stale < timeout` remains true)
+
+If repo vars are missing, workflow preflight logs effective defaults and still validates the invariant before executing `worker.py`.
