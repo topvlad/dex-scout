@@ -103,6 +103,8 @@ USE_HEAVY_MIGRATION_CHECK = not WORKER_FAST_MODE
 
 SCAN_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 300
+PULSE_SPARKLINE_LOG_DEBOUNCE_SEC = 300
+PULSE_SPARKLINE_LOG_LAST_TS: Dict[str, float] = {}
 
 MEME_KEYWORDS = [
     "dog",
@@ -10641,32 +10643,56 @@ def _pulse_card_summary_line(best: Optional[Dict[str, Any]], row: Dict[str, Any]
     )
 
 
-def _log_pulse_sparkline_missing(reason: str) -> None:
+def _log_pulse_sparkline_missing(reason: str, token_key: str = "") -> None:
     normalized = str(reason or "").strip().lower()
     if normalized in {"no_history", "not_enough_points", "no_score_or_price_series"}:
+        debounce_key = f"{str(token_key or '').strip().lower()}|{normalized}"
+        if debounce_key != f"|{normalized}":
+            now_ts = time.time()
+            last_ts = float(PULSE_SPARKLINE_LOG_LAST_TS.get(debounce_key, 0.0) or 0.0)
+            if (now_ts - last_ts) < PULSE_SPARKLINE_LOG_DEBOUNCE_SEC:
+                return
+            PULSE_SPARKLINE_LOG_LAST_TS[debounce_key] = now_ts
         debug_log(f"pulse_sparkline_missing reason={normalized}")
 
 
 def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict[str, Any]:
     chain = token_chain(row)
     base_addr = token_ca(row)
+    token_key = canonical_entity_key(chain, base_addr)
     empty_payload = {
         "series": "score",
         "values": [],
         "points": 0,
-        "reason": "no_history",
+        "reason": "warming_up",
         "source": "token_history",
     }
+
+    def _coerce_row_series(raw_values: Any) -> List[float]:
+        if raw_values is None:
+            return []
+        values = raw_values
+        if isinstance(values, str):
+            stripped = values.strip()
+            if not stripped:
+                return []
+            try:
+                loaded = json.loads(stripped)
+                values = loaded
+            except Exception:
+                values = [part.strip() for part in stripped.split(",")]
+        if isinstance(values, dict):
+            values = list(values.values())
+        if not isinstance(values, list):
+            values = [values]
+        return [parse_float(v, 0.0) for v in values if parse_float(v, 0.0) > 0]
+
     if not chain or not base_addr:
-        _log_pulse_sparkline_missing("no_history")
+        _log_pulse_sparkline_missing("no_history", token_key=token_key)
         return empty_payload
 
     hist = token_history_rows(chain, base_addr, limit=40)
-    if not hist:
-        _log_pulse_sparkline_missing("no_history")
-        return empty_payload
-
-    series = build_history_series(hist)
+    series = build_history_series(hist) if hist else {}
 
     def _series_values(raw_values: Any) -> List[float]:
         return [parse_float(v, 0.0) for v in list(raw_values or []) if parse_float(v, 0.0) > 0]
@@ -10685,6 +10711,8 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict
             _series_values([h.get("price_usd") for h in hist if str(h.get("price_usd", "")).strip()]),
             "history_raw.price_usd",
         ),
+        ("row.history_series", _coerce_row_series(row.get("history_series")), "row.history_series"),
+        ("row.entry_score_trail", _coerce_row_series(row.get("entry_score_trail")), "row.entry_score_trail"),
     ]
 
     best_partial: Optional[Tuple[str, List[float], str]] = None
@@ -10705,21 +10733,21 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict
     if best_partial:
         series_name, values, source = best_partial
         trimmed = values[-24:]
-        _log_pulse_sparkline_missing("not_enough_points")
+        _log_pulse_sparkline_missing("not_enough_points", token_key=token_key)
         return {
             "series": series_name,
             "values": trimmed,
             "points": len(trimmed),
-            "reason": "not_enough_points",
+            "reason": "warming_up",
             "source": source,
         }
 
-    _log_pulse_sparkline_missing("no_score_or_price_series")
+    _log_pulse_sparkline_missing("no_score_or_price_series", token_key=token_key)
     return {
         "series": "score",
         "values": [],
         "points": 0,
-        "reason": "no_score_or_price_series",
+        "reason": "warming_up",
         "source": "token_history",
     }
 
@@ -11431,9 +11459,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             else:
                 fallback_reason = str(mini_sparkline.get("reason") or "").strip().lower() if mini_sparkline else ""
                 if not fallback_reason:
-                    fallback_reason = "no_score_or_price_series"
-                _log_pulse_sparkline_missing(fallback_reason)
-                st.caption(fallback_reason)
+                    fallback_reason = "warming_up"
+                if fallback_reason in {"warming_up", "not_enough_points"} or spark_points < 3:
+                    _log_pulse_sparkline_missing("not_enough_points", token_key=card_key)
+                    st.caption("collecting history…")
+                else:
+                    _log_pulse_sparkline_missing(fallback_reason, token_key=card_key)
+                    st.caption(fallback_reason)
             st.caption(f"sparkline source: {spark_source}")
             st.caption(f"points: {spark_points}")
             c1, c2 = st.columns(2)
