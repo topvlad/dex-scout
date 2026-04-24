@@ -1087,6 +1087,7 @@ MAJORS_STABLES = {
 }
 HARD_BLOCK_SYMBOLS = {"USDT", "USDC", "ETH", "BTC", "BNB"}
 MIN_LIQ_USD = 10000
+PULSE_MIN_LIQ_USD = float(max(0, _env_int("PULSE_MIN_LIQ_USD", 8000)))
 MIN_TXNS_5M = 5
 MIN_VOL_5M = 1500
 MAX_KEEP = int(os.getenv("SCANNER_MAX_KEEP", "80"))
@@ -10643,6 +10644,17 @@ def _pulse_card_summary_line(best: Optional[Dict[str, Any]], row: Dict[str, Any]
     )
 
 
+def _pulse_card_liquidity_usd(best: Optional[Dict[str, Any]], row: Dict[str, Any]) -> float:
+    liq = parse_float(safe_get(best or {}, "liquidity", "usd", default=0), 0.0)
+    if liq > 0:
+        return liq
+    for candidate in (row.get("liq_init"), row.get("liq_usd")):
+        parsed = parse_float(candidate, 0.0)
+        if parsed > 0:
+            return parsed
+    return 0.0
+
+
 def _log_pulse_sparkline_missing(reason: str, token_key: str = "") -> None:
     normalized = str(reason or "").strip().lower()
     if normalized in {"no_history", "not_enough_points", "no_score_or_price_series"}:
@@ -10799,6 +10811,7 @@ def build_market_pulse_cards(
     )
     pulse_cards: List[Dict[str, Any]] = []
     seen: Set[str] = set()
+    low_liq_skipped = 0
     for row in discovery_pool:
         key = canonical_token_key(row)
         chain = token_chain(row)
@@ -10818,6 +10831,10 @@ def build_market_pulse_cards(
         novelty_bonus = (8.0 if key in runtime_keys else 0.0) + (4.0 if key in queue_keys else 0.0)
         pulse_sort = score + freshness_bonus + novelty_bonus + timing_bonus
         best = best_pair_for_token_cached(chain, token_ca(row)) if chain and token_ca(row) else None
+        liq_usd = _pulse_card_liquidity_usd(best if isinstance(best, dict) else None, row)
+        if liq_usd < PULSE_MIN_LIQ_USD:
+            low_liq_skipped += 1
+            continue
         pulse_cards.append(
             {
                 "row": row,
@@ -10830,6 +10847,9 @@ def build_market_pulse_cards(
                 "freshness_min": round(freshness_min, 1),
                 "pulse_sort": round(pulse_sort, 3),
                 "best": best,
+                "liq_usd": round(liq_usd, 2),
+                "pulse_min_liq_usd": float(PULSE_MIN_LIQ_USD),
+                "low_liquidity": liq_usd < PULSE_MIN_LIQ_USD,
                 "summary_line": _pulse_card_summary_line(best, row),
             }
         )
@@ -10845,6 +10865,18 @@ def build_market_pulse_cards(
     for card in selected_cards:
         row = card.get("row", {}) or {}
         card["mini_sparkline"] = _pulse_card_mini_sparkline(row)
+    update_worker_runtime_state(
+        updates={
+            "last_pulse_liq_min_usd": float(PULSE_MIN_LIQ_USD),
+            "last_pulse_candidates_total": int(len(discovery_pool)),
+            "last_pulse_candidates_low_liq_skipped": int(low_liq_skipped),
+            "last_pulse_candidates_after_liq_gate": int(len(pulse_cards)),
+        }
+    )
+    if low_liq_skipped > 0:
+        debug_log(
+            f"pulse_liquidity_gate skipped={low_liq_skipped} min_liq_usd={float(PULSE_MIN_LIQ_USD):.2f}"
+        )
     return selected_cards
 
 
@@ -11442,6 +11474,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         in_monitoring = card_key in active_monitoring_keys
         dex_url = dex_url_for_token(chain, base_addr)
         best = pulse.get("best")
+        liq_usd = parse_float(pulse.get("liq_usd"), 0.0)
+        pulse_min_liq_usd = parse_float(pulse.get("pulse_min_liq_usd", PULSE_MIN_LIQ_USD), PULSE_MIN_LIQ_USD)
+        low_liq_for_monitor = liq_usd < pulse_min_liq_usd
         if not dex_url and isinstance(best, dict):
             dex_url = str(best.get("url") or "")
         header = f"{symbol} • {chain.upper()} • score {score:.1f}"
@@ -11477,6 +11512,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             with c2:
                 if in_monitoring:
                     st.button("Already in Monitoring", disabled=True, use_container_width=True, key=f"pulse_in_mon_{idx}_{hkey(card_key)}")
+                elif low_liq_for_monitor:
+                    st.button("+ Monitor", disabled=True, use_container_width=True, key=f"pulse_add_disabled_{idx}_{hkey(card_key)}")
+                    st.caption(f"Low liquidity ({fmt_usd(liq_usd)} < {fmt_usd(pulse_min_liq_usd)})")
                 else:
                     if st.button("+ Monitor", use_container_width=True, key=f"pulse_add_{idx}_{hkey(card_key)}"):
                         payload = _pulse_pair_payload(row, best if isinstance(best, dict) else None)
