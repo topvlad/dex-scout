@@ -45,6 +45,16 @@ import config as app_config
 st.set_page_config(page_title="DEX Scout", layout="wide")
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def _maybe_autorefresh(interval_ms: int, key: str):
     """Best-effort autorefresh without extra deps."""
     try:
@@ -121,8 +131,8 @@ ALERT_MODE_REGISTRY = {"quiet", "normal", "aggressive"}
 DIGEST_SOURCE_MODE_DEFAULT = "ui_truth"
 DIGEST_SOURCE_MODES = {"ui_truth", "backend_candidates"}
 DIGEST_BACKEND_REUSE_TTL_SEC = max(300, int(os.getenv("DIGEST_BACKEND_REUSE_TTL_SEC", "7200")))
-DIGEST_UI_HEARTBEAT_HOURS = max(1, int(os.getenv("DIGEST_UI_HEARTBEAT_HOURS", "12") or 12))
-DIGEST_DISCOVERY_HEARTBEAT_HOURS = max(1, int(os.getenv("DIGEST_DISCOVERY_HEARTBEAT_HOURS", "12") or 12))
+DIGEST_UI_HEARTBEAT_HOURS = max(1, _env_int("DIGEST_UI_HEARTBEAT_HOURS", 12))
+DIGEST_DISCOVERY_HEARTBEAT_HOURS = max(1, _env_int("DIGEST_DISCOVERY_HEARTBEAT_HOURS", 12))
 OUTCOME_HORIZONS_MINUTES: Dict[str, int] = {
     "15m": 15,
     "1h": 60,
