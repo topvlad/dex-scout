@@ -893,13 +893,17 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     if _sb_ok():
         ok = sb_put_storage(key, content)
         if ok:
+            # Keep read-back as diagnostics, but success criterion is exact round-trip.
             check = sb_get_storage(key)
-            if check:
-                debug_log(f"supabase_store_verified key={key}")
-                st.session_state["_save_badge"] = "💾 saved (supabase verified)"
+            if check == content:
+                debug_log(f"supabase_store_verified key={key} mode=roundtrip")
+                st.session_state["_save_badge"] = "💾 saved (supabase round-trip verified)"
             else:
-                debug_log(f"supabase_store_unverified key={key}")
-                st.session_state["_save_badge"] = "⚠️ saved local, supabase unverified"
+                check_len = len(check) if isinstance(check, str) else 0
+                debug_log(
+                    f"supabase_store_mismatch key={key} expected_len={len(content)} got_len={check_len}"
+                )
+                st.session_state["_save_badge"] = "⚠️ saved local, supabase write ok (round-trip mismatch)"
         else:
             debug_log(f"supabase_store_failed_local_kept key={key}")
             st.session_state["_save_badge"] = "⚠️ saved local, supabase write failed"
