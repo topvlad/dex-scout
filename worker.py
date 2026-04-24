@@ -142,6 +142,7 @@ JOB_DISPATCH: Dict[str, Callable[[], Dict[str, Any]]] = {
 def run_job_mode(job_mode: str) -> int:
     assert app is not None
     mode = str(job_mode or "").strip().lower()
+    lock_key = None
     runner = JOB_DISPATCH.get(mode)
     if runner is None:
         reason = f"unknown_job_mode:{mode or 'empty'}"
@@ -314,7 +315,9 @@ def run_job_mode(job_mode: str) -> int:
         traceback.print_exc()
         return 1
     finally:
-        app.release_lock(lock_key=lock_key, owner=owner)
+        # Lock may be missing in skip scenarios where we return before acquisition.
+        if lock_key:
+            app.release_lock(lock_key=lock_key, owner=owner)
 
 
 def main() -> int:
