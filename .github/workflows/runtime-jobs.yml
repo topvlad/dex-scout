@@ -57,9 +57,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
-    timeout-minutes: 30
+    timeout-minutes: 35
     env:
-      WORKFLOW_TIMEOUT_MINUTES: "30"
+      WORKFLOW_TIMEOUT_MINUTES: "35"
       PYTHONUNBUFFERED: "1"
       JOB_MODE: ${{ matrix.job_mode }}
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -106,7 +106,7 @@ jobs:
 
           lock_ttl_sec_raw="${JOB_LOCK_TTL_SEC:-}"
           stale_run_sec_raw="${JOB_STALE_RUN_SEC:-}"
-          timeout_min_raw="${WORKFLOW_TIMEOUT_MINUTES:-30}"
+          timeout_min_raw="${WORKFLOW_TIMEOUT_MINUTES:-35}"
 
           lock_ttl_sec="${lock_ttl_sec_raw:-900}"
           stale_run_sec="${stale_run_sec_raw:-$(( lock_ttl_sec * 2 ))}"
