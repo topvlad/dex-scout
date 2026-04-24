@@ -1,7 +1,9 @@
 import os
+import signal
 import socket
 import time
 import traceback
+import uuid
 from importlib import import_module
 from typing import Any, Callable, Dict, Optional
 
@@ -75,6 +77,32 @@ USE_BIRDEYE_TRENDING = _env_bool("USE_BIRDEYE_TRENDING", True)
 BIRDEYE_LIMIT = _env_int("BIRDEYE_LIMIT", 10)
 JOB_LOCK_TTL_SEC = max(60, _env_int("JOB_LOCK_TTL_SEC", 900))
 JOB_STALE_RUN_SEC = max(JOB_LOCK_TTL_SEC, _env_int("JOB_STALE_RUN_SEC", JOB_LOCK_TTL_SEC * 2))
+
+
+class _TerminatedSignal(RuntimeError):
+    pass
+
+
+def _finalize_runtime_if_token_matches(
+    *,
+    mode: str,
+    run_id: str,
+    updates: Dict[str, Any],
+    increments: Optional[Dict[str, int]] = None,
+) -> bool:
+    assert app is not None
+    runtime = app.get_worker_runtime_state()
+    current_run_id = str(runtime.get("run_id") or "").strip()
+    current_mode = str(runtime.get("last_job_mode") or "").strip().lower()
+    if current_run_id != run_id or current_mode != mode:
+        print(
+            f"[worker] finalize token mismatch mode={mode} run_id={run_id} "
+            f"current_mode={current_mode} current_run_id={current_run_id}",
+            flush=True,
+        )
+        return False
+    app.update_worker_runtime_state(updates=updates, increments=increments)
+    return True
 
 
 def _run_scan_cycle() -> Dict[str, Any]:
@@ -172,7 +200,28 @@ def run_job_mode(job_mode: str) -> int:
     prev_mode = str(runtime.get("last_job_mode") or "").strip().lower()
     prev_started_epoch = float(app.parse_float(runtime.get("last_job_started_epoch", 0.0), 0.0))
     age_sec = max(0.0, time.time() - prev_started_epoch) if prev_started_epoch > 0 else 0.0
-    stale_run = bool(prev_status == "running" and prev_mode == mode and age_sec >= JOB_STALE_RUN_SEC)
+    stale_run = bool(prev_status == "running" and age_sec >= JOB_STALE_RUN_SEC)
+    if stale_run:
+        app.update_worker_runtime_state(
+            updates={
+                "worker_status": "job_stale_recovered",
+                "last_job_status": "aborted",
+                "last_job_reason": "stale_aborted",
+                "last_job_finished_ts": app.now_utc_str(),
+                "last_job_finished_epoch": time.time(),
+                "last_error_reason": (
+                    f"stale_recovered:prev_mode={prev_mode or 'unknown'}:age_sec={int(age_sec)}"
+                ),
+            }
+        )
+        app.update_job_heartbeat(
+            job_name="job_dispatch",
+            job_mode=mode,
+            status="stale_recovered",
+            meta={"prev_mode": prev_mode, "age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
+        )
+        print(f"[worker] stale_recovered mode={prev_mode or 'unknown'} age_sec={int(age_sec)}", flush=True)
+        prev_status = "aborted"
 
     if prev_status == "running" and prev_mode == mode and age_sec < JOB_STALE_RUN_SEC:
         reason = f"duplicate_run_guard:mode={mode}:age_sec={int(age_sec)}"
@@ -190,10 +239,10 @@ def run_job_mode(job_mode: str) -> int:
         app.update_job_heartbeat(
             job_name="job_dispatch",
             job_mode=mode,
-            status="duplicate_run",
+            status="duplicate_guard",
             meta={"reason": reason, "age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
         )
-        print(f"[worker] duplicate run blocked mode={mode} age_sec={int(age_sec)}", flush=True)
+        print(f"[worker] duplicate_guard mode={mode} age_sec={int(age_sec)}", flush=True)
         return 3
 
     # FIX #1: initialise lock_key to None before any branching so the
@@ -225,6 +274,7 @@ def run_job_mode(job_mode: str) -> int:
     if not lock_status.get("ok"):
         code = str(lock_status.get("code") or "lock_failed")
         reason = f"{code}:{lock_status.get('detail') or lock_status.get('message') or ''}".strip(":")
+        heartbeat_status = "lock_held" if code == "lock_held" else "lock_failed"
         app.update_worker_runtime_state(
             updates={
                 "worker_status": "job_skipped_locked",
@@ -239,29 +289,16 @@ def run_job_mode(job_mode: str) -> int:
         app.update_job_heartbeat(
             job_name="job_dispatch",
             job_mode=mode,
-            status="skipped_locked",
+            status=heartbeat_status,
             meta={"lock_key": lock_key, "owner": owner, "lock_status": lock_status},
         )
-        print(f"[worker] skipped by lock mode={mode} code={code}", flush=True)
+        print(f"[worker] {heartbeat_status} mode={mode} code={code}", flush=True)
         return 3
-
-    if stale_run and lock_status.get("ok"):
-        # Write the stale-run note only when lock acquisition succeeded.
-        app.update_worker_runtime_state(
-            updates={
-                "last_stale_run_ts": app.now_utc_str(),
-                "last_job_reason": f"stale_run_detected:mode={mode}:age_sec={int(age_sec)}",
-            }
-        )
-        app.update_job_heartbeat(
-            job_name="job_dispatch",
-            job_mode=mode,
-            status="stale_run_detected",
-            meta={"age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
-        )
 
     start_epoch = time.time()
     start_ts = app.now_utc_str()
+    run_id = str(uuid.uuid4())
+    job_start_token = run_id
     app.update_worker_runtime_state(
         updates={
             "worker_status": "job_running",
@@ -273,6 +310,8 @@ def run_job_mode(job_mode: str) -> int:
             "last_lock_code": "",
             "last_job_started_ts": start_ts,
             "last_job_started_epoch": start_epoch,
+            "job_start_token": job_start_token,
+            "run_id": run_id,
             "last_error_reason": "",
         }
     )
@@ -283,11 +322,20 @@ def run_job_mode(job_mode: str) -> int:
         meta={"lock_key": lock_key, "owner": owner},
     )
 
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _on_sigterm(_signum, _frame):
+        raise _TerminatedSignal("terminated_signal")
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     try:
         result = runner()
         end_epoch = time.time()
         duration_sec = round(max(0.0, end_epoch - start_epoch), 3)
-        app.update_worker_runtime_state(
+        _finalize_runtime_if_token_matches(
+            mode=mode,
+            run_id=run_id,
             updates={
                 "worker_status": "job_finished",
                 "last_job_mode": mode,
@@ -296,20 +344,48 @@ def run_job_mode(job_mode: str) -> int:
                 "last_job_finished_ts": app.now_utc_str(),
                 "last_job_finished_epoch": end_epoch,
                 "last_job_duration_sec": duration_sec,
-            }
+            },
         )
         app.update_job_heartbeat(
             job_name="job_dispatch",
             job_mode=mode,
             status="finished",
-            meta={"duration_sec": duration_sec, "result": result},
+            meta={"duration_sec": duration_sec, "result": result, "run_id": run_id},
         )
         print(f"[worker] mode={mode} finished result={result}", flush=True)
         return 0
 
+    except _TerminatedSignal:
+        end_epoch = time.time()
+        _finalize_runtime_if_token_matches(
+            mode=mode,
+            run_id=run_id,
+            updates={
+                "worker_status": "job_terminated",
+                "last_error_ts": app.now_utc_str(),
+                "last_error_reason": "terminated_signal",
+                "last_job_mode": mode,
+                "last_job_status": "aborted",
+                "last_job_reason": "terminated_signal",
+                "last_job_finished_ts": app.now_utc_str(),
+                "last_job_finished_epoch": end_epoch,
+                "last_job_duration_sec": round(max(0.0, end_epoch - start_epoch), 3),
+            },
+        )
+        app.update_job_heartbeat(
+            job_name="job_dispatch",
+            job_mode=mode,
+            status="terminated",
+            meta={"reason": "terminated_signal", "run_id": run_id},
+        )
+        print(f"[worker] terminated mode={mode} run_id={run_id}", flush=True)
+        return 1
+
     except Exception as exc:
         reason = f"job_mode_exception:{mode}:{type(exc).__name__}:{exc}"
-        app.update_worker_runtime_state(
+        _finalize_runtime_if_token_matches(
+            mode=mode,
+            run_id=run_id,
             updates={
                 "worker_status": "job_failed",
                 "last_error_ts": app.now_utc_str(),
@@ -318,19 +394,20 @@ def run_job_mode(job_mode: str) -> int:
                 "last_job_status": "failed",
                 "last_job_reason": reason,
                 "last_job_finished_ts": app.now_utc_str(),
-            }
+            },
         )
         app.update_job_heartbeat(
             job_name="job_dispatch",
             job_mode=mode,
             status="failed",
-            meta={"reason": reason},
+            meta={"reason": reason, "run_id": run_id},
         )
         print(f"[worker] mode={mode} failed reason={reason}", flush=True)
         traceback.print_exc()
         return 1
 
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
         if lock_key is not None:
             app.release_lock(lock_key=lock_key, owner=owner)
 
