@@ -9540,6 +9540,7 @@ def worker_runtime_defaults() -> Dict[str, Any]:
         "last_notification_diag": {},
         "last_notification_counters": {},
         "last_notification_block_reasons": {},
+        "concurrent_mode_overlap": 0,
         "heartbeat_interval_sec": 0,
         "loop_iterations": 0,
         "notification_runs": 0,

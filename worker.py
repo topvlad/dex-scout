@@ -77,6 +77,10 @@ USE_BIRDEYE_TRENDING = _env_bool("USE_BIRDEYE_TRENDING", True)
 BIRDEYE_LIMIT = _env_int("BIRDEYE_LIMIT", 10)
 JOB_LOCK_TTL_SEC = max(60, _env_int("JOB_LOCK_TTL_SEC", 900))
 JOB_STALE_RUN_SEC = max(JOB_LOCK_TTL_SEC + 1, _env_int("JOB_STALE_RUN_SEC", JOB_LOCK_TTL_SEC * 2))
+RUNTIME_UPDATE_LOCK_KEY = "worker_runtime_update"
+RUNTIME_UPDATE_LOCK_TTL_SEC = 15
+RUNTIME_UPDATE_LOCK_RETRIES = 40
+RUNTIME_UPDATE_LOCK_SLEEP_SEC = 0.05
 
 if JOB_LOCK_TTL_SEC >= JOB_STALE_RUN_SEC:
     raise RuntimeError(
@@ -89,25 +93,94 @@ class _TerminatedSignal(RuntimeError):
     pass
 
 
+def _heartbeat_job_name(mode: str) -> str:
+    return f"job_dispatch:{mode}"
+
+
+def _runtime_modes(runtime: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    raw = runtime.get("modes")
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, value in raw.items():
+        if isinstance(key, str) and isinstance(value, dict):
+            out[key] = dict(value)
+    return out
+
+
+def _runtime_mode_state(runtime: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    return dict(_runtime_modes(runtime).get(mode, {}))
+
+
+def _update_worker_runtime_with_mode_state(
+    *,
+    mode: str,
+    owner: str,
+    mode_updates: Optional[Dict[str, Any]] = None,
+    global_updates: Optional[Dict[str, Any]] = None,
+    increments: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    assert app is not None
+    lock_status: Dict[str, Any] = {"ok": False, "code": "not_attempted"}
+    for _ in range(RUNTIME_UPDATE_LOCK_RETRIES):
+        lock_status = app.acquire_lock(
+            lock_key=RUNTIME_UPDATE_LOCK_KEY,
+            owner=owner,
+            ttl_sec=RUNTIME_UPDATE_LOCK_TTL_SEC,
+        )
+        if lock_status.get("ok"):
+            break
+        time.sleep(RUNTIME_UPDATE_LOCK_SLEEP_SEC)
+    if not lock_status.get("ok"):
+        print(
+            "[worker] runtime_update_lock_failed "
+            f"mode={mode} owner={owner} code={lock_status.get('code')}",
+            flush=True,
+        )
+        return {}
+    try:
+        runtime = app.get_worker_runtime_state()
+        modes = _runtime_modes(runtime)
+        mode_state = dict(modes.get(mode, {}))
+        if mode_updates:
+            mode_state.update(mode_updates)
+        modes[mode] = mode_state
+        updates: Dict[str, Any] = {"modes": modes}
+        if global_updates:
+            updates.update(global_updates)
+        return app.update_worker_runtime_state(updates=updates, increments=increments)
+    finally:
+        app.release_lock(lock_key=RUNTIME_UPDATE_LOCK_KEY, owner=owner)
+
+
 def _finalize_runtime_if_token_matches(
     *,
     mode: str,
+    owner: str,
     run_id: str,
     updates: Dict[str, Any],
+    global_updates: Optional[Dict[str, Any]] = None,
     increments: Optional[Dict[str, int]] = None,
 ) -> bool:
     assert app is not None
     runtime = app.get_worker_runtime_state()
-    current_run_id = str(runtime.get("run_id") or "").strip()
-    current_mode = str(runtime.get("last_job_mode") or "").strip().lower()
-    if current_run_id != run_id or current_mode != mode:
+    mode_state = _runtime_mode_state(runtime, mode)
+    current_run_id = str(mode_state.get("run_id") or "").strip()
+    current_token = str(mode_state.get("job_start_token") or "").strip()
+    if current_run_id != run_id or current_token != run_id:
         print(
             f"[worker] finalize token mismatch mode={mode} run_id={run_id} "
-            f"current_mode={current_mode} current_run_id={current_run_id}",
+            f"current_mode_run_id={current_run_id} current_token={current_token}",
             flush=True,
         )
         return False
-    app.update_worker_runtime_state(updates=updates, increments=increments)
+    _update_worker_runtime_with_mode_state(
+        mode=mode,
+        owner=owner,
+        mode_updates=updates,
+        global_updates={"last_job_mode": mode, **dict(global_updates or {})},
+        increments=increments,
+    )
     return True
 
 
@@ -178,21 +251,27 @@ def run_job_mode(job_mode: str) -> int:
     assert app is not None
     mode = str(job_mode or "").strip().lower()
     lock_key = None
+    owner = f"{socket.gethostname()}:{os.getpid()}"
     runner = JOB_DISPATCH.get(mode)
 
     if runner is None:
         reason = f"unknown_job_mode:{mode or 'empty'}"
-        app.update_worker_runtime_state(
-            updates={
-                "worker_status": "job_mode_invalid",
+        _update_worker_runtime_with_mode_state(
+            mode=mode or "unknown",
+            owner=owner,
+            mode_updates={
+                "last_job_status": "invalid",
+                "last_job_reason": reason,
                 "last_error_ts": app.now_utc_str(),
                 "last_error_reason": reason,
+            },
+            global_updates={
+                "worker_status": "job_mode_invalid",
                 "last_job_mode": mode,
-                "last_job_status": "invalid",
-            }
+            },
         )
         app.update_job_heartbeat(
-            job_name="job_dispatch",
+            job_name=_heartbeat_job_name(mode or "unknown"),
             job_mode=mode,
             status="invalid_mode",
             meta={"reason": reason, "allowed_modes": list(JOB_DISPATCH.keys())},
@@ -200,50 +279,58 @@ def run_job_mode(job_mode: str) -> int:
         print(f"[worker] safe-fail: {reason}", flush=True)
         return 2
 
-    owner = f"{socket.gethostname()}:{os.getpid()}"
     runtime = app.get_worker_runtime_state()
-    prev_status = str(runtime.get("last_job_status") or "").strip().lower()
-    prev_mode = str(runtime.get("last_job_mode") or "").strip().lower()
-    prev_started_epoch = float(app.parse_float(runtime.get("last_job_started_epoch", 0.0), 0.0))
+    mode_state = _runtime_mode_state(runtime, mode)
+    prev_status = str(mode_state.get("last_job_status") or "").strip().lower()
+    prev_started_epoch = float(app.parse_float(mode_state.get("last_job_started_epoch", 0.0), 0.0))
     age_sec = max(0.0, time.time() - prev_started_epoch) if prev_started_epoch > 0 else 0.0
     stale_run = bool(prev_status == "running" and age_sec >= JOB_STALE_RUN_SEC)
     if stale_run:
-        app.update_worker_runtime_state(
-            updates={
-                "worker_status": "job_stale_recovered",
+        _update_worker_runtime_with_mode_state(
+            mode=mode,
+            owner=owner,
+            mode_updates={
                 "last_job_status": "aborted",
                 "last_job_reason": "stale_aborted",
                 "last_job_finished_ts": app.now_utc_str(),
                 "last_job_finished_epoch": time.time(),
+                "last_error_reason": f"stale_recovered:prev_mode={mode}:age_sec={int(age_sec)}",
+            },
+            global_updates={
+                "worker_status": "job_stale_recovered",
                 "last_error_reason": (
-                    f"stale_recovered:prev_mode={prev_mode or 'unknown'}:age_sec={int(age_sec)}"
+                    f"stale_recovered:prev_mode={mode or 'unknown'}:age_sec={int(age_sec)}"
                 ),
-            }
+            },
         )
         app.update_job_heartbeat(
-            job_name="job_dispatch",
+            job_name=_heartbeat_job_name(mode),
             job_mode=mode,
             status="stale_recovered",
-            meta={"prev_mode": prev_mode, "age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
+            meta={"prev_mode": mode, "age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
         )
-        print(f"[worker] stale_recovered mode={prev_mode or 'unknown'} age_sec={int(age_sec)}", flush=True)
+        print(f"[worker] stale_recovered mode={mode or 'unknown'} age_sec={int(age_sec)}", flush=True)
         prev_status = "aborted"
 
-    if prev_status == "running" and prev_mode == mode and age_sec < JOB_STALE_RUN_SEC:
+    if prev_status == "running" and age_sec < JOB_STALE_RUN_SEC:
         reason = f"duplicate_run_guard:mode={mode}:age_sec={int(age_sec)}"
-        app.update_worker_runtime_state(
-            updates={
-                "worker_status": "job_skipped_duplicate_run",
-                "last_error_ts": app.now_utc_str(),
-                "last_error_reason": reason,
-                "last_job_mode": mode,
+        _update_worker_runtime_with_mode_state(
+            mode=mode,
+            owner=owner,
+            mode_updates={
                 "last_job_status": "skipped_duplicate_run",
                 "last_job_reason": reason,
+                "last_error_ts": app.now_utc_str(),
+                "last_error_reason": reason,
                 "last_lock_code": "duplicate_run_guard",
-            }
+            },
+            global_updates={
+                "worker_status": "job_skipped_duplicate_run",
+                "last_job_mode": mode,
+            },
         )
         app.update_job_heartbeat(
-            job_name="job_dispatch",
+            job_name=_heartbeat_job_name(mode),
             job_mode=mode,
             status="duplicate_guard",
             meta={"reason": reason, "age_sec": int(age_sec), "stale_threshold_sec": JOB_STALE_RUN_SEC},
@@ -262,16 +349,18 @@ def run_job_mode(job_mode: str) -> int:
     lock_status = app.acquire_lock(lock_key=lock_key, owner=owner, ttl_sec=JOB_LOCK_TTL_SEC)
 
     if lock_status.get("ok") and bool(lock_status.get("stale_replaced")):
-        app.update_worker_runtime_state(
-            updates={
+        _update_worker_runtime_with_mode_state(
+            mode=mode,
+            owner=owner,
+            mode_updates={
                 "last_stale_lock_ts": app.now_utc_str(),
                 "last_job_reason": (
                     f"stale_lock_replaced:{lock_key}:age_sec={int(app.parse_float(lock_status.get('stale_age_sec'), 0.0))}"
                 ),
-            }
+            },
         )
         app.update_job_heartbeat(
-            job_name="job_dispatch",
+            job_name=_heartbeat_job_name(mode),
             job_mode=mode,
             status="stale_lock_replaced",
             meta={"lock_key": lock_key, "lock_status": lock_status},
@@ -281,19 +370,23 @@ def run_job_mode(job_mode: str) -> int:
         code = str(lock_status.get("code") or "lock_failed")
         reason = f"{code}:{lock_status.get('detail') or lock_status.get('message') or ''}".strip(":")
         heartbeat_status = "lock_held" if code == "lock_held" else "lock_failed"
-        app.update_worker_runtime_state(
-            updates={
-                "worker_status": "job_skipped_locked",
-                "last_error_ts": app.now_utc_str(),
-                "last_error_reason": reason,
-                "last_job_mode": mode,
+        _update_worker_runtime_with_mode_state(
+            mode=mode,
+            owner=owner,
+            mode_updates={
                 "last_job_status": "skipped_locked",
                 "last_job_reason": reason,
+                "last_error_ts": app.now_utc_str(),
+                "last_error_reason": reason,
                 "last_lock_code": code,
-            }
+            },
+            global_updates={
+                "worker_status": "job_skipped_locked",
+                "last_job_mode": mode,
+            },
         )
         app.update_job_heartbeat(
-            job_name="job_dispatch",
+            job_name=_heartbeat_job_name(mode),
             job_mode=mode,
             status=heartbeat_status,
             meta={"lock_key": lock_key, "owner": owner, "lock_status": lock_status},
@@ -305,27 +398,43 @@ def run_job_mode(job_mode: str) -> int:
     start_ts = app.now_utc_str()
     run_id = str(uuid.uuid4())
     job_start_token = run_id
-    app.update_worker_runtime_state(
-        updates={
-            "worker_status": "job_running",
-            "worker_id": owner,
-            "worker_role": "job_dispatch",
-            "last_job_mode": mode,
+    runtime = app.get_worker_runtime_state()
+    overlap_count = 0
+    for other_mode, other_state in _runtime_modes(runtime).items():
+        if other_mode == mode:
+            continue
+        if str(other_state.get("last_job_status") or "").strip().lower() == "running":
+            overlap_count += 1
+    _update_worker_runtime_with_mode_state(
+        mode=mode,
+        owner=owner,
+        mode_updates={
+            "run_id": run_id,
+            "job_start_token": job_start_token,
             "last_job_status": "running",
             "last_job_reason": "",
             "last_lock_code": "",
             "last_job_started_ts": start_ts,
             "last_job_started_epoch": start_epoch,
-            "job_start_token": job_start_token,
-            "run_id": run_id,
+            "last_job_finished_ts": "",
+            "last_job_finished_epoch": 0.0,
             "last_error_reason": "",
-        }
+            "concurrent_mode_overlap_last": overlap_count,
+        },
+        global_updates={
+            "worker_status": "job_running",
+            "worker_id": owner,
+            "worker_role": "job_dispatch",
+            "last_job_mode": mode,
+            "last_error_reason": "",
+        },
+        increments={"concurrent_mode_overlap": 1} if overlap_count > 0 else None,
     )
     app.update_job_heartbeat(
-        job_name="job_dispatch",
+        job_name=_heartbeat_job_name(mode),
         job_mode=mode,
         status="started",
-        meta={"lock_key": lock_key, "owner": owner},
+        meta={"lock_key": lock_key, "owner": owner, "concurrent_mode_overlap": overlap_count},
     )
 
     previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -341,19 +450,19 @@ def run_job_mode(job_mode: str) -> int:
         duration_sec = round(max(0.0, end_epoch - start_epoch), 3)
         _finalize_runtime_if_token_matches(
             mode=mode,
+            owner=owner,
             run_id=run_id,
             updates={
-                "worker_status": "job_finished",
-                "last_job_mode": mode,
                 "last_job_status": "finished",
                 "last_job_reason": "ok",
                 "last_job_finished_ts": app.now_utc_str(),
                 "last_job_finished_epoch": end_epoch,
                 "last_job_duration_sec": duration_sec,
             },
+            global_updates={"worker_status": "job_finished"},
         )
         app.update_job_heartbeat(
-            job_name="job_dispatch",
+            job_name=_heartbeat_job_name(mode),
             job_mode=mode,
             status="finished",
             meta={"duration_sec": duration_sec, "result": result, "run_id": run_id},
@@ -365,21 +474,25 @@ def run_job_mode(job_mode: str) -> int:
         end_epoch = time.time()
         _finalize_runtime_if_token_matches(
             mode=mode,
+            owner=owner,
             run_id=run_id,
             updates={
-                "worker_status": "job_terminated",
                 "last_error_ts": app.now_utc_str(),
                 "last_error_reason": "terminated_signal",
-                "last_job_mode": mode,
                 "last_job_status": "aborted",
                 "last_job_reason": "terminated_signal",
                 "last_job_finished_ts": app.now_utc_str(),
                 "last_job_finished_epoch": end_epoch,
                 "last_job_duration_sec": round(max(0.0, end_epoch - start_epoch), 3),
             },
+            global_updates={
+                "worker_status": "job_terminated",
+                "last_error_ts": app.now_utc_str(),
+                "last_error_reason": "terminated_signal",
+            },
         )
         app.update_job_heartbeat(
-            job_name="job_dispatch",
+            job_name=_heartbeat_job_name(mode),
             job_mode=mode,
             status="terminated",
             meta={"reason": "terminated_signal", "run_id": run_id},
@@ -391,19 +504,23 @@ def run_job_mode(job_mode: str) -> int:
         reason = f"job_mode_exception:{mode}:{type(exc).__name__}:{exc}"
         _finalize_runtime_if_token_matches(
             mode=mode,
+            owner=owner,
             run_id=run_id,
             updates={
-                "worker_status": "job_failed",
                 "last_error_ts": app.now_utc_str(),
                 "last_error_reason": reason,
-                "last_job_mode": mode,
                 "last_job_status": "failed",
                 "last_job_reason": reason,
                 "last_job_finished_ts": app.now_utc_str(),
             },
+            global_updates={
+                "worker_status": "job_failed",
+                "last_error_ts": app.now_utc_str(),
+                "last_error_reason": reason,
+            },
         )
         app.update_job_heartbeat(
-            job_name="job_dispatch",
+            job_name=_heartbeat_job_name(mode),
             job_mode=mode,
             status="failed",
             meta={"reason": reason, "run_id": run_id},
