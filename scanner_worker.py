@@ -92,6 +92,8 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
     )
 
     while True:
+        cycle_started_ts = time.time()
+        app.storage_metrics_reset()
         default_sleep_for = max(60, SCAN_INTERVAL_SEC)
         sleep_for = default_sleep_for
         now_ts = time.time()
@@ -284,6 +286,17 @@ def run_worker_loop(stop_event: Optional[object] = None, one_pass: bool = False)
                 increments={"notification_failed_cycles": 1},
             )
             traceback.print_exc()
+        finally:
+            cycle_duration_sec = max(0.0, time.time() - cycle_started_ts)
+            storage_metrics = app.storage_metrics_snapshot()
+            app.update_worker_runtime_state(
+                updates={
+                    "storage_writes_per_cycle": int(storage_metrics.get("writes", 0) or 0),
+                    "storage_roundtrip_checks_per_cycle": int(storage_metrics.get("roundtrip_checks", 0) or 0),
+                    "cycle_duration_sec": round(cycle_duration_sec, 3),
+                }
+            )
+            app.flush_monitoring_history_buffer(force=True)
 
         slept = 0
         while slept < sleep_for:

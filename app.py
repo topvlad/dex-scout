@@ -56,6 +56,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def _maybe_autorefresh(interval_ms: int, key: str):
     """Best-effort autorefresh without extra deps."""
     try:
@@ -101,11 +111,27 @@ ENTRY_MODE = "aggressive"
 TEMP_DISABLE_BEST_PAIR = False
 WORKER_FAST_MODE = os.getenv("DEX_SCOUT_WORKER_MODE", "0") == "1"
 USE_HEAVY_MIGRATION_CHECK = not WORKER_FAST_MODE
+STORAGE_VERIFY_MODE = str(
+    os.getenv("STORAGE_VERIFY_MODE", "sampled" if WORKER_FAST_MODE else "always")
+).strip().lower()
+if STORAGE_VERIFY_MODE not in {"off", "sampled", "always"}:
+    STORAGE_VERIFY_MODE = "sampled" if WORKER_FAST_MODE else "always"
+STORAGE_VERIFY_SAMPLE_RATE = min(
+    1.0,
+    max(0.0, _env_float("STORAGE_VERIFY_SAMPLE_RATE", 0.2 if WORKER_FAST_MODE else 1.0)),
+)
+CSV_BACKUP_INTERVAL_SEC = max(60, _env_int("CSV_BACKUP_INTERVAL_SEC", 900 if WORKER_FAST_MODE else 300))
+CSV_BACKUP_MIN_SIZE_DELTA_BYTES = max(256, _env_int("CSV_BACKUP_MIN_SIZE_DELTA_BYTES", 4096))
+MON_HISTORY_FLUSH_BATCH = max(10, _env_int("MON_HISTORY_FLUSH_BATCH", 50 if WORKER_FAST_MODE else 25))
 
 SCAN_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 300
 PULSE_SPARKLINE_LOG_DEBOUNCE_SEC = 300
 PULSE_SPARKLINE_LOG_LAST_TS: Dict[str, float] = {}
+_CSV_BACKUP_STATE: Dict[str, Dict[str, Any]] = {}
+_MON_HISTORY_BUFFER: List[Dict[str, Any]] = []
+_MON_HISTORY_BUFFER_LAST_FLUSH_TS: float = 0.0
+_STORAGE_METRICS: Dict[str, int] = {"writes": 0, "roundtrip_checks": 0}
 
 MEME_KEYWORDS = [
     "dog",
@@ -892,6 +918,27 @@ def load_monitoring_rows_cached() -> List[Dict[str, Any]]:
     return load_csv(MONITORING_CSV, MON_FIELDS)
 
 
+def storage_metrics_reset() -> None:
+    _STORAGE_METRICS["writes"] = 0
+    _STORAGE_METRICS["roundtrip_checks"] = 0
+
+
+def storage_metrics_snapshot() -> Dict[str, int]:
+    return {
+        "writes": int(_STORAGE_METRICS.get("writes", 0) or 0),
+        "roundtrip_checks": int(_STORAGE_METRICS.get("roundtrip_checks", 0) or 0),
+    }
+
+
+def _should_verify_roundtrip() -> bool:
+    mode = STORAGE_VERIFY_MODE
+    if mode == "off":
+        return False
+    if mode == "always":
+        return True
+    return random.random() < STORAGE_VERIFY_SAMPLE_RATE
+
+
 def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     ensure_storage()
     key = storage_key_for_path(path)
@@ -906,20 +953,26 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     except Exception as e:
         debug_log(f"local_fallback_write_failed key={key} err={type(e).__name__}:{e}")
 
+    _STORAGE_METRICS["writes"] = int(_STORAGE_METRICS.get("writes", 0) or 0) + 1
     if _sb_ok():
         ok = sb_put_storage(key, content)
         if ok:
-            # Keep read-back as diagnostics, but success criterion is exact round-trip.
-            check = sb_get_storage(key)
-            if check == content:
-                debug_log(f"supabase_store_verified key={key} mode=roundtrip")
-                st.session_state["_save_badge"] = "💾 saved (supabase round-trip verified)"
+            do_verify = _should_verify_roundtrip()
+            if do_verify:
+                _STORAGE_METRICS["roundtrip_checks"] = int(_STORAGE_METRICS.get("roundtrip_checks", 0) or 0) + 1
+                check = sb_get_storage(key)
+                if check == content:
+                    debug_log(f"supabase_store_verified key={key} mode={STORAGE_VERIFY_MODE}")
+                    st.session_state["_save_badge"] = "💾 saved (supabase round-trip verified)"
+                else:
+                    check_len = len(check) if isinstance(check, str) else 0
+                    debug_log(
+                        f"supabase_store_mismatch key={key} expected_len={len(content)} got_len={check_len}"
+                    )
+                    st.session_state["_save_badge"] = "⚠️ saved local, supabase write ok (round-trip mismatch)"
             else:
-                check_len = len(check) if isinstance(check, str) else 0
-                debug_log(
-                    f"supabase_store_mismatch key={key} expected_len={len(content)} got_len={check_len}"
-                )
-                st.session_state["_save_badge"] = "⚠️ saved local, supabase write ok (round-trip mismatch)"
+                debug_log(f"supabase_store_verified_skipped key={key} mode={STORAGE_VERIFY_MODE}")
+                st.session_state["_save_badge"] = "💾 saved (supabase write, verify skipped)"
         else:
             debug_log(f"supabase_store_failed_local_kept key={key}")
             st.session_state["_save_badge"] = "⚠️ saved local, supabase write failed"
@@ -932,11 +985,30 @@ def backup_csv_snapshot(path: str, rows: List[Dict[str, Any]], fieldnames: List[
     if not _sb_ok():
         return
     try:
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        key = storage_key_for_path(path)
-        backup_key = f"backup/{ts}_{key}"
         content = _csv_to_string(rows, fieldnames)
+        key = storage_key_for_path(path)
+        now_ts = time.time()
+        digest = hashlib.md5(content.encode("utf-8")).hexdigest()
+        prev = _CSV_BACKUP_STATE.get(key, {})
+        prev_ts = float(prev.get("ts", 0.0) or 0.0)
+        prev_len = int(prev.get("len", 0) or 0)
+        prev_hash = str(prev.get("hash", "") or "")
+        size_delta = abs(len(content) - prev_len)
+        elapsed = now_ts - prev_ts
+        should_backup = (
+            prev_ts <= 0
+            or elapsed >= CSV_BACKUP_INTERVAL_SEC
+            or size_delta >= CSV_BACKUP_MIN_SIZE_DELTA_BYTES
+        )
+        if not should_backup and prev_hash and digest != prev_hash:
+            # Fast-changing content still gets periodic snapshots, but not every write.
+            should_backup = elapsed >= max(60, CSV_BACKUP_INTERVAL_SEC // 3)
+        if not should_backup:
+            return
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_key = f"backup/{ts}_{key}"
         sb_put_storage(backup_key, content)
+        _CSV_BACKUP_STATE[key] = {"ts": now_ts, "len": len(content), "hash": digest}
     except Exception:
         pass
 
@@ -4363,10 +4435,32 @@ def migrate_reason_fields() -> int:
 
 def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
     # Source of truth: load_csv (Supabase app_storage if enabled, else local)
+    flush_monitoring_history_buffer(force=True)
     rows = load_csv(MON_HISTORY_CSV)
     if not rows:
         return []
     return rows[-limit_rows:]
+
+
+def flush_monitoring_history_buffer(force: bool = False) -> int:
+    global _MON_HISTORY_BUFFER_LAST_FLUSH_TS
+    if not _MON_HISTORY_BUFFER:
+        return 0
+    now_ts = time.time()
+    if not force and len(_MON_HISTORY_BUFFER) < MON_HISTORY_FLUSH_BATCH:
+        if (now_ts - float(_MON_HISTORY_BUFFER_LAST_FLUSH_TS or 0.0)) < 30:
+            return 0
+    try:
+        rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
+        rows.extend(_MON_HISTORY_BUFFER)
+        save_csv(MON_HISTORY_CSV, rows, HIST_FIELDS)
+        flushed = len(_MON_HISTORY_BUFFER)
+        _MON_HISTORY_BUFFER.clear()
+        _MON_HISTORY_BUFFER_LAST_FLUSH_TS = now_ts
+        return flushed
+    except Exception as exc:
+        debug_log(f"monitoring_history_flush_failed err={type(exc).__name__}:{exc}")
+        return 0
 
 
 def append_monitoring_history(row: Dict[str, Any]):
@@ -4377,7 +4471,8 @@ def append_monitoring_history(row: Dict[str, Any]):
     hist_row["timing_label"] = str(row.get("timing_label", ""))
     hist_row["risk_level"] = str(row.get("risk_level", ""))
     payload = {k: hist_row.get(k, "") for k in HIST_FIELDS}
-    append_csv(MON_HISTORY_CSV, payload, HIST_FIELDS)
+    _MON_HISTORY_BUFFER.append(payload)
+    flush_monitoring_history_buffer(force=False)
 
 
 def classify_health_bucket(health: Dict[str, Any]) -> str:
@@ -4452,6 +4547,8 @@ def update_existing_token(
     entry_status: str = "",
     entry_score: float = 0.0,
     risk_level: str = "",
+    rows: Optional[List[Dict[str, Any]]] = None,
+    autosave: bool = True,
 ) -> str:
     return add_to_monitoring(
         p,
@@ -4461,6 +4558,8 @@ def update_existing_token(
         entry_status=entry_status,
         entry_score=entry_score,
         risk_level=risk_level,
+        rows=rows,
+        autosave=autosave,
     )
 
 
@@ -4472,6 +4571,8 @@ def add_to_monitoring(
     entry_status: str = "",
     entry_score: float = 0.0,
     risk_level: str = "",
+    rows: Optional[List[Dict[str, Any]]] = None,
+    autosave: bool = True,
 ) -> str:
     chain = (p.get("chainId") or "").lower().strip()
     base_addr_raw = (safe_get(p, "baseToken", "address", default="") or "").strip()
@@ -4480,7 +4581,7 @@ def add_to_monitoring(
 
     base_addr = addr_store(chain, base_addr_raw)
     key = addr_key(chain, base_addr)
-    rows = load_monitoring()
+    rows = rows if isinstance(rows, list) else load_monitoring()
 
     if not base_addr:
         return "NO_ADDR"
@@ -4548,7 +4649,8 @@ def add_to_monitoring(
                 "timing_label": str(r.get("timing_label", "")),
                 "risk_level": str(r.get("risk_level", "")),
             })
-            save_monitoring(rows)
+            if autosave:
+                save_monitoring(rows)
             return "EXISTS_ACTIVE"
 
     for r in rows:
@@ -4558,7 +4660,8 @@ def add_to_monitoring(
                 r["source_window"] = _merge_csv_values(r.get("source_window", ""), window_name)
             if preset_key:
                 r["source_preset"] = _merge_csv_values(r.get("source_preset", ""), preset_key)
-            save_monitoring(rows)
+            if autosave:
+                save_monitoring(rows)
             return "EXISTS_ARCHIVED"
 
     risk = "EARLY" if preset_key in {"ultra", "momentum"} else ""
@@ -4630,7 +4733,8 @@ def add_to_monitoring(
             "status": LIFECYCLE_MONITORING,
         }
     )
-    save_monitoring(rows)
+    if autosave:
+        save_monitoring(rows)
     return "OK"
 
 
@@ -9019,6 +9123,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         ranked = fallback_ranked
     seen_token_keys: Set[str] = set()
     existing_rows = load_monitoring()
+    monitoring_rows = existing_rows
     active_symbols = {
         str(r.get("base_symbol") or "").strip().upper()
         for r in existing_rows
@@ -9142,10 +9247,6 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["skipped_suppressed"] = counts.get("skipped_suppressed", 0) + 1
                 continue
 
-            if token_exists(contract):
-                update_existing_token(row, s, window_name=window_name, preset_key=preset_key, entry_status=entry_status, entry_score=entry_score, risk_level=str(row.get("risk_level", "MEDIUM")))
-                counts["updated_active"] += 1
-                continue
             res = add_to_monitoring(
                 row,
                 s,
@@ -9154,7 +9255,12 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 entry_status=entry_status,
                 entry_score=entry_score,
                 risk_level=str(row.get("risk_level", "MEDIUM")),
+                rows=monitoring_rows,
+                autosave=False,
             )
+            if res == "EXISTS_ACTIVE":
+                counts["updated_active"] += 1
+                continue
 
             append_monitoring_history({
                 "ts_utc": now_utc_str(),
@@ -9183,8 +9289,6 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                 counts["added"] += 1
                 if base_sym:
                     active_symbols.add(base_sym)
-            elif res == "EXISTS_ACTIVE":
-                counts["skipped_active"] += 1
             elif res == "EXISTS_ARCHIVED":
                 counts["skipped_archived"] += 1
             if entry_status in {"WATCH", "WAIT"} and detect_auto_signal(row):
@@ -9196,6 +9300,8 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
                     entry_status=entry_status,
                     entry_score=entry_score,
                     risk_level=str(row.get("risk_level", "MEDIUM")),
+                    rows=monitoring_rows,
+                    autosave=False,
                 )
         except Exception as e:
             log_error(e)
@@ -9215,8 +9321,12 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             entry_status="WATCH",
             entry_score=parse_float(fallback.get("entry_score", ranked[0][0]), 0.0),
             risk_level=str(fallback.get("risk_level", "MEDIUM")),
+            rows=monitoring_rows,
+            autosave=False,
         )
         counts["added"] += 1
+    save_monitoring(monitoring_rows)
+    flush_monitoring_history_buffer(force=True)
     save_smart_wallets(smart_wallets)
     debug_log(f"RAW: {len(pairs)}")
     debug_log(f"NORMALIZED: {len(normalized)}")
@@ -9552,6 +9662,9 @@ def worker_runtime_defaults() -> Dict[str, Any]:
         "notification_blocked_cycles": 0,
         "notification_failed_cycles": 0,
         "notification_send_failures": 0,
+        "storage_writes_per_cycle": 0,
+        "storage_roundtrip_checks_per_cycle": 0,
+        "cycle_duration_sec": 0.0,
     }
 
 
