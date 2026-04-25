@@ -930,10 +930,14 @@ def storage_metrics_snapshot() -> Dict[str, int]:
     }
 
 
-def _should_verify_roundtrip() -> bool:
+def _should_verify_roundtrip(key: str = "", payload_len: int = 0) -> bool:
     mode = STORAGE_VERIFY_MODE
     if mode == "off":
         return False
+    if key == storage_key_for_path(MON_HISTORY_CSV):
+        # Cheaper verify policy for hot monitoring history path.
+        sampled_rate = min(STORAGE_VERIFY_SAMPLE_RATE, 0.1 if payload_len < 300_000 else 0.03)
+        return random.random() < sampled_rate
     if mode == "always":
         return True
     return random.random() < STORAGE_VERIFY_SAMPLE_RATE
@@ -957,7 +961,7 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     if _sb_ok():
         ok = sb_put_storage(key, content)
         if ok:
-            do_verify = _should_verify_roundtrip()
+            do_verify = _should_verify_roundtrip(key=key, payload_len=len(content))
             if do_verify:
                 _STORAGE_METRICS["roundtrip_checks"] = int(_STORAGE_METRICS.get("roundtrip_checks", 0) or 0) + 1
                 check = sb_get_storage(key)
@@ -972,6 +976,8 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
                     st.session_state["_save_badge"] = "⚠️ saved local, supabase write ok (round-trip mismatch)"
             else:
                 debug_log(f"supabase_store_verified_skipped key={key} mode={STORAGE_VERIFY_MODE}")
+                if key == storage_key_for_path(MON_HISTORY_CSV):
+                    debug_log("history_verify_skipped_sampled key=monitoring_history.csv")
                 st.session_state["_save_badge"] = "💾 saved (supabase write, verify skipped)"
         else:
             debug_log(f"supabase_store_failed_local_kept key={key}")
@@ -1521,21 +1527,66 @@ def fmt_usd_delta(x: float) -> str:
 # =============================
 TOKEN_PAIRS_MIN_INTERVAL_SEC = max(0.0, float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_MIN_INTERVAL_SEC", "0.12")))
 _TOKEN_PAIRS_THROTTLE_LOCK = threading.Lock()
-_TOKEN_PAIRS_LAST_REQUEST_TS = 0.0
+_TOKEN_PAIRS_LAST_REQUEST_TS_BY_CHAIN: Dict[str, float] = {}
+TOKEN_PAIRS_MIN_INTERVAL_SOLANA_SEC = max(
+    TOKEN_PAIRS_MIN_INTERVAL_SEC,
+    float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_MIN_INTERVAL_SOLANA_SEC", "0.35")),
+)
+TOKEN_PAIRS_RUN_CACHE_TTL_SEC = max(10.0, float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_RUN_CACHE_TTL_SEC", "120")))
+TOKEN_PAIRS_429_PRESSURE_THRESHOLD = max(2, _env_int("DEX_SCOUT_TOKEN_PAIRS_429_PRESSURE_THRESHOLD", 4))
+TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC = max(5.0, float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC", "45")))
+TOKEN_PAIRS_429_DEFER_THRESHOLD = max(1, _env_int("DEX_SCOUT_TOKEN_PAIRS_429_DEFER_THRESHOLD", 2))
+TOKEN_PAIRS_429_MAX_RETRIES = max(1, _env_int("DEX_SCOUT_TOKEN_PAIRS_429_MAX_RETRIES", 3))
+TOKEN_PAIRS_429_BACKOFF_BASE_SEC = max(0.05, float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_429_BACKOFF_BASE_SEC", "0.35")))
+_TOKEN_PAIRS_RUN_CACHE: Dict[str, Dict[str, Any]] = {}
+_TOKEN_PAIRS_CHAIN_STATE: Dict[str, Dict[str, Any]] = {}
+_PAIR_FETCH_PRIORITY_HINT = "normal"
 
 
-def _throttle_token_pairs_requests() -> None:
-    global _TOKEN_PAIRS_LAST_REQUEST_TS
-    if TOKEN_PAIRS_MIN_INTERVAL_SEC <= 0:
+def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
+    chain_key = str(chain or "").strip().lower() or "unknown"
+    return _TOKEN_PAIRS_CHAIN_STATE.setdefault(
+        chain_key,
+        {
+            "consecutive_429": 0,
+            "recent_429": 0,
+            "pressure_until_ts": 0.0,
+            "deferred_count": 0,
+            "skipped_count": 0,
+        },
+    )
+
+
+def _token_pairs_is_pressure_active(chain: str) -> bool:
+    state = _token_pairs_chain_state(chain)
+    return time.monotonic() < float(state.get("pressure_until_ts", 0.0) or 0.0)
+
+
+def reset_pair_fetch_run_state() -> None:
+    globals()["_PAIR_FETCH_PRIORITY_HINT"] = "normal"
+    _TOKEN_PAIRS_RUN_CACHE.clear()
+    for state in _TOKEN_PAIRS_CHAIN_STATE.values():
+        state["recent_429"] = 0
+        state["deferred_count"] = 0
+        state["skipped_count"] = 0
+
+
+def _throttle_token_pairs_requests(chain: str) -> None:
+    chain_norm = str(chain or "").strip().lower() or "unknown"
+    base_interval = TOKEN_PAIRS_MIN_INTERVAL_SOLANA_SEC if chain_norm == "solana" else TOKEN_PAIRS_MIN_INTERVAL_SEC
+    if base_interval <= 0:
         return
 
     with _TOKEN_PAIRS_THROTTLE_LOCK:
+        pressure_mult = 2.0 if _token_pairs_is_pressure_active(chain_norm) else 1.0
+        target_interval = max(0.0, base_interval * pressure_mult)
         now = time.monotonic()
-        wait_for = TOKEN_PAIRS_MIN_INTERVAL_SEC - (now - _TOKEN_PAIRS_LAST_REQUEST_TS)
+        last_ts = float(_TOKEN_PAIRS_LAST_REQUEST_TS_BY_CHAIN.get(chain_norm, 0.0) or 0.0)
+        wait_for = target_interval - (now - last_ts)
         if wait_for > 0:
             time.sleep(wait_for)
             now = time.monotonic()
-        _TOKEN_PAIRS_LAST_REQUEST_TS = now
+        _TOKEN_PAIRS_LAST_REQUEST_TS_BY_CHAIN[chain_norm] = now
 
 
 def _http_get_json(
@@ -1548,6 +1599,7 @@ def _http_get_json(
 ) -> Any:
     last_err = None
     backoff = max(0.05, float(backoff_base))
+    chain_for_rate = str((rate_limit_marker or {}).get("chain") or "").strip().lower()
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(
@@ -1559,17 +1611,26 @@ def _http_get_json(
             if r.status_code == 429 or (500 <= r.status_code <= 599):
                 last_err = requests.HTTPError(f"HTTP {r.status_code} (attempt {attempt}/{max_retries})")
                 if r.status_code == 429 and rate_limit_marker:
+                    state = _token_pairs_chain_state(chain_for_rate)
+                    state["consecutive_429"] = int(state.get("consecutive_429", 0) or 0) + 1
+                    state["recent_429"] = int(state.get("recent_429", 0) or 0) + 1
+                    if state["consecutive_429"] >= TOKEN_PAIRS_429_PRESSURE_THRESHOLD:
+                        state["pressure_until_ts"] = time.monotonic() + TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC
                     debug_log(
                         "rate_limit_429 "
                         f"chain={rate_limit_marker.get('chain','')} "
                         f"token={rate_limit_marker.get('token','')} "
                         f"attempt={attempt}/{max_retries} final_fail=0"
                     )
-                sleep_for = backoff + random.uniform(0.0, 0.25)
+                pressure_mult = 1.75 if _token_pairs_is_pressure_active(chain_for_rate) else 1.0
+                sleep_for = (backoff * pressure_mult) + random.uniform(0.0, 0.25)
                 time.sleep(sleep_for)
                 backoff *= 2
                 continue
             r.raise_for_status()
+            if rate_limit_marker:
+                state = _token_pairs_chain_state(chain_for_rate)
+                state["consecutive_429"] = 0
             return r.json()
         except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
             last_err = e
@@ -1716,11 +1777,15 @@ def fetch_birdeye_pairs(limit: int = 50) -> List[Dict[str, Any]]:
         return out
     for mint in birdeye_trending_solana(limit=limit):
         try:
+            previous_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
+            globals()["_PAIR_FETCH_PRIORITY_HINT"] = "best_effort"
             bp = best_pair_for_token_cached("solana", mint)
             if bp:
                 out.append(bp)
         except Exception:
             continue
+        finally:
+            globals()["_PAIR_FETCH_PRIORITY_HINT"] = previous_priority
     return out
 
 @st.cache_data(ttl=60, max_entries=500, show_spinner=False)
@@ -1739,25 +1804,49 @@ def fetch_dexscreener_search(term: str, limit: int = 20) -> List[Dict[str, Any]]
 
 
 @st.cache_data(ttl=60, max_entries=500, show_spinner=False)
-def fetch_token_pairs(chain: str, token_address: str) -> List[Dict[str, Any]]:
-    if not token_address:
+def fetch_token_pairs(chain: str, token_address: str, priority_hint: str = "normal") -> List[Dict[str, Any]]:
+    chain_norm = normalize_chain_name(chain or "")
+    token = str(token_address or "").strip()
+    if not token:
+        return []
+    now_mono = time.monotonic()
+    cache_key = f"{chain_norm}:{token}"
+    cached = _TOKEN_PAIRS_RUN_CACHE.get(cache_key)
+    if cached and (now_mono - float(cached.get("ts", 0.0) or 0.0)) <= TOKEN_PAIRS_RUN_CACHE_TTL_SEC:
+        debug_log(f"pair_fetch_cache_hit chain={chain_norm} token={token}")
+        return list(cached.get("pairs", []))
+    priority = str(priority_hint or _PAIR_FETCH_PRIORITY_HINT or "normal").strip().lower()
+    state = _token_pairs_chain_state(chain_norm)
+    if _token_pairs_is_pressure_active(chain_norm) and priority not in {"high", "critical"}:
+        state["deferred_count"] = int(state.get("deferred_count", 0) or 0) + 1
+        debug_log(f"pair_fetch_deferred chain={chain_norm} token={token} priority={priority}")
+        _TOKEN_PAIRS_RUN_CACHE[cache_key] = {"ts": now_mono, "pairs": []}
+        return []
+    if int(state.get("recent_429", 0) or 0) >= TOKEN_PAIRS_429_DEFER_THRESHOLD and priority == "best_effort":
+        state["skipped_count"] = int(state.get("skipped_count", 0) or 0) + 1
+        debug_log(
+            f"pair_fetch_skipped_due_to_pressure chain={chain_norm} token={token} "
+            f"priority={priority} recent_429={state.get('recent_429', 0)}"
+        )
+        _TOKEN_PAIRS_RUN_CACHE[cache_key] = {"ts": now_mono, "pairs": []}
         return []
     try:
-        _throttle_token_pairs_requests()
-        url = f"{DEX_BASE}/token-pairs/v1/{chain}/{token_address}"
+        _throttle_token_pairs_requests(chain_norm)
+        url = f"{DEX_BASE}/token-pairs/v1/{chain_norm}/{token}"
         data = _http_get_json(
             url,
             params=None,
             timeout=8,
-            max_retries=4,
-            backoff_base=0.25,
-            rate_limit_marker={"chain": chain, "token": token_address},
+            max_retries=TOKEN_PAIRS_429_MAX_RETRIES,
+            backoff_base=TOKEN_PAIRS_429_BACKOFF_BASE_SEC,
+            rate_limit_marker={"chain": chain_norm, "token": token},
         )
         if isinstance(data, list):
+            _TOKEN_PAIRS_RUN_CACHE[cache_key] = {"ts": now_mono, "pairs": data}
             return data
         return []
     except Exception as e:
-        debug_log(f"fetch_token_pairs_fail chain={chain} token={token_address} err={type(e).__name__}:{e}")
+        debug_log(f"fetch_token_pairs_fail chain={chain_norm} token={token} err={type(e).__name__}:{e}")
         return []
 
 @st.cache_data(ttl=60, max_entries=500)
@@ -1765,7 +1854,7 @@ def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, An
     if TEMP_DISABLE_BEST_PAIR:
         return None
     try:
-        pools = fetch_token_pairs(chain, token_address)
+        pools = fetch_token_pairs(chain, token_address, priority_hint=str(_PAIR_FETCH_PRIORITY_HINT or "normal"))
     except Exception:
         return None
     if not pools:
@@ -4434,9 +4523,11 @@ def migrate_reason_fields() -> int:
 
 
 def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
-    # Source of truth: load_csv (Supabase app_storage if enabled, else local)
-    flush_monitoring_history_buffer(force=True)
+    # Source of truth: persisted CSV + in-run buffer (avoid noisy write/read roundtrip on hot path).
+    flush_monitoring_history_buffer(force=False)
     rows = load_csv(MON_HISTORY_CSV)
+    if _MON_HISTORY_BUFFER:
+        rows = rows + list(_MON_HISTORY_BUFFER)
     if not rows:
         return []
     return rows[-limit_rows:]
@@ -4455,6 +4546,7 @@ def flush_monitoring_history_buffer(force: bool = False) -> int:
         rows.extend(_MON_HISTORY_BUFFER)
         save_csv(MON_HISTORY_CSV, rows, HIST_FIELDS)
         flushed = len(_MON_HISTORY_BUFFER)
+        debug_log(f"history_batch_flush rows={flushed} force={1 if force else 0}")
         _MON_HISTORY_BUFFER.clear()
         _MON_HISTORY_BUFFER_LAST_FLUSH_TS = now_ts
         return flushed
@@ -9129,7 +9221,9 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         for r in existing_rows
         if str(r.get("active", "1")).strip() == "1"
     }
-    for s, p, smart, signal in ranked:
+    high_priority_cutoff = min(len(ranked), max(10, int(max_items * 0.35)))
+    for idx, (s, p, smart, signal) in enumerate(ranked):
+        globals()["_PAIR_FETCH_PRIORITY_HINT"] = "high" if idx < high_priority_cutoff else "best_effort"
         counts["seen"] += 1
         row = normalize_pair_row(p)
         if row is None:
@@ -9325,6 +9419,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             autosave=False,
         )
         counts["added"] += 1
+    globals()["_PAIR_FETCH_PRIORITY_HINT"] = "normal"
     save_monitoring(monitoring_rows)
     flush_monitoring_history_buffer(force=True)
     save_smart_wallets(smart_wallets)
@@ -9886,6 +9981,8 @@ def run_priority_scanner_cycle(
         row_state = dict(queue_state.get(token_key, {}))
 
         try:
+            prev_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
+            globals()["_PAIR_FETCH_PRIORITY_HINT"] = "high"
             pair = best_pair_for_token_cached(chain, base_addr)
             if pair:
                 score_live = score_pair(pair)
@@ -9909,6 +10006,8 @@ def run_priority_scanner_cycle(
             current_backoff = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
             row_state["backoff_sec"] = min(1800, max(60, current_backoff * 2 if current_backoff else 90))
             row_state["last_error_ts"] = now_utc_str()
+        finally:
+            globals()["_PAIR_FETCH_PRIORITY_HINT"] = prev_priority
 
         backoff_sec = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
         row_state["tier"] = tier
@@ -9964,6 +10063,7 @@ def current_scan_slot(now_ts: Optional[float] = None) -> Tuple[str, str, str, in
     return window_name, preset_key, chain, step
 
 def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
+    reset_pair_fetch_run_state()
     state = scanner_state_load() or {}
     if not isinstance(state, dict):
         state = {}
@@ -10001,6 +10101,7 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
 
 def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
+    reset_pair_fetch_run_state()
     window_name, preset_key, chain, slot = current_scan_slot()
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
@@ -10025,6 +10126,7 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
 
 def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
+    reset_pair_fetch_run_state()
     state = scanner_state_load() or {}
     window_name = "Wide Net (explore)"
     preset_key = "wide"
