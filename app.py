@@ -2419,11 +2419,15 @@ def is_in_portfolio_active(row: Dict[str, Any], portfolio_rows: List[Dict[str, A
 def build_history_series(hist: List[Dict[str, Any]]) -> Dict[str, List[float]]:
     return {
         "price": [parse_float(h.get("price_usd"), 0.0) for h in hist if str(h.get("price_usd", "")).strip()],
-        "score": [parse_float(h.get("last_score"), 0.0) for h in hist if str(h.get("last_score", "")).strip()],
+        "score": [
+            parse_float(h.get("score_live", h.get("last_score", 0.0)), 0.0)
+            for h in hist
+            if str(h.get("score_live", h.get("last_score", ""))).strip()
+        ],
         "entry_score": [parse_float(h.get("entry_score"), 0.0) for h in hist if str(h.get("entry_score", "")).strip()],
         "liquidity": [parse_float(h.get("liq_usd"), 0.0) for h in hist if str(h.get("liq_usd", "")).strip()],
-        "vol5": [parse_float(h.get("vol5"), 0.0) for h in hist if str(h.get("vol5", "")).strip()],
-        "vol24": [parse_float(h.get("vol24"), 0.0) for h in hist if str(h.get("vol24", "")).strip()],
+        "vol5": [parse_float(h.get("vol5_usd", h.get("vol5", 0.0)), 0.0) for h in hist if str(h.get("vol5_usd", h.get("vol5", ""))).strip()],
+        "vol24": [parse_float(h.get("vol24_usd", h.get("vol24", 0.0)), 0.0) for h in hist if str(h.get("vol24_usd", h.get("vol24", ""))).strip()],
     }
 
 
@@ -4467,6 +4471,28 @@ def add_to_monitoring(
                 r["source_window"] = _merge_csv_values(r.get("source_window", ""), window_name)
             if preset_key:
                 r["source_preset"] = _merge_csv_values(r.get("source_preset", ""), preset_key)
+            append_monitoring_history({
+                "ts_utc": now_utc_str(),
+                "chain": chain,
+                "base_symbol": safe_get(p, "baseToken", "symbol", default="") or r.get("base_symbol", ""),
+                "base_addr": base_addr,
+                "pair_addr": p.get("pairAddress", "") or r.get("pair_addr", ""),
+                "dex": p.get("dexId", "") or "",
+                "quote_symbol": safe_get(p, "quoteToken", "symbol", default="") or "",
+                "price_usd": str(parse_float(p.get("priceUsd"), 0.0)),
+                "liq_usd": str(parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0)),
+                "vol24_usd": str(parse_float(safe_get(p, "volume", "h24", default=0), 0.0)),
+                "vol5_usd": str(parse_float(safe_get(p, "volume", "m5", default=0), 0.0)),
+                "pc1h": str(parse_float(safe_get(p, "priceChange", "h1", default=0), 0.0)),
+                "pc5": str(parse_float(safe_get(p, "priceChange", "m5", default=0), 0.0)),
+                "score_live": str(score),
+                "decision": str(r.get("last_decision") or "watch"),
+                "entry_score": str(r.get("entry_score", "")),
+                "entry_action": str(r.get("entry_status", "")),
+                "entry_reason": str(r.get("signal_reason", "")),
+                "timing_label": str(r.get("timing_label", "")),
+                "risk_level": str(r.get("risk_level", "")),
+            })
             save_monitoring(rows)
             return "EXISTS_ACTIVE"
 
