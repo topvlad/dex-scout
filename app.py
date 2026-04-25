@@ -30,6 +30,7 @@ import random
 import math
 import hashlib
 import inspect
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional, Set
@@ -1446,9 +1447,35 @@ def fmt_usd_delta(x: float) -> str:
 # =============================
 # HTTP with retry/backoff
 # =============================
-def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, max_retries: int = 3) -> Any:
+TOKEN_PAIRS_MIN_INTERVAL_SEC = max(0.0, float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_MIN_INTERVAL_SEC", "0.12")))
+_TOKEN_PAIRS_THROTTLE_LOCK = threading.Lock()
+_TOKEN_PAIRS_LAST_REQUEST_TS = 0.0
+
+
+def _throttle_token_pairs_requests() -> None:
+    global _TOKEN_PAIRS_LAST_REQUEST_TS
+    if TOKEN_PAIRS_MIN_INTERVAL_SEC <= 0:
+        return
+
+    with _TOKEN_PAIRS_THROTTLE_LOCK:
+        now = time.monotonic()
+        wait_for = TOKEN_PAIRS_MIN_INTERVAL_SEC - (now - _TOKEN_PAIRS_LAST_REQUEST_TS)
+        if wait_for > 0:
+            time.sleep(wait_for)
+            now = time.monotonic()
+        _TOKEN_PAIRS_LAST_REQUEST_TS = now
+
+
+def _http_get_json(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: int = 20,
+    max_retries: int = 3,
+    backoff_base: float = 0.7,
+    rate_limit_marker: Optional[Dict[str, Any]] = None,
+) -> Any:
     last_err = None
-    backoff = 0.7
+    backoff = max(0.05, float(backoff_base))
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(
@@ -1459,7 +1486,15 @@ def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, m
             )
             if r.status_code == 429 or (500 <= r.status_code <= 599):
                 last_err = requests.HTTPError(f"HTTP {r.status_code} (attempt {attempt}/{max_retries})")
-                time.sleep(backoff)
+                if r.status_code == 429 and rate_limit_marker:
+                    debug_log(
+                        "rate_limit_429 "
+                        f"chain={rate_limit_marker.get('chain','')} "
+                        f"token={rate_limit_marker.get('token','')} "
+                        f"attempt={attempt}/{max_retries} final_fail=0"
+                    )
+                sleep_for = backoff + random.uniform(0.0, 0.25)
+                time.sleep(sleep_for)
                 backoff *= 2
                 continue
             r.raise_for_status()
@@ -1467,13 +1502,25 @@ def _http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20, m
         except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
             last_err = e
             if attempt < max_retries:
-                time.sleep(backoff)
+                sleep_for = backoff + random.uniform(0.0, 0.25)
+                time.sleep(sleep_for)
                 backoff *= 2
             else:
                 break
         except Exception as e:
             last_err = e
             break
+    if (
+        rate_limit_marker
+        and isinstance(last_err, requests.HTTPError)
+        and "HTTP 429" in str(last_err)
+    ):
+        debug_log(
+            "rate_limit_429 "
+            f"chain={rate_limit_marker.get('chain','')} "
+            f"token={rate_limit_marker.get('token','')} "
+            f"attempt={max_retries}/{max_retries} final_fail=1"
+        )
     raise RuntimeError(f"Request failed after {max_retries} tries: {last_err}")
 
 
@@ -1624,8 +1671,16 @@ def fetch_token_pairs(chain: str, token_address: str) -> List[Dict[str, Any]]:
     if not token_address:
         return []
     try:
+        _throttle_token_pairs_requests()
         url = f"{DEX_BASE}/token-pairs/v1/{chain}/{token_address}"
-        data = _http_get_json(url, params=None, timeout=8, max_retries=1)
+        data = _http_get_json(
+            url,
+            params=None,
+            timeout=8,
+            max_retries=4,
+            backoff_base=0.25,
+            rate_limit_marker={"chain": chain, "token": token_address},
+        )
         if isinstance(data, list):
             return data
         return []
