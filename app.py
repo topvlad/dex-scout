@@ -9247,7 +9247,6 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         fetch_priority = "high" if idx < high_priority_cutoff else "best_effort"
 
         globals()["_PAIR_FETCH_PRIORITY_HINT"] = "high" if idx < high_priority_cutoff else "best_effort"
-         main
         counts["seen"] += 1
         with pair_fetch_priority(fetch_priority):
             row = normalize_pair_row(p)
