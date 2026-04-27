@@ -1538,6 +1538,16 @@ _TOKEN_PAIRS_CHAIN_STATE: Dict[str, Dict[str, Any]] = {}
 _PAIR_FETCH_PRIORITY_HINT = "normal"
 
 
+@contextmanager
+def pair_fetch_priority(priority: str):
+    prev_priority = str(globals().get("_PAIR_FETCH_PRIORITY_HINT", "normal") or "normal")
+    globals()["_PAIR_FETCH_PRIORITY_HINT"] = str(priority or "normal")
+    try:
+        yield
+    finally:
+        globals()["_PAIR_FETCH_PRIORITY_HINT"] = prev_priority
+
+
 def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
     chain_key = str(chain or "").strip().lower() or "unknown"
     state = _TOKEN_PAIRS_CHAIN_STATE.setdefault(
@@ -1775,16 +1785,13 @@ def fetch_birdeye_pairs(limit: int = 50) -> List[Dict[str, Any]]:
     if not BIRDEYE_ENABLED:
         return out
     for mint in birdeye_trending_solana(limit=limit):
-        previous_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
-        globals()["_PAIR_FETCH_PRIORITY_HINT"] = "best_effort"
         try:
-            bp = best_pair_for_token_cached("solana", mint)
+            with pair_fetch_priority("best_effort"):
+                bp = best_pair_for_token_cached("solana", mint)
             if bp:
                 out.append(bp)
         except Exception:
             continue
-        finally:
-            globals()["_PAIR_FETCH_PRIORITY_HINT"] = previous_priority
     return out
 
 @st.cache_data(ttl=60, max_entries=500, show_spinner=False)
@@ -9979,9 +9986,8 @@ def run_priority_scanner_cycle(
         row_state = dict(queue_state.get(token_key, {}))
 
         try:
-            previous_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
-            globals()["_PAIR_FETCH_PRIORITY_HINT"] = "high"
-            pair = best_pair_for_token_cached(chain, base_addr)
+            with pair_fetch_priority("high"):
+                pair = best_pair_for_token_cached(chain, base_addr)
             if pair:
                 score_live = score_pair(pair)
                 normalized = normalize_pair_row(pair)
@@ -10004,9 +10010,6 @@ def run_priority_scanner_cycle(
             current_backoff = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
             row_state["backoff_sec"] = min(1800, max(60, current_backoff * 2 if current_backoff else 90))
             row_state["last_error_ts"] = now_utc_str()
-        finally:
-            globals()["_PAIR_FETCH_PRIORITY_HINT"] = previous_priority
-
         backoff_sec = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
         row_state["tier"] = tier
         row_state["last_scan_ts"] = now_utc_str()
