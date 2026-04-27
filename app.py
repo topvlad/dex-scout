@@ -104,6 +104,7 @@ def maybe_safe_auto_refresh(enabled: bool, interval_sec: int = 60) -> None:
 
 
 VERSION = "v0.5.6-entry-engine-v1"
+# NOTE: Keep this file aligned with main when resolving stale PR conflicts.
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
@@ -1521,21 +1522,73 @@ def fmt_usd_delta(x: float) -> str:
 # =============================
 TOKEN_PAIRS_MIN_INTERVAL_SEC = max(0.0, float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_MIN_INTERVAL_SEC", "0.12")))
 _TOKEN_PAIRS_THROTTLE_LOCK = threading.Lock()
-_TOKEN_PAIRS_LAST_REQUEST_TS = 0.0
+_TOKEN_PAIRS_LAST_REQUEST_TS_BY_CHAIN: Dict[str, float] = {}
+TOKEN_PAIRS_MIN_INTERVAL_SOLANA_SEC = max(
+    TOKEN_PAIRS_MIN_INTERVAL_SEC,
+    float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_MIN_INTERVAL_SOLANA_SEC", "0.35")),
+)
+TOKEN_PAIRS_RUN_CACHE_TTL_SEC = max(10.0, float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_RUN_CACHE_TTL_SEC", "120")))
+TOKEN_PAIRS_429_PRESSURE_THRESHOLD = max(2, _env_int("DEX_SCOUT_TOKEN_PAIRS_429_PRESSURE_THRESHOLD", 4))
+TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC = max(5.0, float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC", "45")))
+TOKEN_PAIRS_429_DEFER_THRESHOLD = max(1, _env_int("DEX_SCOUT_TOKEN_PAIRS_429_DEFER_THRESHOLD", 2))
+TOKEN_PAIRS_429_MAX_RETRIES = max(1, _env_int("DEX_SCOUT_TOKEN_PAIRS_429_MAX_RETRIES", 3))
+TOKEN_PAIRS_429_BACKOFF_BASE_SEC = max(0.05, float(os.getenv("DEX_SCOUT_TOKEN_PAIRS_429_BACKOFF_BASE_SEC", "0.35")))
+_TOKEN_PAIRS_RUN_CACHE: Dict[str, Dict[str, Any]] = {}
+_TOKEN_PAIRS_CHAIN_STATE: Dict[str, Dict[str, Any]] = {}
+_PAIR_FETCH_PRIORITY_HINT = "normal"
 
 
-def _throttle_token_pairs_requests() -> None:
-    global _TOKEN_PAIRS_LAST_REQUEST_TS
-    if TOKEN_PAIRS_MIN_INTERVAL_SEC <= 0:
+def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
+    chain_key = str(chain or "").strip().lower() or "unknown"
+    state = _TOKEN_PAIRS_CHAIN_STATE.setdefault(
+        chain_key,
+        {
+            "consecutive_429": 0,
+            "recent_429": 0,
+            "pressure_until_ts": 0.0,
+            "deferred_count": 0,
+            "skipped_count": 0,
+            "last_429_ts": 0.0,
+        },
+    )
+    now_mono = time.monotonic()
+    last_429_ts = float(state.get("last_429_ts", 0.0) or 0.0)
+    if last_429_ts > 0 and (now_mono - last_429_ts) > TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC:
+        state["recent_429"] = max(0, int(state.get("recent_429", 0) or 0) - 1)
+    return state
+
+
+def _token_pairs_is_pressure_active(chain: str) -> bool:
+    state = _token_pairs_chain_state(chain)
+    return time.monotonic() < float(state.get("pressure_until_ts", 0.0) or 0.0)
+
+
+def reset_pair_fetch_run_state() -> None:
+    global _PAIR_FETCH_PRIORITY_HINT
+    _PAIR_FETCH_PRIORITY_HINT = "normal"
+    _TOKEN_PAIRS_RUN_CACHE.clear()
+    for state in _TOKEN_PAIRS_CHAIN_STATE.values():
+        state["recent_429"] = 0
+        state["deferred_count"] = 0
+        state["skipped_count"] = 0
+
+
+def _throttle_token_pairs_requests(chain: str) -> None:
+    chain_norm = str(chain or "").strip().lower() or "unknown"
+    base_interval = TOKEN_PAIRS_MIN_INTERVAL_SOLANA_SEC if chain_norm == "solana" else TOKEN_PAIRS_MIN_INTERVAL_SEC
+    if base_interval <= 0:
         return
 
     with _TOKEN_PAIRS_THROTTLE_LOCK:
+        pressure_mult = 2.0 if _token_pairs_is_pressure_active(chain_norm) else 1.0
+        target_interval = max(0.0, base_interval * pressure_mult)
         now = time.monotonic()
-        wait_for = TOKEN_PAIRS_MIN_INTERVAL_SEC - (now - _TOKEN_PAIRS_LAST_REQUEST_TS)
+        last_ts = float(_TOKEN_PAIRS_LAST_REQUEST_TS_BY_CHAIN.get(chain_norm, 0.0) or 0.0)
+        wait_for = target_interval - (now - last_ts)
         if wait_for > 0:
             time.sleep(wait_for)
             now = time.monotonic()
-        _TOKEN_PAIRS_LAST_REQUEST_TS = now
+        _TOKEN_PAIRS_LAST_REQUEST_TS_BY_CHAIN[chain_norm] = now
 
 
 def _http_get_json(
@@ -1546,54 +1599,61 @@ def _http_get_json(
     backoff_base: float = 0.7,
     rate_limit_marker: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    last_err = None
+    last_err: Optional[Exception] = None
+    retries = max(1, int(max_retries))
     backoff = max(0.05, float(backoff_base))
-    for attempt in range(1, max_retries + 1):
+    headers = {"User-Agent": "dex-scout/" + str(VERSION)}
+    chain_for_rate = str((rate_limit_marker or {}).get("chain") or "").strip().lower()
+
+    for attempt in range(1, retries + 1):
         try:
-            r = requests.get(
-                url,
-                params=params,
-                timeout=timeout,
-                headers={"User-Agent": f"dex-scout/{VERSION}"},
-            )
-            if r.status_code == 429 or (500 <= r.status_code <= 599):
-                last_err = requests.HTTPError(f"HTTP {r.status_code} (attempt {attempt}/{max_retries})")
-                if r.status_code == 429 and rate_limit_marker:
+            response = requests.get(url, params=params, timeout=timeout, headers=headers)
+            status = int(response.status_code)
+
+            if status == 429 or (500 <= status <= 599):
+                last_err = requests.HTTPError(f"HTTP {status} (attempt {attempt}/{retries})")
+                if status == 429 and rate_limit_marker:
+                    state = _token_pairs_chain_state(chain_for_rate)
+                    state["consecutive_429"] = int(state.get("consecutive_429", 0) or 0) + 1
+                    state["recent_429"] = int(state.get("recent_429", 0) or 0) + 1
+                    state["last_429_ts"] = time.monotonic()
+                    if state["consecutive_429"] >= TOKEN_PAIRS_429_PRESSURE_THRESHOLD:
+                        state["pressure_until_ts"] = time.monotonic() + TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC
                     debug_log(
                         "rate_limit_429 "
                         f"chain={rate_limit_marker.get('chain','')} "
                         f"token={rate_limit_marker.get('token','')} "
-                        f"attempt={attempt}/{max_retries} final_fail=0"
+                        f"attempt={attempt}/{retries} final_fail=0"
                     )
-                sleep_for = backoff + random.uniform(0.0, 0.25)
-                time.sleep(sleep_for)
+                pressure_mult = 1.75 if _token_pairs_is_pressure_active(chain_for_rate) else 1.0
+                time.sleep((backoff * pressure_mult) + random.uniform(0.0, 0.25))
                 backoff *= 2
                 continue
-            r.raise_for_status()
-            return r.json()
-        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
-            last_err = e
-            if attempt < max_retries:
-                sleep_for = backoff + random.uniform(0.0, 0.25)
-                time.sleep(sleep_for)
+
+            response.raise_for_status()
+            if rate_limit_marker:
+                state = _token_pairs_chain_state(chain_for_rate)
+                state["consecutive_429"] = 0
+            return response.json()
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            last_err = exc
+            if attempt < retries:
+                time.sleep(backoff + random.uniform(0.0, 0.25))
                 backoff *= 2
-            else:
-                break
-        except Exception as e:
-            last_err = e
+                continue
             break
-    if (
-        rate_limit_marker
-        and isinstance(last_err, requests.HTTPError)
-        and "HTTP 429" in str(last_err)
-    ):
+        except Exception as exc:
+            last_err = exc
+            break
+
+    if rate_limit_marker and isinstance(last_err, requests.HTTPError) and "HTTP 429" in str(last_err):
         debug_log(
             "rate_limit_429 "
             f"chain={rate_limit_marker.get('chain','')} "
             f"token={rate_limit_marker.get('token','')} "
-            f"attempt={max_retries}/{max_retries} final_fail=1"
+            f"attempt={retries}/{retries} final_fail=1"
         )
-    raise RuntimeError(f"Request failed after {max_retries} tries: {last_err}")
+    raise RuntimeError(f"Request failed after {retries} tries: {last_err}")
 
 
 # =============================
@@ -1715,12 +1775,16 @@ def fetch_birdeye_pairs(limit: int = 50) -> List[Dict[str, Any]]:
     if not BIRDEYE_ENABLED:
         return out
     for mint in birdeye_trending_solana(limit=limit):
+        previous_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
+        globals()["_PAIR_FETCH_PRIORITY_HINT"] = "best_effort"
         try:
             bp = best_pair_for_token_cached("solana", mint)
             if bp:
                 out.append(bp)
         except Exception:
             continue
+        finally:
+            globals()["_PAIR_FETCH_PRIORITY_HINT"] = previous_priority
     return out
 
 @st.cache_data(ttl=60, max_entries=500, show_spinner=False)
@@ -1739,25 +1803,54 @@ def fetch_dexscreener_search(term: str, limit: int = 20) -> List[Dict[str, Any]]
 
 
 @st.cache_data(ttl=60, max_entries=500, show_spinner=False)
-def fetch_token_pairs(chain: str, token_address: str) -> List[Dict[str, Any]]:
-    if not token_address:
+def fetch_token_pairs(chain: str, token_address: str, priority_hint: str = "normal") -> List[Dict[str, Any]]:
+    chain_norm = normalize_chain_name(chain or "")
+    token = str(token_address or "").strip()
+    if not token:
+        return []
+    now_mono = time.monotonic()
+    cache_key = f"{chain_norm}:{token}"
+    cached = _TOKEN_PAIRS_RUN_CACHE.get(cache_key)
+    if cached and (now_mono - float(cached.get("ts", 0.0) or 0.0)) <= TOKEN_PAIRS_RUN_CACHE_TTL_SEC:
+        debug_log(f"pair_fetch_cache_hit chain={chain_norm} token={token}")
+        return list(cached.get("pairs", []))
+    priority = str(priority_hint or _PAIR_FETCH_PRIORITY_HINT or "normal").strip().lower()
+    state = _token_pairs_chain_state(chain_norm)
+    if _token_pairs_is_pressure_active(chain_norm) and priority not in {"high", "critical"}:
+        state["deferred_count"] = int(state.get("deferred_count", 0) or 0) + 1
+        pressure_until = float(state.get("pressure_until_ts", 0.0) or 0.0)
+        wait_left = max(0.0, pressure_until - time.monotonic())
+        debug_log(
+            f"pair_fetch_deferred chain={chain_norm} token={token} priority={priority} "
+            f"wait_left_sec={wait_left:.1f}"
+        )
+        _TOKEN_PAIRS_RUN_CACHE[cache_key] = {"ts": now_mono, "pairs": []}
+        return []
+    if int(state.get("recent_429", 0) or 0) >= TOKEN_PAIRS_429_DEFER_THRESHOLD and priority == "best_effort":
+        state["skipped_count"] = int(state.get("skipped_count", 0) or 0) + 1
+        debug_log(
+            f"pair_fetch_skipped_due_to_pressure chain={chain_norm} token={token} "
+            f"priority={priority} recent_429={state.get('recent_429', 0)}"
+        )
+        _TOKEN_PAIRS_RUN_CACHE[cache_key] = {"ts": now_mono, "pairs": []}
         return []
     try:
-        _throttle_token_pairs_requests()
-        url = f"{DEX_BASE}/token-pairs/v1/{chain}/{token_address}"
+        _throttle_token_pairs_requests(chain_norm)
+        url = f"{DEX_BASE}/token-pairs/v1/{chain_norm}/{token}"
         data = _http_get_json(
             url,
             params=None,
             timeout=8,
-            max_retries=4,
-            backoff_base=0.25,
-            rate_limit_marker={"chain": chain, "token": token_address},
+            max_retries=TOKEN_PAIRS_429_MAX_RETRIES,
+            backoff_base=TOKEN_PAIRS_429_BACKOFF_BASE_SEC,
+            rate_limit_marker={"chain": chain_norm, "token": token},
         )
         if isinstance(data, list):
+            _TOKEN_PAIRS_RUN_CACHE[cache_key] = {"ts": now_mono, "pairs": data}
             return data
         return []
     except Exception as e:
-        debug_log(f"fetch_token_pairs_fail chain={chain} token={token_address} err={type(e).__name__}:{e}")
+        debug_log(f"fetch_token_pairs_fail chain={chain_norm} token={token} err={type(e).__name__}:{e}")
         return []
 
 @st.cache_data(ttl=60, max_entries=500)
@@ -1765,7 +1858,7 @@ def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, An
     if TEMP_DISABLE_BEST_PAIR:
         return None
     try:
-        pools = fetch_token_pairs(chain, token_address)
+        pools = fetch_token_pairs(chain, token_address, priority_hint=str(_PAIR_FETCH_PRIORITY_HINT or "normal"))
     except Exception:
         return None
     if not pools:
@@ -9886,6 +9979,8 @@ def run_priority_scanner_cycle(
         row_state = dict(queue_state.get(token_key, {}))
 
         try:
+            previous_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
+            globals()["_PAIR_FETCH_PRIORITY_HINT"] = "high"
             pair = best_pair_for_token_cached(chain, base_addr)
             if pair:
                 score_live = score_pair(pair)
@@ -9909,6 +10004,8 @@ def run_priority_scanner_cycle(
             current_backoff = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
             row_state["backoff_sec"] = min(1800, max(60, current_backoff * 2 if current_backoff else 90))
             row_state["last_error_ts"] = now_utc_str()
+        finally:
+            globals()["_PAIR_FETCH_PRIORITY_HINT"] = previous_priority
 
         backoff_sec = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
         row_state["tier"] = tier
@@ -9964,6 +10061,7 @@ def current_scan_slot(now_ts: Optional[float] = None) -> Tuple[str, str, str, in
     return window_name, preset_key, chain, step
 
 def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
+    reset_pair_fetch_run_state()
     state = scanner_state_load() or {}
     if not isinstance(state, dict):
         state = {}
@@ -10001,6 +10099,7 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
 
 def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
+    reset_pair_fetch_run_state()
     window_name, preset_key, chain, slot = current_scan_slot()
     try:
         stats = ingest_window_to_monitoring(chain=chain, window_name=window_name, preset_key=preset_key, seeds_raw=seeds_raw, max_items=max_items, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
@@ -10025,6 +10124,7 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
     return {"ran": True, "slot": slot, "window": window_name, "chain": chain, "stats": stats}
 
 def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
+    reset_pair_fetch_run_state()
     state = scanner_state_load() or {}
     window_name = "Wide Net (explore)"
     preset_key = "wide"
