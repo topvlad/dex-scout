@@ -104,6 +104,7 @@ def maybe_safe_auto_refresh(enabled: bool, interval_sec: int = 60) -> None:
 
 
 VERSION = "v0.5.6-entry-engine-v1"
+# NOTE: Keep this file aligned with main when resolving stale PR conflicts.
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
@@ -1553,15 +1554,13 @@ def pair_fetch_priority(priority: str):
         globals()["_PAIR_FETCH_PRIORITY_HINT"] = prev_priority
 
 
+def _token_pairs_is_pressure_active(chain: str) -> bool:
+    state = _token_pairs_chain_state(chain)
+    return time.monotonic() < float(state.get("pressure_until_ts", 0.0) or 0.0)
+
 def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
     chain_key = str(chain or "").strip().lower() or "unknown"
     state = _TOKEN_PAIRS_CHAIN_STATE.setdefault(
-
-      
-def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
-    chain_key = str(chain or "").strip().lower() or "unknown"
-    return _TOKEN_PAIRS_CHAIN_STATE.setdefault(
-        main
         chain_key,
         {
             "consecutive_429": 0,
@@ -1569,7 +1568,6 @@ def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
             "pressure_until_ts": 0.0,
             "deferred_count": 0,
             "skipped_count": 0,
-        
             "last_429_ts": 0.0,
         },
     )
@@ -1586,7 +1584,8 @@ def _token_pairs_is_pressure_active(chain: str) -> bool:
 
 
 def reset_pair_fetch_run_state() -> None:
-    globals()["_PAIR_FETCH_PRIORITY_HINT"] = "normal"
+    global _PAIR_FETCH_PRIORITY_HINT
+    _PAIR_FETCH_PRIORITY_HINT = "normal"
     _TOKEN_PAIRS_RUN_CACHE.clear()
     for state in _TOKEN_PAIRS_CHAIN_STATE.values():
         state["recent_429"] = 0
@@ -1594,25 +1593,6 @@ def reset_pair_fetch_run_state() -> None:
         state["skipped_count"] = 0
 
 
-        },
-    )
-
-
-def _token_pairs_is_pressure_active(chain: str) -> bool:
-    state = _token_pairs_chain_state(chain)
-    return time.monotonic() < float(state.get("pressure_until_ts", 0.0) or 0.0)
-
-
-def reset_pair_fetch_run_state() -> None:
-    globals()["_PAIR_FETCH_PRIORITY_HINT"] = "normal"
-    _TOKEN_PAIRS_RUN_CACHE.clear()
-    for state in _TOKEN_PAIRS_CHAIN_STATE.values():
-        state["recent_429"] = 0
-        state["deferred_count"] = 0
-        state["skipped_count"] = 0
-
-
-main
 def _throttle_token_pairs_requests(chain: str) -> None:
     chain_norm = str(chain or "").strip().lower() or "unknown"
     base_interval = TOKEN_PAIRS_MIN_INTERVAL_SOLANA_SEC if chain_norm == "solana" else TOKEN_PAIRS_MIN_INTERVAL_SEC
@@ -1639,67 +1619,61 @@ def _http_get_json(
     backoff_base: float = 0.7,
     rate_limit_marker: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    last_err = None
+    last_err: Optional[Exception] = None
+    retries = max(1, int(max_retries))
     backoff = max(0.05, float(backoff_base))
+    headers = {"User-Agent": "dex-scout/" + str(VERSION)}
     chain_for_rate = str((rate_limit_marker or {}).get("chain") or "").strip().lower()
-    for attempt in range(1, max_retries + 1):
+
+    for attempt in range(1, retries + 1):
         try:
-            r = requests.get(
-                url,
-                params=params,
-                timeout=timeout,
-                headers={"User-Agent": f"dex-scout/{VERSION}"},
-            )
-            if r.status_code == 429 or (500 <= r.status_code <= 599):
-                last_err = requests.HTTPError(f"HTTP {r.status_code} (attempt {attempt}/{max_retries})")
-                if r.status_code == 429 and rate_limit_marker:
+            response = requests.get(url, params=params, timeout=timeout, headers=headers)
+            status = int(response.status_code)
+
+            if status == 429 or (500 <= status <= 599):
+                last_err = requests.HTTPError(f"HTTP {status} (attempt {attempt}/{retries})")
+                if status == 429 and rate_limit_marker:
                     state = _token_pairs_chain_state(chain_for_rate)
                     state["consecutive_429"] = int(state.get("consecutive_429", 0) or 0) + 1
                     state["recent_429"] = int(state.get("recent_429", 0) or 0) + 1
                     state["last_429_ts"] = time.monotonic()
-
-        main
                     if state["consecutive_429"] >= TOKEN_PAIRS_429_PRESSURE_THRESHOLD:
                         state["pressure_until_ts"] = time.monotonic() + TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC
                     debug_log(
                         "rate_limit_429 "
                         f"chain={rate_limit_marker.get('chain','')} "
                         f"token={rate_limit_marker.get('token','')} "
-                        f"attempt={attempt}/{max_retries} final_fail=0"
+                        f"attempt={attempt}/{retries} final_fail=0"
                     )
                 pressure_mult = 1.75 if _token_pairs_is_pressure_active(chain_for_rate) else 1.0
-                sleep_for = (backoff * pressure_mult) + random.uniform(0.0, 0.25)
-                time.sleep(sleep_for)
+                time.sleep((backoff * pressure_mult) + random.uniform(0.0, 0.25))
                 backoff *= 2
                 continue
-            r.raise_for_status()
+
+            response.raise_for_status()
             if rate_limit_marker:
                 state = _token_pairs_chain_state(chain_for_rate)
                 state["consecutive_429"] = 0
-            return r.json()
-        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
-            last_err = e
-            if attempt < max_retries:
-                sleep_for = backoff + random.uniform(0.0, 0.25)
-                time.sleep(sleep_for)
+            return response.json()
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            last_err = exc
+            if attempt < retries:
+                time.sleep(backoff + random.uniform(0.0, 0.25))
                 backoff *= 2
-            else:
-                break
-        except Exception as e:
-            last_err = e
+                continue
             break
-    if (
-        rate_limit_marker
-        and isinstance(last_err, requests.HTTPError)
-        and "HTTP 429" in str(last_err)
-    ):
+        except Exception as exc:
+            last_err = exc
+            break
+
+    if rate_limit_marker and isinstance(last_err, requests.HTTPError) and "HTTP 429" in str(last_err):
         debug_log(
             "rate_limit_429 "
             f"chain={rate_limit_marker.get('chain','')} "
             f"token={rate_limit_marker.get('token','')} "
-            f"attempt={max_retries}/{max_retries} final_fail=1"
+            f"attempt={retries}/{retries} final_fail=1"
         )
-    raise RuntimeError(f"Request failed after {max_retries} tries: {last_err}")
+    raise RuntimeError(f"Request failed after {retries} tries: {last_err}")
 
 
 # =============================
@@ -1824,17 +1798,10 @@ def fetch_birdeye_pairs(limit: int = 50) -> List[Dict[str, Any]]:
         try:
             with pair_fetch_priority("best_effort"):
                 bp = best_pair_for_token_cached("solana", mint)
-
-            previous_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
-            globals()["_PAIR_FETCH_PRIORITY_HINT"] = "best_effort"
-            bp = best_pair_for_token_cached("solana", mint)
-        main
             if bp:
                 out.append(bp)
         except Exception:
             continue
-        finally:
-            globals()["_PAIR_FETCH_PRIORITY_HINT"] = previous_priority
     return out
 
 @st.cache_data(ttl=60, max_entries=500, show_spinner=False)
@@ -1852,8 +1819,7 @@ def fetch_dexscreener_search(term: str, limit: int = 20) -> List[Dict[str, Any]]
     return pairs[:limit]
 
 
-
-main
+@st.cache_data(ttl=60, max_entries=500, show_spinner=False)
 def fetch_token_pairs(chain: str, token_address: str, priority_hint: str = "normal") -> List[Dict[str, Any]]:
     chain_norm = normalize_chain_name(chain or "")
     token = str(token_address or "").strip()
@@ -1869,16 +1835,12 @@ def fetch_token_pairs(chain: str, token_address: str, priority_hint: str = "norm
     state = _token_pairs_chain_state(chain_norm)
     if _token_pairs_is_pressure_active(chain_norm) and priority not in {"high", "critical"}:
         state["deferred_count"] = int(state.get("deferred_count", 0) or 0) + 1
-
         pressure_until = float(state.get("pressure_until_ts", 0.0) or 0.0)
         wait_left = max(0.0, pressure_until - time.monotonic())
         debug_log(
             f"pair_fetch_deferred chain={chain_norm} token={token} priority={priority} "
             f"wait_left_sec={wait_left:.1f}"
         )
-
-        debug_log(f"pair_fetch_deferred chain={chain_norm} token={token} priority={priority}")
-        main
         _TOKEN_PAIRS_RUN_CACHE[cache_key] = {"ts": now_mono, "pairs": []}
         return []
     if int(state.get("recent_429", 0) or 0) >= TOKEN_PAIRS_429_DEFER_THRESHOLD and priority == "best_effort":
@@ -10046,11 +10008,6 @@ def run_priority_scanner_cycle(
         try:
             with pair_fetch_priority("high"):
                 pair = best_pair_for_token_cached(chain, base_addr)
-
-            prev_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
-            globals()["_PAIR_FETCH_PRIORITY_HINT"] = "high"
-            pair = best_pair_for_token_cached(chain, base_addr)
-        main
             if pair:
                 score_live = score_pair(pair)
                 normalized = normalize_pair_row(pair)
@@ -10073,11 +10030,6 @@ def run_priority_scanner_cycle(
             current_backoff = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
             row_state["backoff_sec"] = min(1800, max(60, current_backoff * 2 if current_backoff else 90))
             row_state["last_error_ts"] = now_utc_str()
-
-        finally:
-            globals()["_PAIR_FETCH_PRIORITY_HINT"] = prev_priority
-
-        main
         backoff_sec = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
         row_state["tier"] = tier
         row_state["last_scan_ts"] = now_utc_str()
