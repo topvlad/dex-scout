@@ -1550,15 +1550,11 @@ def _http_get_json(
     last_err: Optional[Exception] = None
     retries = max(1, int(max_retries))
     backoff = max(0.05, float(backoff_base))
+    headers = {"User-Agent": "dex-scout/" + str(VERSION)}
 
     for attempt in range(1, retries + 1):
         try:
-            response = requests.get(
-                url,
-                params=params,
-                timeout=timeout,
-                headers={"User-Agent": f"dex-scout/{VERSION}"},
-            )
+            response = requests.get(url, params=params, timeout=timeout, headers=headers)
             status = int(response.status_code)
 
             if status == 429 or (500 <= status <= 599):
