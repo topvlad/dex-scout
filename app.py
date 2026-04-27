@@ -9241,9 +9241,10 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     }
     high_priority_cutoff = min(len(ranked), max(10, int(max_items * 0.35)))
     for idx, (s, p, smart, signal) in enumerate(ranked):
-        globals()["_PAIR_FETCH_PRIORITY_HINT"] = "high" if idx < high_priority_cutoff else "best_effort"
+        fetch_priority = "high" if idx < high_priority_cutoff else "best_effort"
         counts["seen"] += 1
-        row = normalize_pair_row(p)
+        with pair_fetch_priority(fetch_priority):
+            row = normalize_pair_row(p)
         if row is None:
             counts["skipped_noise"] += 1
             continue
@@ -9437,7 +9438,6 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             autosave=False,
         )
         counts["added"] += 1
-    globals()["_PAIR_FETCH_PRIORITY_HINT"] = "normal"
     save_monitoring(monitoring_rows)
     flush_monitoring_history_buffer(force=True)
     save_smart_wallets(smart_wallets)
@@ -9998,7 +9998,6 @@ def run_priority_scanner_cycle(
         interval_sec = _scanner_interval_for_tier(tier, score)
         row_state = dict(queue_state.get(token_key, {}))
 
-        prev_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
         try:
             with pair_fetch_priority("high"):
                 pair = best_pair_for_token_cached(chain, base_addr)
@@ -10024,9 +10023,6 @@ def run_priority_scanner_cycle(
             current_backoff = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
             row_state["backoff_sec"] = min(1800, max(60, current_backoff * 2 if current_backoff else 90))
             row_state["last_error_ts"] = now_utc_str()
-        finally:
-            globals()["_PAIR_FETCH_PRIORITY_HINT"] = prev_priority
-
         backoff_sec = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
         row_state["tier"] = tier
         row_state["last_scan_ts"] = now_utc_str()
