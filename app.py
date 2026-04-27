@@ -104,6 +104,7 @@ def maybe_safe_auto_refresh(enabled: bool, interval_sec: int = 60) -> None:
 
 
 VERSION = "v0.5.6-entry-engine-v1"
+# NOTE: Keep this file aligned with main when resolving stale PR conflicts.
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
@@ -1543,9 +1544,25 @@ _TOKEN_PAIRS_CHAIN_STATE: Dict[str, Dict[str, Any]] = {}
 _PAIR_FETCH_PRIORITY_HINT = "normal"
 
 
+@contextmanager
+def pair_fetch_priority(priority: str):
+    prev_priority = str(globals().get("_PAIR_FETCH_PRIORITY_HINT", "normal") or "normal")
+    globals()["_PAIR_FETCH_PRIORITY_HINT"] = str(priority or "normal")
+    try:
+        yield
+    finally:
+        globals()["_PAIR_FETCH_PRIORITY_HINT"] = prev_priority
+
+
+def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
+    chain_key = str(chain or "").strip().lower() or "unknown"
+    state = _TOKEN_PAIRS_CHAIN_STATE.setdefault(
+
+      
 def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
     chain_key = str(chain or "").strip().lower() or "unknown"
     return _TOKEN_PAIRS_CHAIN_STATE.setdefault(
+        main
         chain_key,
         {
             "consecutive_429": 0,
@@ -1553,6 +1570,31 @@ def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
             "pressure_until_ts": 0.0,
             "deferred_count": 0,
             "skipped_count": 0,
+        
+            "last_429_ts": 0.0,
+        },
+    )
+    now_mono = time.monotonic()
+    last_429_ts = float(state.get("last_429_ts", 0.0) or 0.0)
+    if last_429_ts > 0 and (now_mono - last_429_ts) > TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC:
+        state["recent_429"] = max(0, int(state.get("recent_429", 0) or 0) - 1)
+    return state
+
+
+def _token_pairs_is_pressure_active(chain: str) -> bool:
+    state = _token_pairs_chain_state(chain)
+    return time.monotonic() < float(state.get("pressure_until_ts", 0.0) or 0.0)
+
+
+def reset_pair_fetch_run_state() -> None:
+    globals()["_PAIR_FETCH_PRIORITY_HINT"] = "normal"
+    _TOKEN_PAIRS_RUN_CACHE.clear()
+    for state in _TOKEN_PAIRS_CHAIN_STATE.values():
+        state["recent_429"] = 0
+        state["deferred_count"] = 0
+        state["skipped_count"] = 0
+
+
         },
     )
 
@@ -1571,6 +1613,7 @@ def reset_pair_fetch_run_state() -> None:
         state["skipped_count"] = 0
 
 
+main
 def _throttle_token_pairs_requests(chain: str) -> None:
     chain_norm = str(chain or "").strip().lower() or "unknown"
     base_interval = TOKEN_PAIRS_MIN_INTERVAL_SOLANA_SEC if chain_norm == "solana" else TOKEN_PAIRS_MIN_INTERVAL_SEC
@@ -1614,6 +1657,9 @@ def _http_get_json(
                     state = _token_pairs_chain_state(chain_for_rate)
                     state["consecutive_429"] = int(state.get("consecutive_429", 0) or 0) + 1
                     state["recent_429"] = int(state.get("recent_429", 0) or 0) + 1
+                    state["last_429_ts"] = time.monotonic()
+
+        main
                     if state["consecutive_429"] >= TOKEN_PAIRS_429_PRESSURE_THRESHOLD:
                         state["pressure_until_ts"] = time.monotonic() + TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC
                     debug_log(
@@ -1777,9 +1823,13 @@ def fetch_birdeye_pairs(limit: int = 50) -> List[Dict[str, Any]]:
         return out
     for mint in birdeye_trending_solana(limit=limit):
         try:
+            with pair_fetch_priority("best_effort"):
+                bp = best_pair_for_token_cached("solana", mint)
+
             previous_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
             globals()["_PAIR_FETCH_PRIORITY_HINT"] = "best_effort"
             bp = best_pair_for_token_cached("solana", mint)
+        main
             if bp:
                 out.append(bp)
         except Exception:
@@ -1803,7 +1853,8 @@ def fetch_dexscreener_search(term: str, limit: int = 20) -> List[Dict[str, Any]]
     return pairs[:limit]
 
 
-@st.cache_data(ttl=60, max_entries=500, show_spinner=False)
+
+main
 def fetch_token_pairs(chain: str, token_address: str, priority_hint: str = "normal") -> List[Dict[str, Any]]:
     chain_norm = normalize_chain_name(chain or "")
     token = str(token_address or "").strip()
@@ -1819,7 +1870,16 @@ def fetch_token_pairs(chain: str, token_address: str, priority_hint: str = "norm
     state = _token_pairs_chain_state(chain_norm)
     if _token_pairs_is_pressure_active(chain_norm) and priority not in {"high", "critical"}:
         state["deferred_count"] = int(state.get("deferred_count", 0) or 0) + 1
+
+        pressure_until = float(state.get("pressure_until_ts", 0.0) or 0.0)
+        wait_left = max(0.0, pressure_until - time.monotonic())
+        debug_log(
+            f"pair_fetch_deferred chain={chain_norm} token={token} priority={priority} "
+            f"wait_left_sec={wait_left:.1f}"
+        )
+
         debug_log(f"pair_fetch_deferred chain={chain_norm} token={token} priority={priority}")
+        main
         _TOKEN_PAIRS_RUN_CACHE[cache_key] = {"ts": now_mono, "pairs": []}
         return []
     if int(state.get("recent_429", 0) or 0) >= TOKEN_PAIRS_429_DEFER_THRESHOLD and priority == "best_effort":
@@ -9223,9 +9283,13 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     }
     high_priority_cutoff = min(len(ranked), max(10, int(max_items * 0.35)))
     for idx, (s, p, smart, signal) in enumerate(ranked):
+        fetch_priority = "high" if idx < high_priority_cutoff else "best_effort"
+
         globals()["_PAIR_FETCH_PRIORITY_HINT"] = "high" if idx < high_priority_cutoff else "best_effort"
+         main
         counts["seen"] += 1
-        row = normalize_pair_row(p)
+        with pair_fetch_priority(fetch_priority):
+            row = normalize_pair_row(p)
         if row is None:
             counts["skipped_noise"] += 1
             continue
@@ -9981,9 +10045,13 @@ def run_priority_scanner_cycle(
         row_state = dict(queue_state.get(token_key, {}))
 
         try:
+            with pair_fetch_priority("high"):
+                pair = best_pair_for_token_cached(chain, base_addr)
+
             prev_priority = str(_PAIR_FETCH_PRIORITY_HINT or "normal")
             globals()["_PAIR_FETCH_PRIORITY_HINT"] = "high"
             pair = best_pair_for_token_cached(chain, base_addr)
+        main
             if pair:
                 score_live = score_pair(pair)
                 normalized = normalize_pair_row(pair)
@@ -10006,9 +10074,11 @@ def run_priority_scanner_cycle(
             current_backoff = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
             row_state["backoff_sec"] = min(1800, max(60, current_backoff * 2 if current_backoff else 90))
             row_state["last_error_ts"] = now_utc_str()
+
         finally:
             globals()["_PAIR_FETCH_PRIORITY_HINT"] = prev_priority
 
+        main
         backoff_sec = int(parse_float(row_state.get("backoff_sec", 0), 0.0))
         row_state["tier"] = tier
         row_state["last_scan_ts"] = now_utc_str()
