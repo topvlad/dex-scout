@@ -931,10 +931,14 @@ def storage_metrics_snapshot() -> Dict[str, int]:
     }
 
 
-def _should_verify_roundtrip() -> bool:
+def _should_verify_roundtrip(key: str = "", payload_len: int = 0) -> bool:
     mode = STORAGE_VERIFY_MODE
     if mode == "off":
         return False
+    if key == storage_key_for_path(MON_HISTORY_CSV):
+        # Cheaper verify policy for hot monitoring history path.
+        sampled_rate = min(STORAGE_VERIFY_SAMPLE_RATE, 0.1 if payload_len < 300_000 else 0.03)
+        return random.random() < sampled_rate
     if mode == "always":
         return True
     return random.random() < STORAGE_VERIFY_SAMPLE_RATE
@@ -958,7 +962,7 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     if _sb_ok():
         ok = sb_put_storage(key, content)
         if ok:
-            do_verify = _should_verify_roundtrip()
+            do_verify = _should_verify_roundtrip(key=key, payload_len=len(content))
             if do_verify:
                 _STORAGE_METRICS["roundtrip_checks"] = int(_STORAGE_METRICS.get("roundtrip_checks", 0) or 0) + 1
                 check = sb_get_storage(key)
@@ -973,6 +977,8 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
                     st.session_state["_save_badge"] = "⚠️ saved local, supabase write ok (round-trip mismatch)"
             else:
                 debug_log(f"supabase_store_verified_skipped key={key} mode={STORAGE_VERIFY_MODE}")
+                if key == storage_key_for_path(MON_HISTORY_CSV):
+                    debug_log("history_verify_skipped_sampled key=monitoring_history.csv")
                 st.session_state["_save_badge"] = "💾 saved (supabase write, verify skipped)"
         else:
             debug_log(f"supabase_store_failed_local_kept key={key}")
@@ -1547,6 +1553,10 @@ def pair_fetch_priority(priority: str):
     finally:
         globals()["_PAIR_FETCH_PRIORITY_HINT"] = prev_priority
 
+
+def _token_pairs_is_pressure_active(chain: str) -> bool:
+    state = _token_pairs_chain_state(chain)
+    return time.monotonic() < float(state.get("pressure_until_ts", 0.0) or 0.0)
 
 def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
     chain_key = str(chain or "").strip().lower() or "unknown"
@@ -4534,9 +4544,11 @@ def migrate_reason_fields() -> int:
 
 
 def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
-    # Source of truth: load_csv (Supabase app_storage if enabled, else local)
-    flush_monitoring_history_buffer(force=True)
+    # Source of truth: persisted CSV + in-run buffer (avoid noisy write/read roundtrip on hot path).
+    flush_monitoring_history_buffer(force=False)
     rows = load_csv(MON_HISTORY_CSV)
+    if _MON_HISTORY_BUFFER:
+        rows = rows + list(_MON_HISTORY_BUFFER)
     if not rows:
         return []
     return rows[-limit_rows:]
@@ -4555,6 +4567,7 @@ def flush_monitoring_history_buffer(force: bool = False) -> int:
         rows.extend(_MON_HISTORY_BUFFER)
         save_csv(MON_HISTORY_CSV, rows, HIST_FIELDS)
         flushed = len(_MON_HISTORY_BUFFER)
+        debug_log(f"history_batch_flush rows={flushed} force={1 if force else 0}")
         _MON_HISTORY_BUFFER.clear()
         _MON_HISTORY_BUFFER_LAST_FLUSH_TS = now_ts
         return flushed
@@ -9229,9 +9242,15 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
         for r in existing_rows
         if str(r.get("active", "1")).strip() == "1"
     }
-    for s, p, smart, signal in ranked:
+    high_priority_cutoff = min(len(ranked), max(10, int(max_items * 0.35)))
+    for idx, (s, p, smart, signal) in enumerate(ranked):
+        fetch_priority = "high" if idx < high_priority_cutoff else "best_effort"
+
+        globals()["_PAIR_FETCH_PRIORITY_HINT"] = "high" if idx < high_priority_cutoff else "best_effort"
+         main
         counts["seen"] += 1
-        row = normalize_pair_row(p)
+        with pair_fetch_priority(fetch_priority):
+            row = normalize_pair_row(p)
         if row is None:
             counts["skipped_noise"] += 1
             continue
@@ -9425,6 +9444,7 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
             autosave=False,
         )
         counts["added"] += 1
+    globals()["_PAIR_FETCH_PRIORITY_HINT"] = "normal"
     save_monitoring(monitoring_rows)
     flush_monitoring_history_buffer(force=True)
     save_smart_wallets(smart_wallets)
