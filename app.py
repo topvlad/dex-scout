@@ -104,7 +104,6 @@ def maybe_safe_auto_refresh(enabled: bool, interval_sec: int = 60) -> None:
 
 
 VERSION = "v0.5.6-entry-engine-v1"
-# NOTE: Keep this file aligned with main when resolving stale PR conflicts.
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
