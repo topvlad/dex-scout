@@ -104,6 +104,7 @@ def maybe_safe_auto_refresh(enabled: bool, interval_sec: int = 60) -> None:
 
 
 VERSION = "v0.5.6-entry-engine-v1"
+# NOTE: Keep this file aligned with main when resolving stale PR conflicts.
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
@@ -1546,54 +1547,54 @@ def _http_get_json(
     backoff_base: float = 0.7,
     rate_limit_marker: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    last_err = None
+    last_err: Optional[Exception] = None
+    retries = max(1, int(max_retries))
     backoff = max(0.05, float(backoff_base))
-    for attempt in range(1, max_retries + 1):
+
+    for attempt in range(1, retries + 1):
         try:
-            r = requests.get(
+            response = requests.get(
                 url,
                 params=params,
                 timeout=timeout,
                 headers={"User-Agent": f"dex-scout/{VERSION}"},
             )
-            if r.status_code == 429 or (500 <= r.status_code <= 599):
-                last_err = requests.HTTPError(f"HTTP {r.status_code} (attempt {attempt}/{max_retries})")
-                if r.status_code == 429 and rate_limit_marker:
+            status = int(response.status_code)
+
+            if status == 429 or (500 <= status <= 599):
+                last_err = requests.HTTPError(f"HTTP {status} (attempt {attempt}/{retries})")
+                if status == 429 and rate_limit_marker:
                     debug_log(
                         "rate_limit_429 "
                         f"chain={rate_limit_marker.get('chain','')} "
                         f"token={rate_limit_marker.get('token','')} "
-                        f"attempt={attempt}/{max_retries} final_fail=0"
+                        f"attempt={attempt}/{retries} final_fail=0"
                     )
-                sleep_for = backoff + random.uniform(0.0, 0.25)
-                time.sleep(sleep_for)
+                time.sleep(backoff + random.uniform(0.0, 0.25))
                 backoff *= 2
                 continue
-            r.raise_for_status()
-            return r.json()
-        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
-            last_err = e
-            if attempt < max_retries:
-                sleep_for = backoff + random.uniform(0.0, 0.25)
-                time.sleep(sleep_for)
+
+            response.raise_for_status()
+            return response.json()
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            last_err = exc
+            if attempt < retries:
+                time.sleep(backoff + random.uniform(0.0, 0.25))
                 backoff *= 2
-            else:
-                break
-        except Exception as e:
-            last_err = e
+                continue
             break
-    if (
-        rate_limit_marker
-        and isinstance(last_err, requests.HTTPError)
-        and "HTTP 429" in str(last_err)
-    ):
+        except Exception as exc:
+            last_err = exc
+            break
+
+    if rate_limit_marker and isinstance(last_err, requests.HTTPError) and "HTTP 429" in str(last_err):
         debug_log(
             "rate_limit_429 "
             f"chain={rate_limit_marker.get('chain','')} "
             f"token={rate_limit_marker.get('token','')} "
-            f"attempt={max_retries}/{max_retries} final_fail=1"
+            f"attempt={retries}/{retries} final_fail=1"
         )
-    raise RuntimeError(f"Request failed after {max_retries} tries: {last_err}")
+    raise RuntimeError(f"Request failed after {retries} tries: {last_err}")
 
 
 # =============================
