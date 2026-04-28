@@ -123,7 +123,14 @@ STORAGE_VERIFY_SAMPLE_RATE = min(
 )
 CSV_BACKUP_INTERVAL_SEC = max(60, _env_int("CSV_BACKUP_INTERVAL_SEC", 900 if WORKER_FAST_MODE else 300))
 CSV_BACKUP_MIN_SIZE_DELTA_BYTES = max(256, _env_int("CSV_BACKUP_MIN_SIZE_DELTA_BYTES", 4096))
-MON_HISTORY_FLUSH_BATCH = max(10, _env_int("MON_HISTORY_FLUSH_BATCH", 50 if WORKER_FAST_MODE else 25))
+MON_HISTORY_FLUSH_BATCH = max(25, _env_int("MON_HISTORY_FLUSH_BATCH", 200 if WORKER_FAST_MODE else 100))
+MON_HISTORY_FLUSH_INTERVAL_SEC = max(60, _env_int("MON_HISTORY_FLUSH_INTERVAL_SEC", 300 if WORKER_FAST_MODE else 180))
+MON_HISTORY_REMOTE_BACKUP_INTERVAL_SEC = max(
+    600, _env_int("MON_HISTORY_REMOTE_BACKUP_INTERVAL_SEC", 7200 if WORKER_FAST_MODE else 3600)
+)
+MON_HISTORY_SUPABASE_MODE = str(os.getenv("MON_HISTORY_SUPABASE_MODE", "local_only")).strip().lower()
+if MON_HISTORY_SUPABASE_MODE not in {"off", "local_only", "blob_fallback"}:
+    MON_HISTORY_SUPABASE_MODE = "local_only"
 
 SCAN_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL = 300
@@ -132,6 +139,7 @@ PULSE_SPARKLINE_LOG_LAST_TS: Dict[str, float] = {}
 _CSV_BACKUP_STATE: Dict[str, Dict[str, Any]] = {}
 _MON_HISTORY_BUFFER: List[Dict[str, Any]] = []
 _MON_HISTORY_BUFFER_LAST_FLUSH_TS: float = 0.0
+_MON_HISTORY_REMOTE_BACKUP_LAST_TS: float = 0.0
 _STORAGE_METRICS: Dict[str, int] = {"writes": 0, "roundtrip_checks": 0}
 
 MEME_KEYWORDS = [
@@ -658,6 +666,10 @@ def storage_key_for_path(path: str) -> str:
     return base or path
 
 
+def _is_monitoring_history_key(key: str) -> bool:
+    return storage_key_for_path(key) == storage_key_for_path(MON_HISTORY_CSV)
+
+
 def local_fallback_path(path: str) -> str:
     ensure_storage()
     return path
@@ -847,6 +859,7 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
     """
     ensure_storage()
     key = storage_key_for_path(path)
+    fallback = local_fallback_path(path)
 
     def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not fields:
@@ -856,16 +869,29 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
             normalized.append({name: row.get(name, "") for name in fields})
         return normalized
 
-    if _sb_ok():
+    is_history = _is_monitoring_history_key(key)
+    history_mode = MON_HISTORY_SUPABASE_MODE
+
+    if is_history:
+        debug_log(f"history_supabase_bypass mode={history_mode} op=load")
+    if _sb_ok() and (not is_history or history_mode == "blob_fallback"):
         content = sb_get_storage(key)
         if content:
             try:
                 st.session_state[f"_storage_source_{key}"] = "supabase"
-                return _normalize_rows(_csv_from_string(content))
+                rows = _normalize_rows(_csv_from_string(content))
+                if is_history and not os.path.exists(fallback):
+                    try:
+                        lockp = fallback + ".lock"
+                        with file_lock(lockp):
+                            with open(fallback, "w", newline="", encoding="utf-8") as f:
+                                f.write(content)
+                    except Exception:
+                        pass
+                return rows
             except Exception:
                 debug_log(f"corrupt_supabase_csv key={key}")
 
-    fallback = local_fallback_path(path)
     if os.path.exists(fallback):
         try:
             with open(fallback, "r", newline="", encoding="utf-8") as f:
@@ -935,10 +961,8 @@ def _should_verify_roundtrip(key: str = "", payload_len: int = 0) -> bool:
     mode = STORAGE_VERIFY_MODE
     if mode == "off":
         return False
-    if key == storage_key_for_path(MON_HISTORY_CSV):
-        # Cheaper verify policy for hot monitoring history path.
-        sampled_rate = min(STORAGE_VERIFY_SAMPLE_RATE, 0.1 if payload_len < 300_000 else 0.03)
-        return random.random() < sampled_rate
+    if _is_monitoring_history_key(key):
+        return False
     if mode == "always":
         return True
     return random.random() < STORAGE_VERIFY_SAMPLE_RATE
@@ -959,6 +983,28 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
         debug_log(f"local_fallback_write_failed key={key} err={type(e).__name__}:{e}")
 
     _STORAGE_METRICS["writes"] = int(_STORAGE_METRICS.get("writes", 0) or 0) + 1
+    is_history = _is_monitoring_history_key(key)
+    if is_history:
+        debug_log("history_verify_disabled key=monitoring_history.csv")
+    if is_history and _sb_ok():
+        if MON_HISTORY_SUPABASE_MODE == "blob_fallback":
+            now_ts = time.time()
+            global _MON_HISTORY_REMOTE_BACKUP_LAST_TS
+            elapsed = now_ts - float(_MON_HISTORY_REMOTE_BACKUP_LAST_TS or 0.0)
+            if elapsed >= MON_HISTORY_REMOTE_BACKUP_INTERVAL_SEC:
+                if sb_put_storage(key, content):
+                    _MON_HISTORY_REMOTE_BACKUP_LAST_TS = now_ts
+                    debug_log(f"history_remote_backup_ok bytes={len(content)}")
+                else:
+                    debug_log("history_remote_backup_failed")
+            else:
+                debug_log("history_remote_backup_skipped reason=interval")
+        else:
+            debug_log(f"history_remote_backup_skipped mode={MON_HISTORY_SUPABASE_MODE}")
+        st.session_state["_save_badge"] = "💾 saved (local history hot path)"
+        load_monitoring_rows_cached.clear()
+        return
+
     if _sb_ok():
         ok = sb_put_storage(key, content)
         if ok:
@@ -977,8 +1023,6 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
                     st.session_state["_save_badge"] = "⚠️ saved local, supabase write ok (round-trip mismatch)"
             else:
                 debug_log(f"supabase_store_verified_skipped key={key} mode={STORAGE_VERIFY_MODE}")
-                if key == storage_key_for_path(MON_HISTORY_CSV):
-                    debug_log("history_verify_skipped_sampled key=monitoring_history.csv")
                 st.session_state["_save_badge"] = "💾 saved (supabase write, verify skipped)"
         else:
             debug_log(f"supabase_store_failed_local_kept key={key}")
@@ -4545,7 +4589,6 @@ def migrate_reason_fields() -> int:
 
 def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
     # Source of truth: persisted CSV + in-run buffer (avoid noisy write/read roundtrip on hot path).
-    flush_monitoring_history_buffer(force=False)
     rows = load_csv(MON_HISTORY_CSV)
     if _MON_HISTORY_BUFFER:
         rows = rows + list(_MON_HISTORY_BUFFER)
@@ -4560,14 +4603,42 @@ def flush_monitoring_history_buffer(force: bool = False) -> int:
         return 0
     now_ts = time.time()
     if not force and len(_MON_HISTORY_BUFFER) < MON_HISTORY_FLUSH_BATCH:
-        if (now_ts - float(_MON_HISTORY_BUFFER_LAST_FLUSH_TS or 0.0)) < 30:
+        if (now_ts - float(_MON_HISTORY_BUFFER_LAST_FLUSH_TS or 0.0)) < MON_HISTORY_FLUSH_INTERVAL_SEC:
             return 0
     try:
-        rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
-        rows.extend(_MON_HISTORY_BUFFER)
-        save_csv(MON_HISTORY_CSV, rows, HIST_FIELDS)
+        ensure_storage()
         flushed = len(_MON_HISTORY_BUFFER)
-        debug_log(f"history_batch_flush rows={flushed} force={1 if force else 0}")
+        fallback = local_fallback_path(MON_HISTORY_CSV)
+        lockp = fallback + ".lock"
+        write_header = not os.path.exists(fallback) or os.path.getsize(fallback) == 0
+        with file_lock(lockp):
+            with open(fallback, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=HIST_FIELDS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(_MON_HISTORY_BUFFER)
+        debug_log(f"history_local_flush rows={flushed} force={1 if force else 0}")
+        debug_log(f"history_flush_batch rows={flushed}")
+        if _sb_ok():
+            if MON_HISTORY_SUPABASE_MODE == "blob_fallback":
+                global _MON_HISTORY_REMOTE_BACKUP_LAST_TS
+                elapsed = now_ts - float(_MON_HISTORY_REMOTE_BACKUP_LAST_TS or 0.0)
+                if force or elapsed >= MON_HISTORY_REMOTE_BACKUP_INTERVAL_SEC:
+                    try:
+                        content = Path(fallback).read_text(encoding="utf-8")
+                        if sb_put_storage(storage_key_for_path(MON_HISTORY_CSV), content):
+                            _MON_HISTORY_REMOTE_BACKUP_LAST_TS = now_ts
+                            debug_log(f"history_remote_backup_ok bytes={len(content)}")
+                        else:
+                            debug_log("history_remote_backup_failed")
+                    except Exception as backup_exc:
+                        debug_log(f"history_remote_backup_failed err={type(backup_exc).__name__}:{backup_exc}")
+                else:
+                    debug_log("history_remote_backup_skipped reason=interval")
+            else:
+                debug_log(f"history_remote_backup_skipped mode={MON_HISTORY_SUPABASE_MODE}")
+        else:
+            debug_log("history_remote_backup_skipped reason=supabase_off")
         _MON_HISTORY_BUFFER.clear()
         _MON_HISTORY_BUFFER_LAST_FLUSH_TS = now_ts
         return flushed
