@@ -142,6 +142,11 @@ _MON_HISTORY_BUFFER: List[Dict[str, Any]] = []
 _MON_HISTORY_BUFFER_LAST_FLUSH_TS: float = 0.0
 _MON_HISTORY_REMOTE_BACKUP_LAST_TS: float = 0.0
 _STORAGE_METRICS: Dict[str, int] = {"writes": 0, "roundtrip_checks": 0}
+PULSE_HISTORY_KEY = "pulse_history_compact.json"
+PULSE_HISTORY_MAX_POINTS = max(8, min(12, _env_int("PULSE_HISTORY_MAX_POINTS", 10)))
+PULSE_HISTORY_MAX_TOKENS = max(30, _env_int("PULSE_HISTORY_MAX_TOKENS", 180))
+PULSE_HISTORY_TTL_SEC = max(600, _env_int("PULSE_HISTORY_TTL_SEC", 6 * 3600))
+_PULSE_HISTORY_BUFFER: Dict[str, List[Dict[str, Any]]] = {}
 
 MEME_KEYWORDS = [
     "dog",
@@ -11057,6 +11062,79 @@ def _log_pulse_sparkline_missing(reason: str, token_key: str = "") -> None:
         debug_log(f"pulse_sparkline_missing reason={normalized}")
 
 
+def _load_pulse_history_shared() -> Dict[str, Any]:
+    raw = storage_read_text(PULSE_HISTORY_KEY, "{}")
+    try:
+        payload = json.loads(raw) if str(raw or "").strip() else {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        return {"tokens": {}, "meta": {}}
+    tokens = payload.get("tokens", {})
+    if not isinstance(tokens, dict):
+        tokens = {}
+    return {"tokens": tokens, "meta": payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}}
+
+
+def _flush_pulse_history_buffer() -> int:
+    global _PULSE_HISTORY_BUFFER
+    if not _PULSE_HISTORY_BUFFER:
+        return 0
+    now_iso = now_utc_iso()
+    now_ts = time.time()
+    payload = _load_pulse_history_shared()
+    tokens: Dict[str, Any] = payload.get("tokens", {}) if isinstance(payload.get("tokens"), dict) else {}
+    append_count = 0
+    evicted = 0
+    for token_key, points in list(_PULSE_HISTORY_BUFFER.items()):
+        if not token_key or not isinstance(points, list):
+            continue
+        existing = tokens.get(token_key, {}) if isinstance(tokens.get(token_key), dict) else {}
+        series = list(existing.get("points", [])) if isinstance(existing.get("points"), list) else []
+        series.extend(points)
+        series = sorted(series, key=lambda x: str((x or {}).get("ts") or ""))[-PULSE_HISTORY_MAX_POINTS:]
+        tokens[token_key] = {"points": series, "updated_at": now_iso}
+        append_count += len(points)
+
+    ttl_cutoff = now_ts - float(PULSE_HISTORY_TTL_SEC)
+    sortable: List[Tuple[str, str, Dict[str, Any]]] = []
+    for token_key, entry in list(tokens.items()):
+        entry_obj = entry if isinstance(entry, dict) else {}
+        updated_at_raw = str(entry_obj.get("updated_at") or "")
+        updated_dt = parse_ts(updated_at_raw)
+        if updated_dt is None:
+            points = entry_obj.get("points", [])
+            if isinstance(points, list) and points:
+                updated_dt = parse_ts(str((points[-1] or {}).get("ts") or ""))
+        if updated_dt and updated_dt.timestamp() < ttl_cutoff:
+            tokens.pop(token_key, None)
+            evicted += 1
+            continue
+        sortable.append((token_key, updated_at_raw, entry_obj))
+    if len(tokens) > PULSE_HISTORY_MAX_TOKENS:
+        sortable.sort(key=lambda item: item[1], reverse=True)
+        keep = {token for token, _, _ in sortable[:PULSE_HISTORY_MAX_TOKENS]}
+        for token_key in list(tokens.keys()):
+            if token_key not in keep:
+                tokens.pop(token_key, None)
+                evicted += 1
+    payload = {"schema": 1, "tokens": tokens, "meta": {"updated_at": now_iso, "points_per_token": PULSE_HISTORY_MAX_POINTS}}
+    storage_write_text(PULSE_HISTORY_KEY, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    debug_log(f"pulse_history_flush tokens={len(tokens)} append_count={append_count}")
+    if evicted > 0:
+        debug_log(f"pulse_history_evicted count={evicted}")
+    _PULSE_HISTORY_BUFFER = {}
+    return append_count
+
+
+def _append_pulse_history_point(token_key: str, point: Dict[str, Any]) -> None:
+    if not token_key:
+        return
+    bucket = _PULSE_HISTORY_BUFFER.setdefault(token_key, [])
+    bucket.append(point)
+    debug_log(f"pulse_history_append key={token_key}")
+
+
 def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict[str, Any]:
     chain = token_chain(row)
     base_addr = token_ca(row)
@@ -11092,6 +11170,17 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict
         _log_pulse_sparkline_missing("no_history", token_key=token_key)
         return empty_payload
 
+    shared_history = _load_pulse_history_shared()
+    shared_tokens = shared_history.get("tokens", {}) if isinstance(shared_history, dict) else {}
+    shared_entry = shared_tokens.get(token_key, {}) if isinstance(shared_tokens, dict) else {}
+    shared_points = shared_entry.get("points", []) if isinstance(shared_entry, dict) else []
+    shared_series = [parse_float((p or {}).get("score"), 0.0) for p in shared_points if parse_float((p or {}).get("score"), 0.0) > 0]
+    if len(shared_series) >= min_points:
+        debug_log("pulse_history_render_source=shared")
+        return {"series": "score", "values": shared_series[-24:], "points": len(shared_series[-24:]), "reason": "", "source": "shared.pulse_history"}
+    if not _sb_ok():
+        return {"series": "score", "values": shared_series[-24:], "points": len(shared_series[-24:]), "reason": "unshared_local_only", "source": "shared.pulse_history"}
+
     hist = token_history_rows(chain, base_addr, limit=40)
     series = build_history_series(hist) if hist else {}
 
@@ -11121,6 +11210,7 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict
         points = len(values)
         if points >= min_points:
             trimmed = values[-24:]
+            debug_log("pulse_history_render_source=row_fallback")
             return {
                 "series": series_name,
                 "values": trimmed,
@@ -11242,6 +11332,15 @@ def build_market_pulse_cards(
                 "summary_line": _pulse_card_summary_line(best, row),
             }
         )
+        point = {
+            "ts": now_utc_iso(),
+            "score": round(score, 2),
+            "price_usd": round(parse_float(safe_get(best or {}, "priceUsd", default=row.get("price_usd", 0)), 0.0), 8),
+            "liq_usd": round(liq_usd, 2),
+            "vol24_usd": round(parse_float(safe_get(best or {}, "volume", "h24", default=row.get("vol24_init", row.get("vol24_usd", 0))), 0.0), 2),
+            "timing_label": timing_label,
+        }
+        _append_pulse_history_point(key, point)
     pulse_cards.sort(
         key=lambda x: (
             float(x.get("pulse_sort", 0.0)),
@@ -11266,6 +11365,7 @@ def build_market_pulse_cards(
         debug_log(
             f"pulse_liquidity_gate skipped={low_liq_skipped} min_liq_usd={float(PULSE_MIN_LIQ_USD):.2f}"
         )
+    _flush_pulse_history_buffer()
     return selected_cards
 
 
@@ -11903,8 +12003,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 if not fallback_reason:
                     fallback_reason = "warming_up"
                 if fallback_reason in {"warming_up", "not_enough_points"} or spark_points < 3:
+                    debug_log("pulse_history_render_reason=warming_up")
                     _log_pulse_sparkline_missing("not_enough_points", token_key=card_key)
-                    st.caption("collecting history…")
+                    st.caption("warming up…")
+                elif fallback_reason == "unshared_local_only":
+                    debug_log("pulse_history_render_reason=unshared_local_only")
+                    st.caption("shared history unavailable (local-only runtime)")
+                elif fallback_reason == "rate_limited_deferred":
+                    debug_log("pulse_history_render_reason=rate_limited_deferred")
+                    st.caption("history deferred (rate-limited cycle)")
                 else:
                     _log_pulse_sparkline_missing(fallback_reason, token_key=card_key)
                     st.caption(fallback_reason)
