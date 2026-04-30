@@ -13612,9 +13612,6 @@ def main():
     portfolio_rows = load_csv(PORTFOLIO_CSV, PORTFOLIO_FIELDS)
     monitoring_rows = load_csv(MONITORING_CSV, MON_FIELDS)
     monitoring_history_rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
-    if record_pulse_history is None:
-        record_pulse_history = bool(WORKER_FAST_MODE)
-
     scan_state = scanner_state_load() or {}
     if not isinstance(scan_state, dict):
         scan_state = {}
