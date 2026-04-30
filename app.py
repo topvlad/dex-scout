@@ -11091,18 +11091,32 @@ def _log_pulse_sparkline_missing(reason: str, token_key: str = "") -> None:
         debug_log(f"pulse_sparkline_missing reason={normalized}")
 
 
-def _load_pulse_history_shared() -> Dict[str, Any]:
-    raw = storage_read_text(PULSE_HISTORY_KEY, "{}")
-    try:
-        payload = json.loads(raw) if str(raw or "").strip() else {}
-    except Exception:
-        payload = {}
+_PULSE_HISTORY_SHARED_CACHE: Optional[Dict[str, Any]] = None
+
+
+def _pulse_history_payload_sanitized(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return {"tokens": {}, "meta": {}}
     tokens = payload.get("tokens", {})
     if not isinstance(tokens, dict):
         tokens = {}
-    return {"tokens": tokens, "meta": payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}}
+    meta = payload.get("meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    return {"tokens": tokens, "meta": meta}
+
+
+def _load_pulse_history_shared(force_refresh: bool = False) -> Dict[str, Any]:
+    global _PULSE_HISTORY_SHARED_CACHE
+    if not force_refresh and isinstance(_PULSE_HISTORY_SHARED_CACHE, dict):
+        return _PULSE_HISTORY_SHARED_CACHE
+    raw = storage_read_text(PULSE_HISTORY_KEY, "{}")
+    try:
+        payload = json.loads(raw) if str(raw or "").strip() else {}
+    except Exception:
+        payload = {}
+    _PULSE_HISTORY_SHARED_CACHE = _pulse_history_payload_sanitized(payload)
+    return _PULSE_HISTORY_SHARED_CACHE
 
 
 def _flush_pulse_history_buffer() -> int:
@@ -11147,8 +11161,14 @@ def _flush_pulse_history_buffer() -> int:
             if token_key not in keep:
                 tokens.pop(token_key, None)
                 evicted += 1
+    if append_count <= 0:
+        _PULSE_HISTORY_BUFFER = {}
+        return 0
     payload = {"schema": 1, "tokens": tokens, "meta": {"updated_at": now_iso, "points_per_token": PULSE_HISTORY_MAX_POINTS}}
-    storage_write_text(PULSE_HISTORY_KEY, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    storage_write_text(PULSE_HISTORY_KEY, serialized)
+    global _PULSE_HISTORY_SHARED_CACHE
+    _PULSE_HISTORY_SHARED_CACHE = _pulse_history_payload_sanitized(payload)
     debug_log(f"pulse_history_flush tokens={len(tokens)} append_count={append_count}")
     if evicted > 0:
         debug_log(f"pulse_history_evicted count={evicted}")
@@ -11306,7 +11326,10 @@ def build_market_pulse_cards(
     active_monitoring_keys: Set[str],
     chain_filter: str = "all",
     limit: int = 8,
+    record_pulse_history: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
+    if record_pulse_history is None:
+        record_pulse_history = bool(WORKER_FAST_MODE)
     scan_state = scanner_state_load() or {}
     queue_state = scan_state.get("queue_state", {}) if isinstance(scan_state.get("queue_state"), dict) else {}
     runtime = scan_state.get("worker_runtime", {}) if isinstance(scan_state.get("worker_runtime"), dict) else {}
@@ -11369,7 +11392,8 @@ def build_market_pulse_cards(
             "vol24_usd": round(parse_float(safe_get(best or {}, "volume", "h24", default=row.get("vol24_init", row.get("vol24_usd", 0))), 0.0), 2),
             "timing_label": timing_label,
         }
-        _append_pulse_history_point(key, point)
+        if record_pulse_history:
+            _append_pulse_history_point(key, point)
     pulse_cards.sort(
         key=lambda x: (
             float(x.get("pulse_sort", 0.0)),
@@ -11394,7 +11418,8 @@ def build_market_pulse_cards(
         debug_log(
             f"pulse_liquidity_gate skipped={low_liq_skipped} min_liq_usd={float(PULSE_MIN_LIQ_USD):.2f}"
         )
-    _flush_pulse_history_buffer()
+    if record_pulse_history:
+        _flush_pulse_history_buffer()
     return selected_cards
 
 
@@ -11866,6 +11891,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         active_monitoring_keys=active_monitoring_keys,
         chain_filter=chain_filter,
         limit=8,
+        record_pulse_history=False,
     )
 
     priority_cards = render_dedupe(priority_cards)
