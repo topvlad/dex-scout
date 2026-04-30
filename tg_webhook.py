@@ -5,6 +5,8 @@ from typing import Any, Callable, Dict, List, Tuple
 import requests
 from fastapi import FastAPI, Request, Response
 
+BOOTSTRAP_ERROR: Dict[str, str] = {}
+
 try:
     from app import (
         MON_FIELDS,
@@ -28,21 +30,21 @@ try:
         trigger_digest_notification,
     )
 except Exception as e:
-    print(f"[tg_webhook] helper import failed: {e}", flush=True)
+    BOOTSTRAP_ERROR = {
+        "module": "app",
+        "helper": "bootstrap_import",
+        "exception_type": type(e).__name__,
+        "exception_text": str(e),
+    }
+    print(
+        "[tg_webhook] bootstrap import failed "
+        f"helper={BOOTSTRAP_ERROR['helper']} "
+        f"type={BOOTSTRAP_ERROR['exception_type']} "
+        f"text={BOOTSTRAP_ERROR['exception_text']}",
+        flush=True,
+    )
     MON_FIELDS = ["chain", "base_addr", "active", "archived", "status", "updated_at", "note", "archived_reason"]
     PORTFOLIO_FIELDS = ["chain", "base_token_address", "active", "archived", "updated_at", "note"]
-
-    def load_monitoring() -> List[Dict[str, Any]]:
-        return []
-
-    def load_portfolio() -> List[Dict[str, Any]]:
-        return []
-
-    def save_monitoring(rows: List[Dict[str, Any]]) -> None:
-        _ = rows
-
-    def save_portfolio(rows: List[Dict[str, Any]]) -> None:
-        _ = rows
 
     def normalize_chain_name(raw_chain: Any) -> str:
         return str(raw_chain or "").strip().lower()
@@ -51,59 +53,15 @@ except Exception as e:
         _ = chain
         return str(addr or "").strip()
 
-    def canonical_entity_key(chain: str, ca: str) -> str:
-        chain_norm = normalize_chain_name(chain or "")
-        ca_norm = addr_store(chain_norm, ca or "")
-        return f"{chain_norm}|{ca_norm}" if chain_norm and ca_norm else ""
 
-    def now_utc_str() -> str:
-        from datetime import datetime, timezone
-
-        return datetime.now(timezone.utc).isoformat()
-
-    def parse_float(v: Any, default: float = 0.0) -> float:
-        try:
-            return float(v)
-        except Exception:
-            return default
-
-    def normalize_timing_label(raw: Any) -> str:
-        return str(raw or "NEUTRAL").upper()
-
-    def build_active_monitoring_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [r for r in rows if str(r.get("active", "1")).strip() == "1"]
-
-    def build_notification_candidates(
-        monitoring_rows: List[Dict[str, Any]],
-        portfolio_rows: List[Dict[str, Any]],
-        limit_monitoring: int = 12,
-        limit_portfolio: int = 8,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        _ = limit_monitoring, limit_portfolio
-        return monitoring_rows, portfolio_rows
-
-    def send_telegram(text: str, parse_mode: str = "HTML", reply_markup: Dict[str, Any] = None) -> bool:
-        _ = text, parse_mode, reply_markup
-        return False
-
-    def suppress_token(chain: str, ca: str, reason: str = "manual_remove", days: int = 30) -> None:
-        _ = chain, ca, reason, days
-        return None
-
-    def trigger_digest_notification(
-        trigger_source: str = "manual",
-        cooldown_seconds: int = 3600,
-        force: bool = False,
-    ) -> Dict[str, Any]:
-        _ = trigger_source, cooldown_seconds, force
-        return {"ok": False, "sent": False, "duplicate": False, "event_type": "digest"}
-
-    def get_worker_runtime_state(state: Dict[str, Any] = None) -> Dict[str, Any]:
-        _ = state
-        return {}
-
-    def get_job_heartbeats_snapshot() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-        return {}, {"ok": False, "code": "helper_unavailable"}
+def _require_bootstrap() -> None:
+    if BOOTSTRAP_ERROR:
+        raise RuntimeError(
+            "bootstrap_unavailable:"
+            f"{BOOTSTRAP_ERROR.get('helper')}:"
+            f"{BOOTSTRAP_ERROR.get('exception_type')}:"
+            f"{BOOTSTRAP_ERROR.get('exception_text')}"
+        )
 
 
 app = FastAPI()
@@ -315,6 +273,10 @@ def health_head():
 @app.get("/runtime")
 def runtime():
     try:
+        _require_bootstrap()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    try:
         runtime_state = get_worker_runtime_state() or {}
         if not isinstance(runtime_state, dict):
             runtime_state = {}
@@ -347,6 +309,11 @@ def runtime():
 
 @app.post("/tg_webhook")
 async def tg_webhook(req: Request):
+    try:
+        _require_bootstrap()
+    except Exception as e:
+        print(f"[tg_webhook] runtime bootstrap error: {type(e).__name__}: {e}", flush=True)
+        return {"ok": False, "error": str(e)}
     try:
         data = await req.json()
         cb = data.get("callback_query")
@@ -449,6 +416,10 @@ async def tg_webhook_alias(req: Request):
 
 @app.get("/tg/summary")
 def tg_summary(key: str):
+    try:
+        _require_bootstrap()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
     if not summary_key_ok(key):
         return {"ok": False, "error": "forbidden"}
     result = trigger_digest_notification(trigger_source="tg_summary", cooldown_seconds=3600, force=False)
@@ -462,6 +433,10 @@ def tg_summary(key: str):
 
 @app.get("/tg/digest")
 def tg_digest(key: str, force: int = 0):
+    try:
+        _require_bootstrap()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
     if not summary_key_ok(key):
         return {"ok": False, "error": "forbidden"}
     result = trigger_digest_notification(
