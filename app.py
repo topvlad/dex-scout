@@ -42,8 +42,10 @@ import streamlit as st
 import pandas as pd
 import config as app_config
 
+WORKER_FAST_MODE = os.getenv("DEX_SCOUT_WORKER_MODE", "0") == "1"
 
-st.set_page_config(page_title="DEX Scout", layout="wide")
+if not WORKER_FAST_MODE:
+    st.set_page_config(page_title="DEX Scout", layout="wide")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -110,7 +112,6 @@ DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
 ENTRY_MODE = "aggressive"
 TEMP_DISABLE_BEST_PAIR = False
-WORKER_FAST_MODE = os.getenv("DEX_SCOUT_WORKER_MODE", "0") == "1"
 USE_HEAVY_MIGRATION_CHECK = not WORKER_FAST_MODE
 STORAGE_VERIFY_MODE = str(
     os.getenv("STORAGE_VERIFY_MODE", "sampled" if WORKER_FAST_MODE else "always")
