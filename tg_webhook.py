@@ -3,7 +3,7 @@ from html import escape
 from typing import Any, Callable, Dict, List, Tuple
 
 import requests
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 
 BOOTSTRAP_ERROR: Dict[str, str] = {}
 
@@ -65,6 +65,10 @@ def _require_bootstrap() -> None:
 
 
 app = FastAPI()
+
+
+def _raise_bootstrap_http_500() -> None:
+    _require_bootstrap()
 
 
 def tg_token() -> str:
@@ -273,9 +277,9 @@ def health_head():
 @app.get("/runtime")
 def runtime():
     try:
-        _require_bootstrap()
+        _raise_bootstrap_http_500()
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e)) from e
     try:
         runtime_state = get_worker_runtime_state() or {}
         if not isinstance(runtime_state, dict):
@@ -310,10 +314,10 @@ def runtime():
 @app.post("/tg_webhook")
 async def tg_webhook(req: Request):
     try:
-        _require_bootstrap()
+        _raise_bootstrap_http_500()
     except Exception as e:
         print(f"[tg_webhook] runtime bootstrap error: {type(e).__name__}: {e}", flush=True)
-        return {"ok": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e)) from e
     try:
         data = await req.json()
         cb = data.get("callback_query")
@@ -417,9 +421,9 @@ async def tg_webhook_alias(req: Request):
 @app.get("/tg/summary")
 def tg_summary(key: str):
     try:
-        _require_bootstrap()
+        _raise_bootstrap_http_500()
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e)) from e
     if not summary_key_ok(key):
         return {"ok": False, "error": "forbidden"}
     result = trigger_digest_notification(trigger_source="tg_summary", cooldown_seconds=3600, force=False)
@@ -434,9 +438,9 @@ def tg_summary(key: str):
 @app.get("/tg/digest")
 def tg_digest(key: str, force: int = 0):
     try:
-        _require_bootstrap()
+        _raise_bootstrap_http_500()
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e)) from e
     if not summary_key_ok(key):
         return {"ok": False, "error": "forbidden"}
     result = trigger_digest_notification(
