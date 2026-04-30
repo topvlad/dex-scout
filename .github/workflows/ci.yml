@@ -16,23 +16,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          python - <<'PY'
-import importlib.util, subprocess, sys
-if importlib.util.find_spec('pytest') is None:
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pytest'])
-PY
+          python -c "import importlib.util, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pytest']) if importlib.util.find_spec('pytest') is None else None"
       - name: Compile guard
         run: python -m py_compile app.py worker.py tg_webhook.py alerts.py scoring.py dex.py
       - name: Import-order guard
         run: |
-          python - <<'PY'
-from pathlib import Path
-text = Path('app.py').read_text(encoding='utf-8')
-idx_mode = text.find('WORKER_FAST_MODE = os.getenv("DEX_SCOUT_WORKER_MODE", "0") == "1"')
-idx_cfg = text.find('st.set_page_config(page_title="DEX Scout", layout="wide")')
-if idx_mode == -1 or idx_cfg == -1 or idx_mode > idx_cfg:
-    raise SystemExit('WORKER_FAST_MODE must be defined before st.set_page_config')
-print('guard-ok')
-PY
+          python -c "from pathlib import Path; text = Path('app.py').read_text(encoding='utf-8'); idx_mode = text.find('WORKER_FAST_MODE = os.getenv(\"DEX_SCOUT_WORKER_MODE\", \"0\") == \"1\"'); idx_cfg = text.find('st.set_page_config(page_title=\"DEX Scout\", layout=\"wide\")'); (_ for _ in ()).throw(SystemExit('WORKER_FAST_MODE must be defined before st.set_page_config')) if idx_mode == -1 or idx_cfg == -1 or idx_mode > idx_cfg else print('guard-ok')"
       - name: Tests
         run: pytest -q
