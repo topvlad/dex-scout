@@ -8155,7 +8155,20 @@ def build_digest_summary(
     }
 
 
-def format_digest_summary_message(digest: Dict[str, Any], trigger_source: str = "manual") -> str:
+def format_digest_summary_message(
+    digest: Dict[str, Any],
+    trigger_source: str = "manual",
+    actionable_discovery_blocks: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    digest_path = str(digest.get("digest_path") or "digest_ui")
+    if digest_path == "digest_discovery":
+        actionable_count = len(actionable_discovery_blocks or [])
+        return (
+            "<b>DEX Scout discovery</b>\n"
+            "backend candidates\n"
+            f"{actionable_count} actionable candidates"
+        )
+
     top_monitoring = digest.get("top_monitoring_now") or []
     top_risks = digest.get("top_portfolio_risks") or []
     warnings = digest.get("dead_cold_warnings") or []
@@ -8175,14 +8188,10 @@ def format_digest_summary_message(digest: Dict[str, Any], trigger_source: str = 
         only_in_digest_block = "\n\n<b>Non-UI digest tokens</b>\n" + "\n".join(lines)
     backend_disclaimer = ""
     if source_mode == "backend_candidates":
-        backend_disclaimer = (
-            "⚠ backend candidates, not current UI list\n"
-        )
+        backend_disclaimer = "⚠ backend candidates, not current UI list\n"
 
-    digest_path = str(digest.get("digest_path") or "digest_ui")
-    digest_label = "digest_ui" if digest_path == "digest_ui" else "digest_discovery"
     return (
-        f"<b>DEX Scout {digest_label}</b>\n"
+        f"<b>DEX Scout digest_ui</b>\n"
         f"event_type: <code>{digest.get('event_type', 'digest')}</code>\n"
         f"trigger: {str(trigger_source or 'manual').upper()}\n"
         f"source_mode: {source_mode}\n"
@@ -8478,10 +8487,30 @@ def trigger_digest_notification(
         portfolio_rows=portfolio_rows,
         digest_path=digest_path,
     )
+    actionable_discovery_blocks = token_blocks if digest_path == "digest_discovery" else []
+    if digest_path == "digest_discovery":
+        digest["top_monitoring_now"] = []
+        digest["top_portfolio_risks"] = []
+        digest["dead_cold_warnings"] = []
+        digest["actionable_discovery_count"] = len(actionable_discovery_blocks)
+        if not actionable_discovery_blocks:
+            debug_log(
+                f"digest_discovery_suppressed reason=no_actionable_blocks "
+                f"path={digest_path} trigger={trigger_source}"
+            )
+            return {
+                "ok": True,
+                "sent": False,
+                "duplicate": False,
+                "event_type": resolve_event_type("DIGEST"),
+                "suppressed_reason": "no_actionable_blocks",
+                "digest_path": digest_path,
+            }
+
     fingerprint_payload = (
         _build_ui_digest_fingerprint_payload(digest)
         if digest_path == "digest_ui"
-        else _build_discovery_digest_fingerprint_payload(digest, token_blocks)
+        else _build_discovery_digest_fingerprint_payload(digest, actionable_discovery_blocks)
     )
     new_fingerprint = _digest_fingerprint(fingerprint_payload)
     prev_fingerprint = str(state.get(fingerprint_field) or "")
@@ -8507,7 +8536,7 @@ def trigger_digest_notification(
             "digest_path": digest_path,
         }
 
-    text = format_digest_summary_message(digest, trigger_source=trigger_source)
+    text = format_digest_summary_message(digest, trigger_source=trigger_source, actionable_discovery_blocks=actionable_discovery_blocks)
     summary_ok = send_telegram(text, parse_mode="HTML")
     block_sent = 0
     for row in token_blocks:
