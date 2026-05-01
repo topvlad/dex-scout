@@ -3,88 +3,144 @@
 ## What DEX Scout currently does
 
 ### 1) Runtime architecture and process separation
-- Splits runtime into three roles:
-  - Streamlit UI (`app.py`) for visualization, controls, manual operations.
-  - FastAPI webhook (`tg_webhook.py`) for Telegram callback actions.
-  - Worker loop (`worker.py` / `scanner_worker.py`) for autonomous scan/monitor/notify cycles.
-- Uses env-gated behavior to keep notification emission primarily in worker mode.
+- Splits runtime into three roles plus CI/runtime orchestration:
+  - Streamlit UI (`app.py`) for visualization, manual controls, and manual add-to-monitoring operations.
+  - FastAPI webhook (`tg_webhook.py`) for Telegram callback actions and control-path routing.
+  - Worker loop (`worker.py` / `scanner_worker.py`) for autonomous `scan_cycle`, `monitor_cycle`, `notify_cycle`, `digest_cycle`, and `outcome_cycle` execution.
+  - GitHub Actions workflows for runtime jobs orchestration and a separate CI workflow for compile/test/runtime-safety checks.
+- Live Pulse render path in UI is non-mutating: UI reads compact pulse history but does not write or backfill it.
+- Pulse history write path is worker/scanner-driven after scan/monitor cycles.
 
-### 2) Data sources and token discovery
+### 2) Import/runtime safety and contracts
+- `WORKER_FAST_MODE` is defined before `st.set_page_config`, enabling import-safe worker usage of `app.py`.
+- Worker imports UI module in a runtime-safe manner (without forcing UI bootstrap behavior).
+- Runtime contract checks validate required Supabase entities and operational state prerequisites.
+- Worker uses mode-scoped lock/heartbeat/runtime diagnostics to detect stale loops and degraded execution.
+
+### 3) Data sources and token discovery
 - Pulls market/pair data from DexScreener API.
-- Supports rotating scanner seeds and optional Birdeye trending feed integration (toggle by env flags).
-- Focused on Solana + BSC chain handling.
+- Supports rotating scanner seeds and optional Birdeye trending feed integration (env-gated).
+- Live Pulse candidates are sourced from backend discovery candidate pool.
+- Includes 429-pressure controls for pair fetching.
+- Chain focus remains Solana + BSC.
 
-### 3) Signal processing and scoring
+### 4) Signal processing and scoring
 - Applies hard filters + weighted scoring (liquidity, tx imbalance, volume, price-change penalties).
-- Maintains monitoring queues and prioritization logic (`run_priority_scanner_cycle`) with adaptive sleep hints.
+- Maintains monitoring prioritization logic (`run_priority_scanner_cycle`) with adaptive sleep hints.
 - Includes queue-order telemetry assertions for tier invariants in background loop.
 
-### 4) State, persistence, and storage fallback
-- Supports Supabase-backed persistence when credentials are available.
-- Falls back to local CSV storage for portfolio/monitoring/history and multiple journal logs.
-- Includes runtime-state/lock/heartbeat contract checks and lock-mediated runtime updates.
+### 5) State, persistence, and storage fallback
+- Uses Supabase-backed persistence when credentials are available.
+- Retains local CSV fallback for operational continuity.
+- `monitoring_history.csv` no longer relies on default hot-path full Supabase blob read/write.
+- `MON_HISTORY_SUPABASE_MODE` controls monitoring-history persistence mode; low-egress default is `local_only`.
+- `pulse_history_compact.json` provides compact bounded shared history for Live Pulse mini-sparklines.
+- Pulse history is written by worker/scanner path, not by UI rendering path.
 
-### 5) Notification and operator workflows
-- Runs auto-notifications from worker context.
-- Supports digest notifications and outcome journal evaluation cycles.
-- Telegram webhook can add/remove/suppress tokens and trigger digest behavior.
+### 6) Telegram and notification workflows
+- Worker emits notifications from `notify_cycle`.
+- Discovery digest is actionable-only; empty/non-actionable digest is intentionally suppressed.
+- Raw backend candidate list payloads (e.g., `solana|...`) are not intended operator-facing digest output.
+- Portfolio meaningful alerts are emitted for:
+  - `REDUCE`, `CLOSE`, `EXIT`, `TRIM`, `TAKE_PROFIT`;
+  - `HIGH` / `CRITICAL` risk;
+  - dead/cold, liquidity drop, drawdown, stale data;
+  - linked monitoring `NO_ENTRY` / `EXIT` / `AVOID`.
+- `HOLD`, `UNKNOWN`, and `score n/a` are intentionally not treated as meaningful portfolio alerts.
+- Compact Telegram suppression heartbeat exists.
 
-### 6) Operational safety and recovery
-- Startup fail-fast checks for required env vars and runtime entities.
-- Job heartbeats and stale-loop detection to surface degraded/stuck execution.
-- Emergency reset script for runtime locks/state + GitHub Actions redispatch + log validation.
+### 7) Manual Monitoring control plane
+- User can manually add tokens to Monitoring from UI using:
+  - raw contract address (CA);
+  - DexScreener URL;
+  - pair address / pair-style input with safe minimal fallback.
+- Canonical path is `manual_add_token_to_monitoring(...)`.
+- Telegram `+ Monitor` route uses the same canonical helper path.
+- Active-row dedupe prevents duplicate Monitoring entries.
+- Solana CA casing is preserved.
+- If enrichment is incomplete/fails, system can persist minimal deferred rows (e.g., `MANUAL WATCH` / `PAIR_FETCH_DEFERRED`) so tracking is not lost.
+- Manual add does not auto-add to Portfolio and does not trigger auto-buy/auto-execution.
+
+### 8) Operational safety and security controls (current)
+- Webhook bootstrap includes fail-fast validation for critical endpoints/config.
+- `/health` remains lightweight and independently available.
 
 ## What DEX Scout should do (target behavior)
 
 ### A) Deterministic runtime and idempotency
 - Guarantee exactly-once semantics for per-token notification events (cross-worker/process safe).
-- Ensure every cycle mode (`scan_cycle`, `monitor_cycle`, `notify_cycle`, `digest_cycle`, `outcome_cycle`) is idempotent and restart-safe.
+- Ensure every cycle mode remains idempotent and restart-safe under concurrency.
 
 ### B) Strong typed domain model
-- Replace dict-heavy untyped row passing with typed schemas (Pydantic/dataclass) across ingest→score→persist→notify.
-- Enforce canonical entity key consistency (chain + address normalization rules) at type boundary.
+- Replace dict-heavy row passing with typed schemas (Pydantic/dataclass) across ingest→score→persist→notify.
+- Enforce canonical entity key consistency at typed boundaries.
 
 ### C) Storage reliability
-- Move journals/history to append-only durable tables with strict constraints and migration management.
+- Migrate journals/history to normalized append-only durable tables with strict constraints and migration management.
 - Add write-ahead buffering / retry queues for transient DB/API outages.
 
 ### D) Strategy and evaluation
 - Version scoring/filter policies and persist policy version with emitted events.
-- Provide offline replay/backtest over historical snapshots to evaluate precision/recall and PnL proxies before production rollout.
+- Provide offline replay/backtest over historical snapshots for precision/recall and PnL-proxy evaluation.
 
 ### E) Observability
-- Export structured metrics (latency, error-rate, queue depth, emit counts, duplicate suppressions).
-- Add machine-readable health endpoints and alerting thresholds for runtime SLOs.
+- Export structured metrics (latency, error rate, queue depth, emit counts, duplicate suppressions).
+- Add machine-readable health and alert thresholds tied to runtime SLOs.
 
 ### F) Security and controls
-- Tighten webhook authn/authz and replay protection.
-- Separate secrets per runtime role (least privilege service accounts).
+- Strengthen webhook auth and replay protection.
+- Introduce scoped operator RBAC.
+- Implement secret rotation workflow.
+- Separate least-privilege runtime roles/accounts.
 
 ## What it does not do yet / gaps
 
-### Core pipeline
-- No explicit exactly-once event bus; dedup appears stateful but not formally transactional.
-- No strict schema validation at ingestion boundaries (heavy dict usage).
-- No clear contract test suite for chain-specific address normalization edge cases.
+### Runtime/eventing and control plane
+- No guaranteed exactly-once cross-worker notification/event bus.
+- No robust full operator command surface.
+- No dedicated Telegram DLQ.
 
-### Data quality and modeling
-- No explicit confidence/uncertainty modeling for low-liquidity noisy pairs.
-- No robust anomaly/outlier detection layer separate from heuristic thresholds.
-- No versioned feature store or reproducible model/scoring artifact pipeline.
+### Data model and persistence
+- No full typed domain model at all ingestion/processing boundaries.
+- Journals/history are not yet fully migrated to normalized append-only DB schema.
+- No write-ahead retry queue / DLQ for failed persistence writes.
 
-### Reliability and scale
-- No documented horizontal scaling protocol for multiple concurrent workers sharing same lock/state tables under load.
-- No explicit dead-letter queue for failed notifications / failed persistence writes.
-- No benchmarked throughput/latency profile for high token universe sizes.
+### Testing and CI maturity
+- Baseline automated tests exist, but no comprehensive integration/e2e/replay/backtest suite.
+- No full integration suite against frozen market snapshots.
+- No CI environment smoke against real Supabase/Telegram secrets.
+- Basic CI quality gates exist; advanced runtime-quality gates remain limited.
 
-### Product/control-plane
-- No dedicated admin/API control plane for policy rollout/rollback, kill-switches, or scoped dry-run modes.
-- No explicit RBAC/audit trail abstraction for operator actions beyond row-level note fields.
+### Live pulse and history depth
+- Compact pulse history is bounded operational state, not a full historical OHLCV/feature store.
+- Sparse/new candidates can show warm-up behavior (insufficient points).
+- No extra fetches are performed solely to draw UI sparklines.
 
-### Testing and release engineering
-- No visible comprehensive automated tests (unit/integration/e2e) in repo.
-- No explicit migration/versioning framework committed for DB schema evolution.
-- Limited CI-visible quality gates for runtime safety regressions.
+### Manual monitoring enrichment limits
+- Full pair-address-to-base-token enrichment is not guaranteed in all cases.
+- Pair-style manual inputs can remain in minimal/deferred tracking path until later enrichment.
+
+### Product scope limits
+- No portfolio execution automation / auto-trading.
+- No backtesting-grade full historical research pipeline.
+- No ML-based scoring pipeline in production.
+- No multi-user/SaaS tenancy model.
+- No on-chain transaction analysis engine.
+- No real-time websocket market ingest layer.
+
+## Testing and CI (current state)
+- Minimal pytest baseline exists and is active.
+- Covered baseline areas include:
+  - `alerts.py` behavior;
+  - `dex.py` behavior;
+  - `scoring.py` behavior;
+  - `worker.py` behavior;
+  - `tg_webhook.py` bootstrap behavior;
+  - manual monitoring add parsing/dedupe paths (including Solana casing preservation).
+- CI currently runs:
+  - `py_compile`;
+  - `pytest -q`;
+  - import-order guard asserting `WORKER_FAST_MODE` placement before `st.set_page_config`.
 
 ## Good to have across major functional areas
 
@@ -93,16 +149,16 @@
 - Raw payload archival for replay and incident forensics.
 
 ### 2) Signal engine
-- Policy versioning + feature flags + canary policy rollout.
-- Regime-aware scoring templates (trend, mean-revert, high-volatility buckets).
+- Policy versioning + feature flags + canary rollout.
+- Regime-aware scoring templates (trend/mean-revert/high-volatility).
 
 ### 3) State and storage
-- Strict DB schema with unique constraints for event keys.
-- Migration tooling + backward-compatible readers during transitions.
+- Strict DB constraints for event-key uniqueness.
+- Migration tooling + backward-compatible readers.
 
 ### 4) Notifications
 - Per-channel QoS (rate limits, retries, DLQ, exponential backoff).
-- User-level preference routing and suppression windows.
+- User-level routing preferences and suppression windows.
 
 ### 5) Runtime orchestration
 - Distributed lock observability dashboard.
@@ -110,12 +166,12 @@
 
 ### 6) Monitoring/observability
 - Unified metrics + traces + logs with correlation IDs per cycle/run.
-- Error budget policy and SLOs (scan freshness, notify latency, digest timeliness).
+- Error-budget policy and runtime SLO enforcement.
 
 ### 7) Security
 - Signed webhook payload validation and nonce/timestamp replay defense.
-- Secret rotation workflow and key provenance audit.
+- Secret rotation + key provenance audit.
 
 ### 8) QA and delivery
 - Deterministic replay tests against frozen market snapshots.
-- Pre-deploy conformance suite for runtime contract and data schema invariants.
+- Pre-deploy conformance suite for runtime contracts and schema invariants.
