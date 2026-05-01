@@ -4934,27 +4934,65 @@ def add_to_monitoring(
     return "OK"
 
 
-def parse_manual_monitoring_input(chain: str, raw_input: str) -> Dict[str, str]:
-    chain_norm = normalize_chain_name(chain or "")
+def parse_manual_token_input(raw_input: str, chain_hint: str) -> Dict[str, Any]:
+    chain_norm = normalize_chain_name(chain_hint or "")
     text = str(raw_input or "").strip()
     if not text:
-        return {"chain": chain_norm, "base_addr": "", "pair_addr": "", "source_url": ""}
-    src = text
+        return {"ok": False, "error": "invalid_input"}
+    dex_url = ""
+    input_type = "ca"
+    token_addr = ""
+    pair_addr = ""
     if "dexscreener.com" in text.lower():
+        dex_url = text
+        input_type = "dex_url"
         try:
             from urllib.parse import urlparse
             parsed = urlparse(text)
             path_parts = [p for p in str(parsed.path or "").split("/") if p]
             if len(path_parts) >= 2:
                 chain_norm = normalize_chain_name(path_parts[0] or chain_norm)
-                if path_parts[1] == "token" and len(path_parts) >= 3:
-                    text = path_parts[2]
+                mode = str(path_parts[1] or "").lower()
+                if mode == "token" and len(path_parts) >= 3:
+                    token_addr = path_parts[2].strip()
+                elif mode == "pair" and len(path_parts) >= 3:
+                    pair_addr = path_parts[2].strip()
+                    input_type = "pair"
                 else:
-                    text = path_parts[1]
+                    token_addr = path_parts[1].strip()
+            else:
+                return {"ok": False, "error": "invalid_input"}
         except Exception:
-            pass
-    addr = addr_store(chain_norm, text.strip())
-    return {"chain": chain_norm, "base_addr": addr, "pair_addr": "", "source_url": src}
+            return {"ok": False, "error": "invalid_input"}
+    else:
+        token_addr = text
+
+    if pair_addr:
+        pair_addr = addr_store(chain_norm, pair_addr)
+    if token_addr:
+        token_addr = addr_store(chain_norm, token_addr)
+    if not token_addr and not pair_addr:
+        return {"ok": False, "error": "invalid_input"}
+    return {
+        "ok": True,
+        "chain": chain_norm,
+        "token_addr": token_addr,
+        "pair_addr": pair_addr,
+        "input_type": input_type,
+        "dex_url": dex_url,
+    }
+
+
+def parse_manual_monitoring_input(chain: str, raw_input: str) -> Dict[str, str]:
+    parsed = parse_manual_token_input(raw_input, chain)
+    if not parsed.get("ok"):
+        return {"chain": normalize_chain_name(chain or ""), "base_addr": "", "pair_addr": "", "source_url": ""}
+    return {
+        "chain": str(parsed.get("chain") or ""),
+        "base_addr": str(parsed.get("token_addr") or ""),
+        "pair_addr": str(parsed.get("pair_addr") or ""),
+        "source_url": str(parsed.get("dex_url") or str(raw_input or "").strip()),
+    }
 
 
 def canonical_add_to_monitoring(
@@ -4965,13 +5003,26 @@ def canonical_add_to_monitoring(
     score: float = 0.0,
     source_label: str = "manual",
 ) -> Dict[str, str]:
-    parsed = parse_manual_monitoring_input(chain, raw_input)
-    chain_norm = parsed.get("chain", "")
-    base_addr = parsed.get("base_addr", "")
+    return manual_add_token_to_monitoring(raw_input=raw_input, chain=chain, note=note, tags=[tag] if tag else None, source=source_label, score=score)
+
+
+def manual_add_token_to_monitoring(
+    raw_input: str,
+    chain: str,
+    note: str = "",
+    tags: Optional[List[str]] = None,
+    source: str = "manual",
+    score: float = 0.0,
+) -> Dict[str, str]:
+    parsed = parse_manual_token_input(raw_input, chain)
+    chain_norm = str(parsed.get("chain") or normalize_chain_name(chain or ""))
+    base_addr = str(parsed.get("token_addr") or "")
+    pair_addr = str(parsed.get("pair_addr") or "")
     if not base_addr:
-        return {"status": "NO_ADDR", "warning": "invalid token address"}
+        return {"status": "NO_ADDR", "warning": "Could not parse CA or Dex URL"}
     key = addr_key(chain_norm, base_addr)
     rows = load_monitoring()
+    tag = ",".join([str(t).strip() for t in (tags or []) if str(t).strip()]) or "manual_watch"
     for r in rows:
         if str(r.get("active", "1")).strip() == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
             return {"status": "EXISTS_ACTIVE", "dex_url": dex_url_for_token(chain_norm, base_addr)}
@@ -5011,7 +5062,7 @@ def canonical_add_to_monitoring(
         "chain": chain_norm,
         "base_symbol": "",
         "base_addr": base_addr,
-        "pair_addr": "",
+        "pair_addr": pair_addr,
         "score_init": str(score or 0.0),
         "liq_init": "0",
         "vol24_init": "0",
@@ -5020,11 +5071,11 @@ def canonical_add_to_monitoring(
         "ts_archived": "",
         "archived_reason": "",
         "last_score": str(score or 0.0),
-        "last_decision": "watch",
+        "last_decision": "PAIR_FETCH_DEFERRED",
         "priority_score": str(score or 0.0),
         "last_decay_ts": now_utc_str(),
         "decay_hits": "0",
-        "source_window": source_label,
+        "source_window": source,
         "source_preset": "",
         "risk": "",
         "tp_target_pct": "",
@@ -5065,7 +5116,7 @@ def canonical_add_to_monitoring(
         "status": LIFECYCLE_MONITORING,
         "tags": tag or "manual_watch",
         "pair_fetch_deferred": "1",
-        "source": source_label,
+        "source": source,
     }
     rows.insert(0, minimal)
     save_monitoring(rows)
@@ -12262,9 +12313,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     with m2:
         manual_raw = st.text_input("CA / pair address / DexScreener URL", key="manual_mon_input")
     with m3:
-        manual_tag = st.selectbox("tag", ["manual_watch", "high_risk_watch"], index=0, key="manual_mon_tag")
+        manual_high_risk = st.checkbox("Mark as high-risk watch", value=False, key="manual_mon_high_risk")
     manual_note = st.text_input("note (optional)", key="manual_mon_note")
-    if st.button("Manual add", key="manual_add_submit", use_container_width=False):
+    if st.button("Add to Monitoring", key="manual_add_submit", use_container_width=False):
+        manual_tag = "manual_watch,high_risk_watch" if manual_high_risk else "manual_watch"
         res = canonical_add_to_monitoring(
             chain=manual_chain,
             raw_input=manual_raw,

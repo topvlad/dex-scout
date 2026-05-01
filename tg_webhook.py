@@ -22,6 +22,7 @@ try:
         normalize_chain_name,
         normalize_timing_label,
         now_utc_str,
+        manual_add_token_to_monitoring,
         parse_float,
         save_monitoring,
         save_portfolio,
@@ -172,36 +173,14 @@ def add_contract_to_portfolio(chain: str, ca: str) -> bool:
 
 def add_contract_to_monitoring(chain: str, ca: str) -> bool:
     chain = normalize_chain_name(chain)
-    ca = addr_store(chain, ca)
-    if not chain or not ca:
-        return False
-
-    rows = load_monitoring()
-    for row in rows:
-        row_chain = normalize_chain_name(row.get("chain", ""))
-        vals = [row.get("base_addr"), row.get("base_token_address"), row.get("ca"), row.get("address")]
-        if row_chain == chain and any(addr_store(chain, str(v or "")) == ca for v in vals if str(v or "").strip()):
-            _touch_active(row, "added_from_tg_callback")
-            row["status"] = "ACTIVE"
-            row["updated_at"] = now_utc_str()
-            save_monitoring(rows)
-            return True
-
-    new_row: Dict[str, Any] = {k: "" for k in MON_FIELDS}
-    new_row.update(
-        {
-            "chain": chain,
-            "base_addr": ca,
-            "active": "1",
-            "archived": "0",
-            "status": "ACTIVE",
-            "updated_at": now_utc_str(),
-            "note": "added_from_tg_callback",
-        }
+    res = manual_add_token_to_monitoring(
+        raw_input=ca,
+        chain=chain,
+        note="added_from_tg_callback",
+        tags=["manual_watch"],
+        source="tg_callback",
     )
-    rows.append(new_row)
-    save_monitoring(rows)
-    return True
+    return str(res.get("status") or "") in {"OK", "OK_DEFERRED", "EXISTS_ACTIVE", "REACTIVATED"}
 
 
 def remove_contract_everywhere(chain: str, ca: str) -> bool:
