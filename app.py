@@ -177,6 +177,11 @@ DIGEST_SOURCE_MODES = {"ui_truth", "backend_candidates"}
 DIGEST_BACKEND_REUSE_TTL_SEC = max(300, int(os.getenv("DIGEST_BACKEND_REUSE_TTL_SEC", "7200")))
 DIGEST_UI_HEARTBEAT_HOURS = max(1, _env_int("DIGEST_UI_HEARTBEAT_HOURS", 12))
 DIGEST_DISCOVERY_HEARTBEAT_HOURS = max(1, _env_int("DIGEST_DISCOVERY_HEARTBEAT_HOURS", 12))
+TG_SUPPRESSION_HEARTBEAT_HOURS = max(1, _env_int("TG_SUPPRESSION_HEARTBEAT_HOURS", 12))
+PORTFOLIO_ALERT_COOLDOWN_SECONDS = max(300, _env_int("PORTFOLIO_ALERT_COOLDOWN_SECONDS", 1800))
+PORTFOLIO_LIQ_DROP_PCT_THRESHOLD = max(5.0, _env_float("PORTFOLIO_LIQ_DROP_PCT_THRESHOLD", 35.0))
+PORTFOLIO_DRAWDOWN_PCT_THRESHOLD = max(5.0, _env_float("PORTFOLIO_DRAWDOWN_PCT_THRESHOLD", 20.0))
+PORTFOLIO_STALE_MINUTES_THRESHOLD = max(5.0, _env_float("PORTFOLIO_STALE_MINUTES_THRESHOLD", 30.0))
 OUTCOME_HORIZONS_MINUTES: Dict[str, int] = {
     "15m": 15,
     "1h": 60,
@@ -7735,11 +7740,18 @@ def format_portfolio_action_message(row: Dict[str, Any]) -> str:
     chain = token_chain(row).upper()
     addr = token_ca(row)
     unified = compute_unified_recommendation(row, source="portfolio")
+    entry = parse_float(get_portfolio_entry_price(row), 0.0)
+    current = parse_float(row.get("price_usd", row.get("current_price", 0)), 0.0)
+    delta = ((current - entry) / entry * 100.0) if entry > 0 and current > 0 else 0.0
     return (
-        f"<b>{unified['final_action']}</b> | <b>{symbol}</b>\n"
-        f"source: PORTFOLIO\n"
+        f"<b>PORTFOLIO ACTION</b> | <b>{symbol}</b>\n"
+        f"action: <b>{unified['final_action']}</b>\n"
+        f"risk: <b>{str(row.get('risk_level') or row.get('risk') or 'UNKNOWN').upper()}</b>\n"
         f"chain: {chain}\n"
-        f"reason: {unified['final_reason']}\n\n"
+        f"reason: {unified['final_reason']}\n"
+        f"entry: {entry:.8f}\n"
+        f"current: {current:.8f}\n"
+        f"delta: {delta:+.2f}%\n\n"
         f"CA:\n<code>{addr}</code>"
     )
 
@@ -8643,8 +8655,58 @@ def tg_buttons(row: Dict[str, Any]) -> Dict[str, Any]:
         buttons.append([
             {"text": "📈 Dex", "url": dex_url}
         ])
+    buttons.append([{"text": "📂 Open Portfolio", "url": os.getenv("PORTFOLIO_URL", "https://dexscreener.com")}])
+    buttons.append([{"text": "✅ Acknowledge", "callback_data": f"ack|{chain}|{ca}"}])
 
     return {"inline_keyboard": buttons}
+
+
+def build_portfolio_meaningful_events(
+    portfolio_rows: List[Dict[str, Any]],
+    monitoring_rows: List[Dict[str, Any]],
+    tg_state: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    _ = monitoring_rows
+    events: Dict[str, Dict[str, Any]] = {}
+    for row in portfolio_rows:
+        key = canonical_token_key(row)
+        if not key:
+            continue
+        unified = compute_unified_recommendation(row, source="portfolio")
+        action = str(unified.get("final_action") or row.get("entry_action") or "").upper().replace(" ", "_")
+        risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
+        score_display = build_notification_semantics(row, source_context="portfolio").get("score_display", "n/a")
+        health = str(row.get("health_label") or row.get("status") or "").upper()
+        liq_init = parse_float(row.get("liq_init", 0), 0.0)
+        liq_now = parse_float(row.get("liq_usd", row.get("liquidity_usd", 0)), 0.0)
+        liq_drop = ((liq_init - liq_now) / liq_init * 100.0) if liq_init > 0 and liq_now > 0 else 0.0
+        entry = parse_float(get_portfolio_entry_price(row), 0.0)
+        current = parse_float(row.get("price_usd", row.get("current_price", 0)), 0.0)
+        drawdown = ((entry - current) / entry * 100.0) if entry > 0 and current > 0 else 0.0
+        last_seen_dt = parse_ts(row.get("ts_last_seen") or row.get("ts_updated") or row.get("ts_utc"))
+        stale_m = (datetime.utcnow() - last_seen_dt).total_seconds() / 60.0 if last_seen_dt else 10**6
+
+        reason = ""
+        if action in {"REDUCE", "CLOSE", "EXIT", "TAKE_PROFIT", "TRIM"}:
+            reason = f"action:{action}"
+        elif risk in {"HIGH", "CRITICAL"}:
+            reason = f"risk:{risk}"
+        elif any(x in health for x in ("DEAD", "COLD")):
+            reason = f"health:{health or 'DEAD/COLD'}"
+        elif liq_drop >= PORTFOLIO_LIQ_DROP_PCT_THRESHOLD:
+            reason = f"liq_drop:{liq_drop:.1f}%"
+        elif drawdown >= PORTFOLIO_DRAWDOWN_PCT_THRESHOLD:
+            reason = f"drawdown:{drawdown:.1f}%"
+        elif stale_m >= PORTFOLIO_STALE_MINUTES_THRESHOLD:
+            reason = f"stale:{stale_m:.1f}m"
+
+        if not reason:
+            continue
+        if risk == "UNKNOWN" or action == "HOLD" or score_display == "n/a":
+            continue
+        fp = _short_hash(f"{key}|{action}|{risk}|{reason}", n=16)
+        events[key] = {"row": row, "unified": unified, "fingerprint": fp, "reason": reason, "action": action}
+    return events
 
 
 def build_notification_candidates(
@@ -8754,6 +8816,7 @@ def run_auto_notifications(
     new_token_state: Dict[str, Dict[str, Any]] = {}
 
     mon_rows, port_rows = build_notification_candidates(monitoring_rows, portfolio_rows)
+    portfolio_events = build_portfolio_meaningful_events(port_rows, monitoring_rows, state)
     eligible_after_candidate_build = len(mon_rows) + len(port_rows)
 
     candidates: List[Tuple[float, str, Dict[str, Any]]] = []
@@ -8839,6 +8902,18 @@ def run_auto_notifications(
             continue
 
         unified = compute_unified_recommendation(row, source=source)
+        if source == "portfolio":
+            p_key = canonical_token_key(row)
+            p_event = portfolio_events.get(p_key or "")
+            if not p_event:
+                stats["no_actionable_event"] += 1
+                stats["blocked_reasons"]["portfolio_blacklist_or_unchanged"] = int(
+                    stats["blocked_reasons"].get("portfolio_blacklist_or_unchanged", 0)
+                ) + 1
+                state["last_suppressed_reason"] = "portfolio_blacklist_or_unchanged"
+                continue
+            row["entry_reason"] = p_event.get("reason", row.get("entry_reason", ""))
+            row["portfolio_alert_fingerprint"] = p_event.get("fingerprint", "")
         current_snapshot = {
             "entry_action": str(unified.get("final_action") or "").upper(),
             "entry_score": parse_float(row.get("entry_score", 0), 0.0),
@@ -8953,6 +9028,21 @@ def run_auto_notifications(
                 send_status="duplicate",
             )
             continue
+        if source == "portfolio":
+            token_alert_state = state.setdefault("portfolio_token_alert_state", {})
+            tkey = canonical_token_key(row)
+            last = token_alert_state.get(tkey, {}) if isinstance(token_alert_state, dict) else {}
+            last_fp = str(last.get("portfolio_alert_fingerprint") or "")
+            last_ts = parse_float(last.get("last_portfolio_alert_ts", 0), 0.0)
+            fp_now = str(row.get("portfolio_alert_fingerprint") or "")
+            if fp_now and fp_now == last_fp:
+                stats["duplicate"] += 1
+                state["last_suppressed_reason"] = "same_fingerprint"
+                continue
+            if last_ts > 0 and (now_ts - last_ts) < PORTFOLIO_ALERT_COOLDOWN_SECONDS:
+                stats["cooldown"] += 1
+                state["last_suppressed_reason"] = "portfolio_cooldown"
+                continue
 
         msg = format_signal_message(
             row,
@@ -8986,6 +9076,21 @@ def run_auto_notifications(
             tier_key = str(alert_classification.get("alert_tier") or "unknown")
             stats["sent_by_event_type"][event_type_key] = int(stats["sent_by_event_type"].get(event_type_key, 0)) + 1
             stats["sent_by_alert_tier"][tier_key] = int(stats["sent_by_alert_tier"].get(tier_key, 0)) + 1
+            if source == "portfolio":
+                token_alert_state = state.setdefault("portfolio_token_alert_state", {})
+                tkey = canonical_token_key(row)
+                if isinstance(token_alert_state, dict) and tkey:
+                    token_alert_state[tkey] = {
+                        "portfolio_alert_fingerprint": str(row.get("portfolio_alert_fingerprint") or ""),
+                        "last_portfolio_alert_ts": now_ts,
+                        "last_suppressed_reason": str(state.get("last_suppressed_reason") or ""),
+                    }
+                state["last_portfolio_alert"] = {
+                    "token_key": tkey,
+                    "action": str(unified.get("final_action") or ""),
+                    "reason": str(row.get("entry_reason") or ""),
+                    "ts": now_utc_str(),
+                }
             journal_actionable_event(
                 row=row,
                 source=source,
@@ -9013,6 +9118,11 @@ def run_auto_notifications(
             break
 
     print(f"[TG] notification stats: {stats}", flush=True)
+    if stats["sent"] == 0:
+        hb_last_raw = state.get("last_portfolio_heartbeat_ts")
+        if _heartbeat_due(hb_last_raw, now_ts=now_ts, heartbeat_hours=TG_SUPPRESSION_HEARTBEAT_HOURS):
+            if send_telegram("DEX Scout alive – no actionable portfolio events", parse_mode="HTML"):
+                state["last_portfolio_heartbeat_ts"] = now_utc_str()
 
     cycle_status = "sent" if stats["sent"] > 0 else "empty"
     if stats["send_fail"] > 0 and stats["sent"] == 0:
@@ -9108,6 +9218,9 @@ def run_auto_notifications(
                 if int(v or 0) > 0
             },
             "last_notification_diag": diag,
+            "last_portfolio_alert": state.get("last_portfolio_alert") or {},
+            "last_suppressed_reason": str(state.get("last_suppressed_reason") or ""),
+            "last_portfolio_heartbeat_ts": str(state.get("last_portfolio_heartbeat_ts") or ""),
         },
         increments={
             "notification_runs": 1,
