@@ -11591,22 +11591,47 @@ def record_live_pulse_history_from_candidates(
     chain_filter: str = "all",
     limit: int = 8,
 ) -> Dict[str, Any]:
-    monitoring_rows = load_monitoring()
-    portfolio_rows = load_portfolio()
-    candidates = build_discovery_candidate_pool(
-        monitoring_rows=monitoring_rows,
-        portfolio_rows=portfolio_rows,
-        limit=max(30, int(limit or 8) * 8),
-    )
     now_iso = now_utc_iso()
+    runtime_updates: Dict[str, Any] = {
+        "pulse_history_writer_ran_at": now_iso,
+        "pulse_history_writer_ran": True,
+        "pulse_history_writer_ok": False,
+        "pulse_history_writer_candidates": 0,
+        "pulse_history_writer_appended": 0,
+        "pulse_history_writer_flushed": False,
+        "pulse_history_writer_reason": "unknown",
+    }
+
+    def _safe_runtime_update(updates: Dict[str, Any]) -> None:
+        try:
+            update_worker_runtime_state(updates=updates)
+        except Exception as exc:
+            debug_log(f"pulse_history_writer_runtime_update_exception:{type(exc).__name__}:{exc}")
+
+    try:
+        monitoring_rows = load_monitoring()
+        portfolio_rows = load_portfolio()
+        candidates = build_discovery_candidate_pool(
+            monitoring_rows=monitoring_rows,
+            portfolio_rows=portfolio_rows,
+            limit=max(30, int(limit or 8) * 8),
+        )
+    except Exception as exc:
+        reason = f"candidate_pool_exception:{type(exc).__name__}:{exc}"
+        runtime_updates.update({"pulse_history_writer_reason": reason, "pulse_history_writer_error_ts": now_iso})
+        _safe_runtime_update(runtime_updates)
+        debug_log(reason)
+        return {"ok": False, "reason": reason, "points_appended": 0, "candidates_seen": 0, "flushed": False}
+
     selected: List[Dict[str, Any]] = []
     seen: Set[str] = set()
+    active_keys = set(active_monitoring_keys or set())
     for row in list(candidates or []):
         key = canonical_token_key(row)
         chain = token_chain(row)
         if not key or key in seen:
             continue
-        if key in set(active_monitoring_keys or set()):
+        if key in active_keys:
             continue
         if chain_filter in {"bsc", "solana"} and chain != chain_filter:
             continue
@@ -11614,6 +11639,7 @@ def record_live_pulse_history_from_candidates(
         selected.append(row)
         if len(selected) >= max(1, int(limit or 8)):
             break
+
     appended = 0
     for row in selected:
         key = canonical_token_key(row)
@@ -11627,24 +11653,40 @@ def record_live_pulse_history_from_candidates(
         }
         _append_pulse_history_point(key, point)
         appended += 1
-    flushed = _flush_pulse_history_buffer() if appended > 0 else 0
-    reason = "ok" if appended > 0 else ("no_candidates" if len(selected) == 0 else "no_points")
-    update_worker_runtime_state(
-        updates={
-            "pulse_history_writer_ran_at": now_iso,
-            "pulse_history_writer_ran": True,
+
+    flush_error = None
+    flushed = 0
+    if appended > 0:
+        try:
+            flushed = _flush_pulse_history_buffer()
+        except Exception as exc:
+            flush_error = exc
+
+    if flush_error is not None:
+        reason = f"flush_exception:{type(flush_error).__name__}:{flush_error}"
+        ok = False
+    else:
+        reason = "ok" if appended > 0 else ("no_candidates" if len(selected) == 0 else "no_points")
+        ok = True
+
+    runtime_updates.update(
+        {
+            "pulse_history_writer_ok": bool(ok),
             "pulse_history_writer_candidates": int(len(candidates or [])),
             "pulse_history_writer_appended": int(appended),
             "pulse_history_writer_flushed": bool(flushed > 0),
             "pulse_history_writer_reason": reason,
         }
     )
+    if not ok:
+        runtime_updates["pulse_history_writer_error_ts"] = now_iso
+    _safe_runtime_update(runtime_updates)
     debug_log(
         f"pulse_history_writer_ran candidates={len(candidates or [])} "
         f"selected={len(selected)} appended={appended} flushed={bool(flushed > 0)} reason={reason}"
     )
     return {
-        "ok": True,
+        "ok": bool(ok),
         "candidates_seen": int(len(selected)),
         "points_appended": int(appended),
         "flushed": bool(flushed > 0),
