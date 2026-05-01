@@ -10465,6 +10465,11 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
         stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
         stats["trimmed"] = trim_active_monitoring(max_active=150)
+        monitoring_rows = load_monitoring()
+        portfolio_rows = load_portfolio()
+        pool = build_discovery_candidate_pool(monitoring_rows=monitoring_rows, portfolio_rows=portfolio_rows, limit=64)
+        active_monitoring_keys = {canonical_token_key(r) for r in monitoring_rows if canonical_token_key(r)}
+        stats["pulse_history_writer"] = record_live_pulse_history_from_candidates(pool, active_monitoring_keys, chain_filter="all", limit=8)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {}), "error": str(e)}
@@ -10489,6 +10494,11 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
         stats["stale_removed"] = 0
         stats["revisited"] = add_new_candidates()
         stats["trimmed"] = trim_active_monitoring(max_active=150)
+        monitoring_rows = load_monitoring()
+        portfolio_rows = load_portfolio()
+        pool = build_discovery_candidate_pool(monitoring_rows=monitoring_rows, portfolio_rows=portfolio_rows, limit=64)
+        active_monitoring_keys = {canonical_token_key(r) for r in monitoring_rows if canonical_token_key(r)}
+        stats["pulse_history_writer"] = record_live_pulse_history_from_candidates(pool, active_monitoring_keys, chain_filter="all", limit=8)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": {}, "error": str(e)}
@@ -10525,6 +10535,11 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
     stats["trimmed"] = trim_active_monitoring(max_active=150)
     stats["cleanup_noise"] = 0
     stats["purged_toxic"] = 0
+    monitoring_rows = load_monitoring()
+    portfolio_rows = load_portfolio()
+    pool = build_discovery_candidate_pool(monitoring_rows=monitoring_rows, portfolio_rows=portfolio_rows, limit=64)
+    active_monitoring_keys = {canonical_token_key(r) for r in monitoring_rows if canonical_token_key(r)}
+    stats["pulse_history_writer"] = record_live_pulse_history_from_candidates(pool, active_monitoring_keys, chain_filter="all", limit=8)
     state["last_window"] = window_name
     state["last_preset"] = preset_key
     state["last_chain"] = normalize_chain_name(chain or "solana")
@@ -11438,17 +11453,69 @@ def _append_pulse_history_point(token_key: str, point: Dict[str, Any]) -> None:
     bucket.append(point)
     debug_log(f"pulse_history_append key={token_key}")
 
+def record_live_pulse_history_from_candidates(
+    candidates: List[Dict[str, Any]],
+    active_monitoring_keys: Set[str],
+    chain_filter: str = "all",
+    limit: int = 8,
+) -> Dict[str, int]:
+    now_iso = now_utc_iso()
+    selected: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for row in list(candidates or []):
+        key = canonical_token_key(row)
+        chain = token_chain(row)
+        if not key or key in seen:
+            continue
+        if key in set(active_monitoring_keys or set()):
+            continue
+        if chain_filter in {"bsc", "solana"} and chain != chain_filter:
+            continue
+        seen.add(key)
+        selected.append(row)
+        if len(selected) >= max(1, int(limit or 8)):
+            break
+    appended = 0
+    for row in selected:
+        key = canonical_token_key(row)
+        point = {
+            "ts": now_iso,
+            "score": round(parse_float(row.get("entry_score", row.get("priority_score", row.get("score", 0))), 0.0), 2),
+            "price_usd": round(parse_float(row.get("price_usd", 0), 0.0), 8),
+            "liq_usd": round(parse_float(row.get("liq_usd", row.get("liq_init", row.get("liquidity_usd", 0))), 0.0), 2),
+            "vol24_usd": round(parse_float(row.get("vol24_usd", row.get("vol24_init", 0)), 0.0), 2),
+            "timing_label": normalize_timing_label(row.get("timing_label") or row.get("entry_status") or row.get("status") or "NEUTRAL"),
+        }
+        _append_pulse_history_point(key, point)
+        appended += 1
+    flushed = _flush_pulse_history_buffer() if appended > 0 else 0
+    update_worker_runtime_state(
+        updates={
+            "pulse_history_writer_ran_at": now_iso,
+            "pulse_history_writer_candidates": int(len(candidates or [])),
+            "pulse_history_writer_appended": int(appended),
+            "pulse_history_writer_flushed": int(flushed),
+        }
+    )
+    debug_log(
+        f"pulse_history_writer_ran candidates={len(candidates or [])} "
+        f"selected={len(selected)} appended={appended} flushed={flushed}"
+    )
+    return {"candidates": int(len(candidates or [])), "appended": int(appended), "flushed": int(flushed)}
+
 
 def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict[str, Any]:
     chain = token_chain(row)
     base_addr = token_ca(row)
     token_key = canonical_entity_key(chain, base_addr)
+    runtime_state = get_worker_runtime_state()
+    writer_seen = bool(runtime_state.get("pulse_history_writer_ran_at"))
     empty_payload = {
         "series": "score",
         "values": [],
         "points": 0,
-        "reason": "warming_up",
-        "source": "token_history",
+        "reason": "writer_not_seen" if not writer_seen else "no_shared_points",
+        "source": "none",
     }
 
     def _coerce_row_series(raw_values: Any) -> List[float]:
@@ -11538,13 +11605,7 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict
         }
 
     _log_pulse_sparkline_missing("no_score_or_price_series", token_key=token_key)
-    return {
-        "series": "score",
-        "values": [],
-        "points": 0,
-        "reason": "warming_up",
-        "source": "token_history",
-    }
+    return {"series": "score", "values": [], "points": 0, "reason": "no_shared_points" if writer_seen else "writer_not_seen", "source": "none"}
 
 
 def _pulse_pair_payload(row: Dict[str, Any], best: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -12345,6 +12406,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     debug_log("pulse_history_render_reason=warming_up")
                     _log_pulse_sparkline_missing("not_enough_points", token_key=card_key)
                     st.caption("warming up…")
+                elif fallback_reason == "writer_not_seen":
+                    debug_log("pulse_history_render_reason=writer_not_seen")
+                    st.caption("history writer not seen yet")
+                elif fallback_reason == "no_shared_points":
+                    debug_log("pulse_history_render_reason=no_shared_points")
+                    st.caption("collecting history…")
                 elif fallback_reason == "unshared_local_only":
                     debug_log("pulse_history_render_reason=unshared_local_only")
                     st.caption("shared history unavailable (local-only runtime)")
