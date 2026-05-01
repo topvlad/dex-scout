@@ -193,7 +193,7 @@ def _run_scan_cycle() -> Dict[str, Any]:
         use_birdeye_trending=USE_BIRDEYE_TRENDING,
         birdeye_limit=BIRDEYE_LIMIT,
     )
-    pulse_result = _record_pulse_history_after_cycle()
+    pulse_result = _record_pulse_history_after_cycle_safe()
     return {"scan": scan_result, "pulse_history": pulse_result}
 
 
@@ -209,8 +209,34 @@ def _run_monitor_cycle() -> Dict[str, Any]:
         portfolio_rows=portfolio_rows,
         max_scans=3,
     )
-    pulse_result = _record_pulse_history_after_cycle()
+    pulse_result = _record_pulse_history_after_cycle_safe()
     return {"monitor": monitor_result, "pulse_history": pulse_result}
+
+
+def _record_pulse_history_after_cycle_safe() -> Dict[str, Any]:
+    assert app is not None
+    try:
+        return _record_pulse_history_after_cycle()
+    except Exception as exc:
+        reason = f"pulse_history_writer_exception:{type(exc).__name__}:{exc}"
+        print(f"[worker] {reason}", flush=True)
+        try:
+            app.update_worker_runtime_state(
+                updates={
+                    "pulse_history_writer_ok": False,
+                    "pulse_history_writer_reason": reason,
+                    "pulse_history_writer_error_ts": app.now_utc_str(),
+                }
+            )
+            app.update_job_heartbeat(
+                job_name="pulse_history_writer",
+                job_mode="pulse_history",
+                status="failed_nonblocking",
+                meta={"reason": reason, "nonblocking": True},
+            )
+        except Exception:
+            pass
+        return {"ok": False, "reason": reason, "nonblocking": True}
 
 
 def _record_pulse_history_after_cycle() -> Dict[str, Any]:
