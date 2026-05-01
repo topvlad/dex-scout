@@ -177,8 +177,9 @@ DIGEST_SOURCE_MODES = {"ui_truth", "backend_candidates"}
 DIGEST_BACKEND_REUSE_TTL_SEC = max(300, int(os.getenv("DIGEST_BACKEND_REUSE_TTL_SEC", "7200")))
 DIGEST_UI_HEARTBEAT_HOURS = max(1, _env_int("DIGEST_UI_HEARTBEAT_HOURS", 12))
 DIGEST_DISCOVERY_HEARTBEAT_HOURS = max(1, _env_int("DIGEST_DISCOVERY_HEARTBEAT_HOURS", 12))
-TG_SUPPRESSION_HEARTBEAT_HOURS = max(1, _env_int("TG_SUPPRESSION_HEARTBEAT_HOURS", 12))
-PORTFOLIO_ALERT_COOLDOWN_SECONDS = max(300, _env_int("PORTFOLIO_ALERT_COOLDOWN_SECONDS", 1800))
+TG_SUPPRESSION_HEARTBEAT_ENABLED = str(os.getenv("TG_SUPPRESSION_HEARTBEAT_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+TG_SUPPRESSION_HEARTBEAT_HOURS = max(1, _env_int("TG_SUPPRESSION_HEARTBEAT_HOURS", 6))
+PORTFOLIO_ALERT_COOLDOWN_SECONDS = max(300, _env_int("TG_PORTFOLIO_ALERT_COOLDOWN_MINUTES", 180) * 60)
 PORTFOLIO_LIQ_DROP_PCT_THRESHOLD = max(5.0, _env_float("PORTFOLIO_LIQ_DROP_PCT_THRESHOLD", 35.0))
 PORTFOLIO_DRAWDOWN_PCT_THRESHOLD = max(5.0, _env_float("PORTFOLIO_DRAWDOWN_PCT_THRESHOLD", 20.0))
 PORTFOLIO_STALE_MINUTES_THRESHOLD = max(5.0, _env_float("PORTFOLIO_STALE_MINUTES_THRESHOLD", 30.0))
@@ -8808,7 +8809,11 @@ def build_portfolio_meaningful_events(
     monitoring_rows: List[Dict[str, Any]],
     tg_state: Dict[str, Any],
 ) -> Dict[str, Dict[str, Any]]:
-    _ = monitoring_rows
+    monitoring_by_key: Dict[str, Dict[str, Any]] = {}
+    for m in monitoring_rows:
+        m_key = canonical_token_key(m)
+        if m_key and m_key not in monitoring_by_key:
+            monitoring_by_key[m_key] = m
     events: Dict[str, Dict[str, Any]] = {}
     for row in portfolio_rows:
         key = canonical_token_key(row)
@@ -8829,12 +8834,21 @@ def build_portfolio_meaningful_events(
         stale_m = (datetime.utcnow() - last_seen_dt).total_seconds() / 60.0 if last_seen_dt else 10**6
 
         reason = ""
+        mon_linked = monitoring_by_key.get(key, {})
+        mon_action = str(
+            mon_linked.get("final_action")
+            or mon_linked.get("entry_action")
+            or mon_linked.get("action")
+            or ""
+        ).upper().replace(" ", "_")
         if action in {"REDUCE", "CLOSE", "EXIT", "TAKE_PROFIT", "TRIM"}:
             reason = f"action:{action}"
         elif risk in {"HIGH", "CRITICAL"}:
             reason = f"risk:{risk}"
         elif any(x in health for x in ("DEAD", "COLD")):
             reason = f"health:{health or 'DEAD/COLD'}"
+        elif mon_action in {"NO_ENTRY", "EXIT", "AVOID"}:
+            reason = f"monitoring:{mon_action}"
         elif liq_drop >= PORTFOLIO_LIQ_DROP_PCT_THRESHOLD:
             reason = f"liq_drop:{liq_drop:.1f}%"
         elif drawdown >= PORTFOLIO_DRAWDOWN_PCT_THRESHOLD:
@@ -8846,9 +8860,58 @@ def build_portfolio_meaningful_events(
             continue
         if risk == "UNKNOWN" or action == "HOLD" or score_display == "n/a":
             continue
-        fp = _short_hash(f"{key}|{action}|{risk}|{reason}", n=16)
-        events[key] = {"row": row, "unified": unified, "fingerprint": fp, "reason": reason, "action": action}
+        price_bucket = round(current, 8) if current > 0 else 0.0
+        liq_bucket = int(liq_now // 1000) if liq_now > 0 else 0
+        fp = _short_hash(f"{key}|{action}|{risk}|{reason}|p:{price_bucket}|l:{liq_bucket}|h:{health}", n=16)
+        events[key] = {"row": row, "unified": unified, "fingerprint": fp, "reason": reason, "action": action, "risk": risk}
     return events
+
+
+def maybe_send_tg_suppression_heartbeat(
+    trigger_source: str,
+    reason: str,
+    stats: Dict[str, Any],
+) -> Dict[str, Any]:
+    _ = trigger_source
+    now_ts = time.time()
+    out = {"sent": False, "reason": ""}
+    if not TG_SUPPRESSION_HEARTBEAT_ENABLED:
+        out["reason"] = "disabled"
+        return out
+    allowed_reasons = {"no_actionable_blocks", "no_meaningful_change", "no_portfolio_events", "empty_cycle"}
+    reason_norm = str(reason or "").strip().lower()
+    if reason_norm not in allowed_reasons:
+        out["reason"] = "not_eligible_reason"
+        return out
+    state = load_tg_state()
+    if not isinstance(state, dict):
+        state = {}
+    success_epoch = parse_float(state.get("last_send_success_epoch", 0), 0.0)
+    hb_last_raw = state.get("last_heartbeat_ts") or state.get("last_portfolio_heartbeat_ts")
+    if not _heartbeat_due(hb_last_raw, now_ts=now_ts, heartbeat_hours=TG_SUPPRESSION_HEARTBEAT_HOURS):
+        out["reason"] = "cooldown"
+        return out
+    if success_epoch > 0 and (now_ts - success_epoch) < (TG_SUPPRESSION_HEARTBEAT_HOURS * 3600):
+        out["reason"] = "recent_success"
+        return out
+    text = (
+        "DEX Scout alive\n"
+        "no actionable events\n"
+        f"monitoring active: {int(parse_float(stats.get('monitoring_active', 0), 0.0))}\n"
+        f"portfolio active: {int(parse_float(stats.get('portfolio_active', 0), 0.0))}\n"
+        f"last reason: {reason_norm}"
+    )
+    if send_telegram(text, parse_mode="HTML"):
+        now = now_utc_str()
+        state["last_heartbeat_ts"] = now
+        state["last_portfolio_heartbeat_ts"] = now
+        state["last_send_success_epoch"] = now_ts
+        state["last_send_success_ts"] = now
+        save_tg_state(state)
+        out["sent"] = True
+        return out
+    out["reason"] = "send_fail"
+    return out
 
 
 def build_notification_candidates(
@@ -9233,6 +9296,9 @@ def run_auto_notifications(
                     "reason": str(row.get("entry_reason") or ""),
                     "ts": now_utc_str(),
                 }
+                state["last_portfolio_alert_ts"] = now_utc_str()
+                state["last_portfolio_alert_reason"] = str(row.get("entry_reason") or "")
+                state["last_portfolio_alert_fingerprint"] = str(row.get("portfolio_alert_fingerprint") or "")
             journal_actionable_event(
                 row=row,
                 source=source,
@@ -9261,10 +9327,17 @@ def run_auto_notifications(
 
     print(f"[TG] notification stats: {stats}", flush=True)
     if stats["sent"] == 0:
-        hb_last_raw = state.get("last_portfolio_heartbeat_ts")
-        if _heartbeat_due(hb_last_raw, now_ts=now_ts, heartbeat_hours=TG_SUPPRESSION_HEARTBEAT_HOURS):
-            if send_telegram("DEX Scout alive – no actionable portfolio events", parse_mode="HTML"):
-                state["last_portfolio_heartbeat_ts"] = now_utc_str()
+        hb_reason = "no_actionable_blocks" if sum(int(v or 0) for v in stats.get("blocked_reasons", {}).values()) > 0 else "empty_cycle"
+        if int(stats.get("no_actionable_event", 0) or 0) > 0:
+            hb_reason = "no_portfolio_events"
+        state["last_digest_suppressed_ts"] = now_utc_str()
+        state["last_digest_suppressed_reason"] = hb_reason
+        state["last_empty_reason"] = hb_reason
+        _ = maybe_send_tg_suppression_heartbeat(
+            trigger_source=trigger_model,
+            reason=hb_reason,
+            stats={"monitoring_active": len(mon_rows), "portfolio_active": len(port_rows)},
+        )
 
     cycle_status = "sent" if stats["sent"] > 0 else "empty"
     if stats["send_fail"] > 0 and stats["sent"] == 0:
@@ -9363,6 +9436,12 @@ def run_auto_notifications(
             "last_portfolio_alert": state.get("last_portfolio_alert") or {},
             "last_suppressed_reason": str(state.get("last_suppressed_reason") or ""),
             "last_portfolio_heartbeat_ts": str(state.get("last_portfolio_heartbeat_ts") or ""),
+            "last_heartbeat_ts": str(state.get("last_heartbeat_ts") or ""),
+            "last_digest_suppressed_ts": str(state.get("last_digest_suppressed_ts") or ""),
+            "last_digest_suppressed_reason": str(state.get("last_digest_suppressed_reason") or ""),
+            "last_portfolio_alert_ts": str(state.get("last_portfolio_alert_ts") or ""),
+            "last_portfolio_alert_reason": str(state.get("last_portfolio_alert_reason") or ""),
+            "last_empty_reason": str(state.get("last_empty_reason") or empty_reason),
         },
         increments={
             "notification_runs": 1,
@@ -9380,6 +9459,9 @@ def run_auto_notifications(
     state["token_state"] = new_token_state
     state["sent_events"] = sent_events
     state["last_scan_ts_processed"] = str(scan_state.get("last_run_ts") or now_utc_str())
+    if stats["sent"] > 0:
+        state["last_send_success_epoch"] = now_ts
+        state["last_send_success_ts"] = now_utc_str()
     save_tg_state(state)
     return {"status": cycle_status, "stats": stats}
 
