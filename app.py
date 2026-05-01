@@ -11454,11 +11454,17 @@ def _append_pulse_history_point(token_key: str, point: Dict[str, Any]) -> None:
     debug_log(f"pulse_history_append key={token_key}")
 
 def record_live_pulse_history_from_candidates(
-    candidates: List[Dict[str, Any]],
     active_monitoring_keys: Set[str],
     chain_filter: str = "all",
     limit: int = 8,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
+    monitoring_rows = load_monitoring()
+    portfolio_rows = load_portfolio()
+    candidates = build_discovery_candidate_pool(
+        monitoring_rows=monitoring_rows,
+        portfolio_rows=portfolio_rows,
+        limit=max(30, int(limit or 8) * 8),
+    )
     now_iso = now_utc_iso()
     selected: List[Dict[str, Any]] = []
     seen: Set[str] = set()
@@ -11489,19 +11495,28 @@ def record_live_pulse_history_from_candidates(
         _append_pulse_history_point(key, point)
         appended += 1
     flushed = _flush_pulse_history_buffer() if appended > 0 else 0
+    reason = "ok" if appended > 0 else ("no_candidates" if len(selected) == 0 else "no_points")
     update_worker_runtime_state(
         updates={
             "pulse_history_writer_ran_at": now_iso,
+            "pulse_history_writer_ran": True,
             "pulse_history_writer_candidates": int(len(candidates or [])),
             "pulse_history_writer_appended": int(appended),
-            "pulse_history_writer_flushed": int(flushed),
+            "pulse_history_writer_flushed": bool(flushed > 0),
+            "pulse_history_writer_reason": reason,
         }
     )
     debug_log(
         f"pulse_history_writer_ran candidates={len(candidates or [])} "
-        f"selected={len(selected)} appended={appended} flushed={flushed}"
+        f"selected={len(selected)} appended={appended} flushed={bool(flushed > 0)} reason={reason}"
     )
-    return {"candidates": int(len(candidates or [])), "appended": int(appended), "flushed": int(flushed)}
+    return {
+        "ok": True,
+        "candidates_seen": int(len(selected)),
+        "points_appended": int(appended),
+        "flushed": bool(flushed > 0),
+        "reason": reason,
+    }
 
 
 def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict[str, Any]:
@@ -11545,6 +11560,10 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict
     shared_tokens = shared_history.get("tokens", {}) if isinstance(shared_history, dict) else {}
     shared_entry = shared_tokens.get(token_key, {}) if isinstance(shared_tokens, dict) else {}
     shared_points = shared_entry.get("points", []) if isinstance(shared_entry, dict) else []
+    scan_state = scanner_state_load() or {}
+    queue_state = scan_state.get("queue_state", {}) if isinstance(scan_state.get("queue_state"), dict) else {}
+    queue_row = queue_state.get(token_key.replace("|", ":"), {}) if isinstance(queue_state, dict) else {}
+    defer_reason = str((queue_row or {}).get("defer_reason") or "").strip().lower()
     shared_series = [parse_float((p or {}).get("score"), 0.0) for p in shared_points if parse_float((p or {}).get("score"), 0.0) > 0]
     if len(shared_series) >= min_points:
         debug_log("pulse_history_render_source=shared")
@@ -11605,7 +11624,11 @@ def _pulse_card_mini_sparkline(row: Dict[str, Any], min_points: int = 3) -> Dict
         }
 
     _log_pulse_sparkline_missing("no_score_or_price_series", token_key=token_key)
-    return {"series": "score", "values": [], "points": 0, "reason": "no_shared_points" if writer_seen else "writer_not_seen", "source": "none"}
+    if "429" in defer_reason or "rate_limit" in defer_reason:
+        reason = "rate_limited_deferred"
+    else:
+        reason = "no_shared_points" if writer_seen else "writer_not_seen"
+    return {"series": "score", "values": [], "points": 0, "reason": reason, "source": "none"}
 
 
 def _pulse_pair_payload(row: Dict[str, Any], best: Optional[Dict[str, Any]]) -> Dict[str, Any]:
