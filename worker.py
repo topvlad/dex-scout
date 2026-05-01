@@ -187,12 +187,14 @@ def _finalize_runtime_if_token_matches(
 def _run_scan_cycle() -> Dict[str, Any]:
     assert app is not None
     seeds_raw = SCANNER_SEEDS or str(app.DEFAULT_SEEDS)
-    return app.maybe_run_rotating_scanner(
+    scan_result = app.maybe_run_rotating_scanner(
         seeds_raw=seeds_raw,
         max_items=SCANNER_MAX_ITEMS,
         use_birdeye_trending=USE_BIRDEYE_TRENDING,
         birdeye_limit=BIRDEYE_LIMIT,
     )
+    pulse_result = _record_pulse_history_after_cycle()
+    return {"scan": scan_result, "pulse_history": pulse_result}
 
 
 def _run_monitor_cycle() -> Dict[str, Any]:
@@ -202,11 +204,38 @@ def _run_monitor_cycle() -> Dict[str, Any]:
         r for r in app.load_portfolio()
         if str(r.get("active", "1")).strip() == "1"
     ]
-    return app.run_priority_scanner_cycle(
+    monitor_result = app.run_priority_scanner_cycle(
         monitoring_rows=monitoring_rows,
         portfolio_rows=portfolio_rows,
         max_scans=3,
     )
+    pulse_result = _record_pulse_history_after_cycle()
+    return {"monitor": monitor_result, "pulse_history": pulse_result}
+
+
+def _record_pulse_history_after_cycle() -> Dict[str, Any]:
+    assert app is not None
+    monitoring_rows = app.load_monitoring()
+    active_monitoring_rows = app.build_active_monitoring_rows(monitoring_rows)
+    active_keys = {
+        app.canonical_token_key(row)
+        for row in active_monitoring_rows
+        if app.canonical_token_key(row)
+    }
+    result = app.record_live_pulse_history_from_candidates(
+        active_monitoring_keys=active_keys,
+        chain_filter="all",
+        limit=8,
+    )
+    print(
+        "[worker] pulse_history_writer_ran "
+        f"pulse_history_writer_candidates={result.get('candidates_seen', 0)} "
+        f"pulse_history_writer_appended={result.get('points_appended', 0)} "
+        f"pulse_history_writer_flushed={str(bool(result.get('flushed', False))).lower()} "
+        f"pulse_history_writer_reason={result.get('reason', 'unknown')}",
+        flush=True,
+    )
+    return result
 
 
 def _run_notify_cycle() -> Dict[str, Any]:
