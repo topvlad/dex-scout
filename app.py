@@ -4933,6 +4933,148 @@ def add_to_monitoring(
     return "OK"
 
 
+def parse_manual_monitoring_input(chain: str, raw_input: str) -> Dict[str, str]:
+    chain_norm = normalize_chain_name(chain or "")
+    text = str(raw_input or "").strip()
+    if not text:
+        return {"chain": chain_norm, "base_addr": "", "pair_addr": "", "source_url": ""}
+    src = text
+    if "dexscreener.com" in text.lower():
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(text)
+            path_parts = [p for p in str(parsed.path or "").split("/") if p]
+            if len(path_parts) >= 2:
+                chain_norm = normalize_chain_name(path_parts[0] or chain_norm)
+                if path_parts[1] == "token" and len(path_parts) >= 3:
+                    text = path_parts[2]
+                else:
+                    text = path_parts[1]
+        except Exception:
+            pass
+    addr = addr_store(chain_norm, text.strip())
+    return {"chain": chain_norm, "base_addr": addr, "pair_addr": "", "source_url": src}
+
+
+def canonical_add_to_monitoring(
+    chain: str,
+    raw_input: str,
+    note: str = "",
+    tag: str = "manual_watch",
+    score: float = 0.0,
+    source_label: str = "manual",
+) -> Dict[str, str]:
+    parsed = parse_manual_monitoring_input(chain, raw_input)
+    chain_norm = parsed.get("chain", "")
+    base_addr = parsed.get("base_addr", "")
+    if not base_addr:
+        return {"status": "NO_ADDR", "warning": "invalid token address"}
+    key = addr_key(chain_norm, base_addr)
+    rows = load_monitoring()
+    for r in rows:
+        if str(r.get("active", "1")).strip() == "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
+            return {"status": "EXISTS_ACTIVE", "dex_url": dex_url_for_token(chain_norm, base_addr)}
+    for r in rows:
+        if str(r.get("active", "1")).strip() != "1" and addr_key(r.get("chain", ""), r.get("base_addr", "")) == key:
+            if reactivate_monitoring(chain_norm, base_addr):
+                return {"status": "REACTIVATED", "dex_url": dex_url_for_token(chain_norm, base_addr)}
+            return {"status": "EXISTS_ARCHIVED"}
+    portfolio_warning = ""
+    for pf in load_portfolio():
+        if str(pf.get("active", "1")).strip() == "1" and addr_key(pf.get("chain", ""), pf.get("base_token_address", "")) == key:
+            portfolio_warning = "token already active in Portfolio"
+            break
+    best = None
+    try:
+        best = best_pair_for_token_cached(chain_norm, base_addr)
+    except Exception:
+        best = None
+    if isinstance(best, dict) and best.get("pairAddress"):
+        payload = _pulse_pair_payload(
+            {
+                "chain": chain_norm,
+                "chainId": chain_norm,
+                "base_addr": base_addr,
+                "baseToken": {"address": base_addr},
+                "note": note,
+                "tags": tag,
+            },
+            best,
+        )
+        payload["note"] = note
+        payload["tags"] = tag
+        res = add_to_monitoring(payload, float(score or 0.0), risk_level="UNKNOWN")
+        return {"status": res, "dex_url": str(best.get("url") or dex_url_for_token(chain_norm, base_addr)), "warning": portfolio_warning}
+    minimal = {
+        "ts_added": now_utc_str(),
+        "chain": chain_norm,
+        "base_symbol": "",
+        "base_addr": base_addr,
+        "pair_addr": "",
+        "score_init": str(score or 0.0),
+        "liq_init": "0",
+        "vol24_init": "0",
+        "vol5_init": "0",
+        "active": "1",
+        "ts_archived": "",
+        "archived_reason": "",
+        "last_score": str(score or 0.0),
+        "last_decision": "watch",
+        "priority_score": str(score or 0.0),
+        "last_decay_ts": now_utc_str(),
+        "decay_hits": "0",
+        "source_window": source_label,
+        "source_preset": "",
+        "risk": "",
+        "tp_target_pct": "",
+        "entry_suggest_usd": "",
+        "ts_last_seen": now_utc_str(),
+        "signal": "",
+        "smart_money": "0",
+        "entry_status": "TRACK ONLY",
+        "entry_score": "0",
+        "risk_level": "UNKNOWN",
+        "entry_state": "MANUAL WATCH",
+        "revisit_count": "0",
+        "revisit_after_ts": "",
+        "last_revisit_ts": "",
+        "portfolio_linked": "0",
+        "note": note,
+        "entry": "",
+        "decision_reason": "",
+        "signal_reason": "pair fetch deferred",
+        "timing_label": "NEUTRAL",
+        "gem_transition_score": str(GEM_TRANSITION_NEUTRAL),
+        "gem_transition_sufficient": "0",
+        "gem_transition_reason": "",
+        "weak_reason": "",
+        "in_portfolio": "0",
+        "toxic_flags": "",
+        "alert_sent": "0",
+        "lifecycle_state": LIFECYCLE_MONITORING,
+        "behavior_state": BEHAVIOR_STATE_DEFAULT,
+        "state_event": "DISCOVERED",
+        "transition_valid": "1",
+        "invalid_transition": "0",
+        "invalid_reason": "",
+        "invalid_from_state": "",
+        "invalid_attempted_to": "",
+        "invalid_event": "",
+        "updated_at": now_utc_str(),
+        "status": LIFECYCLE_MONITORING,
+        "tags": tag or "manual_watch",
+        "pair_fetch_deferred": "1",
+        "source": source_label,
+    }
+    rows.insert(0, minimal)
+    save_monitoring(rows)
+    return {
+        "status": "OK_DEFERRED",
+        "dex_url": dex_url_for_token(chain_norm, base_addr),
+        "warning": "pair data not found yet, will retry on next cycles",
+    }
+
+
 def archive_monitoring(
     chain: str,
     base_addr: str,
@@ -11753,15 +11895,16 @@ def page_scout(cfg: Dict[str, Any]):
         btn3, btn4 = st.columns(2)
         with btn3:
             if st.button("Add to Monitoring", key=f"add_mon_{pair_addr}", use_container_width=True):
-                add_to_monitoring(
-                    pobj,
-                    float(score),
-                    entry_status=entry_status,
-                    entry_score=float(entry_score),
-                    risk_level=risk_level,
+                add_res = canonical_add_to_monitoring(
+                    chain=str(chain_id or ""),
+                    raw_input=str(base_addr or ""),
+                    note="from scout",
+                    tag="manual_watch",
+                    score=float(score),
+                    source_label="scout",
                 )
                 st.session_state["scout_hidden"].add(base_addr)
-                st.toast("Added to monitoring")
+                st.toast(f"Monitoring: {add_res.get('status', 'OK')}")
                 request_rerun()
         with btn4:
             if st.button("Log → Portfolio (I swapped)", key=f"log_pf_{pair_addr}", use_container_width=True):
@@ -11945,6 +12088,34 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             reset_monitoring()
             st.rerun()
         st.caption("Clears monitoring.csv. Does not restore history automatically.")
+
+    st.markdown("### Manual add to Monitoring")
+    m1, m2, m3 = st.columns([2, 5, 3])
+    with m1:
+        manual_chain = st.selectbox("chain", ["solana", "bsc"], index=0, key="manual_mon_chain")
+    with m2:
+        manual_raw = st.text_input("CA / pair address / DexScreener URL", key="manual_mon_input")
+    with m3:
+        manual_tag = st.selectbox("tag", ["manual_watch", "high_risk_watch"], index=0, key="manual_mon_tag")
+    manual_note = st.text_input("note (optional)", key="manual_mon_note")
+    if st.button("Manual add", key="manual_add_submit", use_container_width=False):
+        res = canonical_add_to_monitoring(
+            chain=manual_chain,
+            raw_input=manual_raw,
+            note=manual_note,
+            tag=manual_tag,
+            source_label="manual",
+        )
+        if res.get("status") in {"OK", "OK_DEFERRED", "EXISTS_ACTIVE", "REACTIVATED"}:
+            st.success(f"Monitoring: {res.get('status')}")
+            if res.get("warning"):
+                st.warning(str(res.get("warning")))
+            if res.get("dex_url"):
+                link_button("Dex", str(res.get("dex_url")), use_container_width=False, key=f"manual_dex_{hkey(str(res.get('dex_url')))}")
+            load_monitoring_rows_cached.clear()
+            request_rerun()
+        else:
+            st.warning(f"Manual add failed: {res.get('status')}")
 
     if not active_rows:
         st.info("Monitoring is empty. Run scanner now to fetch and save tokens.")
@@ -12199,20 +12370,20 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.caption(f"Low liquidity ({fmt_usd(liq_usd)} < {fmt_usd(pulse_min_liq_usd)})")
                 else:
                     if st.button("+ Monitor", use_container_width=True, key=f"pulse_add_{idx}_{hkey(card_key)}"):
-                        payload = _pulse_pair_payload(row, best if isinstance(best, dict) else None)
-                        add_res = add_to_monitoring(
-                            payload,
-                            float(score),
-                            entry_status=str(row.get("entry_status") or row.get("entry") or ""),
-                            entry_score=float(parse_float(row.get("entry_score", score), score)),
-                            risk_level=str(row.get("risk_level") or row.get("risk") or ""),
+                        add_res = canonical_add_to_monitoring(
+                            chain=chain,
+                            raw_input=base_addr,
+                            note="from live pulse",
+                            tag="manual_watch",
+                            score=float(score),
+                            source_label="live_pulse",
                         )
-                        if add_res in {"OK", "EXISTS_ACTIVE"}:
+                        if add_res.get("status") in {"OK", "OK_DEFERRED", "EXISTS_ACTIVE", "REACTIVATED"}:
                             st.success("Added to Monitoring.")
-                        elif add_res == "EXISTS_ARCHIVED":
-                            st.info("Token already archived. Re-activate from Archive if needed.")
                         else:
-                            st.warning(f"Monitor action: {add_res}")
+                            st.warning(f"Monitor action: {add_res.get('status')}")
+                        if add_res.get("warning"):
+                            st.warning(str(add_res.get("warning")))
                         load_monitoring_rows_cached.clear()
                         request_rerun()
 
