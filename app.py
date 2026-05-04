@@ -689,6 +689,30 @@ def storage_get_key_size(key: str) -> Optional[int]:
     return None
 
 
+
+
+def storage_list_sizes(limit: int = 200) -> List[Dict[str, Any]]:
+    if not _sb_ok():
+        return []
+    rows, status = _sb_select_rows(
+        table="app_storage_sizes",
+        select="key,bytes,updated_at",
+        limit=max(1, int(limit or 200)),
+    )
+    if not status.get("ok") or not isinstance(rows, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        out.append({
+            "key": str(row.get("key") or ""),
+            "bytes": int(parse_float(row.get("bytes"), 0)),
+            "updated_at": str(row.get("updated_at") or ""),
+        })
+    out.sort(key=lambda r: int(r.get("bytes") or 0), reverse=True)
+    return out
+
 def sb_get_storage(key: str, allow_oversized: bool = False) -> Optional[str]:
     """
     Returns content for key from public.app_storage, or None if not found/readable.
@@ -791,11 +815,11 @@ def storage_delete_key(key: str) -> bool:
     except Exception:
         return False
 
-def _sb_delete_rows(table: str, filters: Dict[str, str]) -> int:
+def _sb_delete_rows(table: str, filters: Dict[str, str], select_col: str = "run_id") -> int:
     if not _sb_ok():
         return 0
     try:
-        params = {"select": "run_id"}
+        params = {"select": str(select_col or "run_id")}
         params.update({str(k): str(v) for k, v in (filters or {}).items()})
         headers = _sb_headers()
         headers["Prefer"] = "return=representation"
@@ -808,12 +832,25 @@ def _sb_delete_rows(table: str, filters: Dict[str, str]) -> int:
         return 0
 
 def run_storage_maintenance_cycle() -> Dict[str, Any]:
-    summary: Dict[str, Any] = {"keys_trimmed": [], "rows_deleted": {}, "bytes_before_est": 0, "bytes_after_est": 0, "errors": []}
+    summary: Dict[str, Any] = {"keys_trimmed": [], "keys_deleted": [], "rows_deleted": {}, "bytes_before_est": 0, "bytes_after_est": 0, "errors": []}
     if not _env_bool("STORAGE_MAINTENANCE_ENABLED", True):
         summary["reason"] = "disabled"
         return summary
+    now_epoch = time.time()
+    stamp = datetime.utcfromtimestamp(now_epoch).strftime("%Y-%m-%d")
+    throttle_key = "maintenance:last_storage_maintenance_day"
+    raw_state = sb_get_storage("scanner_state.json", allow_oversized=True) or "{}"
+    try:
+        throttle_state = json.loads(raw_state) if raw_state else {}
+    except Exception:
+        throttle_state = {}
+    if isinstance(throttle_state, dict) and str(throttle_state.get(throttle_key) or "") == stamp:
+        summary["reason"] = "throttled_daily"
+        return summary
+
     snapshot = get_supabase_storage_budget_snapshot()
     summary["bytes_before_est"] = int(snapshot.get("supabase_bytes_read_est", 0)) + int(snapshot.get("supabase_bytes_written_est", 0))
+
     for key in ("tg_state.json", "scanner_state.json", PULSE_HISTORY_KEY):
         raw = sb_get_storage(key, allow_oversized=True)
         if not raw:
@@ -829,17 +866,65 @@ def run_storage_maintenance_cycle() -> Dict[str, Any]:
                     obj["token_state"] = dict(pairs)
             if key == "scanner_state.json" and isinstance(obj, dict):
                 obj["recent_candidates"] = list((obj.get("recent_candidates") or [])[-SCANNER_STATE_RECENT_CANDIDATES_MAX:])
+            if key == PULSE_HISTORY_KEY and isinstance(obj, list):
+                obj = obj[-2000:]
             if sb_put_storage(key, json.dumps(obj, ensure_ascii=False)):
                 summary["keys_trimmed"].append(key)
         except Exception as exc:
             summary["errors"].append(f"{key}:{type(exc).__name__}:{exc}")
+
+    # trim monitoring history locally to header-only in local-only mode
+    key = storage_key_for_path(MON_HISTORY_CSV)
+    try:
+        raw = sb_get_storage(key, allow_oversized=True)
+        if raw is not None:
+            rows = load_csv_from_string(raw, HIST_FIELDS)
+            if MON_HISTORY_SUPABASE_MODE == "local_only":
+                content = csv_to_string([], HIST_FIELDS)
+            else:
+                keep = max(1, _env_int("MONITORING_HISTORY_REMOTE_MAX_ROWS", 8000))
+                content = csv_to_string(rows[-keep:], HIST_FIELDS)
+            if sb_put_storage(key, content):
+                summary["keys_trimmed"].append(key)
+    except Exception as exc:
+        summary["errors"].append(f"{key}:{type(exc).__name__}:{exc}")
+
+    # trim journals
+    for pth, fields in ((SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS), (PORTFOLIO_RECO_LOG_CSV, PORTFOLIO_RECO_LOG_FIELDS), (HEALTH_OVERRIDE_JOURNAL_CSV, HEALTH_OVERRIDE_JOURNAL_FIELDS), (PORTFOLIO_ACTION_JOURNAL_CSV, PORTFOLIO_ACTION_JOURNAL_FIELDS)):
+        try:
+            rows = load_csv(pth, fields)
+            keep = rows[-5000:]
+            if len(keep) != len(rows):
+                save_csv(pth, keep, fields)
+                summary["keys_trimmed"].append(os.path.basename(pth))
+        except Exception as exc:
+            summary["errors"].append(f"{os.path.basename(pth)}:{type(exc).__name__}:{exc}")
+
+    delete_batch_max = max(1, _env_int("STORAGE_MAINTENANCE_DELETE_BATCH_MAX", 500))
+    deleted_count = 0
+    for item in storage_list_sizes(limit=max(1000, delete_batch_max * 2)):
+        if deleted_count >= delete_batch_max:
+            break
+        key = str((item or {}).get("key") or "")
+        key_lower = key.lower()
+        if not key:
+            continue
+        if key.startswith("backup/") or key.startswith("backup_") or key_lower.endswith(".bak") or ("snapshot" in key_lower):
+            if storage_delete_key(key):
+                summary["keys_deleted"].append(key)
+                deleted_count += 1
+
     retention_days = max(1, _env_int("APP_STORAGE_RETENTION_DAYS", 14))
-    now_epoch = time.time()
     hb_cutoff = now_epoch - (max(1, min(14, retention_days)) * 86400)
     jr_cutoff = now_epoch - (retention_days * 86400)
-    summary["rows_deleted"]["job_heartbeats"] = _sb_delete_rows("job_heartbeats", {"heartbeat_epoch": f"lt.{hb_cutoff}"})
-    summary["rows_deleted"]["job_runs"] = _sb_delete_rows("job_runs", {"started_ts": f"lt.{datetime.utcfromtimestamp(jr_cutoff).strftime('%Y-%m-%dT%H:%M:%SZ')}"})
-    summary["rows_deleted"]["locks"] = _sb_delete_rows("locks", {"expires_epoch": f"lt.{now_epoch}"})
+    summary["rows_deleted"]["job_heartbeats"] = _sb_delete_rows("job_heartbeats", {"heartbeat_epoch": f"lt.{hb_cutoff}"}, select_col="job_name")
+    summary["rows_deleted"]["job_runs"] = _sb_delete_rows("job_runs", {"started_ts": f"lt.{datetime.utcfromtimestamp(jr_cutoff).strftime('%Y-%m-%dT%H:%M:%SZ')}"}, select_col="run_id")
+    summary["rows_deleted"]["locks"] = _sb_delete_rows("locks", {"expires_epoch": f"lt.{now_epoch}"}, select_col="lock_key")
+
+    if isinstance(throttle_state, dict):
+        throttle_state[throttle_key] = stamp
+        sb_put_storage("scanner_state.json", json.dumps(throttle_state, ensure_ascii=False))
+
     snapshot_after = get_supabase_storage_budget_snapshot()
     summary["bytes_after_est"] = int(snapshot_after.get("supabase_bytes_read_est", 0)) + int(snapshot_after.get("supabase_bytes_written_est", 0))
     return summary
