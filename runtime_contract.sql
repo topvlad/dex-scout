@@ -60,3 +60,11 @@ create index if not exists job_runs_job_name_idx on public.job_runs (job_name);
 --
 -- Currently the worker uses SUPABASE_SERVICE_ROLE_KEY which bypasses RLS,
 -- so this is low priority — but worth doing before any public-facing reads.
+
+create or replace view public.app_storage_sizes as
+select
+    key,
+    octet_length(content) as bytes,
+    updated_at
+from public.app_storage
+order by octet_length(content) desc;

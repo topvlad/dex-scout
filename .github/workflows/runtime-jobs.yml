@@ -3,7 +3,7 @@ name: Runtime Jobs
 on:
   schedule:
     # Regular autonomous backend runtime (UTC)
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       job_mode:
@@ -18,6 +18,7 @@ on:
           - notify_cycle
           - digest_cycle
           - outcome_cycle
+          - maintenance_cycle
 
 permissions:
   contents: read
@@ -32,6 +33,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+    env:
+      RUNTIME_EGRESS_PROFILE: ${{ vars.RUNTIME_EGRESS_PROFILE || 'free_tier' }}
     steps:
       - name: Set JOB_MODE matrix
         id: set-matrix
@@ -43,6 +46,23 @@ jobs:
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_MODE" != "all" ]]; then
             MATRIX_JSON=$(printf '{"job_mode":["%s"]}' "$INPUT_MODE")
+          elif [[ "$EVENT_NAME" == "schedule" && "${RUNTIME_EGRESS_PROFILE}" == "free_tier" ]]; then
+            hour="$(date -u +%H)"
+            minute="$(date -u +%M)"
+            modes=("notify_cycle")
+            if (( 10#$hour % 2 == 0 )) && (( 10#$minute == 0 )); then
+              modes+=("scan_cycle")
+            fi
+            if (( 10#$hour % 2 == 1 )) && (( 10#$minute == 0 )); then
+              modes+=("monitor_cycle")
+            fi
+            if (( 10#$hour % 6 == 0 )) && (( 10#$minute == 0 )); then
+              modes+=("digest_cycle" "outcome_cycle")
+            fi
+            if (( 10#$hour == 2 )) && (( 10#$minute == 0 )); then
+              modes+=("maintenance_cycle")
+            fi
+            MATRIX_JSON="{\"job_mode\":[\"$(IFS='","'; echo "${modes[*]}")\"]}"
           else
             MATRIX_JSON='{"job_mode":["scan_cycle","monitor_cycle","notify_cycle","digest_cycle","outcome_cycle"]}'
           fi
@@ -62,6 +82,9 @@ jobs:
       WORKFLOW_TIMEOUT_MINUTES: "35"
       PYTHONUNBUFFERED: "1"
       JOB_MODE: ${{ matrix.job_mode }}
+      RUNTIME_JOBS_ENABLED: ${{ vars.RUNTIME_JOBS_ENABLED || 'true' }}
+      RUNTIME_SKIP_ON_SUPABASE_UNAVAILABLE: ${{ vars.RUNTIME_SKIP_ON_SUPABASE_UNAVAILABLE || 'true' }}
+      RUNTIME_EGRESS_PROFILE: ${{ vars.RUNTIME_EGRESS_PROFILE || 'free_tier' }}
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       # Required runtime secrets
@@ -92,10 +115,18 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Runtime preflight
+        id: preflight
         shell: bash
         continue-on-error: false
         run: |
           set -euo pipefail
+          if [[ "${RUNTIME_JOBS_ENABLED}" == "false" ]]; then
+            echo "runtime skipped: disabled by RUNTIME_JOBS_ENABLED"
+            echo "runtime skipped: disabled by RUNTIME_JOBS_ENABLED" >> "$GITHUB_STEP_SUMMARY"
+            echo "skip_runtime=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip_runtime=false" >> "$GITHUB_OUTPUT"
 
           echo "[runtime-jobs][preflight] mode=${JOB_MODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "[runtime-jobs][preflight] env JOB_MODE_set=$([[ -n "${JOB_MODE:-}" ]] && echo true || echo false)"
@@ -191,6 +222,11 @@ jobs:
           print("[runtime-jobs][preflight] runtime_contract=" + json.dumps(safe_contract, ensure_ascii=False), flush=True)
 
           if not contract.get("ok"):
+              if str(os.getenv("RUNTIME_SKIP_ON_SUPABASE_UNAVAILABLE", "true")).strip().lower() in {"1","true","yes","on"} and app.is_supabase_unavailable_status(contract):
+                  print("[runtime-jobs][preflight] runtime skipped: external storage unavailable/quota paused", flush=True)
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                      fh.write("skip_runtime=true\n")
+                  sys.exit(0)
               print(
                   "::error::[runtime-jobs][preflight] runtime_contract_error:"
                   + str(contract.get("code") or "unknown")
@@ -204,10 +240,15 @@ jobs:
           PY
 
       - name: Runtime start/heartbeat/finish/fail logs
+        if: steps.preflight.outputs.skip_runtime != 'true'
         shell: bash
         continue-on-error: false
         run: |
           set -euo pipefail
+          if [[ "${RUNTIME_JOBS_ENABLED}" == "false" ]]; then
+            echo "runtime skipped: disabled by RUNTIME_JOBS_ENABLED" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
           echo "[runtime-jobs] start mode=${JOB_MODE} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
