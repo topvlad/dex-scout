@@ -67,6 +67,16 @@ def _env_float(name: str, default: float) -> float:
     except (TypeError, ValueError):
         return default
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
 
 def _maybe_autorefresh(interval_ms: int, key: str):
     """Best-effort autorefresh without extra deps."""
@@ -113,11 +123,12 @@ SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
 ENTRY_MODE = "aggressive"
 TEMP_DISABLE_BEST_PAIR = False
 USE_HEAVY_MIGRATION_CHECK = not WORKER_FAST_MODE
+LOW_EGRESS_MODE = str(os.getenv("LOW_EGRESS_MODE", "true")).strip().lower() in {"1", "true", "yes", "on"}
 STORAGE_VERIFY_MODE = str(
-    os.getenv("STORAGE_VERIFY_MODE", "sampled" if WORKER_FAST_MODE else "always")
+    os.getenv("STORAGE_VERIFY_MODE", "off" if WORKER_FAST_MODE else "always")
 ).strip().lower()
 if STORAGE_VERIFY_MODE not in {"off", "sampled", "always"}:
-    STORAGE_VERIFY_MODE = "sampled" if WORKER_FAST_MODE else "always"
+    STORAGE_VERIFY_MODE = "off" if WORKER_FAST_MODE else "always"
 STORAGE_VERIFY_SAMPLE_RATE = min(
     1.0,
     max(0.0, _env_float("STORAGE_VERIFY_SAMPLE_RATE", 0.2 if WORKER_FAST_MODE else 1.0)),
@@ -142,6 +153,19 @@ _MON_HISTORY_BUFFER: List[Dict[str, Any]] = []
 _MON_HISTORY_BUFFER_LAST_FLUSH_TS: float = 0.0
 _MON_HISTORY_REMOTE_BACKUP_LAST_TS: float = 0.0
 _STORAGE_METRICS: Dict[str, int] = {"writes": 0, "roundtrip_checks": 0}
+SUPABASE_STORAGE_READ_CACHE_TTL_SEC = max(5, _env_int("SUPABASE_STORAGE_READ_CACHE_TTL_SEC", 600))
+SUPABASE_MAX_BLOB_READ_BYTES = max(50_000, _env_int("SUPABASE_MAX_BLOB_READ_BYTES", 500_000))
+APP_STORAGE_MAX_SAFE_BYTES = max(50_000, _env_int("APP_STORAGE_MAX_SAFE_BYTES", 500_000))
+TG_STATE_SENT_EVENTS_MAX = max(100, _env_int("TG_STATE_SENT_EVENTS_MAX", 500))
+TG_STATE_TOKEN_STATE_MAX = max(200, _env_int("TG_STATE_TOKEN_STATE_MAX", 1000))
+SCANNER_STATE_RECENT_CANDIDATES_MAX = max(50, _env_int("SCANNER_STATE_RECENT_CANDIDATES_MAX", 200))
+_SB_READ_CACHE: Dict[str, Tuple[float, Optional[str]]] = {}
+_SB_BUDGET: Dict[str, Any] = {
+    "supabase_bytes_read_est": 0,
+    "supabase_bytes_written_est": 0,
+    "supabase_reads_by_key": {},
+    "supabase_writes_by_key": {},
+}
 PULSE_HISTORY_KEY = "pulse_history_compact.json"
 PULSE_HISTORY_MAX_POINTS = max(8, min(12, _env_int("PULSE_HISTORY_MAX_POINTS", 10)))
 PULSE_HISTORY_MAX_TOKENS = max(30, _env_int("PULSE_HISTORY_MAX_TOKENS", 180))
@@ -556,6 +580,29 @@ def _sb_headers() -> Dict[str, str]:
 def _sb_table_url(table: str) -> str:
     return f"{SUPABASE_URL}/rest/v1/{table}"
 
+def _sb_budget_bump(kind: str, key: str, byte_count: int) -> None:
+    metric_bytes = "supabase_bytes_read_est" if kind == "read" else "supabase_bytes_written_est"
+    metric_by_key = "supabase_reads_by_key" if kind == "read" else "supabase_writes_by_key"
+    _SB_BUDGET[metric_bytes] = int(_SB_BUDGET.get(metric_bytes, 0)) + max(0, int(byte_count or 0))
+    by_key = _SB_BUDGET.get(metric_by_key) or {}
+    by_key[str(key)] = int(by_key.get(str(key), 0)) + max(0, int(byte_count or 0))
+    _SB_BUDGET[metric_by_key] = by_key
+
+def reset_supabase_storage_budget_counters() -> None:
+    _SB_READ_CACHE.clear()
+    _SB_BUDGET["supabase_bytes_read_est"] = 0
+    _SB_BUDGET["supabase_bytes_written_est"] = 0
+    _SB_BUDGET["supabase_reads_by_key"] = {}
+    _SB_BUDGET["supabase_writes_by_key"] = {}
+
+def get_supabase_storage_budget_snapshot() -> Dict[str, Any]:
+    return dict(_SB_BUDGET)
+
+def is_supabase_unavailable_status(status: Dict[str, Any]) -> bool:
+    http_status = int(parse_float((status or {}).get("http_status", 0), 0))
+    code = str((status or {}).get("code") or "").lower()
+    return http_status in {402, 403, 429, 500, 502, 503, 504} or "supabase_" in code
+
 
 def _runtime_status(ok: bool, code: str, message: str = "", **extra: Any) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
@@ -615,7 +662,34 @@ def _sb_upsert_row(table: str, payload: Dict[str, Any], on_conflict: str) -> Dic
         debug_log(f"runtime_upsert_exception table={table} err={type(e).__name__}:{e}")
         return status
 
-def sb_get_storage(key: str) -> Optional[str]:
+def storage_get_key_size(key: str) -> Optional[int]:
+    if not _sb_ok():
+        return None
+    key = str(key or "").strip()
+    if not key:
+        return None
+    rows, status = _sb_select_rows(
+        table="app_storage_sizes",
+        filters={"key": f"eq.{key}"},
+        select="key,bytes,updated_at",
+        limit=1,
+    )
+    if rows and status.get("ok"):
+        val = rows[0].get("bytes")
+        return int(parse_float(val, 0))
+    rows2, status2 = _sb_select_rows(
+        table="app_storage",
+        filters={"key": f"eq.{key}"},
+        select="key,updated_at,content",
+        limit=1,
+    )
+    if rows2 and status2.get("ok"):
+        content = str(rows2[0].get("content") or "")
+        return len(content.encode("utf-8"))
+    return None
+
+
+def sb_get_storage(key: str, allow_oversized: bool = False) -> Optional[str]:
     """
     Returns content for key from public.app_storage, or None if not found/readable.
     Reliability refactor: HTTP 4xx/5xx responses degrade to None instead of bubbling up.
@@ -623,6 +697,15 @@ def sb_get_storage(key: str) -> Optional[str]:
     if not USE_SUPABASE:
         return None
     try:
+        now_epoch = time.time()
+        cached = _SB_READ_CACHE.get(key)
+        if cached and (now_epoch - float(cached[0])) <= SUPABASE_STORAGE_READ_CACHE_TTL_SEC:
+            return cached[1]
+        if LOW_EGRESS_MODE and not allow_oversized:
+            key_size = storage_get_key_size(key)
+            if key_size is not None and key_size > SUPABASE_MAX_BLOB_READ_BYTES:
+                debug_log(f"storage_blob_over_budget key={key} bytes={key_size} source=size_probe")
+                return None
         url = _sb_table_url("app_storage")
         params = {"select": "content", "key": f"eq.{key}"}
         r = requests.get(url, headers=_sb_headers(), params=params, timeout=12)
@@ -637,6 +720,12 @@ def sb_get_storage(key: str) -> Optional[str]:
             debug_log(f"supabase_read_empty key={key}")
             return None
         content = (data[0].get("content") or "")
+        bytes_count = len(content.encode("utf-8")) if isinstance(content, str) else 0
+        _sb_budget_bump("read", key, bytes_count)
+        if LOW_EGRESS_MODE and (not allow_oversized) and bytes_count > SUPABASE_MAX_BLOB_READ_BYTES:
+            debug_log(f"storage_blob_over_budget key={key} bytes={bytes_count}")
+            return None
+        _SB_READ_CACHE[key] = (now_epoch, content)
         debug_log(f"supabase_read_ok key={key} bytes={len(content)}")
         return content
     except Exception as e:
@@ -665,7 +754,8 @@ def sb_put_storage(key: str, content: str) -> bool:
             err_preview = (res.text or "").strip().replace("\n", " ")[:200]
             debug_log(f"supabase_write_failed key={key} status={res.status_code} body={err_preview}")
             return False
-
+        _SB_READ_CACHE[key] = (time.time(), content)
+        _sb_budget_bump("write", key, len((content or "").encode("utf-8")))
         debug_log(f"supabase_write_ok key={key} bytes={len(content)}")
         return True
     except Exception as e:
@@ -685,6 +775,148 @@ def _is_monitoring_history_key(key: str) -> bool:
 def local_fallback_path(path: str) -> str:
     ensure_storage()
     return path
+
+def storage_read_text(key: str) -> Optional[str]:
+    return sb_get_storage(key)
+
+def storage_write_text(key: str, content: str) -> bool:
+    return sb_put_storage(key, content)
+
+def storage_delete_key(key: str) -> bool:
+    if not _sb_ok():
+        return False
+    try:
+        resp = requests.delete(_sb_table_url("app_storage"), headers=_sb_headers(), params={"key": f"eq.{key}"}, timeout=12)
+        return resp.status_code < 400
+    except Exception:
+        return False
+
+def storage_list_sizes(limit: int = 200) -> List[Dict[str, Any]]:
+    rows, status = _sb_select_rows(
+        table="app_storage_sizes",
+        select="key,bytes,updated_at",
+        limit=max(1, int(limit)),
+    )
+    if not rows or not status.get("ok"):
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "key": str(row.get("key") or ""),
+                "bytes": int(parse_float(row.get("bytes", 0), 0)),
+                "updated_at": str(row.get("updated_at") or ""),
+            }
+        )
+    return out
+
+def _sb_delete_rows(table: str, filters: Dict[str, str], select_col: str = "id") -> int:
+    if not _sb_ok():
+        return 0
+    try:
+        params = {"select": str(select_col or "id")}
+        params.update({str(k): str(v) for k, v in (filters or {}).items()})
+        headers = _sb_headers()
+        headers["Prefer"] = "return=representation"
+        resp = requests.delete(_sb_table_url(table), headers=headers, params=params, timeout=12)
+        if resp.status_code >= 400:
+            return 0
+        data = resp.json() if resp.text else []
+        return len(data) if isinstance(data, list) else 0
+    except Exception:
+        return 0
+
+def _trim_csv_text(content: str, max_rows: int) -> str:
+    lines = (content or "").splitlines()
+    if not lines:
+        return ""
+    header = lines[0]
+    body = lines[1:]
+    trimmed = body[-max(0, int(max_rows)) :]
+    return "\n".join([header] + trimmed) + "\n"
+
+def run_storage_maintenance_cycle() -> Dict[str, Any]:
+    summary: Dict[str, Any] = {"keys_trimmed": [], "keys_deleted": [], "rows_deleted": {}, "bytes_before_est": 0, "bytes_after_est": 0, "errors": []}
+    if not _env_bool("STORAGE_MAINTENANCE_ENABLED", True):
+        summary["reason"] = "disabled"
+        return summary
+    maintenance_state, _ = read_runtime_state(state_key="storage_maintenance")
+    now_epoch = time.time()
+    min_interval_sec = 86400
+    last_epoch = float(parse_float((maintenance_state or {}).get("last_run_epoch", 0), 0))
+    if last_epoch > 0 and (now_epoch - last_epoch) < min_interval_sec:
+        summary["reason"] = "throttled_once_per_day"
+        return summary
+    snapshot = get_supabase_storage_budget_snapshot()
+    summary["bytes_before_est"] = int(snapshot.get("supabase_bytes_read_est", 0)) + int(snapshot.get("supabase_bytes_written_est", 0))
+    mon_hist_max_rows = max(100, _env_int("MONITORING_HISTORY_REMOTE_MAX_ROWS", 2000))
+    journal_max_rows = max(200, _env_int("JOURNAL_REMOTE_MAX_ROWS", 5000))
+    sizes = storage_list_sizes(limit=500)
+    for item in sizes:
+        key = str(item.get("key") or "")
+        key_lower = key.lower()
+        try:
+            if key_lower.endswith(".bak") or key_lower.startswith("backup_") or "snapshot" in key_lower:
+                if storage_delete_key(key):
+                    summary["keys_deleted"].append(key)
+                continue
+            if key == storage_key_for_path(MON_HISTORY_CSV):
+                raw = sb_get_storage(key, allow_oversized=True) or ""
+                if MON_HISTORY_SUPABASE_MODE == "local_only":
+                    header = raw.splitlines()[0] if raw else "ts_utc,token_key,chain,score,action,event_type,note"
+                    compact = (header + "\n") if header else ""
+                    if sb_put_storage(key, compact):
+                        summary["keys_trimmed"].append(key)
+                else:
+                    trimmed = _trim_csv_text(raw, mon_hist_max_rows)
+                    if trimmed and trimmed != raw and sb_put_storage(key, trimmed):
+                        summary["keys_trimmed"].append(key)
+                continue
+            if key in {
+                storage_key_for_path(SIGNAL_JOURNAL_CSV),
+                storage_key_for_path(PORTFOLIO_RECO_LOG_CSV),
+                storage_key_for_path(PORTFOLIO_ACTION_JOURNAL_CSV),
+                storage_key_for_path(HEALTH_OVERRIDE_JOURNAL_CSV),
+            }:
+                raw = sb_get_storage(key, allow_oversized=True) or ""
+                trimmed = _trim_csv_text(raw, journal_max_rows)
+                if trimmed and trimmed != raw and sb_put_storage(key, trimmed):
+                    summary["keys_trimmed"].append(key)
+        except Exception as exc:
+            summary["errors"].append(f"{key}:{type(exc).__name__}:{exc}")
+
+    for key in ("tg_state.json", "scanner_state.json", PULSE_HISTORY_KEY):
+        raw = sb_get_storage(key, allow_oversized=True)
+        if not raw:
+            continue
+        if len(raw.encode("utf-8")) <= APP_STORAGE_MAX_SAFE_BYTES:
+            continue
+        try:
+            obj = json.loads(raw)
+            if key == "tg_state.json" and isinstance(obj, dict):
+                obj["sent_events"] = list((obj.get("sent_events") or [])[-TG_STATE_SENT_EVENTS_MAX:])
+                if isinstance(obj.get("token_state"), dict):
+                    pairs = list(obj["token_state"].items())[-TG_STATE_TOKEN_STATE_MAX:]
+                    obj["token_state"] = dict(pairs)
+            if key == "scanner_state.json" and isinstance(obj, dict):
+                obj["recent_candidates"] = list((obj.get("recent_candidates") or [])[-SCANNER_STATE_RECENT_CANDIDATES_MAX:])
+            if sb_put_storage(key, json.dumps(obj, ensure_ascii=False)):
+                summary["keys_trimmed"].append(key)
+        except Exception as exc:
+            summary["errors"].append(f"{key}:{type(exc).__name__}:{exc}")
+    retention_days = max(1, _env_int("APP_STORAGE_RETENTION_DAYS", 14))
+    hb_cutoff = now_epoch - (max(1, min(14, retention_days)) * 86400)
+    jr_cutoff = now_epoch - (retention_days * 86400)
+    summary["rows_deleted"]["job_heartbeats"] = _sb_delete_rows("job_heartbeats", {"heartbeat_epoch": f"lt.{hb_cutoff}"}, select_col="job_name")
+    summary["rows_deleted"]["job_runs"] = _sb_delete_rows("job_runs", {"started_ts": f"lt.{datetime.utcfromtimestamp(jr_cutoff).strftime('%Y-%m-%dT%H:%M:%SZ')}"}, select_col="run_id")
+    summary["rows_deleted"]["locks"] = _sb_delete_rows("locks", {"expires_epoch": f"lt.{now_epoch}"}, select_col="lock_key")
+    update_runtime_state(
+        updates={"last_run_epoch": now_epoch, "last_run_ts": now_utc_str(), "last_summary": summary},
+        state_key="storage_maintenance",
+    )
+    snapshot_after = get_supabase_storage_budget_snapshot()
+    summary["bytes_after_est"] = int(snapshot_after.get("supabase_bytes_read_est", 0)) + int(snapshot_after.get("supabase_bytes_written_est", 0))
+    return summary
 
 
 # Storage + lock (CSV fallback)
