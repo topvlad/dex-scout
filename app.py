@@ -598,10 +598,46 @@ def reset_supabase_storage_budget_counters() -> None:
 def get_supabase_storage_budget_snapshot() -> Dict[str, Any]:
     return dict(_SB_BUDGET)
 
+def _status_text_contains_unavailable_markers(payload: Any) -> bool:
+    markers = (
+        "supabase_",
+        "exceed_egress_quota",
+        "quota",
+        "restricted",
+        "unavailable",
+        "service for this project is restricted",
+        "supabase support",
+    )
+    text = str(payload or "").lower()
+    return any(marker in text for marker in markers)
+
+
 def is_supabase_unavailable_status(status: Dict[str, Any]) -> bool:
-    http_status = int(parse_float((status or {}).get("http_status", 0), 0))
-    code = str((status or {}).get("code") or "").lower()
-    return http_status in {402, 403, 429, 500, 502, 503, 504} or "supabase_" in code
+    unavailable_http_statuses = {402, 403, 429, 500, 502, 503, 504}
+    payload = status or {}
+
+    http_status = int(parse_float(payload.get("http_status", 0), 0))
+    if http_status in unavailable_http_statuses:
+        return True
+
+    for field in ("code", "detail", "message"):
+        if _status_text_contains_unavailable_markers(payload.get(field)):
+            return True
+
+    failures = payload.get("failures")
+    if not isinstance(failures, list):
+        return False
+
+    for failure in failures:
+        if not isinstance(failure, dict):
+            continue
+        nested_http_status = int(parse_float(failure.get("http_status", 0), 0))
+        if nested_http_status in unavailable_http_statuses:
+            return True
+        for field in ("code", "detail", "message"):
+            if _status_text_contains_unavailable_markers(failure.get(field)):
+                return True
+    return False
 
 
 def _runtime_status(ok: bool, code: str, message: str = "", **extra: Any) -> Dict[str, Any]:
