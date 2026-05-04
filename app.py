@@ -832,7 +832,7 @@ def _sb_delete_rows(table: str, filters: Dict[str, str], select_col: str = "run_
         return 0
 
 def run_storage_maintenance_cycle() -> Dict[str, Any]:
-    summary: Dict[str, Any] = {"keys_trimmed": [], "rows_deleted": {}, "bytes_before_est": 0, "bytes_after_est": 0, "errors": []}
+    summary: Dict[str, Any] = {"keys_trimmed": [], "keys_deleted": [], "rows_deleted": {}, "bytes_before_est": 0, "bytes_after_est": 0, "errors": []}
     if not _env_bool("STORAGE_MAINTENANCE_ENABLED", True):
         summary["reason"] = "disabled"
         return summary
@@ -874,16 +874,23 @@ def run_storage_maintenance_cycle() -> Dict[str, Any]:
             summary["errors"].append(f"{key}:{type(exc).__name__}:{exc}")
 
     # trim monitoring history locally to header-only in local-only mode
-    if _env_bool("LOCAL_ONLY", False) and os.path.exists(MON_HISTORY_CSV):
-        try:
-            with open(MON_HISTORY_CSV, "w", newline="", encoding="utf-8") as f:
-                csv.DictWriter(f, fieldnames=HIST_FIELDS).writeheader()
-            summary["keys_trimmed"].append("monitoring_history.csv")
-        except Exception as exc:
-            summary["errors"].append(f"monitoring_history.csv:{type(exc).__name__}:{exc}")
+    key = storage_key_for_path(MON_HISTORY_CSV)
+    try:
+        raw = sb_get_storage(key, allow_oversized=True)
+        if raw is not None:
+            rows = load_csv_from_string(raw, HIST_FIELDS)
+            if MON_HISTORY_SUPABASE_MODE == "local_only":
+                content = csv_to_string([], HIST_FIELDS)
+            else:
+                keep = max(1, _env_int("MONITORING_HISTORY_REMOTE_MAX_ROWS", 8000))
+                content = csv_to_string(rows[-keep:], HIST_FIELDS)
+            if sb_put_storage(key, content):
+                summary["keys_trimmed"].append(key)
+    except Exception as exc:
+        summary["errors"].append(f"{key}:{type(exc).__name__}:{exc}")
 
     # trim journals
-    for pth, fields in ((SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS), (HEALTH_OVERRIDE_JOURNAL_CSV, HEALTH_OVERRIDE_JOURNAL_FIELDS), (PORTFOLIO_ACTION_JOURNAL_CSV, PORTFOLIO_ACTION_JOURNAL_FIELDS)):
+    for pth, fields in ((SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS), (PORTFOLIO_RECO_LOG_CSV, PORTFOLIO_RECO_LOG_FIELDS), (HEALTH_OVERRIDE_JOURNAL_CSV, HEALTH_OVERRIDE_JOURNAL_FIELDS), (PORTFOLIO_ACTION_JOURNAL_CSV, PORTFOLIO_ACTION_JOURNAL_FIELDS)):
         try:
             rows = load_csv(pth, fields)
             keep = rows[-5000:]
@@ -893,12 +900,26 @@ def run_storage_maintenance_cycle() -> Dict[str, Any]:
         except Exception as exc:
             summary["errors"].append(f"{os.path.basename(pth)}:{type(exc).__name__}:{exc}")
 
+    delete_batch_max = max(1, _env_int("STORAGE_MAINTENANCE_DELETE_BATCH_MAX", 500))
+    deleted_count = 0
+    for item in storage_list_sizes(limit=max(1000, delete_batch_max * 2)):
+        if deleted_count >= delete_batch_max:
+            break
+        key = str((item or {}).get("key") or "")
+        key_lower = key.lower()
+        if not key:
+            continue
+        if key.startswith("backup/") or key.startswith("backup_") or key_lower.endswith(".bak") or ("snapshot" in key_lower):
+            if storage_delete_key(key):
+                summary["keys_deleted"].append(key)
+                deleted_count += 1
+
     retention_days = max(1, _env_int("APP_STORAGE_RETENTION_DAYS", 14))
     hb_cutoff = now_epoch - (max(1, min(14, retention_days)) * 86400)
     jr_cutoff = now_epoch - (retention_days * 86400)
-    summary["rows_deleted"]["job_heartbeats"] = _sb_delete_rows("job_heartbeats", {"heartbeat_epoch": f"lt.{hb_cutoff}"}, select_col="id")
+    summary["rows_deleted"]["job_heartbeats"] = _sb_delete_rows("job_heartbeats", {"heartbeat_epoch": f"lt.{hb_cutoff}"}, select_col="job_name")
     summary["rows_deleted"]["job_runs"] = _sb_delete_rows("job_runs", {"started_ts": f"lt.{datetime.utcfromtimestamp(jr_cutoff).strftime('%Y-%m-%dT%H:%M:%SZ')}"}, select_col="run_id")
-    summary["rows_deleted"]["locks"] = _sb_delete_rows("locks", {"expires_epoch": f"lt.{now_epoch}"}, select_col="key")
+    summary["rows_deleted"]["locks"] = _sb_delete_rows("locks", {"expires_epoch": f"lt.{now_epoch}"}, select_col="lock_key")
 
     if isinstance(throttle_state, dict):
         throttle_state[throttle_key] = stamp
