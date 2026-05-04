@@ -48,7 +48,7 @@ jobs:
           if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_MODE" != "all" ]]; then
             MATRIX_JSON=$(printf '{"job_mode":["%s"]}' "$INPUT_MODE")
           # Recovery mode is intended after Supabase quota restriction/downtime:
-          # maintenance -> notify -> monitor -> scan.
+          # maintenance -> notify -> monitor -> notify -> scan.
           elif [[ "$EVENT_NAME" == "schedule" && "${RUNTIME_RECOVERY_MODE}" == "true" ]]; then
             hour="$(date -u +%H)"
             minute="$(date -u +%M)"
@@ -61,6 +61,8 @@ jobs:
             elif (( 10#$hour % 6 == 1 )) && (( 10#$minute == 0 )); then
               modes=("monitor_cycle")
             elif (( 10#$hour % 6 == 1 )) && (( 10#$minute == 30 )); then
+              modes=("notify_cycle")
+            elif (( 10#$hour % 6 == 2 )) && (( 10#$minute == 0 )); then
               modes=("scan_cycle")
             fi
 
