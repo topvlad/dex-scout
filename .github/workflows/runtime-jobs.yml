@@ -35,6 +35,7 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     env:
       RUNTIME_EGRESS_PROFILE: ${{ vars.RUNTIME_EGRESS_PROFILE || 'free_tier' }}
+      RUNTIME_RECOVERY_MODE: ${{ vars.RUNTIME_RECOVERY_MODE || 'false' }}
     steps:
       - name: Set JOB_MODE matrix
         id: set-matrix
@@ -46,6 +47,24 @@ jobs:
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_MODE" != "all" ]]; then
             MATRIX_JSON=$(printf '{"job_mode":["%s"]}' "$INPUT_MODE")
+          # Recovery mode is intended after Supabase quota restriction/downtime:
+          # maintenance -> notify -> monitor -> scan.
+          elif [[ "$EVENT_NAME" == "schedule" && "${RUNTIME_RECOVERY_MODE}" == "true" ]]; then
+            hour="$(date -u +%H)"
+            minute="$(date -u +%M)"
+            modes=("notify_cycle")
+
+            if (( 10#$hour % 6 == 0 )) && (( 10#$minute == 0 )); then
+              modes=("maintenance_cycle")
+            elif (( 10#$hour % 6 == 0 )) && (( 10#$minute == 30 )); then
+              modes=("notify_cycle")
+            elif (( 10#$hour % 6 == 1 )) && (( 10#$minute == 0 )); then
+              modes=("monitor_cycle")
+            elif (( 10#$hour % 6 == 1 )) && (( 10#$minute == 30 )); then
+              modes=("scan_cycle")
+            fi
+
+            MATRIX_JSON="{\"job_mode\":[\"$(IFS='","'; echo "${modes[*]}")\"]}"
           elif [[ "$EVENT_NAME" == "schedule" && "${RUNTIME_EGRESS_PROFILE}" == "free_tier" ]]; then
             hour="$(date -u +%H)"
             minute="$(date -u +%M)"
