@@ -292,6 +292,10 @@ def _run_outcome_cycle() -> Dict[str, Any]:
     assert app is not None
     return app.evaluate_outcome_journals()
 
+def _run_maintenance_cycle() -> Dict[str, Any]:
+    assert app is not None
+    return app.run_storage_maintenance_cycle()
+
 
 JOB_DISPATCH: Dict[str, Callable[[], Dict[str, Any]]] = {
     "scan_cycle": _run_scan_cycle,
@@ -299,6 +303,7 @@ JOB_DISPATCH: Dict[str, Callable[[], Dict[str, Any]]] = {
     "notify_cycle": _run_notify_cycle,
     "digest_cycle": _run_digest_cycle,
     "outcome_cycle": _run_outcome_cycle,
+    "maintenance_cycle": _run_maintenance_cycle,
 }
 
 
@@ -522,6 +527,7 @@ def run_job_mode(job_mode: str) -> int:
             status="finished",
             meta={"duration_sec": duration_sec, "result": result, "run_id": run_id},
         )
+        print(f"[worker] storage_budget_summary {app.get_supabase_storage_budget_snapshot()}", flush=True)
         print(f"[worker] mode={mode} finished result={result}", flush=True)
         return 0
 
@@ -600,8 +606,12 @@ def main() -> int:
 
     app.ensure_storage()
 
+    skip_on_unavailable = _env_bool("RUNTIME_SKIP_ON_SUPABASE_UNAVAILABLE", True)
     contract = app.check_runtime_contract()
     if not contract.get("ok"):
+        if skip_on_unavailable and app.is_supabase_unavailable_status(contract):
+            print("[worker] skipped: external storage unavailable/quota paused", flush=True)
+            return 0
         failures = contract.get("failures")
         failure_tables = set()
         if isinstance(failures, list):
@@ -643,6 +653,7 @@ def main() -> int:
         )
         return 14
 
+    app.reset_supabase_storage_budget_counters()
     job_mode = os.getenv("JOB_MODE", "").strip().lower()
     return run_job_mode(job_mode=job_mode)
 
