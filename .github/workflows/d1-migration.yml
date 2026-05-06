@@ -14,6 +14,7 @@ on:
           - export_only
           - export_import_verify
           - manual_secret_import_verify
+          - manual_encrypted_file_import_verify
       source:
         description: "Export source"
         required: true
@@ -51,6 +52,7 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       APP_STORAGE_JSONL_B64: ${{ secrets.APP_STORAGE_JSONL_B64 }}
+      APP_STORAGE_JSONL_GPG_PASSPHRASE: ${{ secrets.APP_STORAGE_JSONL_GPG_PASSPHRASE }}
 
     steps:
       - name: Checkout
@@ -108,6 +110,18 @@ jobs:
             if [[ -z "${APP_STORAGE_JSONL_B64:-}" ]]; then
               echo "::error::[d1-migration][preflight] missing_env:APP_STORAGE_JSONL_B64"
               exit 15
+            fi
+          fi
+
+          if [[ "${action_input}" == "manual_encrypted_file_import_verify" ]]; then
+            echo "[d1-migration][preflight] env APP_STORAGE_JSONL_GPG_PASSPHRASE_set=$([[ -n "${APP_STORAGE_JSONL_GPG_PASSPHRASE:-}" ]] && echo true || echo false)"
+            if [[ -z "${APP_STORAGE_JSONL_GPG_PASSPHRASE:-}" ]]; then
+              echo "::error::[d1-migration][preflight] missing_env:APP_STORAGE_JSONL_GPG_PASSPHRASE"
+              exit 16
+            fi
+            if [[ ! -f .d1_export/app_storage.jsonl.gpg ]]; then
+              echo "::error::[d1-migration][preflight] missing_file:.d1_export/app_storage.jsonl.gpg"
+              exit 17
             fi
           fi
 
@@ -178,19 +192,12 @@ jobs:
           mkdir -p .d1_export
           printf '%s' "${APP_STORAGE_JSONL_B64}" | base64 -d > .d1_export/app_storage.jsonl
 
-      - name: Validate manual JSONL
+      - name: Validate manual JSONL (secret)
         if: ${{ inputs.action == 'manual_secret_import_verify' }}
         run: |
           python scripts/validate_app_storage_jsonl.py --in .d1_export/app_storage.jsonl
 
-      - name: Upload manual artifact (manual_secret_import_verify)
-        if: ${{ inputs.action == 'manual_secret_import_verify' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: d1-manual-secret-import
-          path: .d1_export/app_storage.jsonl
-
-      - name: Import manual JSONL to D1
+      - name: Import manual JSONL to D1 (secret)
         if: ${{ inputs.action == 'manual_secret_import_verify' }}
         shell: bash
         run: |
@@ -201,7 +208,31 @@ jobs:
           fi
           "${cmd[@]}"
 
+      - name: Decrypt manual encrypted JSONL
+        if: ${{ inputs.action == 'manual_encrypted_file_import_verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .d1_export
+          gpg --batch --yes --passphrase "${APP_STORAGE_JSONL_GPG_PASSPHRASE}" --output .d1_export/app_storage.jsonl --decrypt .d1_export/app_storage.jsonl.gpg
+
+      - name: Validate manual JSONL (encrypted file)
+        if: ${{ inputs.action == 'manual_encrypted_file_import_verify' }}
+        run: |
+          python scripts/validate_app_storage_jsonl.py --in .d1_export/app_storage.jsonl
+
+      - name: Import manual JSONL to D1 (encrypted file)
+        if: ${{ inputs.action == 'manual_encrypted_file_import_verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmd=(python scripts/import_app_storage_to_d1.py --in .d1_export/app_storage.jsonl)
+          if [[ "${{ inputs.replace }}" == "true" ]]; then
+            cmd+=(--replace)
+          fi
+          "${cmd[@]}"
+
       - name: Verify after import
-        if: ${{ inputs.action == 'export_import_verify' || inputs.action == 'manual_secret_import_verify' }}
+        if: ${{ inputs.action == 'export_import_verify' || inputs.action == 'manual_secret_import_verify' || inputs.action == 'manual_encrypted_file_import_verify' }}
         run: |
           python scripts/verify_d1_storage.py --expect "${{ inputs.expected_keys }}"

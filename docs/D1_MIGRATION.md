@@ -149,3 +149,42 @@ This path decodes secret JSONL to `.d1_export/app_storage.jsonl`, validates line
 ### Rollback
 
 Set `STORAGE_BACKEND=supabase`.
+
+
+### Important size limit note
+
+`APP_STORAGE_JSONL_B64` is only suitable for small payloads that fit GitHub Actions secret limits (48 KB per secret).
+For real exports (for example ~1.9 MB JSONL), use encrypted-file import via `.d1_export/app_storage.jsonl.gpg`.
+
+### Recommended path for large payloads: encrypted file import
+
+1. Prepare JSONL from Supabase SQL results in `.d1_export/app_storage.jsonl`.
+2. Encrypt locally:
+
+```bash
+mkdir -p .d1_export
+gpg --symmetric --cipher-algo AES256 .d1_export/app_storage.jsonl
+```
+
+3. Commit/upload encrypted file to the branch/PR:
+   - `.d1_export/app_storage.jsonl.gpg`
+4. Add GitHub Actions secret:
+   - `APP_STORAGE_JSONL_GPG_PASSPHRASE`
+5. Run **Actions → D1 Migration** with:
+   - `action = manual_encrypted_file_import_verify`
+   - `expected_keys = monitoring.csv,portfolio.csv,tg_state.json,scanner_state.json`
+   - `replace = true`
+
+The workflow decrypts the encrypted JSONL file, validates it, imports to D1, and verifies expected keys.
+
+### Post-import cleanup (encrypted-file path)
+
+- Delete `APP_STORAGE_JSONL_GPG_PASSPHRASE`.
+- Remove `.d1_export/app_storage.jsonl.gpg` from repository in a cleanup PR.
+- Set `STORAGE_BACKEND=d1`.
+- Run Runtime Jobs manually:
+  - `maintenance_cycle`
+  - `notify_cycle`
+  - `monitor_cycle`
+  - `scan_cycle`
+
