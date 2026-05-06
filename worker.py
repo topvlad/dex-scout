@@ -9,10 +9,8 @@ from typing import Any, Callable, Dict, Optional
 
 os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
 
-REQUIRED_ENV_VARS = (
+BASE_REQUIRED_ENV_VARS = (
     "JOB_MODE",
-    "SUPABASE_URL",
-    "SUPABASE_SERVICE_ROLE_KEY",
     "TG_BOT_TOKEN",
     "TG_CHAT_ID",
 )
@@ -40,8 +38,16 @@ def _load_app():
 
 
 def _missing_required_env() -> list[str]:
+    backend = str(os.getenv("STORAGE_BACKEND", "supabase")).strip().lower()
+    if backend not in {"supabase", "d1", "local"}:
+        backend = "supabase"
+    required = list(BASE_REQUIRED_ENV_VARS)
+    if backend == "supabase":
+        required += ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
+    elif backend == "d1":
+        required += ["D1_PROXY_URL", "D1_PROXY_TOKEN"]
     missing = []
-    for key in REQUIRED_ENV_VARS:
+    for key in required:
         if not str(os.getenv(key, "")).strip():
             missing.append(key)
     return missing

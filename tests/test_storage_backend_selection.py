@@ -37,3 +37,14 @@ def test_d1_mode_does_not_require_supabase(monkeypatch):
 def test_app_imports_in_worker_mode(monkeypatch):
     app = _load_app(monkeypatch, WORKER_FAST_MODE="1", STORAGE_BACKEND="d1", D1_PROXY_URL="https://d1.example", D1_PROXY_TOKEN="t")
     assert hasattr(app, "check_runtime_contract")
+
+
+def test_runtime_contract_d1_uses_d1_checks(monkeypatch):
+    app = _load_app(monkeypatch, STORAGE_BACKEND="d1", D1_PROXY_URL="https://d1.example", D1_PROXY_TOKEN="t")
+
+    def fake_select_rows(table, filters=None, select="*", limit=1):
+        return [{}], {"ok": True, "code": "ok"}
+
+    monkeypatch.setattr(app, "d1_select_rows", fake_select_rows)
+    status = app.check_runtime_contract()
+    assert status["ok"] is True

@@ -36,6 +36,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional, Set
 from collections import Counter
 from contextlib import contextmanager
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -600,22 +601,22 @@ def d1_request(method: str, path: str, json: Optional[Dict[str, Any]] = None, pa
 
 
 def d1_get_storage(key: str) -> Optional[str]:
-    status = d1_request("GET", f"/v1/storage/{key}")
+    status = d1_request("GET", f"/v1/storage/{quote(str(key or ''), safe='')}")
     data = status.get("data") or {}
     return str(data.get("content") or "") if status.get("ok") and data.get("found") else None
 
 
 def d1_put_storage(key: str, content: str) -> bool:
-    status = d1_request("PUT", f"/v1/storage/{key}", json={"content": str(content or "")})
+    status = d1_request("PUT", f"/v1/storage/{quote(str(key or ''), safe='')}", json={"content": str(content or "")})
     return bool(status.get("ok"))
 
 
 def d1_delete_storage(key: str) -> bool:
-    return bool(d1_request("DELETE", f"/v1/storage/{key}").get("ok"))
+    return bool(d1_request("DELETE", f"/v1/storage/{quote(str(key or ''), safe='')}").get("ok"))
 
 
 def d1_storage_get_key_size(key: str) -> Optional[int]:
-    status = d1_request("GET", f"/v1/storage-size/{key}")
+    status = d1_request("GET", f"/v1/storage-size/{quote(str(key or ''), safe='')}")
     if not status.get("ok"):
         return None
     return int(parse_float((status.get("data") or {}).get("bytes"), 0))
@@ -7119,9 +7120,10 @@ def check_runtime_contract(required_tables: Optional[List[str]] = None) -> Dict[
     tables = required_tables or list(RUNTIME_REQUIRED_TABLES)
     if STORAGE_BACKEND == "local":
         return _runtime_status(True, "local_runtime_disabled", "runtime contract check skipped (local backend)", tables=tables)
-    if not _sb_ok():
-        if USE_D1 and not _d1_ok():
+    if STORAGE_BACKEND == "d1":
+        if not _d1_ok():
             return _runtime_status(False, "d1_disabled", "runtime contract check failed (d1 disabled)", tables=tables)
+    elif not _sb_ok():
         return _runtime_status(True, "supabase_disabled", "runtime contract check skipped (supabase disabled)", tables=tables)
     failures: List[Dict[str, Any]] = []
     for table in tables:

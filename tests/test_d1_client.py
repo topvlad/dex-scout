@@ -38,6 +38,19 @@ def test_d1_storage_endpoints(monkeypatch):
     assert calls[2][1] == "/v1/storage-sizes"
 
 
+def test_d1_storage_key_with_slash_is_encoded(monkeypatch):
+    app = _load_app(monkeypatch)
+    calls = []
+
+    def fake(method, path, json=None, params=None):
+        calls.append(path)
+        return {"ok": True, "data": {"found": False}}
+
+    monkeypatch.setattr(app, "d1_request", fake)
+    app.d1_get_storage("backup/20260502_215026_monitoring.csv")
+    assert calls[0].endswith("backup%2F20260502_215026_monitoring.csv")
+
+
 def test_d1_select_rows_builds_table_params(monkeypatch):
     app = _load_app(monkeypatch)
     captured = {}
