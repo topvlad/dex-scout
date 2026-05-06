@@ -47,9 +47,24 @@ Do **not** set `STORAGE_BACKEND=d1` until import + verify are complete.
    - `monitor_cycle`
    - `scan_cycle`
 
-## D) Rollback
 
-Set `STORAGE_BACKEND=supabase` (or remove `STORAGE_BACKEND` variable).
+## E) Run migration through GitHub Actions
+
+1. Go to **Actions → D1 Migration**.
+2. Click **Run workflow**.
+3. First run: `action=health_only`.
+4. Then run: `action=export_import_verify`, `source=supabase`, `replace=true`.
+5. Confirm health check passes, then verify passes after import.
+6. Only then change repository variable: `STORAGE_BACKEND=d1`.
+7. Run **Runtime Jobs** manually:
+   - `maintenance_cycle`
+   - `notify_cycle`
+   - `monitor_cycle`
+   - `scan_cycle`
+
+## F) Rollback
+
+Set `STORAGE_BACKEND=supabase`.
 
 ## Script quick reference
 
