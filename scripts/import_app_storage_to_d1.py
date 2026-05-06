@@ -56,6 +56,7 @@ def main() -> int:
     imported_keys: List[str] = []
     skipped_keys: List[str] = []
     failed_keys: List[str] = []
+    failed_details: List[Dict] = []
     total_bytes = 0
 
     for row in rows:
@@ -80,16 +81,32 @@ def main() -> int:
         )
         if put_resp.status_code >= 400:
             failed_keys.append(key)
+            failed_details.append({
+                "key": key,
+                "reason": "put_http_error",
+                "status_code": put_resp.status_code,
+            })
             continue
 
         size_resp = requests.get(storage_size_url(base_url, key), headers=headers, timeout=20)
         if size_resp.status_code >= 400:
             failed_keys.append(key)
+            failed_details.append({
+                "key": key,
+                "reason": "size_http_error",
+                "status_code": size_resp.status_code,
+            })
             continue
         payload = size_resp.json()
         actual_bytes = int(payload.get("bytes") or 0)
         if actual_bytes != expected_bytes:
             failed_keys.append(key)
+            failed_details.append({
+                "key": key,
+                "reason": "size_mismatch",
+                "expected_bytes": expected_bytes,
+                "actual_bytes": actual_bytes,
+            })
             continue
 
         imported_keys.append(key)
@@ -101,6 +118,7 @@ def main() -> int:
         "imported_keys": imported_keys,
         "skipped_keys": skipped_keys,
         "failed_keys": failed_keys,
+        "failed_details": failed_details,
         "total_bytes": total_bytes,
     }, ensure_ascii=False, indent=2))
 
