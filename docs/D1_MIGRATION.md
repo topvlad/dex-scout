@@ -77,3 +77,75 @@ Set `STORAGE_BACKEND=supabase`.
 - Verify D1 storage:
   - `python scripts/verify_d1_storage.py`
   - `python scripts/verify_d1_storage.py --expect monitoring.csv,portfolio.csv,tg_state.json,scanner_state.json`
+
+## Emergency import while Supabase REST is restricted
+
+If Supabase REST reads are blocked (for example, `402 Payment Required` on `/rest/v1/app_storage`), run a manual import path that does not require REST export.
+
+### 1) Extract records with Supabase SQL
+
+Use Supabase SQL Editor:
+
+```sql
+select key, content
+from public.app_storage
+where key in (
+  'monitoring.csv',
+  'portfolio.csv',
+  'monitoring_history.csv',
+  'portfolio_reco_log.csv',
+  'scanner_state.json',
+  'tg_state.json',
+  'pulse_history_compact.json'
+);
+```
+
+Download/export rows and convert to JSONL with one record per line, for example:
+
+```json
+{"key":"monitoring.csv","content":"...","bytes":123,"source":"manual_sql"}
+```
+
+### 2) Base64 encode JSONL for GitHub secret
+
+Windows PowerShell:
+
+```powershell
+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-Content .d1_export/app_storage.jsonl -Raw))) | Set-Clipboard
+```
+
+bash/macOS:
+
+```bash
+base64 -w 0 .d1_export/app_storage.jsonl
+```
+
+### 3) Save secret
+
+GitHub → Settings → Secrets and variables → Actions → New repository secret:
+
+- `APP_STORAGE_JSONL_B64 = <base64 string>`
+
+### 4) Run D1 Migration workflow
+
+Actions → D1 Migration, then run with:
+
+- `action = manual_secret_import_verify`
+- `expected_keys = monitoring.csv,portfolio.csv,tg_state.json,scanner_state.json`
+- `replace = true`
+
+This path decodes secret JSONL to `.d1_export/app_storage.jsonl`, validates line-by-line key/content safety, imports via `scripts/import_app_storage_to_d1.py`, verifies expected keys, and uploads artifact `d1-manual-secret-import`.
+
+### 5) Post-import cleanup
+
+- Delete or rotate/remove `APP_STORAGE_JSONL_B64` secret.
+- Set `STORAGE_BACKEND=d1`.
+- Run Runtime Jobs manually:
+  - `maintenance_cycle`
+  - `notify_cycle`
+  - `monitor_cycle`
+  - `scan_cycle`
+
+### Rollback
+
+Set `STORAGE_BACKEND=supabase`.

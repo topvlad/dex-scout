@@ -13,6 +13,7 @@ on:
           - verify_only
           - export_only
           - export_import_verify
+          - manual_secret_import_verify
       source:
         description: "Export source"
         required: true
@@ -49,6 +50,7 @@ jobs:
       D1_TIMEOUT_SEC: ${{ vars.D1_TIMEOUT_SEC || '12' }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      APP_STORAGE_JSONL_B64: ${{ secrets.APP_STORAGE_JSONL_B64 }}
 
     steps:
       - name: Checkout
@@ -65,7 +67,7 @@ jobs:
 
       - name: Compile migration scripts
         run: |
-          python -m py_compile scripts/export_app_storage.py scripts/import_app_storage_to_d1.py scripts/verify_d1_storage.py
+          python -m py_compile scripts/export_app_storage.py scripts/import_app_storage_to_d1.py scripts/verify_d1_storage.py scripts/validate_app_storage_jsonl.py
 
       - name: Preflight
         shell: bash
@@ -78,8 +80,6 @@ jobs:
           echo "[d1-migration][preflight] action=${action_input} source=${source_input}"
           echo "[d1-migration][preflight] env D1_PROXY_URL_set=$([[ -n "${D1_PROXY_URL:-}" ]] && echo true || echo false)"
           echo "[d1-migration][preflight] env D1_PROXY_TOKEN_set=$([[ -n "${D1_PROXY_TOKEN:-}" ]] && echo true || echo false)"
-          echo "[d1-migration][preflight] env SUPABASE_URL_set=$([[ -n "${SUPABASE_URL:-}" ]] && echo true || echo false)"
-          echo "[d1-migration][preflight] env SUPABASE_SERVICE_ROLE_KEY_set=$([[ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]] && echo true || echo false)"
 
           if [[ -z "${D1_PROXY_URL:-}" ]]; then
             echo "::error::[d1-migration][preflight] missing_env:D1_PROXY_URL"
@@ -91,6 +91,8 @@ jobs:
           fi
 
           if [[ "${source_input}" == "supabase" ]] && [[ "${action_input}" == "export_only" || "${action_input}" == "export_import_verify" ]]; then
+            echo "[d1-migration][preflight] env SUPABASE_URL_set=$([[ -n "${SUPABASE_URL:-}" ]] && echo true || echo false)"
+            echo "[d1-migration][preflight] env SUPABASE_SERVICE_ROLE_KEY_set=$([[ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]] && echo true || echo false)"
             if [[ -z "${SUPABASE_URL:-}" ]]; then
               echo "::error::[d1-migration][preflight] missing_env:SUPABASE_URL"
               exit 13
@@ -98,6 +100,14 @@ jobs:
             if [[ -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
               echo "::error::[d1-migration][preflight] missing_env:SUPABASE_SERVICE_ROLE_KEY"
               exit 14
+            fi
+          fi
+
+          if [[ "${action_input}" == "manual_secret_import_verify" ]]; then
+            echo "[d1-migration][preflight] env APP_STORAGE_JSONL_B64_set=$([[ -n "${APP_STORAGE_JSONL_B64:-}" ]] && echo true || echo false)"
+            if [[ -z "${APP_STORAGE_JSONL_B64:-}" ]]; then
+              echo "::error::[d1-migration][preflight] missing_env:APP_STORAGE_JSONL_B64"
+              exit 15
             fi
           fi
 
@@ -160,7 +170,38 @@ jobs:
           fi
           "${cmd[@]}"
 
+      - name: Decode manual import secret
+        if: ${{ inputs.action == 'manual_secret_import_verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .d1_export
+          printf '%s' "${APP_STORAGE_JSONL_B64}" | base64 -d > .d1_export/app_storage.jsonl
+
+      - name: Validate manual JSONL
+        if: ${{ inputs.action == 'manual_secret_import_verify' }}
+        run: |
+          python scripts/validate_app_storage_jsonl.py --in .d1_export/app_storage.jsonl
+
+      - name: Upload manual artifact (manual_secret_import_verify)
+        if: ${{ inputs.action == 'manual_secret_import_verify' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-manual-secret-import
+          path: .d1_export/app_storage.jsonl
+
+      - name: Import manual JSONL to D1
+        if: ${{ inputs.action == 'manual_secret_import_verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmd=(python scripts/import_app_storage_to_d1.py --in .d1_export/app_storage.jsonl)
+          if [[ "${{ inputs.replace }}" == "true" ]]; then
+            cmd+=(--replace)
+          fi
+          "${cmd[@]}"
+
       - name: Verify after import
-        if: ${{ inputs.action == 'export_import_verify' }}
+        if: ${{ inputs.action == 'export_import_verify' || inputs.action == 'manual_secret_import_verify' }}
         run: |
           python scripts/verify_d1_storage.py --expect "${{ inputs.expected_keys }}"
