@@ -90,7 +90,7 @@ jobs:
             exit 12
           fi
 
-          if [[ "${source_input}" == "supabase" && "${action_input}" != "verify_only" ]]; then
+          if [[ "${source_input}" == "supabase" ]] && [[ "${action_input}" == "export_only" || "${action_input}" == "export_import_verify" ]]; then
             if [[ -z "${SUPABASE_URL:-}" ]]; then
               echo "::error::[d1-migration][preflight] missing_env:SUPABASE_URL"
               exit 13
