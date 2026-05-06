@@ -10,6 +10,10 @@ def _bytes_to_mb(n: int) -> float:
     return round(n / (1024 * 1024), 4)
 
 
+def storage_size_url(base_url: str, key: str) -> str:
+    return f"{base_url.rstrip('/')}/v1/storage-size/{quote(key, safe='')}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify D1 app_storage keys")
     parser.add_argument("--expect", default="")
@@ -31,7 +35,7 @@ def main() -> int:
     sizes_resp.raise_for_status()
 
     sizes_payload = sizes_resp.json()
-    rows = ((sizes_payload.get("data") or {}).get("rows") or [])
+    rows = sizes_payload.get("rows") or []
     rows = sorted(rows, key=lambda x: int(x.get("bytes") or 0), reverse=True)
 
     print("Top keys by size:")
@@ -45,19 +49,17 @@ def main() -> int:
     if expected:
         print("\nExpected keys:")
     for key in expected:
-        enc = quote(key, safe="")
-        resp = requests.get(f"{base_url}/v1/storage-size/{enc}", headers=headers, timeout=20)
+        resp = requests.get(storage_size_url(base_url, key), headers=headers, timeout=20)
         if resp.status_code >= 400:
             missing.append(key)
             print(f"- MISSING {key}")
             continue
         payload = resp.json()
-        data = payload.get("data") or {}
-        if not data.get("found"):
+        b = int(payload.get("bytes") or 0)
+        if b <= 0:
             missing.append(key)
             print(f"- MISSING {key}")
             continue
-        b = int(data.get("bytes") or 0)
         print(f"- PRESENT {key}: {b} bytes ({_bytes_to_mb(b)} MB)")
 
     return 1 if missing else 0
