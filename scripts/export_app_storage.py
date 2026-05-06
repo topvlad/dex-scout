@@ -38,7 +38,7 @@ LOCAL_KEY_MAP = {
 
 
 def is_safe_key(key: str) -> bool:
-    k = key.lower()
+    k = str(key or "").lower()
     if k.startswith("backup/") or k.startswith("backup_"):
         return False
     if k.endswith(".bak"):
@@ -53,24 +53,31 @@ def is_safe_key(key: str) -> bool:
 
 
 def fetch_supabase_key(base_url: str, token: str, key: str) -> Optional[str]:
+    """Fetch one app_storage object from the current Supabase schema.
+
+    Current DEX Scout app_storage columns are:
+    - key
+    - content
+    - updated_at
+    """
     url = f"{base_url.rstrip('/')}/rest/v1/app_storage"
     headers = {"apikey": token, "Authorization": f"Bearer {token}"}
-    params = {"select": "storage_value", "storage_key": f"eq.{key}", "limit": "1"}
+    params = {"select": "content", "key": f"eq.{key}", "limit": "1"}
     resp = requests.get(url, headers=headers, params=params, timeout=20)
     resp.raise_for_status()
     rows = resp.json()
     if not rows:
         return None
-    return rows[0].get("storage_value")
+    return rows[0].get("content")
 
 
 def list_supabase_keys(base_url: str, token: str) -> List[str]:
     url = f"{base_url.rstrip('/')}/rest/v1/app_storage"
     headers = {"apikey": token, "Authorization": f"Bearer {token}"}
-    params = {"select": "storage_key", "order": "storage_key.asc", "limit": "10000"}
+    params = {"select": "key", "order": "key.asc", "limit": "10000"}
     resp = requests.get(url, headers=headers, params=params, timeout=30)
     resp.raise_for_status()
-    return [r.get("storage_key", "") for r in resp.json() if r.get("storage_key")]
+    return [r.get("key", "") for r in resp.json() if r.get("key")]
 
 
 def export_records(source: str, include_all_safe: bool) -> Tuple[List[Dict], List[str], List[str]]:
