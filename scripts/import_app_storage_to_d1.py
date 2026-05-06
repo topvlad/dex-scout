@@ -20,6 +20,14 @@ def load_jsonl(path: Path) -> List[Dict]:
     return rows
 
 
+def storage_url(base_url: str, key: str) -> str:
+    return f"{base_url.rstrip('/')}/v1/storage/{quote(key, safe='')}"
+
+
+def storage_size_url(base_url: str, key: str) -> str:
+    return f"{base_url.rstrip('/')}/v1/storage-size/{quote(key, safe='')}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Import app_storage JSONL into D1 via proxy")
     parser.add_argument("--in", dest="input_path", required=True)
@@ -64,23 +72,22 @@ def main() -> int:
             total_bytes += expected_bytes
             continue
 
-        enc_key = quote(key, safe="")
         put_resp = requests.put(
-            f"{base_url}/v1/storage/{enc_key}",
+            storage_url(base_url, key),
             headers=headers,
-            json={"value": content},
+            json={"content": content},
             timeout=20,
         )
         if put_resp.status_code >= 400:
             failed_keys.append(key)
             continue
 
-        size_resp = requests.get(f"{base_url}/v1/storage-size/{enc_key}", headers=headers, timeout=20)
+        size_resp = requests.get(storage_size_url(base_url, key), headers=headers, timeout=20)
         if size_resp.status_code >= 400:
             failed_keys.append(key)
             continue
         payload = size_resp.json()
-        actual_bytes = int(((payload.get("data") or {}).get("bytes") or 0))
+        actual_bytes = int(payload.get("bytes") or 0)
         if actual_bytes != expected_bytes:
             failed_keys.append(key)
             continue
