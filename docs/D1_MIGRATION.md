@@ -52,9 +52,9 @@ Do **not** set `STORAGE_BACKEND=d1` until import + verify are complete.
 
 1. Go to **Actions → D1 Migration**.
 2. Click **Run workflow**.
-3. First run: `action=verify_only`.
+3. First run: `action=health_only`.
 4. Then run: `action=export_import_verify`, `source=supabase`, `replace=true`.
-5. Confirm verify passes.
+5. Confirm health check passes, then verify passes after import.
 6. Only then change repository variable: `STORAGE_BACKEND=d1`.
 7. Run **Runtime Jobs** manually:
    - `maintenance_cycle`

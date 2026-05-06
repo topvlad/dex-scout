@@ -7,8 +7,9 @@ on:
         description: "Migration action"
         required: true
         type: choice
-        default: verify_only
+        default: health_only
         options:
+          - health_only
           - verify_only
           - export_only
           - export_import_verify
@@ -75,10 +76,10 @@ jobs:
           source_input="${{ inputs.source }}"
 
           echo "[d1-migration][preflight] action=${action_input} source=${source_input}"
-          echo "[d1-migration][preflight] env D1_PROXY_URL_set=$([[ -n \"${D1_PROXY_URL:-}\" ]] && echo true || echo false)"
-          echo "[d1-migration][preflight] env D1_PROXY_TOKEN_set=$([[ -n \"${D1_PROXY_TOKEN:-}\" ]] && echo true || echo false)"
-          echo "[d1-migration][preflight] env SUPABASE_URL_set=$([[ -n \"${SUPABASE_URL:-}\" ]] && echo true || echo false)"
-          echo "[d1-migration][preflight] env SUPABASE_SERVICE_ROLE_KEY_set=$([[ -n \"${SUPABASE_SERVICE_ROLE_KEY:-}\" ]] && echo true || echo false)"
+          echo "[d1-migration][preflight] env D1_PROXY_URL_set=$([[ -n "${D1_PROXY_URL:-}" ]] && echo true || echo false)"
+          echo "[d1-migration][preflight] env D1_PROXY_TOKEN_set=$([[ -n "${D1_PROXY_TOKEN:-}" ]] && echo true || echo false)"
+          echo "[d1-migration][preflight] env SUPABASE_URL_set=$([[ -n "${SUPABASE_URL:-}" ]] && echo true || echo false)"
+          echo "[d1-migration][preflight] env SUPABASE_SERVICE_ROLE_KEY_set=$([[ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]] && echo true || echo false)"
 
           if [[ -z "${D1_PROXY_URL:-}" ]]; then
             echo "::error::[d1-migration][preflight] missing_env:D1_PROXY_URL"
@@ -99,6 +100,11 @@ jobs:
               exit 14
             fi
           fi
+
+      - name: Health only
+        if: ${{ inputs.action == 'health_only' }}
+        run: |
+          python scripts/verify_d1_storage.py
 
       - name: Verify only
         if: ${{ inputs.action == 'verify_only' }}
