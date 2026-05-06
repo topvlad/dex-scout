@@ -111,6 +111,10 @@ jobs:
       # Required runtime secrets
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      STORAGE_BACKEND: ${{ vars.STORAGE_BACKEND || 'supabase' }}
+      D1_PROXY_URL: ${{ vars.D1_PROXY_URL }}
+      D1_PROXY_TOKEN: ${{ secrets.D1_PROXY_TOKEN }}
+      D1_TIMEOUT_SEC: ${{ vars.D1_TIMEOUT_SEC || '12' }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
@@ -151,8 +155,11 @@ jobs:
 
           echo "[runtime-jobs][preflight] mode=${JOB_MODE} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "[runtime-jobs][preflight] env JOB_MODE_set=$([[ -n "${JOB_MODE:-}" ]] && echo true || echo false)"
+          echo "[runtime-jobs][preflight] env STORAGE_BACKEND_set=$([[ -n "${STORAGE_BACKEND:-}" ]] && echo true || echo false)"
           echo "[runtime-jobs][preflight] env SUPABASE_URL_set=$([[ -n "${SUPABASE_URL:-}" ]] && echo true || echo false)"
           echo "[runtime-jobs][preflight] env SUPABASE_SERVICE_ROLE_KEY_set=$([[ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]] && echo true || echo false)"
+          echo "[runtime-jobs][preflight] env D1_PROXY_URL_set=$([[ -n "${D1_PROXY_URL:-}" ]] && echo true || echo false)"
+          echo "[runtime-jobs][preflight] env D1_PROXY_TOKEN_set=$([[ -n "${D1_PROXY_TOKEN:-}" ]] && echo true || echo false)"
           echo "[runtime-jobs][preflight] env TG_BOT_TOKEN_set=$([[ -n "${TG_BOT_TOKEN:-}" ]] && echo true || echo false)"
           echo "[runtime-jobs][preflight] env TG_CHAT_ID_set=$([[ -n "${TG_CHAT_ID:-}" ]] && echo true || echo false)"
 
@@ -207,11 +214,23 @@ jobs:
 
           required_env = [
               "JOB_MODE",
-              "SUPABASE_URL",
-              "SUPABASE_SERVICE_ROLE_KEY",
               "TG_BOT_TOKEN",
               "TG_CHAT_ID",
           ]
+
+          storage_backend = str(os.getenv("STORAGE_BACKEND", "supabase") or "supabase").strip().lower()
+          if storage_backend == "":
+              storage_backend = "supabase"
+
+          if storage_backend == "d1":
+              required_env += ["D1_PROXY_URL", "D1_PROXY_TOKEN"]
+          elif storage_backend == "supabase":
+              required_env += ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
+          elif storage_backend == "local":
+              pass
+          else:
+              required_env += ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
+
           missing_env = [k for k in required_env if not str(os.getenv(k, "")).strip()]
           if missing_env:
               print(f"::error::[runtime-jobs][preflight] missing_env:{','.join(missing_env)}", flush=True)

@@ -1,0 +1,160 @@
+name: D1 Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Migration action"
+        required: true
+        type: choice
+        default: verify_only
+        options:
+          - verify_only
+          - export_only
+          - export_import_verify
+      source:
+        description: "Export source"
+        required: true
+        type: choice
+        default: supabase
+        options:
+          - supabase
+          - local
+      include_all_safe:
+        description: "Include all safe keys on export"
+        required: true
+        type: boolean
+        default: false
+      expected_keys:
+        description: "Comma-separated expected keys for verification"
+        required: true
+        type: string
+        default: monitoring.csv,portfolio.csv,tg_state.json,scanner_state.json
+      replace:
+        description: "Replace existing keys when importing"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  d1-migration:
+    runs-on: ubuntu-latest
+    env:
+      D1_PROXY_URL: ${{ vars.D1_PROXY_URL }}
+      D1_PROXY_TOKEN: ${{ secrets.D1_PROXY_TOKEN }}
+      D1_TIMEOUT_SEC: ${{ vars.D1_TIMEOUT_SEC || '12' }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile migration scripts
+        run: |
+          python -m py_compile scripts/export_app_storage.py scripts/import_app_storage_to_d1.py scripts/verify_d1_storage.py
+
+      - name: Preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          action_input="${{ inputs.action }}"
+          source_input="${{ inputs.source }}"
+
+          echo "[d1-migration][preflight] action=${action_input} source=${source_input}"
+          echo "[d1-migration][preflight] env D1_PROXY_URL_set=$([[ -n \"${D1_PROXY_URL:-}\" ]] && echo true || echo false)"
+          echo "[d1-migration][preflight] env D1_PROXY_TOKEN_set=$([[ -n \"${D1_PROXY_TOKEN:-}\" ]] && echo true || echo false)"
+          echo "[d1-migration][preflight] env SUPABASE_URL_set=$([[ -n \"${SUPABASE_URL:-}\" ]] && echo true || echo false)"
+          echo "[d1-migration][preflight] env SUPABASE_SERVICE_ROLE_KEY_set=$([[ -n \"${SUPABASE_SERVICE_ROLE_KEY:-}\" ]] && echo true || echo false)"
+
+          if [[ -z "${D1_PROXY_URL:-}" ]]; then
+            echo "::error::[d1-migration][preflight] missing_env:D1_PROXY_URL"
+            exit 11
+          fi
+          if [[ -z "${D1_PROXY_TOKEN:-}" ]]; then
+            echo "::error::[d1-migration][preflight] missing_env:D1_PROXY_TOKEN"
+            exit 12
+          fi
+
+          if [[ "${source_input}" == "supabase" && "${action_input}" != "verify_only" ]]; then
+            if [[ -z "${SUPABASE_URL:-}" ]]; then
+              echo "::error::[d1-migration][preflight] missing_env:SUPABASE_URL"
+              exit 13
+            fi
+            if [[ -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
+              echo "::error::[d1-migration][preflight] missing_env:SUPABASE_SERVICE_ROLE_KEY"
+              exit 14
+            fi
+          fi
+
+      - name: Verify only
+        if: ${{ inputs.action == 'verify_only' }}
+        run: |
+          python scripts/verify_d1_storage.py --expect "${{ inputs.expected_keys }}"
+
+      - name: Export only
+        if: ${{ inputs.action == 'export_only' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .d1_export
+          cmd=(python scripts/export_app_storage.py --source "${{ inputs.source }}" --out .d1_export/app_storage.jsonl)
+          if [[ "${{ inputs.include_all_safe }}" == "true" ]]; then
+            cmd+=(--include-all-safe)
+          fi
+          "${cmd[@]}"
+
+      - name: Upload export artifact (export_only)
+        if: ${{ inputs.action == 'export_only' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-export
+          path: .d1_export/app_storage.jsonl
+
+      - name: Export for import
+        if: ${{ inputs.action == 'export_import_verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .d1_export
+          cmd=(python scripts/export_app_storage.py --source "${{ inputs.source }}" --out .d1_export/app_storage.jsonl)
+          if [[ "${{ inputs.include_all_safe }}" == "true" ]]; then
+            cmd+=(--include-all-safe)
+          fi
+          "${cmd[@]}"
+
+      - name: Upload export artifact (export_import_verify)
+        if: ${{ inputs.action == 'export_import_verify' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-export
+          path: .d1_export/app_storage.jsonl
+
+      - name: Import to D1
+        if: ${{ inputs.action == 'export_import_verify' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmd=(python scripts/import_app_storage_to_d1.py --in .d1_export/app_storage.jsonl)
+          if [[ "${{ inputs.replace }}" == "true" ]]; then
+            cmd+=(--replace)
+          fi
+          "${cmd[@]}"
+
+      - name: Verify after import
+        if: ${{ inputs.action == 'export_import_verify' }}
+        run: |
+          python scripts/verify_d1_storage.py --expect "${{ inputs.expected_keys }}"
