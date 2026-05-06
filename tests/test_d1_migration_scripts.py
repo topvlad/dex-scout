@@ -206,3 +206,58 @@ runpy.run_path(r'{REPO_ROOT / 'scripts/verify_d1_storage.py'}', run_name='__main
     env.update({"D1_PROXY_URL": "https://d1.example", "D1_PROXY_TOKEN": "t"})
     proc = subprocess.run([sys.executable, str(helper)], env=env)
     assert proc.returncode == 0
+
+
+def test_import_script_reports_size_mismatch_failed_details_without_content(tmp_path):
+    path = tmp_path / "x.jsonl"
+    path.write_text(json.dumps({"key": "nonascii.csv", "content": "hé", "bytes": 3}) + "\n", encoding="utf-8")
+    helper = tmp_path / "run_import_mismatch_test.py"
+    helper.write_text(
+        f"""
+import runpy, requests, sys
+
+class R:
+    def __init__(self, code=200, p=None):
+        self.status_code = code
+        self._p = p or {{"ok": True, "rows": []}}
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._p
+
+
+def g(url, **kw):
+    if url.endswith('/health'):
+        return R()
+    if '/v1/storage-sizes' in url:
+        return R(200, {{"ok": True, "rows": []}})
+    if '/v1/storage-size/' in url:
+        return R(200, {{"ok": True, "key": "nonascii.csv", "bytes": 2}})
+    return R()
+
+
+def p(url, **kw):
+    return R(200, {{"ok": True}})
+
+requests.get = g
+requests.put = p
+sys.argv = ['x', '--in', r'{path}', '--replace']
+runpy.run_path(r'{REPO_ROOT / 'scripts/import_app_storage_to_d1.py'}', run_name='__main__')
+""",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update({"D1_PROXY_URL": "https://d1.example", "D1_PROXY_TOKEN": "t"})
+    proc = subprocess.run([sys.executable, str(helper)], capture_output=True, text=True, env=env)
+    assert proc.returncode == 1
+    out = json.loads(proc.stdout)
+    assert out["failed_keys"] == ["nonascii.csv"]
+    assert out["failed_details"] == [{
+        "key": "nonascii.csv",
+        "reason": "size_mismatch",
+        "expected_bytes": 3,
+        "actual_bytes": 2,
+    }]
+    assert "hé" not in proc.stdout

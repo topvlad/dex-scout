@@ -45,3 +45,47 @@ console.log(JSON.stringify({status: res.status, parsed: body.rows[0].state_json.
     out = _node_eval(script)
     assert out["status"] == 200
     assert out["parsed"] == 1
+
+
+def test_d1_worker_storage_size_uses_blob_length_sql():
+    script = r'''
+import workerMod from "./cloudflare/d1_worker.js";
+let seenSql = "";
+const db = {
+  prepare(sql){
+    seenSql = sql;
+    return { bind(){ return { first: async()=>({bytes: 7}) }; } };
+  }
+};
+const env = { D1_PROXY_TOKEN: "t", DB: db };
+const req = new Request("https://x/v1/storage-size/a", {headers:{authorization:"Bearer t"}});
+const res = await workerMod.fetch(req, env);
+const body = await res.json();
+console.log(JSON.stringify({status: res.status, sql: seenSql, bytes: body.bytes}));
+'''
+    out = _node_eval(script)
+    assert out["status"] == 200
+    assert "length(cast(content as blob)) as bytes" in out["sql"]
+    assert out["bytes"] == 7
+
+
+def test_d1_worker_storage_sizes_uses_blob_length_sql():
+    script = r'''
+import workerMod from "./cloudflare/d1_worker.js";
+let seenSql = "";
+const db = {
+  prepare(sql){
+    seenSql = sql;
+    return { bind(){ return { all: async()=>({results:[{key:"a", bytes: 7, updated_at:""}]}) }; } };
+  }
+};
+const env = { D1_PROXY_TOKEN: "t", DB: db };
+const req = new Request("https://x/v1/storage-sizes?limit=1", {headers:{authorization:"Bearer t"}});
+const res = await workerMod.fetch(req, env);
+const body = await res.json();
+console.log(JSON.stringify({status: res.status, sql: seenSql, rows: body.rows.length}));
+'''
+    out = _node_eval(script)
+    assert out["status"] == 200
+    assert "length(cast(content as blob)) as bytes" in out["sql"]
+    assert out["rows"] == 1

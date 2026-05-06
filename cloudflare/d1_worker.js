@@ -69,12 +69,12 @@ export default {
       }
       if (parts[0] === "v1" && parts[1] === "storage-size" && parts.length > 2 && req.method === "GET") {
         const key = decodeURIComponent(parts.slice(2).join("/"));
-        const r = await env.DB.prepare("select length(content) as bytes from app_storage where key = ? limit 1").bind(key).first();
+        const r = await env.DB.prepare("select length(cast(content as blob)) as bytes from app_storage where key = ? limit 1").bind(key).first();
         return json({ ok: true, key, bytes: Number(r?.bytes || 0) });
       }
       if (parts[0] === "v1" && parts[1] === "storage-sizes" && req.method === "GET") {
         const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit") || 200)));
-        const rows = (await env.DB.prepare("select key, length(content) as bytes, updated_at from app_storage order by bytes desc limit ?").bind(limit).all()).results || [];
+        const rows = (await env.DB.prepare("select key, length(cast(content as blob)) as bytes, updated_at from app_storage order by bytes desc limit ?").bind(limit).all()).results || [];
         return json({ ok: true, rows });
       }
       if (parts[0] === "v1" && parts[1] === "table" && parts[2]) {
