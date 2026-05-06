@@ -549,7 +549,16 @@ SUPABASE_URL = _get_secret("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 SUPABASE_ANON_KEY = _get_secret("SUPABASE_ANON_KEY", "").strip()
 
-USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "supabase").strip().lower()
+if STORAGE_BACKEND not in {"supabase", "d1", "local"}:
+    STORAGE_BACKEND = "supabase"
+
+USE_D1 = STORAGE_BACKEND == "d1"
+D1_PROXY_URL = _get_secret("D1_PROXY_URL", "").strip().rstrip("/")
+D1_PROXY_TOKEN = _get_secret("D1_PROXY_TOKEN", "").strip()
+D1_TIMEOUT_SEC = max(1, _env_int("D1_TIMEOUT_SEC", 12))
+
+USE_SUPABASE = STORAGE_BACKEND == "supabase" and bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
 RUNTIME_STATE_TABLE = "runtime_state"
 LOCKS_TABLE = "locks"
@@ -565,6 +574,89 @@ RUNTIME_REQUIRED_TABLES: Tuple[str, ...] = (
 
 def _sb_ok() -> bool:
     return bool(USE_SUPABASE)
+
+
+def _d1_ok() -> bool:
+    return bool(USE_D1 and D1_PROXY_URL and D1_PROXY_TOKEN)
+
+
+def d1_request(method: str, path: str, json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not _d1_ok():
+        return _runtime_status(False, "d1_disabled", "d1 backend not configured")
+    try:
+        url = f"{D1_PROXY_URL}/{str(path or '').lstrip('/')}"
+        headers = {
+            "Authorization": f"Bearer {D1_PROXY_TOKEN}",
+            "Accept": "application/json",
+        }
+        resp = requests.request(method=method.upper(), url=url, headers=headers, json=json, params=params, timeout=D1_TIMEOUT_SEC)
+        body = resp.json() if (resp.text or "").strip() else {}
+        if resp.status_code >= 400:
+            detail = body if isinstance(body, dict) else {"detail": str(resp.text or "")[:240]}
+            return _runtime_status(False, "d1_http_error", "d1 request failed", http_status=resp.status_code, detail=detail)
+        return _runtime_status(True, "ok", http_status=resp.status_code, data=body if isinstance(body, dict) else {})
+    except Exception as e:
+        return _runtime_status(False, "d1_request_exception", detail=f"{type(e).__name__}:{e}")
+
+
+def d1_get_storage(key: str) -> Optional[str]:
+    status = d1_request("GET", f"/v1/storage/{key}")
+    data = status.get("data") or {}
+    return str(data.get("content") or "") if status.get("ok") and data.get("found") else None
+
+
+def d1_put_storage(key: str, content: str) -> bool:
+    status = d1_request("PUT", f"/v1/storage/{key}", json={"content": str(content or "")})
+    return bool(status.get("ok"))
+
+
+def d1_delete_storage(key: str) -> bool:
+    return bool(d1_request("DELETE", f"/v1/storage/{key}").get("ok"))
+
+
+def d1_storage_get_key_size(key: str) -> Optional[int]:
+    status = d1_request("GET", f"/v1/storage-size/{key}")
+    if not status.get("ok"):
+        return None
+    return int(parse_float((status.get("data") or {}).get("bytes"), 0))
+
+
+def d1_storage_list_sizes(limit: int = 200) -> List[Dict[str, Any]]:
+    status = d1_request("GET", "/v1/storage-sizes", params={"limit": max(1, int(limit or 200))})
+    rows = (status.get("data") or {}).get("rows") or []
+    return rows if isinstance(rows, list) else []
+
+
+def d1_select_rows(table: str, filters: Optional[Dict[str, str]] = None, select: str = "*", limit: int = 1) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any]]:
+    params: Dict[str, Any] = {"select": select, "limit": max(1, int(limit or 1))}
+    f = filters or {}
+    if f:
+        first_key = next(iter(f.keys()))
+        raw = str(f[first_key])
+        if "." in raw:
+            op, val = raw.split(".", 1)
+            params.update({"filter_col": first_key, "filter_op": op, "filter_value": val})
+    status = d1_request("GET", f"/v1/table/{table}", params=params)
+    data = status.get("data") or {}
+    return (data.get("rows") if status.get("ok") else None), status
+
+
+def d1_upsert_row(table: str, payload: Dict[str, Any], on_conflict: str) -> Dict[str, Any]:
+    return d1_request("POST", f"/v1/table/{table}/upsert", json={"payload": payload or {}, "on_conflict": on_conflict})
+
+
+def d1_delete_rows(table: str, filters: Dict[str, str], select_col: str) -> int:
+    req = {"select_col": select_col}
+    if filters:
+        first_key = next(iter(filters.keys()))
+        raw = str(filters[first_key])
+        if "." in raw:
+            op, val = raw.split(".", 1)
+            req.update({"filter_col": first_key, "filter_op": op, "filter_value": val})
+    status = d1_request("DELETE", f"/v1/table/{table}", params=req)
+    if not status.get("ok"):
+        return 0
+    return int(parse_float((status.get("data") or {}).get("deleted"), 0))
 
 def _sb_headers() -> Dict[str, str]:
     # Use service role key for server-side storage
@@ -657,6 +749,8 @@ def _sb_select_rows(
     select: str = "*",
     limit: int = 1,
 ) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any]]:
+    if USE_D1:
+        return d1_select_rows(table=table, filters=filters, select=select, limit=limit)
     if not _sb_ok():
         return [], _runtime_status(True, "supabase_disabled")
     try:
@@ -680,6 +774,8 @@ def _sb_select_rows(
 
 
 def _sb_upsert_row(table: str, payload: Dict[str, Any], on_conflict: str) -> Dict[str, Any]:
+    if USE_D1:
+        return d1_upsert_row(table=table, payload=payload, on_conflict=on_conflict)
     if not _sb_ok():
         return _runtime_status(True, "supabase_disabled")
     try:
@@ -699,6 +795,8 @@ def _sb_upsert_row(table: str, payload: Dict[str, Any], on_conflict: str) -> Dic
         return status
 
 def storage_get_key_size(key: str) -> Optional[int]:
+    if USE_D1:
+        return d1_storage_get_key_size(key)
     if not _sb_ok():
         return None
     key = str(key or "").strip()
@@ -728,6 +826,8 @@ def storage_get_key_size(key: str) -> Optional[int]:
 
 
 def storage_list_sizes(limit: int = 200) -> List[Dict[str, Any]]:
+    if USE_D1:
+        return d1_storage_list_sizes(limit=limit)
     if not _sb_ok():
         return []
     rows, status = _sb_select_rows(
@@ -754,6 +854,8 @@ def sb_get_storage(key: str, allow_oversized: bool = False) -> Optional[str]:
     Returns content for key from public.app_storage, or None if not found/readable.
     Reliability refactor: HTTP 4xx/5xx responses degrade to None instead of bubbling up.
     """
+    if USE_D1:
+        return d1_get_storage(key)
     if not USE_SUPABASE:
         return None
     try:
@@ -793,6 +895,8 @@ def sb_get_storage(key: str, allow_oversized: bool = False) -> Optional[str]:
         return None
 
 def sb_put_storage(key: str, content: str) -> bool:
+    if USE_D1:
+        return d1_put_storage(key, content)
     try:
         if not _sb_ok():
             return False
@@ -843,6 +947,8 @@ def storage_write_text(key: str, content: str) -> bool:
     return sb_put_storage(key, content)
 
 def storage_delete_key(key: str) -> bool:
+    if USE_D1:
+        return d1_delete_storage(key)
     if not _sb_ok():
         return False
     try:
@@ -852,6 +958,8 @@ def storage_delete_key(key: str) -> bool:
         return False
 
 def _sb_delete_rows(table: str, filters: Dict[str, str], select_col: str = "run_id") -> int:
+    if USE_D1:
+        return d1_delete_rows(table=table, filters=filters, select_col=select_col)
     if not _sb_ok():
         return 0
     try:
@@ -7009,7 +7117,11 @@ create table if not exists public.job_runs (
 
 def check_runtime_contract(required_tables: Optional[List[str]] = None) -> Dict[str, Any]:
     tables = required_tables or list(RUNTIME_REQUIRED_TABLES)
+    if STORAGE_BACKEND == "local":
+        return _runtime_status(True, "local_runtime_disabled", "runtime contract check skipped (local backend)", tables=tables)
     if not _sb_ok():
+        if USE_D1 and not _d1_ok():
+            return _runtime_status(False, "d1_disabled", "runtime contract check failed (d1 disabled)", tables=tables)
         return _runtime_status(True, "supabase_disabled", "runtime contract check skipped (supabase disabled)", tables=tables)
     failures: List[Dict[str, Any]] = []
     for table in tables:
