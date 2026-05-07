@@ -1220,6 +1220,10 @@ def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def now_utc_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
 def parse_ts(ts: Any) -> Optional[datetime]:
     raw = str(ts or "").strip()
     if not raw:
@@ -1257,6 +1261,14 @@ def _app_storage_remote_ok() -> bool:
     return bool((USE_D1 and _d1_ok()) or _sb_ok())
 
 
+def _active_storage_source_label() -> str:
+    if USE_D1 and _d1_ok():
+        return "d1"
+    if _sb_ok():
+        return "supabase"
+    return "local_fallback"
+
+
 def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
     Load CSV rows from Supabase storage (if configured) with local fallback.
@@ -1291,7 +1303,7 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
         content = sb_get_storage(key)
         if content:
             try:
-                st.session_state[f"_storage_source_{key}"] = "supabase"
+                st.session_state[f"_storage_source_{key}"] = _active_storage_source_label()
                 rows = _normalize_rows(_csv_from_string(content))
                 if is_history and not os.path.exists(fallback):
                     try:
@@ -1426,20 +1438,20 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
                 _STORAGE_METRICS["roundtrip_checks"] = int(_STORAGE_METRICS.get("roundtrip_checks", 0) or 0) + 1
                 check = sb_get_storage(key)
                 if check == content:
-                    debug_log(f"supabase_store_verified key={key} mode={STORAGE_VERIFY_MODE}")
-                    st.session_state["_save_badge"] = "💾 saved (supabase round-trip verified)"
+                    debug_log(f"storage_store_verified key={key} backend={_active_storage_source_label()} mode={STORAGE_VERIFY_MODE}")
+                    st.session_state["_save_badge"] = "💾 saved (remote round-trip verified)"
                 else:
                     check_len = len(check) if isinstance(check, str) else 0
                     debug_log(
-                        f"supabase_store_mismatch key={key} expected_len={len(content)} got_len={check_len}"
+                        f"storage_store_mismatch key={key} backend={_active_storage_source_label()} expected_len={len(content)} got_len={check_len}"
                     )
-                    st.session_state["_save_badge"] = "⚠️ saved local, supabase write ok (round-trip mismatch)"
+                    st.session_state["_save_badge"] = "⚠️ saved local, remote write ok (round-trip mismatch)"
             else:
-                debug_log(f"supabase_store_verified_skipped key={key} mode={STORAGE_VERIFY_MODE}")
-                st.session_state["_save_badge"] = "💾 saved (supabase write, verify skipped)"
+                debug_log(f"storage_store_verified_skipped key={key} backend={_active_storage_source_label()} mode={STORAGE_VERIFY_MODE}")
+                st.session_state["_save_badge"] = "💾 saved (remote write, verify skipped)"
         else:
-            debug_log(f"supabase_store_failed_local_kept key={key}")
-            st.session_state["_save_badge"] = "⚠️ saved local, supabase write failed"
+            debug_log(f"storage_store_failed_local_kept key={key} backend={_active_storage_source_label()}")
+            st.session_state["_save_badge"] = "⚠️ saved local, remote write failed"
     else:
         st.session_state["_save_badge"] = "💾 saved (local)"
     load_monitoring_rows_cached.clear()
@@ -12685,7 +12697,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     # Source of truth for Monitoring page UI: monitoring.csv filtered through _ui_monitoring_source_rows.
     monitoring_rows = load_monitoring_rows_cached()
-    mon_source = st.session_state.get("_storage_source_monitoring.csv", "unknown")
+    mon_source = st.session_state.get("_storage_source_monitoring.csv", _active_storage_source_label())
     st.caption(f"MONITORING FROM DB: {len(monitoring_rows)} (source: {mon_source})")
     active_rows = _ui_monitoring_source_rows(monitoring_rows)
     rows = list(monitoring_rows)
