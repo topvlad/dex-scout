@@ -540,6 +540,16 @@ def _get_secret(name: str, default: str = "") -> str:
         return str(default)
 
 
+def _secret_int(name: str, default: int) -> int:
+    raw = str(_get_secret(name, os.getenv(name, str(default))) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def get_tg_token() -> str:
     return _get_secret("TG_BOT_TOKEN", "").strip() or _get_secret("TELEGRAM_BOT_TOKEN", "").strip()
 
@@ -550,14 +560,13 @@ SUPABASE_URL = _get_secret("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 SUPABASE_ANON_KEY = _get_secret("SUPABASE_ANON_KEY", "").strip()
 
-STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "supabase").strip().lower()
-if STORAGE_BACKEND not in {"supabase", "d1", "local"}:
-    STORAGE_BACKEND = "supabase"
+raw_storage_backend = _get_secret("STORAGE_BACKEND", os.getenv("STORAGE_BACKEND", "supabase")).strip().lower()
+STORAGE_BACKEND = raw_storage_backend if raw_storage_backend in {"supabase", "d1", "local"} else "supabase"
 
 USE_D1 = STORAGE_BACKEND == "d1"
 D1_PROXY_URL = _get_secret("D1_PROXY_URL", "").strip().rstrip("/")
 D1_PROXY_TOKEN = _get_secret("D1_PROXY_TOKEN", "").strip()
-D1_TIMEOUT_SEC = max(1, _env_int("D1_TIMEOUT_SEC", 12))
+D1_TIMEOUT_SEC = max(1, _secret_int("D1_TIMEOUT_SEC", 12))
 
 USE_SUPABASE = STORAGE_BACKEND == "supabase" and bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
@@ -1244,6 +1253,10 @@ def _csv_to_string(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
     return sio.getvalue()
 
 
+def _app_storage_remote_ok() -> bool:
+    return bool((USE_D1 and _d1_ok()) or _sb_ok())
+
+
 def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
     Load CSV rows from Supabase storage (if configured) with local fallback.
@@ -1274,7 +1287,7 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
 
     if is_history:
         debug_log(f"history_supabase_bypass mode={history_mode} op=load")
-    if _sb_ok() and (not is_history or history_mode == "blob_fallback"):
+    if _app_storage_remote_ok() and (not is_history or history_mode == "blob_fallback"):
         content = sb_get_storage(key)
         if content:
             try:
@@ -1309,7 +1322,7 @@ def storage_read_text(key: str, default: str = "") -> str:
     ensure_storage()
     key = storage_key_for_path(key)
 
-    if _sb_ok():
+    if _app_storage_remote_ok():
         content = sb_get_storage(key)
         if content is not None:
             return str(content)
@@ -1336,7 +1349,7 @@ def storage_write_text(key: str, text: str) -> None:
     except Exception as e:
         debug_log(f"local_fallback_write_failed key={key} err={type(e).__name__}:{e}")
 
-    if _sb_ok():
+    if _app_storage_remote_ok():
         sb_put_storage(key, content)
 
 
@@ -1386,7 +1399,7 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     is_history = _is_monitoring_history_key(key)
     if is_history:
         debug_log("history_verify_disabled key=monitoring_history.csv")
-    if is_history and _sb_ok():
+    if is_history and _app_storage_remote_ok():
         if MON_HISTORY_SUPABASE_MODE == "blob_fallback":
             now_ts = time.time()
             global _MON_HISTORY_REMOTE_BACKUP_LAST_TS
@@ -1405,7 +1418,7 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
         load_monitoring_rows_cached.clear()
         return
 
-    if _sb_ok():
+    if _app_storage_remote_ok():
         ok = sb_put_storage(key, content)
         if ok:
             do_verify = _should_verify_roundtrip(key=key, payload_len=len(content))
@@ -10993,9 +11006,8 @@ def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye
         stats["trimmed"] = trim_active_monitoring(max_active=150)
         monitoring_rows = load_monitoring()
         portfolio_rows = load_portfolio()
-        pool = build_discovery_candidate_pool(monitoring_rows=monitoring_rows, portfolio_rows=portfolio_rows, limit=64)
         active_monitoring_keys = {canonical_token_key(r) for r in monitoring_rows if canonical_token_key(r)}
-        stats["pulse_history_writer"] = record_live_pulse_history_from_candidates(pool, active_monitoring_keys, chain_filter="all", limit=8)
+        stats["pulse_history_writer"] = record_live_pulse_history_from_candidates(active_monitoring_keys=active_monitoring_keys, chain_filter="all", limit=8)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": state.get("last_stats", {}), "error": str(e)}
@@ -11022,9 +11034,8 @@ def run_scanner_now(seeds_raw: str, max_items: int = 100, use_birdeye_trending: 
         stats["trimmed"] = trim_active_monitoring(max_active=150)
         monitoring_rows = load_monitoring()
         portfolio_rows = load_portfolio()
-        pool = build_discovery_candidate_pool(monitoring_rows=monitoring_rows, portfolio_rows=portfolio_rows, limit=64)
         active_monitoring_keys = {canonical_token_key(r) for r in monitoring_rows if canonical_token_key(r)}
-        stats["pulse_history_writer"] = record_live_pulse_history_from_candidates(pool, active_monitoring_keys, chain_filter="all", limit=8)
+        stats["pulse_history_writer"] = record_live_pulse_history_from_candidates(active_monitoring_keys=active_monitoring_keys, chain_filter="all", limit=8)
     except Exception as e:
         log_error(e)
         return {"ran": False, "slot": slot, "window": window_name, "chain": chain, "stats": {}, "error": str(e)}
@@ -11063,9 +11074,8 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
     stats["purged_toxic"] = 0
     monitoring_rows = load_monitoring()
     portfolio_rows = load_portfolio()
-    pool = build_discovery_candidate_pool(monitoring_rows=monitoring_rows, portfolio_rows=portfolio_rows, limit=64)
     active_monitoring_keys = {canonical_token_key(r) for r in monitoring_rows if canonical_token_key(r)}
-    stats["pulse_history_writer"] = record_live_pulse_history_from_candidates(pool, active_monitoring_keys, chain_filter="all", limit=8)
+    stats["pulse_history_writer"] = record_live_pulse_history_from_candidates(active_monitoring_keys=active_monitoring_keys, chain_filter="all", limit=8)
     state["last_window"] = window_name
     state["last_preset"] = preset_key
     state["last_chain"] = normalize_chain_name(chain or "solana")
@@ -14712,15 +14722,28 @@ def main():
         st.caption("TG mode: ENV + Streamlit secrets fallback")
         st.divider()
         st.markdown("### Storage status")
-        if _sb_ok():
-            st.success("Supabase: ON")
+        st.caption(f"Storage backend: {STORAGE_BACKEND}")
+        if USE_D1:
+            if _d1_ok():
+                st.success("D1: ON")
+            else:
+                st.error("D1: OFF")
+            st.caption(f"URL: {bool(D1_PROXY_URL)} | TOKEN: {bool(D1_PROXY_TOKEN)}")
+            if _d1_ok():
+                size_rows = storage_list_sizes(limit=200)
+                st.caption(f"D1 storage keys: {len(size_rows)}")
+                if size_rows:
+                    st.caption(f"D1 storage sizes available: {sum(1 for r in size_rows if int(parse_float(r.get('bytes', 0), 0)) >= 0)}")
         else:
-            st.error("Supabase: OFF")
-        st.caption(f"URL: {bool(SUPABASE_URL)} | KEY: {bool(SUPABASE_SERVICE_ROLE_KEY)}")
-        if _sb_ok():
-            test = sb_get_storage("monitoring.csv")
-            if test is None:
-                st.warning("Supabase reachable but EMPTY / no data")
+            if _sb_ok():
+                st.success("Supabase: ON")
+            else:
+                st.error("Supabase: OFF")
+            st.caption(f"URL: {bool(SUPABASE_URL)} | KEY: {bool(SUPABASE_SERVICE_ROLE_KEY)}")
+            if _sb_ok():
+                test = sb_get_storage("monitoring.csv")
+                if test is None:
+                    st.warning("Supabase reachable but EMPTY / no data")
 
         if st.session_state.get("_save_badge"):
             st.caption(str(st.session_state.get("_save_badge")))
