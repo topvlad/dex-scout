@@ -540,6 +540,16 @@ def _get_secret(name: str, default: str = "") -> str:
         return str(default)
 
 
+def _secret_int(name: str, default: int) -> int:
+    raw = str(_get_secret(name, os.getenv(name, str(default))) or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def get_tg_token() -> str:
     return _get_secret("TG_BOT_TOKEN", "").strip() or _get_secret("TELEGRAM_BOT_TOKEN", "").strip()
 
@@ -556,7 +566,7 @@ STORAGE_BACKEND = raw_storage_backend if raw_storage_backend in {"supabase", "d1
 USE_D1 = STORAGE_BACKEND == "d1"
 D1_PROXY_URL = _get_secret("D1_PROXY_URL", "").strip().rstrip("/")
 D1_PROXY_TOKEN = _get_secret("D1_PROXY_TOKEN", "").strip()
-D1_TIMEOUT_SEC = max(1, int(parse_float(_get_secret("D1_TIMEOUT_SEC", os.getenv("D1_TIMEOUT_SEC", "12")), 12)))
+D1_TIMEOUT_SEC = max(1, _secret_int("D1_TIMEOUT_SEC", 12))
 
 USE_SUPABASE = STORAGE_BACKEND == "supabase" and bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 

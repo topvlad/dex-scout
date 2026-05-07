@@ -48,3 +48,13 @@ def test_runtime_contract_d1_uses_d1_checks(monkeypatch):
     monkeypatch.setattr(app, "d1_select_rows", fake_select_rows)
     status = app.check_runtime_contract()
     assert status["ok"] is True
+
+
+def test_d1_timeout_from_env_parses_without_name_error(monkeypatch):
+    app = _load_app(monkeypatch, STORAGE_BACKEND="d1", D1_PROXY_URL="https://d1.example", D1_PROXY_TOKEN="t", D1_TIMEOUT_SEC="12")
+    assert app.D1_TIMEOUT_SEC == 12
+
+
+def test_d1_timeout_invalid_falls_back_to_default(monkeypatch):
+    app = _load_app(monkeypatch, STORAGE_BACKEND="d1", D1_PROXY_URL="https://d1.example", D1_PROXY_TOKEN="t", D1_TIMEOUT_SEC="bad")
+    assert app.D1_TIMEOUT_SEC == 12
