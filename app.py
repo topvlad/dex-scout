@@ -12704,6 +12704,27 @@ def page_scout(cfg: Dict[str, Any]):
 
 
 def page_monitoring(auto_cfg: Dict[str, Any]):
+    page_t0 = time.perf_counter()
+    UI_RENDER_READONLY = bool(STREAMLIT_FAST_UI_MODE)
+    perf_counts: Dict[str, int] = {
+        "history_load_count": 0,
+        "journal_load_count": 0,
+        "write_attempts_skipped_fast_mode": 0,
+    }
+
+    def _track_history_load() -> None:
+        perf_counts["history_load_count"] = int(perf_counts.get("history_load_count", 0)) + 1
+
+    def _track_journal_load() -> None:
+        perf_counts["journal_load_count"] = int(perf_counts.get("journal_load_count", 0)) + 1
+
+    def _skip_auto_write(action: str, key: str) -> bool:
+        if not UI_RENDER_READONLY:
+            return False
+        perf_counts["write_attempts_skipped_fast_mode"] = int(perf_counts.get("write_attempts_skipped_fast_mode", 0)) + 1
+        debug_log(f"ui_fast_mode_auto_write_skipped action={action} key={key}")
+        return True
+
     st.title("Monitoring")
     st.caption("Manual pipeline: click scanner → save snapshot → render Monitoring.")
     st.caption("Telegram callbacks update storage directly. Use Refresh live data or reload the page to see external changes.")
@@ -12715,15 +12736,21 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     if bool(auto_cfg.get("auto_revisit_enabled", False)):
         try:
-            n = auto_reactivate_archived(days=int(auto_cfg.get("auto_revisit_days", 7)))
-            if n:
-                st.caption(f"Auto-revisited from Archive: {n}")
+            if _skip_auto_write("auto_reactivate_archived", "monitoring.csv"):
+                st.caption("Fast UI mode: auto-reactivation is disabled on page render.")
+            else:
+                n = auto_reactivate_archived(days=int(auto_cfg.get("auto_revisit_days", 7)))
+                if n:
+                    st.caption(f"Auto-revisited from Archive: {n}")
         except Exception:
             pass
     try:
-        revisited_now = revisit_archived(min_days=1, score_threshold=260.0, max_revisits=3)
-        if revisited_now:
-            st.caption(f"Revisited high-score candidates: {revisited_now}")
+        if _skip_auto_write("revisit_archived", "monitoring.csv"):
+            st.caption("Fast UI mode: auto-revisit is disabled on page render.")
+        else:
+            revisited_now = revisit_archived(min_days=1, score_threshold=260.0, max_revisits=3)
+            if revisited_now:
+                st.caption(f"Revisited high-score candidates: {revisited_now}")
     except Exception:
         pass
     perf_t0 = time.perf_counter()
@@ -12861,8 +12888,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     priority_cards: List[Dict[str, Any]] = []
     portfolio_linked_cards: List[Dict[str, Any]] = []
+    run_review_analysis = True
+    if STREAMLIT_FAST_UI_MODE:
+        st.caption("Fast UI mode: review analysis is not run automatically.")
+        run_review_analysis = st.button("Run review analysis", key="run_review_analysis", use_container_width=False)
+
     review_cards: List[Dict[str, Any]] = []
-    dead_cards = [c for c in cards_all if c["ui_bucket"] == "dead"]
+    dead_cards: List[Dict[str, Any]] = []
 
     for c in cards_all:
         if c.get("ui_bucket") == "dead":
@@ -12874,10 +12906,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         is_review = str(c.get("ui_badge", "")).upper() == "REVIEW" or c.get("ui_bucket") == "review" or weak_score
         if in_pf:
             portfolio_linked_cards.append(c)
-        elif is_review:
+        elif is_review and run_review_analysis:
             review_cards.append(c)
         else:
             priority_cards.append(c)
+        if c.get("ui_bucket") == "dead" and run_review_analysis:
+            dead_cards.append(c)
 
     def render_dedupe(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         best_by_symbol: Dict[str, Dict[str, Any]] = {}
@@ -13004,6 +13038,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                     st.caption("Raw internals hidden (debug mode only).")
 
             hist = (item.get("hist", []) or [])[-STREAMLIT_HISTORY_RENDER_LIMIT:]
+            if hist:
+                _track_history_load()
             with dynamics_tab:
                 render_monitoring_sparklines(hist)
 
@@ -13135,10 +13171,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         render_monitoring_card(item)
 
     st.subheader("Needs review")
-    if not review_cards:
-        st.caption("No review candidates.")
-    for item in review_cards:
-        render_monitoring_card(item)
+    if STREAMLIT_FAST_UI_MODE and not run_review_analysis:
+        st.caption("Fast UI mode: review analysis is not run automatically.")
+    else:
+        if not review_cards:
+            st.caption("No review candidates.")
+        for item in review_cards:
+            render_monitoring_card(item)
 
     st.markdown("---")
     with st.expander("🧭 Manual calibration assistant (suggestions only)", expanded=False):
@@ -13150,6 +13189,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
         if run_calibration:
             calibration_t0 = time.perf_counter()
+            _track_journal_load()
             journal_rows = load_csv(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS)
             trust_index = load_pattern_trust_index_cached()
             calibration_output = build_manual_calibration_suggestions(
@@ -13176,15 +13216,22 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.write(f"{k}: {v:.3f}s")
 
     with st.expander("Auto-archived / Dead candidates", expanded=False):
-        if not dead_cards:
-            st.caption("No dead candidates.")
-        for item in dead_cards:
-            r = item["row"]
-            name = extract_name(r).upper()
-            chain = (r.get("chain") or "").strip().lower()
-            flags = item.get("ui_flags") or []
-            st.write(f"{name} ({chain}) • {item.get('decision', 'DEAD')}")
-            st.caption("Flags: " + (" • ".join(flags) if flags else "none"))
+        if STREAMLIT_FAST_UI_MODE and not run_review_analysis:
+            st.caption("Fast UI mode: review analysis is not run automatically.")
+        else:
+            if not dead_cards:
+                st.caption("No dead candidates.")
+            for item in dead_cards:
+                r = item["row"]
+                name = extract_name(r).upper()
+                chain = (r.get("chain") or "").strip().lower()
+                flags = item.get("ui_flags") or []
+                st.write(f"{name} ({chain}) • {item.get('decision', 'DEAD')}")
+                st.caption("Flags: " + (" • ".join(flags) if flags else "none"))
+
+    perf["total_render_time"] = time.perf_counter() - page_t0
+    for key, value in perf_counts.items():
+        perf[key] = float(value)
 
 def page_archive():
     st.title("Archive")
