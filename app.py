@@ -3006,7 +3006,12 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
     }
 
 
-def compute_unified_recommendation(row: Dict[str, Any], source: str, hist: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def compute_unified_recommendation(
+    row: Dict[str, Any],
+    source: str,
+    hist: Optional[List[Dict[str, Any]]] = None,
+    allow_heavy_review: bool = True,
+) -> Dict[str, Any]:
     source = str(source or "monitoring").strip().lower()
     entry_action = str(row.get("entry_action") or row.get("entry") or "").upper()
     entry_score = parse_float(row.get("entry_score", row.get("score", 0)), 0.0)
@@ -3021,7 +3026,17 @@ def compute_unified_recommendation(row: Dict[str, Any], source: str, hist: Optio
     final_action = "TRACK ONLY"
     final_reason = "watch structure"
     health = detect_position_health(row, hist or [])
-    trust_payload = compute_pattern_trust({**row, "health_label": health.get("health_label", row.get("health_label"))})
+    if allow_heavy_review:
+        trust_payload = compute_pattern_trust({**row, "health_label": health.get("health_label", row.get("health_label"))})
+    else:
+        trust_payload = {
+            "trust_score": 0.0,
+            "trust_confidence": 0.0,
+            "trust_sample_size": 0,
+            "trust_reason": "fast_ui_mode_disabled_until_requested",
+            "pattern_key": "",
+            "priority_bias": 0.0,
+        }
     health_override_active = False
     health_override_action = ""
     health_override_reason = ""
@@ -11712,7 +11727,11 @@ def hydrate_monitoring_row_defaults(row: Dict[str, Any], item: Dict[str, Any]) -
     return row
 
 
-def monitoring_row_to_card(row: Dict[str, Any], allow_live_enrich: bool = True) -> Dict[str, Any]:
+def monitoring_row_to_card(
+    row: Dict[str, Any],
+    allow_live_enrich: bool = True,
+    allow_heavy_review: bool = True,
+) -> Dict[str, Any]:
     chain = (row.get("chain") or "").strip().lower()
     base_addr = addr_store(chain, str(row.get("base_addr") or "").strip())
     best = best_pair_for_token_cached(chain, base_addr) if (allow_live_enrich and chain and base_addr) else None
@@ -11788,6 +11807,7 @@ def monitoring_row_to_card(row: Dict[str, Any], allow_live_enrich: bool = True) 
     }
 
     item["row"] = hydrate_monitoring_row_defaults(row, item)
+    item["allow_heavy_review"] = bool(allow_heavy_review)
     return item
 
 def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -12709,6 +12729,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     perf_counts: Dict[str, int] = {
         "history_load_count": 0,
         "journal_load_count": 0,
+        "trust_index_load_count": 0,
         "write_attempts_skipped_fast_mode": 0,
     }
 
@@ -12717,6 +12738,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     def _track_journal_load() -> None:
         perf_counts["journal_load_count"] = int(perf_counts.get("journal_load_count", 0)) + 1
+
+    def _track_trust_index_load() -> None:
+        perf_counts["trust_index_load_count"] = int(perf_counts.get("trust_index_load_count", 0)) + 1
 
     def _skip_auto_write(action: str, key: str) -> bool:
         if not UI_RENDER_READONLY:
@@ -12767,6 +12791,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     active_rows_all = _ui_monitoring_source_rows(monitoring_rows)
     rows = list(monitoring_rows)
     if not STREAMLIT_FAST_UI_MODE:
+        _track_trust_index_load()
         trust_index = load_pattern_trust_index_cached()
         for row in active_rows_all:
             trust_payload = compute_pattern_trust(row, trust_index=trust_index)
@@ -12870,11 +12895,21 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     active = _ui_monitoring_visible_rows(active_render_rows, chain_filter=chain_filter)
     if STREAMLIT_FAST_UI_MODE and active_total > len(active_render_rows):
         st.caption(f"Rendering {len(active_render_rows)} of {active_total} active rows in fast UI mode.")
+    if STREAMLIT_FAST_UI_MODE:
+        st.caption("Fast UI mode: history/journal analytics disabled until requested.")
 
     live_enrich_disabled = STREAMLIT_FAST_UI_MODE or STREAMLIT_DISABLE_LIVE_PAIR_ENRICH_ON_RENDER
     refresh_live_visible = bool(st.session_state.pop("_refresh_live_visible_rows_once", False))
     allow_live_enrich = refresh_live_visible or (not live_enrich_disabled)
-    cards_raw = [monitoring_row_to_card(r, allow_live_enrich=allow_live_enrich) for r in active]
+    allow_heavy_review = (not STREAMLIT_FAST_UI_MODE) or refresh_live_visible
+    cards_raw = [
+        monitoring_row_to_card(
+            r,
+            allow_live_enrich=allow_live_enrich,
+            allow_heavy_review=allow_heavy_review,
+        )
+        for r in active
+    ]
     cards_all = []
     portfolio_rows = load_portfolio_rows_cached() if STREAMLIT_FAST_UI_MODE else load_portfolio()
     for c in cards_raw:
@@ -12958,7 +12993,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         sym = extract_name(r).upper()
         name = sym if sym not in {"", "UNKNOWN"} else "UNKNOWN"
         score = round(float(item.get("ui_visible_score", 0.0)), 2)
-        unified = compute_unified_recommendation(r, source="monitoring")
+        unified = compute_unified_recommendation(
+            r,
+            source="monitoring",
+            allow_heavy_review=bool(item.get("allow_heavy_review", True)),
+        )
         primary = str(unified.get("final_action") or "WAIT")
         secondary = item.get("ui_badge", "INFO")
         header = f"{name} | {primary} | {score:.2f}"
@@ -13197,6 +13236,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             calibration_t0 = time.perf_counter()
             _track_journal_load()
             journal_rows = load_csv(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS)
+            _track_trust_index_load()
             trust_index = load_pattern_trust_index_cached()
             calibration_output = build_manual_calibration_suggestions(
                 journal_rows=journal_rows,
@@ -14700,7 +14740,7 @@ def main():
         st.session_state["_migrated_reason_fields"] = True
     portfolio_rows = load_csv(PORTFOLIO_CSV, PORTFOLIO_FIELDS)
     monitoring_rows = load_csv(MONITORING_CSV, MON_FIELDS)
-    monitoring_history_rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
+    monitoring_history_rows = [] if STREAMLIT_FAST_UI_MODE else load_csv(MON_HISTORY_CSV, HIST_FIELDS)
     scan_state = scanner_state_load() or {}
     if not isinstance(scan_state, dict):
         scan_state = {}
