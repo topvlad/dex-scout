@@ -1671,6 +1671,10 @@ MAJORS_STABLES = {
 HARD_BLOCK_SYMBOLS = {"USDT", "USDC", "ETH", "BTC", "BNB"}
 MIN_LIQ_USD = 10000
 PULSE_MIN_LIQ_USD = float(max(0, _env_int("PULSE_MIN_LIQ_USD", 8000)))
+LIVE_PULSE_TARGET_MIN = max(1, _env_int("LIVE_PULSE_TARGET_MIN", 5))
+LIVE_PULSE_TARGET_MAX = max(LIVE_PULSE_TARGET_MIN, _env_int("LIVE_PULSE_TARGET_MAX", 15))
+LIVE_PULSE_RAW_DEPTH_MIN = 100
+LIVE_PULSE_RAW_DEPTH_MAX = 200
 MIN_TXNS_5M = 5
 MIN_VOL_5M = 1500
 MAX_KEEP = int(os.getenv("SCANNER_MAX_KEEP", "80"))
@@ -12481,20 +12485,31 @@ def build_market_pulse_cards(
     runtime = scan_state.get("worker_runtime", {}) if isinstance(scan_state.get("worker_runtime"), dict) else {}
     runtime_keys = {str(k or "").replace(":", "|") for k in list(runtime.get("last_candidate_keys", []) or []) if str(k or "").strip()}
     queue_keys = {str(k or "").replace(":", "|") for k in queue_state.keys() if str(k or "").strip()}
-    discovery_pool = build_discovery_candidate_pool(
-        monitoring_rows=monitoring_rows,
-        portfolio_rows=portfolio_rows,
-        limit=max(30, int(limit) * 8),
-    )
+    requested_limit = max(1, int(limit or LIVE_PULSE_TARGET_MAX))
+    render_limit = min(requested_limit, LIVE_PULSE_TARGET_MAX)
+    raw_depth_limit = max(LIVE_PULSE_RAW_DEPTH_MIN, min(LIVE_PULSE_RAW_DEPTH_MAX, max(render_limit * 12, 100)))
+    recent_shown_keys = {
+        str(k or "").replace(":", "|")
+        for k in list(runtime.get("last_pulse_recent_keys", []) or [])
+        if str(k or "").strip()
+    }
+    discovery_pool = build_discovery_candidate_pool(monitoring_rows=monitoring_rows, portfolio_rows=portfolio_rows, limit=raw_depth_limit)
     pulse_cards: List[Dict[str, Any]] = []
     seen: Set[str] = set()
     low_liq_skipped = 0
+    filtered_out = 0
+    refill_attempts = 0
     for row in discovery_pool:
+        refill_attempts += 1
         key = canonical_token_key(row)
         chain = token_chain(row)
         if not key or key in seen:
             continue
         if key in active_monitoring_keys:
+            filtered_out += 1
+            continue
+        if key in recent_shown_keys:
+            filtered_out += 1
             continue
         if chain_filter in {"bsc", "solana"} and chain != chain_filter:
             continue
@@ -12511,6 +12526,15 @@ def build_market_pulse_cards(
         liq_usd = _pulse_card_liquidity_usd(best if isinstance(best, dict) else None, row)
         if liq_usd < PULSE_MIN_LIQ_USD:
             low_liq_skipped += 1
+            filtered_out += 1
+            continue
+        row_payload = _pulse_pair_payload(row, best if isinstance(best, dict) else None)
+        toxic, _ = is_toxic_token(row_payload)
+        if toxic:
+            filtered_out += 1
+            continue
+        if pump_probability(row_payload) >= 7:
+            filtered_out += 1
             continue
         pulse_cards.append(
             {
@@ -12540,6 +12564,8 @@ def build_market_pulse_cards(
         }
         if record_pulse_history:
             _append_pulse_history_point(key, point)
+        if len(pulse_cards) >= LIVE_PULSE_TARGET_MAX:
+            break
     pulse_cards.sort(
         key=lambda x: (
             float(x.get("pulse_sort", 0.0)),
@@ -12548,7 +12574,7 @@ def build_market_pulse_cards(
         ),
         reverse=True,
     )
-    selected_cards = pulse_cards[: max(1, int(limit or 8))]
+    selected_cards = pulse_cards[:render_limit]
     for card in selected_cards:
         row = card.get("row", {}) or {}
         card["mini_sparkline"] = _pulse_card_mini_sparkline(row)
@@ -12556,8 +12582,13 @@ def build_market_pulse_cards(
         updates={
             "last_pulse_liq_min_usd": float(PULSE_MIN_LIQ_USD),
             "last_pulse_candidates_total": int(len(discovery_pool)),
+            "last_pulse_raw_seen": int(refill_attempts),
+            "last_pulse_filtered_out": int(filtered_out),
+            "last_pulse_final_candidates": int(len(selected_cards)),
+            "last_pulse_refill_attempts": int(refill_attempts),
             "last_pulse_candidates_low_liq_skipped": int(low_liq_skipped),
             "last_pulse_candidates_after_liq_gate": int(len(pulse_cards)),
+            "last_pulse_recent_keys": [str(c.get("key") or "").replace("|", ":") for c in selected_cards if str(c.get("key") or "").strip()][-300:],
         }
     )
     if low_liq_skipped > 0:
@@ -13277,6 +13308,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     st.subheader("Live pulse candidates")
     st.caption("Live candidates behind glass (read-only layer). Confirmed Monitoring below remains the settled active layer.")
+    pulse_runtime = get_worker_runtime_state()
+    st.caption(
+        f"raw_seen={int(parse_float(pulse_runtime.get('last_pulse_raw_seen', 0), 0))} • "
+        f"filtered_out={int(parse_float(pulse_runtime.get('last_pulse_filtered_out', 0), 0))} • "
+        f"final_pulse_candidates={int(parse_float(pulse_runtime.get('last_pulse_final_candidates', 0), 0))} • "
+        f"refill_attempts={int(parse_float(pulse_runtime.get('last_pulse_refill_attempts', 0), 0))}"
+    )
     if STREAMLIT_FAST_UI_MODE:
         st.caption("Fast UI mode: pulse/history enrichment is disabled by default.")
     elif not pulse_cards:
@@ -14953,11 +14991,18 @@ def main():
         "monitoring_history": len(monitoring_history_rows),
     }
     st.sidebar.caption(f"📥 portfolio: {len(portfolio_rows)}")
+    runtime_ui = get_worker_runtime_state(state=scan_state)
+    persisted_scan_params = runtime_ui.get("scanner_ui_params", {}) if isinstance(runtime_ui.get("scanner_ui_params"), dict) else {}
 
     scanner_seeds_raw = str(DEFAULT_SEEDS)
     scanner_max_items = 100
     use_birdeye_trending = True
     birdeye_limit = 50
+    if persisted_scan_params:
+        scanner_seeds_raw = str(persisted_scan_params.get("seeds_raw") or scanner_seeds_raw)
+        scanner_max_items = int(parse_float(persisted_scan_params.get("max_tokens_per_slot", scanner_max_items), scanner_max_items))
+        use_birdeye_trending = bool(persisted_scan_params.get("use_birdeye_trending", use_birdeye_trending))
+        birdeye_limit = int(parse_float(persisted_scan_params.get("birdeye_limit", birdeye_limit), birdeye_limit))
     auto_refresh_enabled = False
     ui_autorefresh_sec = 60
 
@@ -14994,14 +15039,20 @@ def main():
 
         st.divider()
         st.caption("Scanner")
-        scanner_max_items = st.slider("Max tokens per slot", 10, 100, 100, step=10)
+        scanner_max_items = st.slider("Max tokens per slot", 10, 100, int(scanner_max_items), step=10)
         auto_refresh_enabled = st.checkbox("Auto refresh", value=False)
         ui_autorefresh_sec = st.slider("Auto-refresh interval (sec)", 60, 300, 60, step=10, disabled=(not auto_refresh_enabled))
-        use_birdeye_trending = st.checkbox("Use Solana extra stream (Birdeye)", value=True, disabled=(not BIRDEYE_ENABLED))
+        use_birdeye_trending = st.checkbox("Use Solana extra stream (Birdeye)", value=bool(use_birdeye_trending), disabled=(not BIRDEYE_ENABLED))
         if not BIRDEYE_ENABLED:
             st.caption("Birdeye key missing: add BIRDEYE_API_KEY to secrets to enable extra Solana stream.")
-        birdeye_limit = st.slider("Birdeye trending size", 10, 100, 50, step=10, disabled=(not use_birdeye_trending or not BIRDEYE_ENABLED))
-        scanner_seeds_raw = st.text_area("Scanner seeds", value=str(DEFAULT_SEEDS), height=120)
+        birdeye_limit = st.slider("Birdeye trending size", 10, 200, int(birdeye_limit), step=10, disabled=(not use_birdeye_trending or not BIRDEYE_ENABLED))
+        scanner_seeds_raw = st.text_area("Scanner seeds", value=str(scanner_seeds_raw), height=120)
+        update_worker_runtime_state(updates={"scanner_ui_params": {
+            "use_birdeye_trending": bool(use_birdeye_trending),
+            "birdeye_limit": int(birdeye_limit),
+            "max_tokens_per_slot": int(scanner_max_items),
+            "seeds_raw": str(scanner_seeds_raw or ""),
+        }})
 
         st.divider()
         st.caption("Monitoring")
