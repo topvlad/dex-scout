@@ -3011,6 +3011,7 @@ def compute_unified_recommendation(
     source: str,
     hist: Optional[List[Dict[str, Any]]] = None,
     allow_heavy_review: bool = True,
+    allow_heavy_analytics: bool = True,
 ) -> Dict[str, Any]:
     source = str(source or "monitoring").strip().lower()
     entry_action = str(row.get("entry_action") or row.get("entry") or "").upper()
@@ -3025,6 +3026,37 @@ def compute_unified_recommendation(
     liquidity_health = str(row.get("liquidity_health") or "").upper()
     final_action = "TRACK ONLY"
     final_reason = "watch structure"
+    if not allow_heavy_analytics:
+        final_action = str(row.get("final_action") or entry_action or "TRACK ONLY").upper()
+        final_reason = str(row.get("final_reason") or "fast UI lightweight render")
+        trust_payload = {
+            "trust_score": 0.0,
+            "trust_confidence": 0.0,
+            "trust_sample_size": 0,
+            "trust_reason": "fast_ui_mode_disabled_until_requested",
+            "pattern_key": "",
+            "priority_bias": 0.0,
+        }
+        return {
+            "final_action": final_action,
+            "final_reason": final_reason,
+            "severity": "low",
+            "timing": timing,
+            "size_hint": "WATCH ONLY",
+            "regime": source,
+            "confidence": "LOW",
+            "health": {"health_label": str(row.get("health_label") or "UNKNOWN").upper()},
+            "health_override_active": False,
+            "health_override_action": "",
+            "health_override_reason": "",
+            "trust_score": 0.0,
+            "trust_confidence": 0.0,
+            "trust_sample_size": 0,
+            "trust_reason": trust_payload.get("trust_reason", ""),
+            "trust_pattern_key": "",
+            "trust_pattern_key_schema_version": PATTERN_KEY_SCHEMA_VERSION,
+            "trust_advisory_only": True,
+        }
     health = detect_position_health(row, hist or [])
     if allow_heavy_review:
         trust_payload = compute_pattern_trust({**row, "health_label": health.get("health_label", row.get("health_label"))})
@@ -11731,6 +11763,7 @@ def monitoring_row_to_card(
     row: Dict[str, Any],
     allow_live_enrich: bool = True,
     allow_heavy_review: bool = True,
+    allow_heavy_analytics: bool = True,
 ) -> Dict[str, Any]:
     chain = (row.get("chain") or "").strip().lower()
     base_addr = addr_store(chain, str(row.get("base_addr") or "").strip())
@@ -11808,6 +11841,7 @@ def monitoring_row_to_card(
 
     item["row"] = hydrate_monitoring_row_defaults(row, item)
     item["allow_heavy_review"] = bool(allow_heavy_review)
+    item["allow_heavy_analytics"] = bool(allow_heavy_analytics)
     return item
 
 def monitoring_ui_state(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -12730,6 +12764,8 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         "history_load_count": 0,
         "journal_load_count": 0,
         "trust_index_load_count": 0,
+        "health_override_load_count": 0,
+        "portfolio_action_journal_load_count": 0,
         "write_attempts_skipped_fast_mode": 0,
     }
 
@@ -12902,11 +12938,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     refresh_live_visible = bool(st.session_state.pop("_refresh_live_visible_rows_once", False))
     allow_live_enrich = refresh_live_visible or (not live_enrich_disabled)
     allow_heavy_review = (not STREAMLIT_FAST_UI_MODE) or refresh_live_visible
+    allow_heavy_analytics = refresh_live_visible or (not STREAMLIT_FAST_UI_MODE)
     cards_raw = [
         monitoring_row_to_card(
             r,
             allow_live_enrich=allow_live_enrich,
             allow_heavy_review=allow_heavy_review,
+            allow_heavy_analytics=allow_heavy_analytics,
         )
         for r in active
     ]
@@ -12997,6 +13035,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             r,
             source="monitoring",
             allow_heavy_review=bool(item.get("allow_heavy_review", True)),
+            allow_heavy_analytics=bool(item.get("allow_heavy_analytics", True)),
         )
         primary = str(unified.get("final_action") or "WAIT")
         secondary = item.get("ui_badge", "INFO")
