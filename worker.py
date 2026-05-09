@@ -192,12 +192,30 @@ def _finalize_runtime_if_token_matches(
 
 def _run_scan_cycle() -> Dict[str, Any]:
     assert app is not None
-    seeds_raw = SCANNER_SEEDS or str(app.DEFAULT_SEEDS)
+    runtime_before = app.get_worker_runtime_state()
+    scan_request = runtime_before.get("scan_request") if isinstance(runtime_before.get("scan_request"), dict) else {}
+    pending = bool(runtime_before.get("scan_request_pending"))
+    params = scan_request.get("params") if isinstance(scan_request.get("params"), dict) else {}
+    if not pending:
+        return {"scan": {"ran": False, "reason": "no_pending_scan_request"}, "pulse_history": {"ok": True, "skipped": True}}
+    seeds_raw = str(params.get("seeds_raw") or SCANNER_SEEDS or str(app.DEFAULT_SEEDS))
+    max_items = int(app.parse_float(params.get("max_items", SCANNER_MAX_ITEMS), SCANNER_MAX_ITEMS))
+    use_birdeye_trending = bool(params.get("use_birdeye_trending", USE_BIRDEYE_TRENDING))
+    birdeye_limit = int(app.parse_float(params.get("birdeye_limit", BIRDEYE_LIMIT), BIRDEYE_LIMIT))
     scan_result = app.maybe_run_rotating_scanner(
         seeds_raw=seeds_raw,
-        max_items=SCANNER_MAX_ITEMS,
-        use_birdeye_trending=USE_BIRDEYE_TRENDING,
-        birdeye_limit=BIRDEYE_LIMIT,
+        max_items=max_items,
+        use_birdeye_trending=use_birdeye_trending,
+        birdeye_limit=birdeye_limit,
+    )
+    app.update_worker_runtime_state(
+        updates={
+            "scan_request_pending": False,
+            "scan_request_processed_ts": app.now_utc_str(),
+            "last_scan_status": "ok" if not scan_result.get("error") else "error",
+            "last_scan_stats": scan_result.get("stats", {}),
+            "last_scan_ts": app.now_utc_str(),
+        }
     )
     pulse_result = _record_pulse_history_after_cycle_safe()
     return {"scan": scan_result, "pulse_history": pulse_result}
