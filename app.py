@@ -550,6 +550,17 @@ def _secret_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _secret_bool(name: str, default: bool) -> bool:
+    raw = str(_get_secret(name, os.getenv(name, str(default))) or "").strip().lower()
+    if not raw:
+        return bool(default)
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
 def get_tg_token() -> str:
     return _get_secret("TG_BOT_TOKEN", "").strip() or _get_secret("TELEGRAM_BOT_TOKEN", "").strip()
 
@@ -569,6 +580,11 @@ D1_PROXY_TOKEN = _get_secret("D1_PROXY_TOKEN", "").strip()
 D1_TIMEOUT_SEC = max(1, _secret_int("D1_TIMEOUT_SEC", 12))
 
 USE_SUPABASE = STORAGE_BACKEND == "supabase" and bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+STREAMLIT_FAST_UI_MODE = _secret_bool("STREAMLIT_FAST_UI_MODE", True)
+STREAMLIT_ACTIVE_RENDER_LIMIT = max(1, _secret_int("STREAMLIT_ACTIVE_RENDER_LIMIT", 30))
+STREAMLIT_ARCHIVE_PREVIEW_LIMIT = max(10, _secret_int("STREAMLIT_ARCHIVE_PREVIEW_LIMIT", 50))
+STREAMLIT_HISTORY_RENDER_LIMIT = max(10, _secret_int("STREAMLIT_HISTORY_RENDER_LIMIT", 200))
+STREAMLIT_DISABLE_LIVE_PAIR_ENRICH_ON_RENDER = _secret_bool("STREAMLIT_DISABLE_LIVE_PAIR_ENRICH_ON_RENDER", True)
 
 RUNTIME_STATE_TABLE = "runtime_state"
 LOCKS_TABLE = "locks"
@@ -1370,6 +1386,21 @@ def load_monitoring_rows_cached() -> List[Dict[str, Any]]:
     return load_csv(MONITORING_CSV, MON_FIELDS)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_portfolio_rows_cached() -> List[Dict[str, Any]]:
+    return load_csv(PORTFOLIO_CSV, PORTFOLIO_FIELDS)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def scanner_state_load_cached() -> Dict[str, Any]:
+    return scanner_state_load()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def tg_state_load_cached() -> Dict[str, Any]:
+    return tg_state()
+
+
 def storage_metrics_reset() -> None:
     _STORAGE_METRICS["writes"] = 0
     _STORAGE_METRICS["roundtrip_checks"] = 0
@@ -1455,6 +1486,9 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     else:
         st.session_state["_save_badge"] = "💾 saved (local)"
     load_monitoring_rows_cached.clear()
+    load_portfolio_rows_cached.clear()
+    scanner_state_load_cached.clear()
+    tg_state_load_cached.clear()
 
 
 def backup_csv_snapshot(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
@@ -11678,15 +11712,15 @@ def hydrate_monitoring_row_defaults(row: Dict[str, Any], item: Dict[str, Any]) -
     return row
 
 
-def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
+def monitoring_row_to_card(row: Dict[str, Any], allow_live_enrich: bool = True) -> Dict[str, Any]:
     chain = (row.get("chain") or "").strip().lower()
     base_addr = addr_store(chain, str(row.get("base_addr") or "").strip())
-    best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
-    hist = token_history_rows(chain, base_addr, limit=30)
-    gem_data = compute_gem_transition_score(best, hist)
+    best = best_pair_for_token_cached(chain, base_addr) if (allow_live_enrich and chain and base_addr) else None
+    hist = token_history_rows(chain, base_addr, limit=30) if allow_live_enrich else []
+    gem_data = compute_gem_transition_score(best, hist) if allow_live_enrich else {}
 
-    liq_health = liquidity_health(best)
-    anti_rug = anti_rug_early_detector(best, hist)
+    liq_health = liquidity_health(best) if allow_live_enrich else {"level": "UNKNOWN", "score": 0.0, "reason": "live_enrichment_disabled"}
+    anti_rug = anti_rug_early_detector(best, hist) if allow_live_enrich else {"level": "SAFE", "score": 0.0, "reason": "live_enrichment_disabled"}
     size_info = position_sizing_engine(best, portfolio_value_usd=1000.0, hist=hist) if best else {
         "size_pct": 0.0,
         "size_label": "NA",
@@ -11703,9 +11737,9 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     timing_label = normalize_timing_label(row.get("timing_label") or "NEUTRAL")
     risk_level = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
 
-    dead = is_token_dead(best)
-    post_rug = is_post_rug(best, hist)
-    alive = is_alive(best)
+    dead = is_token_dead(best) if allow_live_enrich else False
+    post_rug = is_post_rug(best, hist) if allow_live_enrich else False
+    alive = is_alive(best) if allow_live_enrich else True
 
     if dead:
         entry_status = "NO_ENTRY"
@@ -11715,7 +11749,7 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     if post_rug:
         risk_level = "EXTREME"
 
-    health = detect_position_health(best or row, hist)
+    health = detect_position_health(best or row, hist) if allow_live_enrich else {"health_label": "UNKNOWN"}
     health_label = str(health.get("health_label", "OK")).upper()
     if str(liq_health.get("level", "")).upper() == "CRITICAL":
         health_label = "CRITICAL"
@@ -12692,34 +12726,42 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption(f"Revisited high-score candidates: {revisited_now}")
     except Exception:
         pass
-    scan_state = scanner_state_load()
+    perf_t0 = time.perf_counter()
+    perf: Dict[str, float] = {}
+    scan_state = scanner_state_load_cached()
     top = st.columns([2,2,3,3])
 
     # Source of truth for Monitoring page UI: monitoring.csv filtered through _ui_monitoring_source_rows.
     monitoring_rows = load_monitoring_rows_cached()
+    perf["load_monitoring"] = time.perf_counter() - perf_t0
     mon_source = st.session_state.get("_storage_source_monitoring.csv", _active_storage_source_label())
     st.caption(f"MONITORING FROM DB: {len(monitoring_rows)} (source: {mon_source})")
-    active_rows = _ui_monitoring_source_rows(monitoring_rows)
+    split_t0 = time.perf_counter()
+    active_rows_all = _ui_monitoring_source_rows(monitoring_rows)
     rows = list(monitoring_rows)
-    trust_index = load_pattern_trust_index_cached()
-    for row in active_rows:
-        trust_payload = compute_pattern_trust(row, trust_index=trust_index)
-        row["trust_score"] = trust_payload.get("trust_score", 0.0)
-        row["trust_confidence"] = trust_payload.get("trust_confidence", 0.0)
-        row["trust_sample_size"] = trust_payload.get("trust_sample_size", 0)
-        row["trust_reason"] = trust_payload.get("trust_reason", "")
-        row["trust_pattern_key"] = trust_payload.get("pattern_key", "")
-        row["trust_priority_bias"] = advisory_trust_bias(trust_payload)
-    active_rows = sorted(
-        active_rows,
+    if not STREAMLIT_FAST_UI_MODE:
+        trust_index = load_pattern_trust_index_cached()
+        for row in active_rows_all:
+            trust_payload = compute_pattern_trust(row, trust_index=trust_index)
+            row["trust_score"] = trust_payload.get("trust_score", 0.0)
+            row["trust_confidence"] = trust_payload.get("trust_confidence", 0.0)
+            row["trust_sample_size"] = trust_payload.get("trust_sample_size", 0)
+            row["trust_reason"] = trust_payload.get("trust_reason", "")
+            row["trust_pattern_key"] = trust_payload.get("pattern_key", "")
+            row["trust_priority_bias"] = advisory_trust_bias(trust_payload)
+    active_rows_sorted = sorted(
+        active_rows_all,
         key=lambda row: (
             parse_float(row.get("priority_score", 0), 0.0) + parse_float(row.get("trust_priority_bias", 0), 0.0)
         ),
         reverse=True,
     )[:50]
-    active = list(active_rows)
+    active_total = len(active_rows_all)
+    active_rows = list(active_rows_sorted)
+    active_render_rows = list(active_rows_sorted)[:STREAMLIT_ACTIVE_RENDER_LIMIT]
     archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
-    top[0].metric("Active", len(active))
+    perf["split_active_archive"] = time.perf_counter() - split_t0
+    top[0].metric("Active", active_total)
     top[1].metric("Archived", len(archived))
     top[2].caption(f"Last scan: {scan_state.get('last_run_ts','—')} • {scan_state.get('last_window','—')} • {scan_state.get('last_chain','—')}")
     top[3].caption(f"Last stats: {scan_state.get('last_stats', {})}")
@@ -12751,6 +12793,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             request_rerun()
     with cbtn2:
         if st.button("Refresh live data", use_container_width=True):
+            st.session_state["_refresh_live_visible_rows_once"] = True
             st.cache_data.clear()
             load_monitoring_rows_cached.clear()
             _ = load_monitoring()
@@ -12797,11 +12840,16 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         return
 
     chain_filter = st.selectbox("Chain filter", ["all", "bsc", "solana"], index=0)
-    active = _ui_monitoring_visible_rows(active_rows, chain_filter=chain_filter)
+    active = _ui_monitoring_visible_rows(active_render_rows, chain_filter=chain_filter)
+    if STREAMLIT_FAST_UI_MODE and active_total > len(active_render_rows):
+        st.caption(f"Rendering {len(active_render_rows)} of {active_total} active rows in fast UI mode.")
 
-    cards_raw = [monitoring_row_to_card(r) for r in active]
+    live_enrich_disabled = STREAMLIT_FAST_UI_MODE or STREAMLIT_DISABLE_LIVE_PAIR_ENRICH_ON_RENDER
+    refresh_live_visible = bool(st.session_state.pop("_refresh_live_visible_rows_once", False))
+    allow_live_enrich = refresh_live_visible or (not live_enrich_disabled)
+    cards_raw = [monitoring_row_to_card(r, allow_live_enrich=allow_live_enrich) for r in active]
     cards_all = []
-    portfolio_rows = load_portfolio()
+    portfolio_rows = load_portfolio_rows_cached() if STREAMLIT_FAST_UI_MODE else load_portfolio()
     for c in cards_raw:
         ui = monitoring_ui_state(c)
         c["ui_bucket"] = ui["bucket"]
@@ -12843,15 +12891,17 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 best_by_symbol[sym] = c
         return list(best_by_symbol.values())
 
-    active_monitoring_keys = {canonical_token_key(r) for r in active_rows if canonical_token_key(r)}
-    pulse_cards = build_market_pulse_cards(
-        monitoring_rows=rows,
-        portfolio_rows=portfolio_rows,
-        active_monitoring_keys=active_monitoring_keys,
-        chain_filter=chain_filter,
-        limit=8,
-        record_pulse_history=False,
-    )
+    active_monitoring_keys = {canonical_token_key(r) for r in active_rows_all if canonical_token_key(r)}
+    pulse_cards: List[Dict[str, Any]] = []
+    if not STREAMLIT_FAST_UI_MODE:
+        pulse_cards = build_market_pulse_cards(
+            monitoring_rows=rows,
+            portfolio_rows=portfolio_rows,
+            active_monitoring_keys=active_monitoring_keys,
+            chain_filter=chain_filter,
+            limit=8,
+            record_pulse_history=False,
+        )
 
     priority_cards = render_dedupe(priority_cards)
     portfolio_linked_cards = render_dedupe(portfolio_linked_cards)
@@ -12953,13 +13003,15 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 else:
                     st.caption("Raw internals hidden (debug mode only).")
 
-            hist = item.get("hist", []) or []
+            hist = (item.get("hist", []) or [])[-STREAMLIT_HISTORY_RENDER_LIMIT:]
             with dynamics_tab:
                 render_monitoring_sparklines(hist)
 
     st.subheader("Live pulse candidates")
     st.caption("Live candidates behind glass (read-only layer). Confirmed Monitoring below remains the settled active layer.")
-    if not pulse_cards:
+    if STREAMLIT_FAST_UI_MODE:
+        st.caption("Fast UI mode: pulse/history enrichment is disabled by default.")
+    elif not pulse_cards:
         st.caption("No pulse candidates right now.")
     pulse_symbol_counts: Dict[str, int] = {}
     for pulse in pulse_cards:
@@ -13074,6 +13126,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         st.info("No items in priority watchlist yet.")
     for item in priority_cards:
         render_monitoring_card(item)
+    perf["render_active_cards"] = time.perf_counter() - perf_t0
 
     st.subheader("Portfolio-linked monitoring")
     if not portfolio_linked_cards:
@@ -13088,35 +13141,39 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         render_monitoring_card(item)
 
     st.markdown("---")
-    st.subheader("🧭 Manual calibration assistant (suggestions only)")
-    journal_rows = load_csv(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS)
-    trust_index = load_pattern_trust_index_cached()
-    calibration_output = build_manual_calibration_suggestions(
-        journal_rows=journal_rows,
-        trust_index=trust_index,
-        review_findings=review_cards,
-        explicit_safety_whitelist=[],
-    )
-    if calibration_output.get("status") != "ok":
-        st.info(str(calibration_output.get("message") or "not enough evidence"))
-    else:
-        st.caption("Manual apply required for every change. No automatic mutation path in this assistant.")
-        for idx, suggestion in enumerate(calibration_output.get("suggestions") or [], start=1):
-            proposed = suggestion.get("proposed_change") or {}
-            evidence = suggestion.get("evidence") or {}
-            st.markdown(f"**Suggestion {idx}: {proposed.get('parameter', 'n/a')}**")
-            st.json(
-                {
-                    "proposed_change": proposed,
-                    "evidence": evidence,
-                    "confidence": suggestion.get("confidence"),
-                    "risk_note": suggestion.get("risk_note"),
-                    "manual_apply_required": suggestion.get("manual_apply_required", True),
-                }
+    with st.expander("🧭 Manual calibration assistant (suggestions only)", expanded=False):
+        if STREAMLIT_FAST_UI_MODE:
+            st.caption("Fast UI mode: click to run calibration.")
+            run_calibration = st.button("Run calibration assistant", key="run_calibration_assistant")
+        else:
+            run_calibration = True
+
+        if run_calibration:
+            calibration_t0 = time.perf_counter()
+            journal_rows = load_csv(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS)
+            trust_index = load_pattern_trust_index_cached()
+            calibration_output = build_manual_calibration_suggestions(
+                journal_rows=journal_rows,
+                trust_index=trust_index,
+                review_findings=review_cards,
+                explicit_safety_whitelist=[],
             )
-        st.caption(
-            "Safety-critical parameters remain excluded unless explicitly whitelisted for manual review."
-        )
+            perf["calibration_assistant"] = time.perf_counter() - calibration_t0
+            if calibration_output.get("status") != "ok":
+                st.info(str(calibration_output.get("message") or "not enough evidence"))
+            else:
+                st.caption("Manual apply required for every change. No automatic mutation path in this assistant.")
+                for idx, suggestion in enumerate(calibration_output.get("suggestions") or [], start=1):
+                    proposed = suggestion.get("proposed_change") or {}
+                    evidence = suggestion.get("evidence") or {}
+                    st.markdown(f"**Suggestion {idx}: {proposed.get('parameter', 'n/a')}**")
+                    st.json({"proposed_change": proposed, "evidence": evidence, "confidence": suggestion.get("confidence")})
+        else:
+            st.caption("Not run on this render.")
+
+    with st.expander("Debug / Performance", expanded=False):
+        for k, v in perf.items():
+            st.write(f"{k}: {v:.3f}s")
 
     with st.expander("Auto-archived / Dead candidates", expanded=False):
         if not dead_cards:
@@ -13133,7 +13190,7 @@ def page_archive():
     st.title("Archive")
     st.caption("Архівовані токени з Monitoring. Можуть повернутися тільки вручну (re-activate).")
 
-    rows = load_monitoring()
+    rows = load_monitoring_rows_cached() if STREAMLIT_FAST_UI_MODE else load_monitoring()
     archived = [r for r in rows if r.get("active") != "1"]
 
     if not archived:
@@ -13142,7 +13199,21 @@ def page_archive():
 
     archived.sort(key=lambda x: x.get("ts_archived", "") or x.get("ts_added", ""), reverse=True)
 
-    for idx, r in enumerate(archived[:200], start=1):
+    q = st.text_input("Search symbol/address", value="", key="archive_search")
+    if q.strip():
+        qn = q.strip().lower()
+        archived = [
+            r for r in archived
+            if qn in str(r.get("base_symbol", "")).lower() or qn in str(r.get("base_addr", "")).lower()
+        ]
+    page_size = STREAMLIT_ARCHIVE_PREVIEW_LIMIT
+    total = len(archived)
+    pages = max(1, math.ceil(total / page_size))
+    page_num = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1)
+    start = (int(page_num) - 1) * page_size
+    end = start + page_size
+    st.caption(f"Showing {start + 1}-{min(end, total)} of {total}")
+    for idx, r in enumerate(archived[start:end], start=1):
         chain = (r.get("chain") or "").strip().lower()
         base_sym = r.get("base_symbol") or "???"
         base_addr = (r.get("base_addr") or "").strip()
