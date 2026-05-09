@@ -12888,6 +12888,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     priority_cards: List[Dict[str, Any]] = []
     portfolio_linked_cards: List[Dict[str, Any]] = []
+    hidden_review_dead_count = 0
     run_review_analysis = True
     if STREAMLIT_FAST_UI_MODE:
         st.caption("Fast UI mode: review analysis is not run automatically.")
@@ -12897,8 +12898,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     dead_cards: List[Dict[str, Any]] = []
 
     for c in cards_all:
-        if c.get("ui_bucket") == "dead":
-            continue
+        is_dead = c.get("ui_bucket") == "dead"
         row = c.get("row", {})
         in_pf = is_in_portfolio_active(row, portfolio_rows)
         c["is_portfolio_active"] = in_pf
@@ -12906,12 +12906,18 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         is_review = str(c.get("ui_badge", "")).upper() == "REVIEW" or c.get("ui_bucket") == "review" or weak_score
         if in_pf:
             portfolio_linked_cards.append(c)
+        elif STREAMLIT_FAST_UI_MODE and (not run_review_analysis) and (is_dead or is_review):
+            hidden_review_dead_count += 1
+            continue
+        elif is_dead and run_review_analysis:
+            dead_cards.append(c)
         elif is_review and run_review_analysis:
             review_cards.append(c)
         else:
             priority_cards.append(c)
-        if c.get("ui_bucket") == "dead" and run_review_analysis:
-            dead_cards.append(c)
+
+    if STREAMLIT_FAST_UI_MODE and not run_review_analysis and hidden_review_dead_count > 0:
+        st.caption(f"Fast UI mode: {hidden_review_dead_count} review/dead candidates hidden until review analysis is run.")
 
     def render_dedupe(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         best_by_symbol: Dict[str, Dict[str, Any]] = {}
@@ -13211,6 +13217,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         else:
             st.caption("Not run on this render.")
 
+    perf["total_render_time"] = time.perf_counter() - page_t0
+    for key, value in perf_counts.items():
+        perf[key] = float(value)
+
     with st.expander("Debug / Performance", expanded=False):
         for k, v in perf.items():
             st.write(f"{k}: {v:.3f}s")
@@ -13228,10 +13238,6 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 flags = item.get("ui_flags") or []
                 st.write(f"{name} ({chain}) • {item.get('decision', 'DEAD')}")
                 st.caption("Flags: " + (" • ".join(flags) if flags else "none"))
-
-    perf["total_render_time"] = time.perf_counter() - page_t0
-    for key, value in perf_counts.items():
-        perf[key] = float(value)
 
 def page_archive():
     st.title("Archive")
