@@ -10777,6 +10777,13 @@ def worker_runtime_defaults() -> Dict[str, Any]:
         "storage_writes_per_cycle": 0,
         "storage_roundtrip_checks_per_cycle": 0,
         "cycle_duration_sec": 0.0,
+        "scan_request": {},
+        "scan_request_pending": False,
+        "scan_request_ts": "",
+        "scan_request_processed_ts": "",
+        "last_scan_status": "",
+        "last_scan_stats": {},
+        "last_scan_ts": "",
     }
 
 
@@ -11176,6 +11183,40 @@ def run_full_ingestion_now(chain: str, seeds_raw: str, max_items: int = 100, use
     state["last_run_ts"] = now_utc_str()
     scanner_state_save(state)
     return stats
+
+def request_scan_cycle(
+    requested_by: str,
+    chain: str,
+    seeds_raw: str,
+    max_items: int,
+    use_birdeye_trending: bool,
+    birdeye_limit: int,
+) -> Dict[str, Any]:
+    now_ts = now_utc_str()
+    payload = {
+        "requested": True,
+        "requested_ts": now_ts,
+        "requested_by": str(requested_by or "streamlit_ui"),
+        "params": {
+            "chain": normalize_chain_name(chain or "solana"),
+            "seeds_raw": str(seeds_raw or ""),
+            "max_items": int(max_items),
+            "use_birdeye_trending": bool(use_birdeye_trending),
+            "birdeye_limit": int(birdeye_limit),
+        },
+    }
+    runtime = update_worker_runtime_state(
+        updates={
+            "scan_request": payload,
+            "scan_request_pending": True,
+            "scan_request_ts": now_ts,
+        }
+    )
+    return payload | {
+        "pending": bool(runtime.get("scan_request_pending", False)),
+        "last_scan_status": str(runtime.get("last_scan_status") or ""),
+        "last_scan_ts": str(runtime.get("last_scan_ts") or ""),
+    }
 
 
 def scan_source_window_name() -> str:
@@ -12854,6 +12895,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     top[2].caption(f"Last scan: {scan_state.get('last_run_ts','—')} • {scan_state.get('last_window','—')} • {scan_state.get('last_chain','—')}")
     top[3].caption(f"Last stats: {scan_state.get('last_stats', {})}")
     stats = scan_state.get("last_stats", {}) or {}
+    runtime_scan = get_worker_runtime_state(state=scan_state)
+    st.caption(f"Scan request pending: {'yes' if runtime_scan.get('scan_request_pending') else 'no'}")
+    st.caption(f"Last scan status: {runtime_scan.get('last_scan_status') or '-'}")
+    st.caption(f"Last scan stats: {runtime_scan.get('last_scan_stats') or {}}")
     st.caption(
         f"Added: {stats.get('added', 0)} • "
         f"Skipped active: {stats.get('skipped_active', 0)} • "
@@ -12868,17 +12913,29 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     cbtn1, cbtn2, cbtn3 = st.columns([2,2,6])
     with cbtn1:
-        if st.button("Run full scout ingestion", use_container_width=True, key="run_scanner_now"):
-            stats = run_full_ingestion_now(
+        if st.button("Request scan cycle", use_container_width=True, key="request_scan_cycle_now"):
+            req = request_scan_cycle(
+                requested_by="ui_monitoring",
                 chain=str(st.session_state.get("chain", "solana")),
                 seeds_raw=str(auto_cfg.get("scanner_seeds_raw", "")),
                 max_items=int(auto_cfg.get("scanner_max_items", 50)),
                 use_birdeye_trending=bool(auto_cfg.get("use_birdeye_trending", True)),
                 birdeye_limit=int(auto_cfg.get("birdeye_limit", 50)),
             )
-            st.success(f"Scanner ran: {stats}")
-            load_monitoring_rows_cached.clear()
+            st.success(f"Scan requested: pending={req.get('pending')} at {req.get('requested_ts')}")
             request_rerun()
+        if str(os.getenv("STREAMLIT_ENABLE_DIRECT_INGESTION", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            if st.button("Run full scout ingestion", use_container_width=True, key="run_scanner_now"):
+                stats = run_full_ingestion_now(
+                    chain=str(st.session_state.get("chain", "solana")),
+                    seeds_raw=str(auto_cfg.get("scanner_seeds_raw", "")),
+                    max_items=int(auto_cfg.get("scanner_max_items", 50)),
+                    use_birdeye_trending=bool(auto_cfg.get("use_birdeye_trending", True)),
+                    birdeye_limit=int(auto_cfg.get("birdeye_limit", 50)),
+                )
+                st.success(f"Scanner ran: {stats}")
+                load_monitoring_rows_cached.clear()
+                request_rerun()
     with cbtn2:
         if st.button("Refresh live data", use_container_width=True):
             st.session_state["_refresh_live_visible_rows_once"] = True
@@ -14873,16 +14930,28 @@ def main():
         )
 
         st.divider()
-        if st.button("Run scanner now", use_container_width=True):
-            stats = run_full_ingestion_now(
+        if st.button("Request scan cycle", use_container_width=True):
+            req = request_scan_cycle(
+                requested_by="ui_sidebar",
                 chain=str(st.session_state.get("chain", "solana")),
                 seeds_raw=str(scanner_seeds_raw or ""),
                 max_items=int(scanner_max_items),
                 use_birdeye_trending=bool(use_birdeye_trending),
                 birdeye_limit=int(birdeye_limit),
             )
-            st.session_state["_scan_feedback"] = f"Scanner saved: {stats}"
+            st.session_state["_scan_feedback"] = f"Scan requested: pending={req.get('pending')} at {req.get('requested_ts')}"
             request_rerun()
+        if str(os.getenv("STREAMLIT_ENABLE_DIRECT_INGESTION", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            if st.button("Run scanner now", use_container_width=True):
+                stats = run_full_ingestion_now(
+                    chain=str(st.session_state.get("chain", "solana")),
+                    seeds_raw=str(scanner_seeds_raw or ""),
+                    max_items=int(scanner_max_items),
+                    use_birdeye_trending=bool(use_birdeye_trending),
+                    birdeye_limit=int(birdeye_limit),
+                )
+                st.session_state["_scan_feedback"] = f"Scanner saved: {stats}"
+                request_rerun()
 
         if st.button("Clear cache", use_container_width=True):
             st.cache_data.clear()
