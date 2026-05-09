@@ -11712,15 +11712,15 @@ def hydrate_monitoring_row_defaults(row: Dict[str, Any], item: Dict[str, Any]) -
     return row
 
 
-def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
+def monitoring_row_to_card(row: Dict[str, Any], allow_live_enrich: bool = True) -> Dict[str, Any]:
     chain = (row.get("chain") or "").strip().lower()
     base_addr = addr_store(chain, str(row.get("base_addr") or "").strip())
-    best = best_pair_for_token_cached(chain, base_addr) if (chain and base_addr) else None
-    hist = token_history_rows(chain, base_addr, limit=30)
-    gem_data = compute_gem_transition_score(best, hist)
+    best = best_pair_for_token_cached(chain, base_addr) if (allow_live_enrich and chain and base_addr) else None
+    hist = token_history_rows(chain, base_addr, limit=30) if allow_live_enrich else []
+    gem_data = compute_gem_transition_score(best, hist) if allow_live_enrich else {}
 
-    liq_health = liquidity_health(best)
-    anti_rug = anti_rug_early_detector(best, hist)
+    liq_health = liquidity_health(best) if allow_live_enrich else {"level": "UNKNOWN", "score": 0.0, "reason": "live_enrichment_disabled"}
+    anti_rug = anti_rug_early_detector(best, hist) if allow_live_enrich else {"level": "SAFE", "score": 0.0, "reason": "live_enrichment_disabled"}
     size_info = position_sizing_engine(best, portfolio_value_usd=1000.0, hist=hist) if best else {
         "size_pct": 0.0,
         "size_label": "NA",
@@ -11737,9 +11737,9 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     timing_label = normalize_timing_label(row.get("timing_label") or "NEUTRAL")
     risk_level = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
 
-    dead = is_token_dead(best)
-    post_rug = is_post_rug(best, hist)
-    alive = is_alive(best)
+    dead = is_token_dead(best) if allow_live_enrich else False
+    post_rug = is_post_rug(best, hist) if allow_live_enrich else False
+    alive = is_alive(best) if allow_live_enrich else True
 
     if dead:
         entry_status = "NO_ENTRY"
@@ -11749,7 +11749,7 @@ def monitoring_row_to_card(row: Dict[str, Any]) -> Dict[str, Any]:
     if post_rug:
         risk_level = "EXTREME"
 
-    health = detect_position_health(best or row, hist)
+    health = detect_position_health(best or row, hist) if allow_live_enrich else {"health_label": "UNKNOWN"}
     health_label = str(health.get("health_label", "OK")).upper()
     if str(liq_health.get("level", "")).upper() == "CRITICAL":
         health_label = "CRITICAL"
@@ -12737,11 +12737,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     mon_source = st.session_state.get("_storage_source_monitoring.csv", _active_storage_source_label())
     st.caption(f"MONITORING FROM DB: {len(monitoring_rows)} (source: {mon_source})")
     split_t0 = time.perf_counter()
-    active_rows = _ui_monitoring_source_rows(monitoring_rows)
+    active_rows_all = _ui_monitoring_source_rows(monitoring_rows)
     rows = list(monitoring_rows)
     if not STREAMLIT_FAST_UI_MODE:
         trust_index = load_pattern_trust_index_cached()
-        for row in active_rows:
+        for row in active_rows_all:
             trust_payload = compute_pattern_trust(row, trust_index=trust_index)
             row["trust_score"] = trust_payload.get("trust_score", 0.0)
             row["trust_confidence"] = trust_payload.get("trust_confidence", 0.0)
@@ -12749,17 +12749,19 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             row["trust_reason"] = trust_payload.get("trust_reason", "")
             row["trust_pattern_key"] = trust_payload.get("pattern_key", "")
             row["trust_priority_bias"] = advisory_trust_bias(trust_payload)
-    active_rows = sorted(
-        active_rows,
+    active_rows_sorted = sorted(
+        active_rows_all,
         key=lambda row: (
             parse_float(row.get("priority_score", 0), 0.0) + parse_float(row.get("trust_priority_bias", 0), 0.0)
         ),
         reverse=True,
     )[:50]
-    active = list(active_rows)[:STREAMLIT_ACTIVE_RENDER_LIMIT]
+    active_total = len(active_rows_all)
+    active_rows = list(active_rows_sorted)
+    active_render_rows = list(active_rows_sorted)[:STREAMLIT_ACTIVE_RENDER_LIMIT]
     archived = [r for r in rows if str(r.get("active", "1")).strip() != "1"]
     perf["split_active_archive"] = time.perf_counter() - split_t0
-    top[0].metric("Active", len(active))
+    top[0].metric("Active", active_total)
     top[1].metric("Archived", len(archived))
     top[2].caption(f"Last scan: {scan_state.get('last_run_ts','—')} • {scan_state.get('last_window','—')} • {scan_state.get('last_chain','—')}")
     top[3].caption(f"Last stats: {scan_state.get('last_stats', {})}")
@@ -12791,6 +12793,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             request_rerun()
     with cbtn2:
         if st.button("Refresh live data", use_container_width=True):
+            st.session_state["_refresh_live_visible_rows_once"] = True
             st.cache_data.clear()
             load_monitoring_rows_cached.clear()
             _ = load_monitoring()
@@ -12837,9 +12840,14 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         return
 
     chain_filter = st.selectbox("Chain filter", ["all", "bsc", "solana"], index=0)
-    active = _ui_monitoring_visible_rows(active_rows, chain_filter=chain_filter)
+    active = _ui_monitoring_visible_rows(active_render_rows, chain_filter=chain_filter)
+    if STREAMLIT_FAST_UI_MODE and active_total > len(active_render_rows):
+        st.caption(f"Rendering {len(active_render_rows)} of {active_total} active rows in fast UI mode.")
 
-    cards_raw = [monitoring_row_to_card(r) for r in active]
+    live_enrich_disabled = STREAMLIT_FAST_UI_MODE or STREAMLIT_DISABLE_LIVE_PAIR_ENRICH_ON_RENDER
+    refresh_live_visible = bool(st.session_state.pop("_refresh_live_visible_rows_once", False))
+    allow_live_enrich = refresh_live_visible or (not live_enrich_disabled)
+    cards_raw = [monitoring_row_to_card(r, allow_live_enrich=allow_live_enrich) for r in active]
     cards_all = []
     portfolio_rows = load_portfolio_rows_cached() if STREAMLIT_FAST_UI_MODE else load_portfolio()
     for c in cards_raw:
@@ -12883,7 +12891,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 best_by_symbol[sym] = c
         return list(best_by_symbol.values())
 
-    active_monitoring_keys = {canonical_token_key(r) for r in active_rows if canonical_token_key(r)}
+    active_monitoring_keys = {canonical_token_key(r) for r in active_rows_all if canonical_token_key(r)}
     pulse_cards: List[Dict[str, Any]] = []
     if not STREAMLIT_FAST_UI_MODE:
         pulse_cards = build_market_pulse_cards(
@@ -13135,24 +13143,33 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     st.markdown("---")
     with st.expander("🧭 Manual calibration assistant (suggestions only)", expanded=False):
         if STREAMLIT_FAST_UI_MODE:
-            st.caption("Fast UI mode keeps calibration lazy. Expand to run computations.")
-        journal_rows = load_csv(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS)
-        trust_index = load_pattern_trust_index_cached()
-        calibration_output = build_manual_calibration_suggestions(
-            journal_rows=journal_rows,
-            trust_index=trust_index,
-            review_findings=review_cards,
-            explicit_safety_whitelist=[],
-        )
-        if calibration_output.get("status") != "ok":
-            st.info(str(calibration_output.get("message") or "not enough evidence"))
+            st.caption("Fast UI mode: click to run calibration.")
+            run_calibration = st.button("Run calibration assistant", key="run_calibration_assistant")
         else:
-            st.caption("Manual apply required for every change. No automatic mutation path in this assistant.")
-            for idx, suggestion in enumerate(calibration_output.get("suggestions") or [], start=1):
-                proposed = suggestion.get("proposed_change") or {}
-                evidence = suggestion.get("evidence") or {}
-                st.markdown(f"**Suggestion {idx}: {proposed.get('parameter', 'n/a')}**")
-                st.json({"proposed_change": proposed, "evidence": evidence, "confidence": suggestion.get("confidence")})
+            run_calibration = True
+
+        if run_calibration:
+            calibration_t0 = time.perf_counter()
+            journal_rows = load_csv(SIGNAL_JOURNAL_CSV, SIGNAL_JOURNAL_FIELDS)
+            trust_index = load_pattern_trust_index_cached()
+            calibration_output = build_manual_calibration_suggestions(
+                journal_rows=journal_rows,
+                trust_index=trust_index,
+                review_findings=review_cards,
+                explicit_safety_whitelist=[],
+            )
+            perf["calibration_assistant"] = time.perf_counter() - calibration_t0
+            if calibration_output.get("status") != "ok":
+                st.info(str(calibration_output.get("message") or "not enough evidence"))
+            else:
+                st.caption("Manual apply required for every change. No automatic mutation path in this assistant.")
+                for idx, suggestion in enumerate(calibration_output.get("suggestions") or [], start=1):
+                    proposed = suggestion.get("proposed_change") or {}
+                    evidence = suggestion.get("evidence") or {}
+                    st.markdown(f"**Suggestion {idx}: {proposed.get('parameter', 'n/a')}**")
+                    st.json({"proposed_change": proposed, "evidence": evidence, "confidence": suggestion.get("confidence")})
+        else:
+            st.caption("Not run on this render.")
 
     with st.expander("Debug / Performance", expanded=False):
         for k, v in perf.items():
