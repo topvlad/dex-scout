@@ -10780,6 +10780,10 @@ def worker_runtime_defaults() -> Dict[str, Any]:
         "scan_request": {},
         "scan_request_pending": False,
         "scan_request_ts": "",
+        "scan_request_dispatched_ts": "",
+        "scan_request_dispatch_status": "",
+        "scan_request_dispatch_error": "",
+        "scan_request_cooldown_until": "",
         "scan_request_processed_ts": "",
         "last_scan_status": "",
         "last_scan_stats": {},
@@ -11192,6 +11196,46 @@ def request_scan_cycle(
     use_birdeye_trending: bool,
     birdeye_limit: int,
 ) -> Dict[str, Any]:
+    cooldown_sec = max(0, _secret_int("SCAN_REQUEST_COOLDOWN_SEC", 900))
+    github_token = _get_secret("GITHUB_WORKFLOW_DISPATCH_TOKEN", "").strip()
+    github_repo = _get_secret("GITHUB_REPO", "topvlad/dex-scout").strip() or "topvlad/dex-scout"
+    github_workflow_file = _get_secret("GITHUB_WORKFLOW_FILE", "runtime-jobs.yml").strip() or "runtime-jobs.yml"
+    github_ref = _get_secret("GITHUB_REF", "main").strip() or "main"
+
+    runtime_before = get_worker_runtime_state()
+    if bool(runtime_before.get("scan_request_pending", False)):
+        return {
+            "requested": False,
+            "pending": True,
+            "blocked": True,
+            "message": "Scan is already pending/running.",
+            "requested_ts": str(runtime_before.get("scan_request_ts") or ""),
+            "last_scan_status": str(runtime_before.get("last_scan_status") or ""),
+            "last_scan_ts": str(runtime_before.get("last_scan_ts") or ""),
+        }
+
+    now_dt = datetime.utcnow()
+    now_epoch = now_dt.timestamp()
+    cooldown_anchor_epoch = 0.0
+    for key in ("scan_request_dispatched_ts", "scan_request_ts"):
+        ts_val = parse_ts(runtime_before.get(key))
+        if ts_val:
+            cooldown_anchor_epoch = max(cooldown_anchor_epoch, ts_val.timestamp())
+    if cooldown_sec > 0 and cooldown_anchor_epoch > 0 and (now_epoch - cooldown_anchor_epoch) < cooldown_sec:
+        cooldown_until_epoch = cooldown_anchor_epoch + cooldown_sec
+        remaining_min = max(1, int(math.ceil((cooldown_until_epoch - now_epoch) / 60.0)))
+        cooldown_until_ts = datetime.utcfromtimestamp(cooldown_until_epoch).strftime("%Y-%m-%d %H:%M:%S UTC")
+        update_worker_runtime_state(updates={"scan_request_cooldown_until": cooldown_until_ts})
+        return {
+            "requested": False,
+            "pending": False,
+            "blocked": True,
+            "message": f"Scan already requested recently. Try again in {remaining_min} min.",
+            "cooldown_until": cooldown_until_ts,
+            "last_scan_status": str(runtime_before.get("last_scan_status") or ""),
+            "last_scan_ts": str(runtime_before.get("last_scan_ts") or ""),
+        }
+
     now_ts = now_utc_str()
     payload = {
         "requested": True,
@@ -11205,15 +11249,59 @@ def request_scan_cycle(
             "birdeye_limit": int(birdeye_limit),
         },
     }
+    dispatch_status = "not_attempted"
+    dispatch_error = ""
+    dispatch_message = "Scan requested."
+    dispatched_ts = ""
+
+    if github_token:
+        dispatch_status = "error"
+        try:
+            owner, repo_name = github_repo.split("/", 1)
+            resp = requests.post(
+                f"https://api.github.com/repos/{owner}/{repo_name}/actions/workflows/{github_workflow_file}/dispatches",
+                headers={
+                    "Authorization": f"Bearer {github_token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                json={"ref": github_ref, "inputs": {"job_mode": "scan_cycle"}},
+                timeout=10,
+            )
+            if resp.status_code in {200, 201, 202, 204}:
+                dispatch_status = "ok"
+                dispatched_ts = now_ts
+                dispatch_message = "Scan request accepted and runtime job dispatched."
+            else:
+                dispatch_error = f"dispatch_http_{resp.status_code}"
+                dispatch_message = "Scan request saved. Automatic pickup will happen on schedule."
+        except Exception as e:
+            dispatch_error = f"{type(e).__name__}: {e}"
+            dispatch_message = "Scan request saved. Automatic pickup will happen on schedule."
+    else:
+        dispatch_status = "token_missing"
+        dispatch_message = "Scan request saved. Automatic pickup will happen on schedule."
+
+    cooldown_until_ts = ""
+    if cooldown_sec > 0:
+        cooldown_until_ts = datetime.utcfromtimestamp(now_epoch + cooldown_sec).strftime("%Y-%m-%d %H:%M:%S UTC")
     runtime = update_worker_runtime_state(
         updates={
             "scan_request": payload,
             "scan_request_pending": True,
             "scan_request_ts": now_ts,
+            "scan_request_dispatched_ts": dispatched_ts or str(runtime_before.get("scan_request_dispatched_ts") or ""),
+            "scan_request_dispatch_status": dispatch_status,
+            "scan_request_dispatch_error": dispatch_error,
+            "scan_request_cooldown_until": cooldown_until_ts,
         }
     )
     return payload | {
         "pending": bool(runtime.get("scan_request_pending", False)),
+        "dispatch_status": dispatch_status,
+        "dispatch_error": dispatch_error,
+        "message": dispatch_message,
+        "cooldown_until": cooldown_until_ts,
         "last_scan_status": str(runtime.get("last_scan_status") or ""),
         "last_scan_ts": str(runtime.get("last_scan_ts") or ""),
     }
@@ -12922,7 +13010,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 use_birdeye_trending=bool(auto_cfg.get("use_birdeye_trending", True)),
                 birdeye_limit=int(auto_cfg.get("birdeye_limit", 50)),
             )
-            st.success(f"Scan requested: pending={req.get('pending')} at {req.get('requested_ts')}")
+            if req.get("blocked"):
+                st.info(str(req.get("message") or "Scan request blocked."))
+            else:
+                st.success(str(req.get("message") or f"Scan requested: pending={req.get('pending')} at {req.get('requested_ts')}"))
             request_rerun()
         if str(os.getenv("STREAMLIT_ENABLE_DIRECT_INGESTION", "")).strip().lower() in {"1", "true", "yes", "on"}:
             if st.button("Run full scout ingestion", use_container_width=True, key="run_scanner_now"):
@@ -14939,7 +15030,7 @@ def main():
                 use_birdeye_trending=bool(use_birdeye_trending),
                 birdeye_limit=int(birdeye_limit),
             )
-            st.session_state["_scan_feedback"] = f"Scan requested: pending={req.get('pending')} at {req.get('requested_ts')}"
+            st.session_state["_scan_feedback"] = str(req.get("message") or f"Scan requested: pending={req.get('pending')} at {req.get('requested_ts')}")
             request_rerun()
         if str(os.getenv("STREAMLIT_ENABLE_DIRECT_INGESTION", "")).strip().lower() in {"1", "true", "yes", "on"}:
             if st.button("Run scanner now", use_container_width=True):
