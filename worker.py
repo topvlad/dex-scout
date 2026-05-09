@@ -192,7 +192,7 @@ def _finalize_runtime_if_token_matches(
 
 def _run_scan_cycle() -> Dict[str, Any]:
     assert app is not None
-    runtime_before = app.get_worker_runtime_state()
+    runtime_before = app.get_worker_runtime_state() if hasattr(app, "get_worker_runtime_state") else {}
     scan_request = runtime_before.get("scan_request") if isinstance(runtime_before.get("scan_request"), dict) else {}
     pending = bool(runtime_before.get("scan_request_pending"))
     params = scan_request.get("params") if isinstance(scan_request.get("params"), dict) else {}
@@ -229,7 +229,8 @@ def _run_scan_cycle() -> Dict[str, Any]:
     if pending:
         updates["scan_request_pending"] = False
         updates["scan_request_processed_ts"] = app.now_utc_str()
-    app.update_worker_runtime_state(updates=updates)
+    if hasattr(app, "update_worker_runtime_state"):
+        app.update_worker_runtime_state(updates=updates)
     pulse_result = _record_pulse_history_after_cycle_safe()
     return {"scan": scan_result, "pulse_history": pulse_result}
 
