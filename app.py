@@ -11310,6 +11310,23 @@ def request_scan_cycle(
         "last_scan_ts": str(runtime.get("last_scan_ts") or ""),
     }
 
+def save_scanner_ui_params(
+    seeds_raw: str,
+    max_tokens_per_slot: int,
+    use_birdeye_trending: bool,
+    birdeye_limit: int,
+) -> Dict[str, Any]:
+    return update_worker_runtime_state(
+        updates={
+            "scanner_ui_params": {
+                "use_birdeye_trending": bool(use_birdeye_trending),
+                "birdeye_limit": int(birdeye_limit),
+                "max_tokens_per_slot": int(max_tokens_per_slot),
+                "seeds_raw": str(seeds_raw or ""),
+            }
+        }
+    )
+
 
 def scan_source_window_name() -> str:
     state = scanner_state_load() or {}
@@ -12578,19 +12595,12 @@ def build_market_pulse_cards(
     for card in selected_cards:
         row = card.get("row", {}) or {}
         card["mini_sparkline"] = _pulse_card_mini_sparkline(row)
-    update_worker_runtime_state(
-        updates={
-            "last_pulse_liq_min_usd": float(PULSE_MIN_LIQ_USD),
-            "last_pulse_candidates_total": int(len(discovery_pool)),
-            "last_pulse_raw_seen": int(refill_attempts),
-            "last_pulse_filtered_out": int(filtered_out),
-            "last_pulse_final_candidates": int(len(selected_cards)),
-            "last_pulse_refill_attempts": int(refill_attempts),
-            "last_pulse_candidates_low_liq_skipped": int(low_liq_skipped),
-            "last_pulse_candidates_after_liq_gate": int(len(pulse_cards)),
-            "last_pulse_recent_keys": [str(c.get("key") or "").replace("|", ":") for c in selected_cards if str(c.get("key") or "").strip()][-300:],
-        }
-    )
+    st.session_state["last_pulse_ui_stats"] = {
+        "raw_seen": int(refill_attempts),
+        "filtered_out": int(filtered_out),
+        "final_pulse_candidates": int(len(selected_cards)),
+        "refill_attempts": int(refill_attempts),
+    }
     if low_liq_skipped > 0:
         debug_log(
             f"pulse_liquidity_gate skipped={low_liq_skipped} min_liq_usd={float(PULSE_MIN_LIQ_USD):.2f}"
@@ -13308,12 +13318,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     st.subheader("Live pulse candidates")
     st.caption("Live candidates behind glass (read-only layer). Confirmed Monitoring below remains the settled active layer.")
-    pulse_runtime = get_worker_runtime_state()
+    pulse_runtime = st.session_state.get("last_pulse_ui_stats", {}) if isinstance(st.session_state.get("last_pulse_ui_stats"), dict) else {}
     st.caption(
-        f"raw_seen={int(parse_float(pulse_runtime.get('last_pulse_raw_seen', 0), 0))} • "
-        f"filtered_out={int(parse_float(pulse_runtime.get('last_pulse_filtered_out', 0), 0))} • "
-        f"final_pulse_candidates={int(parse_float(pulse_runtime.get('last_pulse_final_candidates', 0), 0))} • "
-        f"refill_attempts={int(parse_float(pulse_runtime.get('last_pulse_refill_attempts', 0), 0))}"
+        f"raw_seen={int(parse_float(pulse_runtime.get('raw_seen', 0), 0))} • "
+        f"filtered_out={int(parse_float(pulse_runtime.get('filtered_out', 0), 0))} • "
+        f"final_pulse_candidates={int(parse_float(pulse_runtime.get('final_pulse_candidates', 0), 0))} • "
+        f"refill_attempts={int(parse_float(pulse_runtime.get('refill_attempts', 0), 0))}"
     )
     if STREAMLIT_FAST_UI_MODE:
         st.caption("Fast UI mode: pulse/history enrichment is disabled by default.")
@@ -15047,12 +15057,15 @@ def main():
             st.caption("Birdeye key missing: add BIRDEYE_API_KEY to secrets to enable extra Solana stream.")
         birdeye_limit = st.slider("Birdeye trending size", 10, 200, int(birdeye_limit), step=10, disabled=(not use_birdeye_trending or not BIRDEYE_ENABLED))
         scanner_seeds_raw = st.text_area("Scanner seeds", value=str(scanner_seeds_raw), height=120)
-        update_worker_runtime_state(updates={"scanner_ui_params": {
-            "use_birdeye_trending": bool(use_birdeye_trending),
-            "birdeye_limit": int(birdeye_limit),
-            "max_tokens_per_slot": int(scanner_max_items),
-            "seeds_raw": str(scanner_seeds_raw or ""),
-        }})
+        if st.button("Save scanner settings", use_container_width=True):
+            save_scanner_ui_params(
+                seeds_raw=str(scanner_seeds_raw or ""),
+                max_tokens_per_slot=int(scanner_max_items),
+                use_birdeye_trending=bool(use_birdeye_trending),
+                birdeye_limit=int(birdeye_limit),
+            )
+            st.session_state["_scan_feedback"] = "Scanner settings saved."
+            request_rerun()
 
         st.divider()
         st.caption("Monitoring")
@@ -15073,6 +15086,12 @@ def main():
 
         st.divider()
         if st.button("Request scan cycle", use_container_width=True):
+            save_scanner_ui_params(
+                seeds_raw=str(scanner_seeds_raw or ""),
+                max_tokens_per_slot=int(scanner_max_items),
+                use_birdeye_trending=bool(use_birdeye_trending),
+                birdeye_limit=int(birdeye_limit),
+            )
             req = request_scan_cycle(
                 requested_by="ui_sidebar",
                 chain=str(st.session_state.get("chain", "solana")),

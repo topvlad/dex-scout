@@ -213,24 +213,35 @@ def _run_scan_cycle() -> Dict[str, Any]:
         max_items = SCANNER_MAX_ITEMS
         use_birdeye_trending = USE_BIRDEYE_TRENDING
         birdeye_limit = BIRDEYE_LIMIT
-    scan_result = app.maybe_run_rotating_scanner(
-        seeds_raw=seeds_raw,
-        max_items=max_items,
-        use_birdeye_trending=use_birdeye_trending,
-        birdeye_limit=birdeye_limit,
-    )
-    updates = {
-        "last_scan_status": "ok" if not scan_result.get("error") else "error",
-        "last_scan_stats": scan_result.get("stats", {}),
-        "last_scan_ts": app.now_utc_str(),
-    }
-    if chain_reason:
-        updates["last_scan_status"] = f"{updates['last_scan_status']}:{chain_reason}"
-    if pending:
-        updates["scan_request_pending"] = False
-        updates["scan_request_processed_ts"] = app.now_utc_str()
-    if hasattr(app, "update_worker_runtime_state"):
-        app.update_worker_runtime_state(updates=updates)
+    scan_result: Dict[str, Any] = {}
+    updates: Dict[str, Any] = {}
+    try:
+        scan_result = app.maybe_run_rotating_scanner(
+            seeds_raw=seeds_raw,
+            max_items=max_items,
+            use_birdeye_trending=use_birdeye_trending,
+            birdeye_limit=birdeye_limit,
+        )
+        updates = {
+            "last_scan_status": "ok" if not scan_result.get("error") else "error",
+            "last_scan_stats": scan_result.get("stats", {}),
+            "last_scan_ts": app.now_utc_str(),
+        }
+    except Exception as exc:
+        updates = {
+            "last_scan_status": f"error:scan_cycle_exception:{type(exc).__name__}",
+            "last_scan_stats": {},
+            "last_scan_ts": app.now_utc_str(),
+        }
+        scan_result = {"error": f"{type(exc).__name__}: {exc}", "stats": {}}
+    finally:
+        if chain_reason:
+            updates["last_scan_status"] = f"{updates['last_scan_status']}:{chain_reason}"
+        if pending:
+            updates["scan_request_pending"] = False
+            updates["scan_request_processed_ts"] = app.now_utc_str()
+        if hasattr(app, "update_worker_runtime_state"):
+            app.update_worker_runtime_state(updates=updates)
     pulse_result = _record_pulse_history_after_cycle_safe()
     return {"scan": scan_result, "pulse_history": pulse_result}
 
