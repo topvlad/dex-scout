@@ -12487,6 +12487,69 @@ def _pulse_pair_payload(row: Dict[str, Any], best: Optional[Dict[str, Any]]) -> 
     return payload
 
 
+def evaluate_live_pulse_scam_gate(row_or_payload: Dict[str, Any]) -> Dict[str, Any]:
+    row = row_or_payload if isinstance(row_or_payload, dict) else {}
+    best = row.get("_best_pair") if isinstance(row.get("_best_pair"), dict) else None
+    payload = _pulse_pair_payload(row, best if isinstance(best, dict) else None)
+    reasons: List[str] = []
+    score = 0.0
+
+    liq = parse_float(safe_get(payload, "liquidity", "usd", default=row.get("liq_usd", 0)), 0.0)
+    vol24 = parse_float(safe_get(payload, "volume", "h24", default=row.get("vol24_usd", row.get("vol24_init", 0))), 0.0)
+    txns_h1 = safe_get(best or {}, "txns", "h1", default={}) if isinstance(best, dict) else {}
+    txns_m5 = safe_get(payload, "txns", "m5", default={})
+    txns_total = (
+        parse_float(txns_h1.get("buys", 0), 0.0) + parse_float(txns_h1.get("sells", 0), 0.0)
+        + parse_float(txns_m5.get("buys", 0), 0.0) + parse_float(txns_m5.get("sells", 0), 0.0)
+    )
+    pc1h = parse_float(safe_get(payload, "priceChange", "h1", default=0), 0.0)
+    pc5m = parse_float(safe_get(payload, "priceChange", "m5", default=0), 0.0)
+    # ATH-like local spike proxy: strong 24h gain + much weaker/negative short-term momentum.
+    pc24h = parse_float(safe_get(best or {}, "priceChange", "h24", default=row.get("price_change_24h", 0)), 0.0)
+    drop_from_peak_proxy = pc24h - max(pc1h, pc5m)
+    vol_liq_ratio = (vol24 / max(liq, 1.0)) if liq > 0 else 0.0
+
+    if liq < max(3_000.0, float(PULSE_MIN_LIQ_USD)):
+        reasons.append("liquidity_too_low")
+        score += 2.5
+    if vol24 < max(4_000.0, liq * 0.18):
+        reasons.append("volume_too_low")
+        score += 1.8
+    if txns_total < 10:
+        reasons.append("txns_too_low")
+        score += 1.2
+    if is_name_suspicious(payload):
+        reasons.append("suspicious_symbol_or_name")
+        score += 1.5
+    toxic, _ = is_toxic_token(payload)
+    if toxic:
+        reasons.append("toxic_token")
+        score += 3.0
+    pp = pump_probability(payload)
+    if pp >= 7:
+        reasons.append("high_pump_probability")
+        score += 2.2
+    if pc24h >= 180 and drop_from_peak_proxy >= 140 and pc1h <= 2 and pc5m <= 1 and vol_liq_ratio < 0.35 and liq < 30_000:
+        reasons.append("post_pump_collapse")
+        score += 4.0
+    if pc24h >= 250 and pc1h < -18 and pc5m < -4:
+        reasons.append("extreme_pump_then_dump")
+        score += 3.0
+
+    status = str(row.get("status") or row.get("entry_status") or "").strip().lower()
+    lifecycle = str(row.get("lifecycle") or row.get("monitoring_stage") or "").strip().lower()
+    if status in {"archived", "portfolio"} or any(x in lifecycle for x in {"archived", "portfolio"}):
+        reasons.append("archived_or_portfolio_duplicate")
+        score += 2.5
+
+    severity = "ok"
+    if score >= 3.5:
+        severity = "watch"
+    if score >= 6.0 or any(r in reasons for r in ("post_pump_collapse", "extreme_pump_then_dump", "toxic_token")):
+        severity = "block"
+    return {"blocked": severity == "block", "score": round(score, 2), "reasons": reasons, "severity": severity}
+
+
 def build_market_pulse_cards(
     monitoring_rows: List[Dict[str, Any]],
     portfolio_rows: List[Dict[str, Any]],
@@ -12515,6 +12578,8 @@ def build_market_pulse_cards(
     seen: Set[str] = set()
     low_liq_skipped = 0
     filtered_out = 0
+    scam_blocked = 0
+    scam_reasons: Dict[str, int] = {}
     refill_attempts = 0
     for row in discovery_pool:
         refill_attempts += 1
@@ -12540,18 +12605,19 @@ def build_market_pulse_cards(
         novelty_bonus = (8.0 if key in runtime_keys else 0.0) + (4.0 if key in queue_keys else 0.0)
         pulse_sort = score + freshness_bonus + novelty_bonus + timing_bonus
         best = best_pair_for_token_cached(chain, token_ca(row)) if chain and token_ca(row) else None
+        row["_best_pair"] = best if isinstance(best, dict) else {}
         liq_usd = _pulse_card_liquidity_usd(best if isinstance(best, dict) else None, row)
         if liq_usd < PULSE_MIN_LIQ_USD:
             low_liq_skipped += 1
             filtered_out += 1
             continue
         row_payload = _pulse_pair_payload(row, best if isinstance(best, dict) else None)
-        toxic, _ = is_toxic_token(row_payload)
-        if toxic:
+        scam_eval = evaluate_live_pulse_scam_gate(row)
+        if bool(scam_eval.get("blocked")):
             filtered_out += 1
-            continue
-        if pump_probability(row_payload) >= 7:
-            filtered_out += 1
+            scam_blocked += 1
+            for reason in list(scam_eval.get("reasons", []) or []):
+                scam_reasons[reason] = int(scam_reasons.get(reason, 0) or 0) + 1
             continue
         pulse_cards.append(
             {
@@ -12598,6 +12664,8 @@ def build_market_pulse_cards(
     st.session_state["last_pulse_ui_stats"] = {
         "raw_seen": int(refill_attempts),
         "filtered_out": int(filtered_out),
+        "last_pulse_scam_blocked": int(scam_blocked),
+        "last_pulse_scam_reasons": dict(scam_reasons),
         "final_pulse_candidates": int(len(selected_cards)),
         "refill_attempts": int(refill_attempts),
     }
@@ -12607,6 +12675,9 @@ def build_market_pulse_cards(
         )
     if record_pulse_history:
         _flush_pulse_history_buffer()
+    if scam_reasons:
+        top = sorted(scam_reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        debug_log("pulse_scam_gate_reasons " + ", ".join(f"{k}={v}" for k, v in top))
     return selected_cards
 
 
@@ -13322,13 +13393,18 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     st.caption(
         f"raw_seen={int(parse_float(pulse_runtime.get('raw_seen', 0), 0))} • "
         f"filtered_out={int(parse_float(pulse_runtime.get('filtered_out', 0), 0))} • "
+        f"scam_blocked={int(parse_float(pulse_runtime.get('last_pulse_scam_blocked', 0), 0))} • "
         f"final_pulse_candidates={int(parse_float(pulse_runtime.get('final_pulse_candidates', 0), 0))} • "
         f"refill_attempts={int(parse_float(pulse_runtime.get('refill_attempts', 0), 0))}"
     )
+    reason_stats = pulse_runtime.get("last_pulse_scam_reasons", {}) if isinstance(pulse_runtime.get("last_pulse_scam_reasons"), dict) else {}
+    if reason_stats:
+        top_reasons = sorted(reason_stats.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        st.caption("scam gate reasons: " + " • ".join(f"{k}={v}" for k, v in top_reasons))
     if STREAMLIT_FAST_UI_MODE:
         st.caption("Fast UI mode: pulse/history enrichment is disabled by default.")
     elif not pulse_cards:
-        st.caption("No pulse candidates right now.")
+        st.caption("Live Pulse found no clean candidates after scam/noise filtering.")
     pulse_symbol_counts: Dict[str, int] = {}
     for pulse in pulse_cards:
         pulse_row = pulse.get("row", {}) or {}
