@@ -1673,8 +1673,8 @@ MIN_LIQ_USD = 10000
 PULSE_MIN_LIQ_USD = float(max(0, _env_int("PULSE_MIN_LIQ_USD", 8000)))
 LIVE_PULSE_TARGET_MIN = max(1, _env_int("LIVE_PULSE_TARGET_MIN", 5))
 LIVE_PULSE_TARGET_MAX = max(LIVE_PULSE_TARGET_MIN, _env_int("LIVE_PULSE_TARGET_MAX", 15))
-LIVE_PULSE_RAW_DEPTH_MIN = 100
-LIVE_PULSE_RAW_DEPTH_MAX = 200
+LIVE_PULSE_RAW_MAX = max(1, _env_int("LIVE_PULSE_RAW_MAX", 200))
+LIVE_PULSE_REFILL_BATCH_SIZE = max(1, _env_int("LIVE_PULSE_REFILL_BATCH_SIZE", 50))
 MIN_TXNS_5M = 5
 MIN_VOL_5M = 1500
 MAX_KEEP = int(os.getenv("SCANNER_MAX_KEEP", "80"))
@@ -12621,7 +12621,7 @@ def build_market_pulse_cards(
     queue_keys = {str(k or "").replace(":", "|") for k in queue_state.keys() if str(k or "").strip()}
     requested_limit = max(1, int(limit or LIVE_PULSE_TARGET_MAX))
     render_limit = min(requested_limit, LIVE_PULSE_TARGET_MAX)
-    raw_depth_limit = max(LIVE_PULSE_RAW_DEPTH_MIN, min(LIVE_PULSE_RAW_DEPTH_MAX, max(render_limit * 12, 100)))
+    raw_depth_limit = max(1, int(LIVE_PULSE_RAW_MAX))
     recent_shown_keys = {
         str(k or "").replace(":", "|")
         for k in list(runtime.get("last_pulse_recent_keys", []) or [])
@@ -12635,73 +12635,81 @@ def build_market_pulse_cards(
     scam_blocked = 0
     scam_reasons: Dict[str, int] = {}
     refill_attempts = 0
-    for row in discovery_pool:
-        refill_attempts += 1
-        key = canonical_token_key(row)
-        chain = token_chain(row)
-        if not key or key in seen:
-            continue
-        if key in active_monitoring_keys:
-            filtered_out += 1
-            continue
-        if key in recent_shown_keys:
-            filtered_out += 1
-            continue
-        if chain_filter in {"bsc", "solana"} and chain != chain_filter:
-            continue
-        seen.add(key)
-        queue_row = queue_state.get(key.replace("|", ":"), {}) if isinstance(queue_state, dict) else {}
-        freshness_min = _pulse_freshness_minutes(row, queue_row if isinstance(queue_row, dict) else {})
-        score = parse_float(row.get("entry_score", row.get("priority_score", row.get("score", 0))), 0.0)
-        timing_label = normalize_timing_label(row.get("timing_label") or row.get("entry_status") or row.get("status") or "NEUTRAL")
-        timing_bonus = 6.0 if timing_label in {"EARLY", "READY"} else (2.0 if timing_label == "NEUTRAL" else 0.0)
-        freshness_bonus = max(0.0, 18.0 - min(freshness_min, 180.0) / 10.0)
-        novelty_bonus = (8.0 if key in runtime_keys else 0.0) + (4.0 if key in queue_keys else 0.0)
-        pulse_sort = score + freshness_bonus + novelty_bonus + timing_bonus
-        best = best_pair_for_token_cached(chain, token_ca(row)) if chain and token_ca(row) else None
-        row["_best_pair"] = best if isinstance(best, dict) else {}
-        liq_usd = _pulse_card_liquidity_usd(best if isinstance(best, dict) else None, row)
-        if liq_usd < PULSE_MIN_LIQ_USD:
-            low_liq_skipped += 1
-            filtered_out += 1
-            continue
-        row_payload = _pulse_pair_payload(row, best if isinstance(best, dict) else None)
-        scam_eval = evaluate_live_pulse_scam_gate(row)
-        if bool(scam_eval.get("blocked")):
-            filtered_out += 1
-            scam_blocked += 1
-            for reason in list(scam_eval.get("reasons", []) or []):
-                scam_reasons[reason] = int(scam_reasons.get(reason, 0) or 0) + 1
-            continue
-        pulse_cards.append(
-            {
-                "row": row,
-                "key": key,
-                "chain": chain,
-                "score": round(score, 2),
-                "timing": timing_label,
-                "stage": str(row.get("entry_status") or row.get("entry") or row.get("status") or "candidate").upper(),
-                "status_marker": _pulse_status_marker(row),
-                "freshness_min": round(freshness_min, 1),
-                "pulse_sort": round(pulse_sort, 3),
-                "best": best,
-                "liq_usd": round(liq_usd, 2),
-                "pulse_min_liq_usd": float(PULSE_MIN_LIQ_USD),
-                "low_liquidity": liq_usd < PULSE_MIN_LIQ_USD,
-                "summary_line": _pulse_card_summary_line(best, row),
-            }
-        )
-        point = {
-            "ts": now_utc_iso(),
-            "score": round(score, 2),
-            "price_usd": round(parse_float(safe_get(best or {}, "priceUsd", default=row.get("price_usd", 0)), 0.0), 8),
-            "liq_usd": round(liq_usd, 2),
-            "vol24_usd": round(parse_float(safe_get(best or {}, "volume", "h24", default=row.get("vol24_init", row.get("vol24_usd", 0))), 0.0), 2),
-            "timing_label": timing_label,
-        }
-        if record_pulse_history:
-            _append_pulse_history_point(key, point)
+    scan_cursor = 0
+    while scan_cursor < len(discovery_pool) and scan_cursor < raw_depth_limit:
         if len(pulse_cards) >= LIVE_PULSE_TARGET_MAX:
+            break
+        refill_attempts += 1
+        batch_end = min(scan_cursor + LIVE_PULSE_REFILL_BATCH_SIZE, len(discovery_pool), raw_depth_limit)
+        for row in discovery_pool[scan_cursor:batch_end]:
+            key = canonical_token_key(row)
+            chain = token_chain(row)
+            if not key or key in seen:
+                filtered_out += 1
+                continue
+            if key in active_monitoring_keys:
+                filtered_out += 1
+                continue
+            if key in recent_shown_keys:
+                filtered_out += 1
+                continue
+            if chain_filter in {"bsc", "solana"} and chain != chain_filter:
+                continue
+            seen.add(key)
+            queue_row = queue_state.get(key.replace("|", ":"), {}) if isinstance(queue_state, dict) else {}
+            freshness_min = _pulse_freshness_minutes(row, queue_row if isinstance(queue_row, dict) else {})
+            score = parse_float(row.get("entry_score", row.get("priority_score", row.get("score", 0))), 0.0)
+            timing_label = normalize_timing_label(row.get("timing_label") or row.get("entry_status") or row.get("status") or "NEUTRAL")
+            timing_bonus = 6.0 if timing_label in {"EARLY", "READY"} else (2.0 if timing_label == "NEUTRAL" else 0.0)
+            freshness_bonus = max(0.0, 18.0 - min(freshness_min, 180.0) / 10.0)
+            novelty_bonus = (8.0 if key in runtime_keys else 0.0) + (4.0 if key in queue_keys else 0.0)
+            pulse_sort = score + freshness_bonus + novelty_bonus + timing_bonus
+            best = best_pair_for_token_cached(chain, token_ca(row)) if chain and token_ca(row) else None
+            row["_best_pair"] = best if isinstance(best, dict) else {}
+            liq_usd = _pulse_card_liquidity_usd(best if isinstance(best, dict) else None, row)
+            if liq_usd < PULSE_MIN_LIQ_USD:
+                low_liq_skipped += 1
+                filtered_out += 1
+                continue
+            scam_eval = evaluate_live_pulse_scam_gate(row)
+            if bool(scam_eval.get("blocked")):
+                filtered_out += 1
+                scam_blocked += 1
+                for reason in list(scam_eval.get("reasons", []) or []):
+                    scam_reasons[reason] = int(scam_reasons.get(reason, 0) or 0) + 1
+                continue
+            pulse_cards.append(
+                {
+                    "row": row,
+                    "key": key,
+                    "chain": chain,
+                    "score": round(score, 2),
+                    "timing": timing_label,
+                    "stage": str(row.get("entry_status") or row.get("entry") or row.get("status") or "candidate").upper(),
+                    "status_marker": _pulse_status_marker(row),
+                    "freshness_min": round(freshness_min, 1),
+                    "pulse_sort": round(pulse_sort, 3),
+                    "best": best,
+                    "liq_usd": round(liq_usd, 2),
+                    "pulse_min_liq_usd": float(PULSE_MIN_LIQ_USD),
+                    "low_liquidity": liq_usd < PULSE_MIN_LIQ_USD,
+                    "summary_line": _pulse_card_summary_line(best, row),
+                }
+            )
+            point = {
+                "ts": now_utc_iso(),
+                "score": round(score, 2),
+                "price_usd": round(parse_float(safe_get(best or {}, "priceUsd", default=row.get("price_usd", 0)), 0.0), 8),
+                "liq_usd": round(liq_usd, 2),
+                "vol24_usd": round(parse_float(safe_get(best or {}, "volume", "h24", default=row.get("vol24_init", row.get("vol24_usd", 0))), 0.0), 2),
+                "timing_label": timing_label,
+            }
+            if record_pulse_history:
+                _append_pulse_history_point(key, point)
+            if len(pulse_cards) >= LIVE_PULSE_TARGET_MAX:
+                break
+        scan_cursor = batch_end
+        if len(pulse_cards) >= LIVE_PULSE_TARGET_MIN and refill_attempts >= 1:
             break
     pulse_cards.sort(
         key=lambda x: (
@@ -12716,10 +12724,13 @@ def build_market_pulse_cards(
         row = card.get("row", {}) or {}
         card["mini_sparkline"] = _pulse_card_mini_sparkline(row)
     st.session_state["last_pulse_ui_stats"] = {
-        "raw_seen": int(refill_attempts),
+        "raw_seen": int(min(scan_cursor, raw_depth_limit)),
+        "duplicate_filtered": int(filtered_out),
         "filtered_out": int(filtered_out),
         "last_pulse_scam_blocked": int(scam_blocked),
+        "scam_blocked": int(scam_blocked),
         "last_pulse_scam_reasons": dict(scam_reasons),
+        "clean_candidates": int(len(pulse_cards)),
         "final_pulse_candidates": int(len(selected_cards)),
         "refill_attempts": int(refill_attempts),
     }
@@ -13478,9 +13489,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     pulse_runtime = st.session_state.get("last_pulse_ui_stats", {}) if isinstance(st.session_state.get("last_pulse_ui_stats"), dict) else {}
     st.caption(
         f"raw_seen={int(parse_float(pulse_runtime.get('raw_seen', 0), 0))} • "
-        f"filtered_out={int(parse_float(pulse_runtime.get('filtered_out', 0), 0))} • "
-        f"scam_blocked={int(parse_float(pulse_runtime.get('last_pulse_scam_blocked', 0), 0))} • "
-        f"final_pulse_candidates={int(parse_float(pulse_runtime.get('final_pulse_candidates', 0), 0))} • "
+        f"duplicate_filtered={int(parse_float(pulse_runtime.get('duplicate_filtered', pulse_runtime.get('filtered_out', 0)), 0))} • "
+        f"scam_blocked={int(parse_float(pulse_runtime.get('scam_blocked', pulse_runtime.get('last_pulse_scam_blocked', 0)), 0))} • "
+        f"clean_candidates={int(parse_float(pulse_runtime.get('clean_candidates', 0), 0))} • "
         f"refill_attempts={int(parse_float(pulse_runtime.get('refill_attempts', 0), 0))}"
     )
     reason_stats = pulse_runtime.get("last_pulse_scam_reasons", {}) if isinstance(pulse_runtime.get("last_pulse_scam_reasons"), dict) else {}
@@ -13490,7 +13501,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     if STREAMLIT_FAST_UI_MODE:
         st.caption("Fast UI mode: pulse/history enrichment is disabled by default.")
     elif not pulse_cards:
-        st.caption("Live Pulse found no clean candidates after scam/noise filtering.")
+        st.caption("No clean Live Pulse candidates after filtering.")
+    elif len(pulse_cards) < LIVE_PULSE_TARGET_MIN:
+        st.caption(f"Only {len(pulse_cards)} clean candidates found after filtering.")
     pulse_symbol_counts: Dict[str, int] = {}
     for pulse in pulse_cards:
         pulse_row = pulse.get("row", {}) or {}
