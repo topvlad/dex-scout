@@ -26,6 +26,7 @@ import csv
 import io
 import time
 import json
+import html
 import random
 import math
 import hashlib
@@ -37,6 +38,7 @@ from typing import Dict, Any, List, Tuple, Optional, Set
 from collections import Counter
 from contextlib import contextmanager
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
@@ -204,6 +206,14 @@ DIGEST_UI_HEARTBEAT_HOURS = max(1, _env_int("DIGEST_UI_HEARTBEAT_HOURS", 12))
 DIGEST_DISCOVERY_HEARTBEAT_HOURS = max(1, _env_int("DIGEST_DISCOVERY_HEARTBEAT_HOURS", 12))
 TG_SUPPRESSION_HEARTBEAT_ENABLED = str(os.getenv("TG_SUPPRESSION_HEARTBEAT_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
 TG_SUPPRESSION_HEARTBEAT_HOURS = max(1, _env_int("TG_SUPPRESSION_HEARTBEAT_HOURS", 6))
+TG_POSITION_ANALYSIS_INTERVAL_MIN = max(15, _env_int("TG_POSITION_ANALYSIS_INTERVAL_MIN", 60))
+TG_QUIET_HOURS_START = max(0, min(23, _env_int("TG_QUIET_HOURS_START", 23)))
+TG_QUIET_HOURS_END = max(0, min(23, _env_int("TG_QUIET_HOURS_END", 8)))
+TG_QUIET_HOURS_TZ = str(os.getenv("TG_QUIET_HOURS_TZ", "Europe/Kyiv")).strip() or "Europe/Kyiv"
+TG_ALLOW_CRITICAL_DURING_QUIET = _env_bool("TG_ALLOW_CRITICAL_DURING_QUIET", False)
+TG_POSITION_ANALYSIS_MAX_ACTION = max(1, _env_int("TG_POSITION_ANALYSIS_MAX_ACTION", 5))
+TG_POSITION_ANALYSIS_MAX_WATCH = max(1, _env_int("TG_POSITION_ANALYSIS_MAX_WATCH", 5))
+TG_POSITION_ANALYSIS_MAX_CHARS = max(500, _env_int("TG_POSITION_ANALYSIS_MAX_CHARS", 3500))
 PORTFOLIO_ALERT_COOLDOWN_SECONDS = max(300, _env_int("TG_PORTFOLIO_ALERT_COOLDOWN_MINUTES", 180) * 60)
 PORTFOLIO_LIQ_DROP_PCT_THRESHOLD = max(5.0, _env_float("PORTFOLIO_LIQ_DROP_PCT_THRESHOLD", 35.0))
 PORTFOLIO_DRAWDOWN_PCT_THRESHOLD = max(5.0, _env_float("PORTFOLIO_DRAWDOWN_PCT_THRESHOLD", 20.0))
@@ -9526,6 +9536,158 @@ def build_notification_candidates(
     return mon, port
 
 
+def _tg_analysis_now_kyiv(now_ts: float) -> datetime:
+    return datetime.fromtimestamp(float(now_ts), tz=ZoneInfo(TG_QUIET_HOURS_TZ))
+
+
+def _is_tg_quiet_hours(now_ts: float) -> bool:
+    h = _tg_analysis_now_kyiv(now_ts).hour
+    if TG_QUIET_HOURS_START == TG_QUIET_HOURS_END:
+        return False
+    if TG_QUIET_HOURS_START < TG_QUIET_HOURS_END:
+        return TG_QUIET_HOURS_START <= h < TG_QUIET_HOURS_END
+    return h >= TG_QUIET_HOURS_START or h < TG_QUIET_HOURS_END
+
+
+def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[Dict[str, Any]], context: Dict[str, Any]) -> Dict[str, Any]:
+    row = position if isinstance(position, dict) else {}
+    mon = monitoring_row if isinstance(monitoring_row, dict) else {}
+    symbol = str(row.get("base_symbol") or mon.get("base_symbol") or "TOKEN").strip().upper()
+    pnl = parse_float(row.get("pnl_pct", row.get("pnl", 0)), 0.0) if str(row.get("pnl_pct", row.get("pnl", ""))).strip() else None
+    score = parse_float(row.get("entry_score", mon.get("entry_score", 0)), 0.0)
+    risk = str(row.get("risk_level") or row.get("risk") or mon.get("risk_level") or "UNKNOWN").upper()
+    entry = parse_float(get_portfolio_entry_price(row), 0.0)
+    price = parse_float(row.get("price_usd", row.get("current_price", mon.get("price_usd", 0))), 0.0)
+    action = str(row.get("final_action") or mon.get("final_action") or row.get("entry_action") or "HOLD").upper().replace(" ", "_")
+    health = str(row.get("health_label") or row.get("status") or "").upper()
+    liq = parse_float(row.get("liq_usd", row.get("liquidity_usd", 0)), 0.0)
+    vol = parse_float(row.get("vol24_usd", row.get("volume_24h", 0)), 0.0)
+    extended = bool(pnl is not None and pnl >= 25.0)
+    critical = action in {"EXIT", "REDUCE"} or any(x in health for x in ("DEAD", "RUG", "SCAM"))
+    if liq > 0 and vol > 0 and vol < 0.05 * liq:
+        critical = True
+        action = "REDUCE" if action not in {"EXIT"} else action
+    if critical and action not in {"EXIT", "REDUCE"}:
+        action = "EXIT" if "RUG" in health or "SCAM" in health else "REDUCE"
+    if action == "HOLD" and extended and risk in {"MED", "MED-HIGH", "HIGH"}:
+        action = "PARTIAL_TP"
+    elif action == "HOLD" and extended and entry > 0 and price > entry * 1.35:
+        action = "NO_CHASE"
+    urgency = "none"
+    if action in {"EXIT", "REDUCE", "PROTECT", "PARTIAL_TP", "NO_CHASE"}:
+        urgency = "action_now"
+    elif action in {"HOLD", "ADD_ONLY_PULLBACK", "WAIT_PULLBACK"}:
+        urgency = "watch"
+    tp = []
+    protect = ""
+    add_zone = []
+    if price > 0:
+        if action in {"PARTIAL_TP", "HOLD", "PROTECT"}:
+            tp = [f"{price*1.15:.6f}".rstrip("0").rstrip("."), f"{price*1.30:.6f}".rstrip("0").rstrip(".")]
+            protect = f"<{price*0.92:.6f}".rstrip("0").rstrip(".")
+        if action in {"NO_CHASE", "ADD_ONLY_PULLBACK", "WAIT_PULLBACK"}:
+            add_zone = [f"{price*0.92:.6f}".rstrip("0").rstrip("."), f"{price*0.84:.6f}".rstrip("0").rstrip("."), f"{price*0.75:.6f}".rstrip("0").rstrip(".")]
+    if action in {"NO_ENTRY", "AVOID"}:
+        action = "NO_CHASE"
+    reason = "no material deterioration"
+    if action in {"PARTIAL_TP", "PROTECT"}:
+        reason = "profit runner, protect gains after extension"
+    elif action == "NO_CHASE":
+        reason = "strong move already extended; avoid vertical add"
+    elif action in {"ADD_ONLY_PULLBACK", "WAIT_PULLBACK"}:
+        reason = "quality acceptable, scale only on pullbacks"
+    elif action in {"REDUCE", "EXIT"}:
+        reason = "risk elevated: health/liquidity deterioration"
+    elif action == "HOLD":
+        reason = "trend still alive, but avoid late risk"
+    rounded_pnl = round(float(pnl), 1) if pnl is not None else "na"
+    dedupe_key = f"position_analysis:{symbol}:{action}:{risk}:{rounded_pnl}:{round(score,1)}"
+    return {
+        "symbol": symbol,
+        "action": action,
+        "risk": risk,
+        "urgency": urgency,
+        "pnl_pct": pnl,
+        "score": score,
+        "entry": entry if entry > 0 else None,
+        "price": price if price > 0 else None,
+        "tp": tp,
+        "protect": protect,
+        "add_zone": add_zone,
+        "reason": reason,
+        "critical": bool(critical),
+        "dedupe_key": dedupe_key,
+    }
+
+
+def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_rows: List[Dict[str, Any]], scanner_state: Dict[str, Any], tg_state: Dict[str, Any], now_ts: float) -> Dict[str, Any]:
+    _ = scanner_state
+    _ = tg_state
+    mon_map = {canonical_token_key(m): m for m in monitoring_rows if canonical_token_key(m)}
+    action_now: List[Dict[str, Any]] = []
+    watch: List[Dict[str, Any]] = []
+    skipped = 0
+    dedupe_keys: List[str] = []
+    for row in portfolio_rows:
+        if str(row.get("active", "1")).strip() != "1":
+            continue
+        key = canonical_token_key(row)
+        analysis = analyze_position_for_tg(row, mon_map.get(key or ""), {})
+        dedupe_keys.append(str(analysis.get("dedupe_key") or ""))
+        if analysis["urgency"] == "action_now":
+            action_now.append(analysis)
+        elif analysis["urgency"] == "watch":
+            watch.append(analysis)
+        else:
+            skipped += 1
+    return {
+        "action_now": action_now[:TG_POSITION_ANALYSIS_MAX_ACTION],
+        "watch": watch[:TG_POSITION_ANALYSIS_MAX_WATCH],
+        "no_urgent_change_count": max(0, len(portfolio_rows) - len(action_now) - len(watch)),
+        "skipped_count": skipped,
+        "generated_ts": now_utc_str(),
+        "quiet_hours": _is_tg_quiet_hours(now_ts),
+        "has_critical": any(bool(x.get("critical")) for x in (action_now + watch)),
+        "dedupe_keys": dedupe_keys,
+    }
+
+
+def format_tg_position_analysis(analysis: Dict[str, Any]) -> str:
+    now_local = _tg_analysis_now_kyiv(time.time()).strftime("%H:%M")
+    action_now = list(analysis.get("action_now") or [])[:TG_POSITION_ANALYSIS_MAX_ACTION]
+    watch = list(analysis.get("watch") or [])[:TG_POSITION_ANALYSIS_MAX_WATCH]
+    lines = [
+        "DEX Scout · Position Check",
+        f"portfolio: {int(parse_float(analysis.get('no_urgent_change_count', 0), 0.0)) + len(action_now) + len(watch)} · action needed: {len(action_now)}",
+        f"time: {now_local} Kyiv",
+        "",
+    ]
+    if action_now:
+        lines.append("🚨 Action now")
+        for item in action_now:
+            pnl = f"pnl {item['pnl_pct']:+.0f}%" if item.get("pnl_pct") is not None else "pnl n/a"
+            lines.extend([
+                f"• {item['symbol']} · {item['action'].replace('_',' ')}",
+                f"  {pnl} · risk {item.get('risk','UNKNOWN')}",
+                f"  {'no add.' if not item.get('add_zone') else 'add only: ' + ' / '.join(item.get('add_zone') or [])} "
+                f"{('TP: ' + '–'.join(item.get('tp') or [])) if item.get('tp') else ''} "
+                f"{('protect ' + str(item.get('protect') or '')) if item.get('protect') else ''}".strip(),
+                f"  why: {str(item.get('reason') or '')}",
+                "",
+            ])
+    if watch:
+        lines.append("⚠️ Watch")
+        for item in watch:
+            lines.extend([
+                f"• {item['symbol']} · {item['action'].replace('_',' ')}",
+                f"  {('no add.' if not item.get('add_zone') else 'add only: ' + ' / '.join(item.get('add_zone') or []))} "
+                f"{('TP: ' + '–'.join(item.get('tp') or [])) if item.get('tp') else ''} "
+                f"{('protect ' + str(item.get('protect') or '')) if item.get('protect') else ''}".strip(),
+                f"  why: {str(item.get('reason') or '')}",
+            ])
+    lines.extend(["", f"✅ No urgent change", f"• {int(parse_float(analysis.get('no_urgent_change_count',0),0.0))} positions skipped: no material change"])
+    txt = html.escape("\n".join(lines).strip())
+    return txt[:TG_POSITION_ANALYSIS_MAX_CHARS]
 def _compact_notification_diagnostics(stats: Dict[str, Any]) -> Dict[str, Any]:
     blocked_map = stats.get("blocked_reasons") if isinstance(stats.get("blocked_reasons"), dict) else {}
     blocked_sorted = sorted(
@@ -9575,6 +9737,41 @@ def run_auto_notifications(
     new_token_state: Dict[str, Dict[str, Any]] = {}
 
     mon_rows, port_rows = build_notification_candidates(monitoring_rows, portfolio_rows)
+    position_analysis = build_tg_position_analysis(
+        portfolio_rows=portfolio_rows,
+        monitoring_rows=monitoring_rows,
+        scanner_state=scan_state if isinstance(scan_state, dict) else {},
+        tg_state=state if isinstance(state, dict) else {},
+        now_ts=now_ts,
+    )
+    interval_sec = TG_POSITION_ANALYSIS_INTERVAL_MIN * 60
+    last_pa_ts = parse_ts(state.get("last_position_analysis_sent_ts")) if isinstance(state, dict) else None
+    due_pa = (last_pa_ts is None) or ((now_ts - last_pa_ts.timestamp()) >= interval_sec)
+    has_urgent = bool(position_analysis.get("action_now") or position_analysis.get("watch"))
+    if _is_tg_quiet_hours(now_ts):
+        state["last_position_analysis_suppressed_ts"] = now_utc_str()
+        state["pending_position_analysis_summary"] = position_analysis
+        state["pending_position_analysis_generated_ts"] = str(position_analysis.get("generated_ts") or now_utc_str())
+        state["last_position_analysis_reason"] = "quiet_hours"
+    else:
+        pending = state.get("pending_position_analysis_summary") if isinstance(state, dict) else None
+        to_send = pending if isinstance(pending, dict) else position_analysis
+        pending_generated = parse_ts(state.get("pending_position_analysis_generated_ts")) if isinstance(state, dict) else None
+        pending_fresh = pending_generated and (now_ts - pending_generated.timestamp()) <= 6 * 3600
+        if has_urgent and due_pa and (pending is None or pending_fresh):
+            msg = format_tg_position_analysis(to_send)
+            if send_telegram(msg, parse_mode="HTML"):
+                state["last_position_analysis_sent_ts"] = now_utc_str()
+                state["last_position_analysis_dedupe_keys"] = list(to_send.get("dedupe_keys") or [])
+                state["last_position_analysis_reason"] = "sent_material"
+                state["pending_position_analysis_summary"] = {}
+                state["pending_position_analysis_generated_ts"] = ""
+        elif due_pa and not has_urgent:
+            hb_dt = parse_ts(state.get("last_position_analysis_heartbeat_ts")) if isinstance(state, dict) else None
+            hb_due = hb_dt is None or (now_ts - hb_dt.timestamp()) >= 12 * 3600
+            if hb_due and send_telegram("Portfolio check: no urgent changes.", parse_mode="HTML"):
+                state["last_position_analysis_heartbeat_ts"] = now_utc_str()
+                state["last_position_analysis_reason"] = "heartbeat_no_urgent"
     portfolio_events = build_portfolio_meaningful_events(port_rows, monitoring_rows, state)
     eligible_after_candidate_build = len(mon_rows) + len(port_rows)
 
