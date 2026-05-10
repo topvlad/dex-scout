@@ -10789,6 +10789,7 @@ def worker_runtime_defaults() -> Dict[str, Any]:
         "scan_request_dispatch_error": "",
         "scan_request_cooldown_until": "",
         "scan_request_processed_ts": "",
+        "scan_request_last_clear_reason": "",
         "last_scan_status": "",
         "last_scan_stats": {},
         "last_scan_ts": "",
@@ -11200,6 +11201,45 @@ def request_scan_cycle(
     use_birdeye_trending: bool,
     birdeye_limit: int,
 ) -> Dict[str, Any]:
+    return _upsert_scan_cycle_request(
+        requested_by=requested_by,
+        chain=chain,
+        seeds_raw=seeds_raw,
+        max_items=max_items,
+        use_birdeye_trending=use_birdeye_trending,
+        birdeye_limit=birdeye_limit,
+        force=False,
+    )
+
+
+def force_dispatch_scan_cycle_request(
+    requested_by: str,
+    chain: str,
+    seeds_raw: str,
+    max_items: int,
+    use_birdeye_trending: bool,
+    birdeye_limit: int,
+) -> Dict[str, Any]:
+    return _upsert_scan_cycle_request(
+        requested_by=requested_by,
+        chain=chain,
+        seeds_raw=seeds_raw,
+        max_items=max_items,
+        use_birdeye_trending=use_birdeye_trending,
+        birdeye_limit=birdeye_limit,
+        force=True,
+    )
+
+
+def _upsert_scan_cycle_request(
+    requested_by: str,
+    chain: str,
+    seeds_raw: str,
+    max_items: int,
+    use_birdeye_trending: bool,
+    birdeye_limit: int,
+    force: bool,
+) -> Dict[str, Any]:
     cooldown_sec = max(0, _secret_int("SCAN_REQUEST_COOLDOWN_SEC", 900))
     github_token = _get_secret("GITHUB_WORKFLOW_DISPATCH_TOKEN", "").strip()
     github_repo = _get_secret("GITHUB_REPO", "topvlad/dex-scout").strip() or "topvlad/dex-scout"
@@ -11207,7 +11247,7 @@ def request_scan_cycle(
     github_ref = _get_secret("GITHUB_REF", "main").strip() or "main"
 
     runtime_before = get_worker_runtime_state()
-    if bool(runtime_before.get("scan_request_pending", False)):
+    if bool(runtime_before.get("scan_request_pending", False)) and (not force):
         return {
             "requested": False,
             "pending": True,
@@ -11298,6 +11338,7 @@ def request_scan_cycle(
             "scan_request_dispatch_status": dispatch_status,
             "scan_request_dispatch_error": dispatch_error,
             "scan_request_cooldown_until": cooldown_until_ts,
+            "scan_request_last_clear_reason": "",
         }
     )
     return payload | {
@@ -11308,6 +11349,19 @@ def request_scan_cycle(
         "cooldown_until": cooldown_until_ts,
         "last_scan_status": str(runtime.get("last_scan_status") or ""),
         "last_scan_ts": str(runtime.get("last_scan_ts") or ""),
+    }
+
+
+def clear_stale_scan_request(reason: str = "manual_stale_clear") -> Dict[str, Any]:
+    runtime = update_worker_runtime_state(
+        updates={
+            "scan_request_pending": False,
+            "scan_request_last_clear_reason": str(reason or "manual_stale_clear"),
+        }
+    )
+    return {
+        "pending": bool(runtime.get("scan_request_pending", False)),
+        "clear_reason": str(runtime.get("scan_request_last_clear_reason") or ""),
     }
 
 def save_scanner_ui_params(
@@ -13096,9 +13150,25 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     top[3].caption(f"Last stats: {scan_state.get('last_stats', {})}")
     stats = scan_state.get("last_stats", {}) or {}
     runtime_scan = get_worker_runtime_state(state=scan_state)
+    stale_sec = max(60, _secret_int("SCAN_REQUEST_STALE_SEC", 1800))
+    pending_ts = parse_ts(runtime_scan.get("scan_request_ts"))
+    pending_age_sec = int(max(0.0, datetime.utcnow().timestamp() - pending_ts.timestamp())) if pending_ts else None
+    pending_stale = bool(runtime_scan.get("scan_request_pending")) and (
+        (not str(runtime_scan.get("scan_request_dispatched_ts") or "").strip())
+        or (pending_age_sec is not None and pending_age_sec > stale_sec)
+    )
     st.caption(f"Scan request pending: {'yes' if runtime_scan.get('scan_request_pending') else 'no'}")
-    st.caption(f"Last scan status: {runtime_scan.get('last_scan_status') or '-'}")
-    st.caption(f"Last scan stats: {runtime_scan.get('last_scan_stats') or {}}")
+    st.caption(
+        f"requested_ts={runtime_scan.get('scan_request_ts') or '-'} • "
+        f"dispatched_ts={runtime_scan.get('scan_request_dispatched_ts') or '-'} • "
+        f"dispatch_status={runtime_scan.get('scan_request_dispatch_status') or '-'} • "
+        f"dispatch_error={runtime_scan.get('scan_request_dispatch_error') or '-'}"
+    )
+    st.caption(
+        f"processed_ts={runtime_scan.get('scan_request_processed_ts') or '-'} • "
+        f"last_scan_status={runtime_scan.get('last_scan_status') or '-'} • "
+        f"last_scan_stats={runtime_scan.get('last_scan_stats') or {}}"
+    )
     st.caption(
         f"Added: {stats.get('added', 0)} • "
         f"Skipped active: {stats.get('skipped_active', 0)} • "
@@ -13148,6 +13218,22 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             _ = load_portfolio()
             request_rerun()
     with cbtn3:
+        if runtime_scan.get("scan_request_pending") and pending_stale:
+            if st.button("Force dispatch scan_cycle", use_container_width=True, key="force_dispatch_scan_cycle_monitoring"):
+                req = force_dispatch_scan_cycle_request(
+                    requested_by="ui_monitoring_force",
+                    chain=str(st.session_state.get("chain", "solana")),
+                    seeds_raw=str(auto_cfg.get("scanner_seeds_raw", "")),
+                    max_items=int(auto_cfg.get("scanner_max_items", 50)),
+                    use_birdeye_trending=bool(auto_cfg.get("use_birdeye_trending", True)),
+                    birdeye_limit=int(auto_cfg.get("birdeye_limit", 200)),
+                )
+                st.success(str(req.get("message") or "Force dispatch requested."))
+                request_rerun()
+            if st.button("Clear stale scan request", use_container_width=True, key="clear_stale_scan_request_monitoring"):
+                res = clear_stale_scan_request(reason="manual_stale_clear")
+                st.success(f"Stale request cleared: pending={res.get('pending')}")
+                request_rerun()
         if st.button("🔥 WIPE MONITORING (destructive)", use_container_width=True):
             save_csv(MONITORING_CSV, [], MON_FIELDS)
             reset_monitoring()
@@ -15083,7 +15169,7 @@ def main():
     scanner_seeds_raw = str(DEFAULT_SEEDS)
     scanner_max_items = 100
     use_birdeye_trending = True
-    birdeye_limit = 50
+    birdeye_limit = 200
     if persisted_scan_params:
         scanner_seeds_raw = str(persisted_scan_params.get("seeds_raw") or scanner_seeds_raw)
         scanner_max_items = int(parse_float(persisted_scan_params.get("max_tokens_per_slot", scanner_max_items), scanner_max_items))
