@@ -1,0 +1,42 @@
+import app
+
+
+def test_levels_take_profit_with_trim_and_levels():
+    row = {
+        "chain": "solana",
+        "base_symbol": "BUTTCOIN",
+        "base_token_address": "Abc",
+        "final_action": "TAKE PROFIT",
+        "risk_level": "MEDIUM",
+        "price_usd": "0.01",
+        "avg_entry_price": "0.006",
+    }
+    plan = app.build_position_action_plan(row, {})
+    assert plan["action"] == "TAKE_PROFIT"
+    assert plan["reduce_size"] in {"25-33%", "33-50%"}
+    assert "unavailable" not in plan["tp1"]
+    assert "unavailable" not in plan["protect"]
+
+
+def test_no_price_explicit_unavailable_not_blank():
+    row = {"base_symbol": "NOPRICE", "final_action": "WATCH CLOSELY"}
+    plan = app.build_position_action_plan(row, {})
+    assert "unavailable" in plan["tp1"]
+    assert "unavailable" in plan["protect"]
+    assert "missing price snapshot" in plan["reason"]
+
+
+def test_watch_closely_not_unexplained_hold():
+    row = {"base_symbol": "WATCH", "final_action": "WATCH CLOSELY", "price_usd": "1", "avg_entry_price": "0.8"}
+    out = app.analyze_position_for_tg(row, None, {})
+    assert out["action"] in {"PROTECT", "PARTIAL_TP", "HOLD"}
+    assert "trend still alive" not in out["reason"]
+
+
+def test_tg_format_take_profit_has_tp_protect_trim():
+    row = {"active": "1", "base_symbol": "BUTT", "base_token_address": "X", "chain": "solana", "final_action": "TAKE PROFIT", "price_usd": "0.01", "avg_entry_price": "0.007"}
+    analysis = app.build_tg_position_analysis([row], [], {}, {"last_position_analysis_dedupe_keys": []}, now_ts=0)
+    text = app.format_tg_position_analysis(analysis)
+    assert "trim" in text
+    assert "TP:" in text
+    assert "protect" in text

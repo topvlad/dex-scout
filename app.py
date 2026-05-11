@@ -9683,61 +9683,147 @@ def _is_tg_quiet_hours(now_ts: float) -> bool:
     return h >= TG_QUIET_HOURS_START or h < TG_QUIET_HOURS_END
 
 
+def _extract_price_value(*sources: Any) -> Tuple[Optional[float], str]:
+    for name, raw in sources:
+        val = parse_float(raw, 0.0)
+        if val > 0:
+            return val, name
+    return None, "fallback"
+
+
+def _fmt_price_level(value: Optional[float], unavailable_text: str) -> str:
+    if value is None or value <= 0:
+        return unavailable_text
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def build_position_levels(row: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    row = row if isinstance(row, dict) else {}
+    mon = (context or {}).get("monitoring_row") if isinstance(context, dict) else {}
+    mon = mon if isinstance(mon, dict) else {}
+    current_price, source = _extract_price_value(
+        ("stored_price", row.get("price_usd")),
+        ("stored_price", row.get("current_price")),
+        ("stored_price", row.get("last_price")),
+        ("pair_snapshot", row.get("pair_price")),
+        ("pair_snapshot", mon.get("priceUsd")),
+        ("pair_snapshot", mon.get("price_usd")),
+    )
+    entry_price, _ = _extract_price_value(
+        ("entry_price", row.get("avg_entry_price")),
+        ("entry_price", row.get("entry_price")),
+        ("entry_price", row.get("entry_price_usd")),
+        ("entry_price", row.get("reference_price_usd")),
+    )
+    pnl_pct = parse_float(row.get("pnl_pct"), 0.0) if str(row.get("pnl_pct", "")).strip() else None
+    if pnl_pct is None and current_price and entry_price:
+        pnl_pct = (current_price / entry_price - 1.0) * 100.0
+
+    levels = {
+        "current_price": current_price,
+        "entry_price": entry_price,
+        "pnl_pct": pnl_pct,
+        "tp1": None,
+        "tp2": None,
+        "protect": None,
+        "invalidation": None,
+        "add_zone_low": None,
+        "add_zone_high": None,
+        "confidence": "medium",
+        "source": source,
+    }
+    if current_price:
+        levels.update({
+            "tp1": current_price * 1.12,
+            "tp2": current_price * 1.30,
+            "protect": current_price * 0.82,
+            "invalidation": current_price * 0.70,
+            "add_zone_low": current_price * 0.75,
+            "add_zone_high": current_price * 0.88,
+        })
+        if pnl_pct is not None and entry_price:
+            if pnl_pct >= 25:
+                levels["tp1"] = current_price * 1.10
+                levels["tp2"] = current_price * 1.25
+                levels["protect"] = max(entry_price * 1.05, current_price * 0.82)
+                levels["invalidation"] = current_price * 0.70
+            if pnl_pct >= 60:
+                levels["protect"] = current_price * 0.78
+            if pnl_pct <= -25:
+                levels["protect"] = current_price * 0.90
+                levels["invalidation"] = current_price * 0.85
+
+    score = parse_float(row.get("score", row.get("entry_score", 0)), 0.0)
+    risk = str(row.get("risk") or row.get("risk_level") or "").upper()
+    health = str(row.get("health_label") or "").upper()
+    if source == "fallback" or not current_price:
+        levels["confidence"] = "low"
+    elif risk in {"HIGH", "CRITICAL"} or "UNTRADEABLE" in health:
+        levels["confidence"] = "low"
+    elif score >= 180 and risk in {"", "LOW", "MEDIUM"}:
+        levels["confidence"] = "high"
+    return levels
+
+
 def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[Dict[str, Any]], context: Dict[str, Any]) -> Dict[str, Any]:
     row = position if isinstance(position, dict) else {}
     mon = monitoring_row if isinstance(monitoring_row, dict) else {}
     symbol = str(row.get("base_symbol") or mon.get("base_symbol") or "TOKEN").strip().upper()
-    pnl = parse_float(row.get("pnl_pct", row.get("pnl", 0)), 0.0) if str(row.get("pnl_pct", row.get("pnl", ""))).strip() else None
-    score = parse_float(row.get("entry_score", mon.get("entry_score", 0)), 0.0)
+    levels = build_position_levels(row, {**(context or {}), "monitoring_row": mon})
+    pnl = levels.get("pnl_pct")
+    score = parse_float(row.get("score", row.get("entry_score", mon.get("entry_score", 0))), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or mon.get("risk_level") or "UNKNOWN").upper()
-    entry = parse_float(get_portfolio_entry_price(row), 0.0)
-    price = parse_float(row.get("price_usd", row.get("current_price", mon.get("price_usd", 0))), 0.0)
-    action = str(row.get("final_action") or mon.get("final_action") or row.get("entry_action") or "HOLD").upper().replace(" ", "_")
     health = str(row.get("health_label") or row.get("status") or "").upper()
-    liq = parse_float(row.get("liq_usd", row.get("liquidity_usd", 0)), 0.0)
-    vol = parse_float(row.get("vol24_usd", row.get("volume_24h", 0)), 0.0)
-    extended = bool(pnl is not None and pnl >= 25.0)
-    critical = action in {"EXIT", "REDUCE"} or any(x in health for x in ("DEAD", "RUG", "SCAM"))
-    if liq > 0 and vol > 0 and vol < 0.05 * liq:
-        critical = True
-        action = "REDUCE" if action not in {"EXIT"} else action
-    if critical and action not in {"EXIT", "REDUCE"}:
-        action = "EXIT" if "RUG" in health or "SCAM" in health else "REDUCE"
-    if action == "HOLD" and extended and risk in {"MED", "MED-HIGH", "HIGH"}:
+    liq = parse_float(row.get("liq_usd", row.get("liquidity", row.get("liquidity_usd", mon.get("liquidity", 0)))), 0.0)
+    if isinstance(mon.get("liquidity"), dict):
+        liq = max(liq, parse_float((mon.get("liquidity") or {}).get("usd"), 0.0))
+    action = str(row.get("final_action") or row.get("recommended_action") or mon.get("final_action") or row.get("entry_action") or "HOLD").upper().replace(" ", "_")
+    if action == "TAKE_PROFIT":
         action = "PARTIAL_TP"
-    elif action == "HOLD" and extended and entry > 0 and price > entry * 1.35:
-        action = "NO_CHASE"
-    urgency = "none"
-    if action in {"EXIT", "REDUCE", "PROTECT", "PARTIAL_TP", "NO_CHASE"}:
-        urgency = "action_now"
-    elif action in {"HOLD", "ADD_ONLY_PULLBACK", "WAIT_PULLBACK"}:
-        urgency = "watch"
-    tp = []
-    protect = ""
-    add_zone = []
-    if price > 0:
-        if action in {"PARTIAL_TP", "HOLD", "PROTECT"}:
-            tp = [f"{price*1.15:.6f}".rstrip("0").rstrip("."), f"{price*1.30:.6f}".rstrip("0").rstrip(".")]
-            protect = f"<{price*0.92:.6f}".rstrip("0").rstrip(".")
-        if action in {"NO_CHASE", "ADD_ONLY_PULLBACK", "WAIT_PULLBACK"}:
-            add_zone = [f"{price*0.92:.6f}".rstrip("0").rstrip("."), f"{price*0.84:.6f}".rstrip("0").rstrip("."), f"{price*0.75:.6f}".rstrip("0").rstrip(".")]
     if action in {"NO_ENTRY", "AVOID"}:
         action = "NO_CHASE"
-    reason = "no material deterioration"
-    if action in {"PARTIAL_TP", "PROTECT"}:
-        reason = "profit runner, protect gains after extension"
+
+    if action == "WATCH_CLOSELY":
+        action = "PROTECT" if levels.get("current_price") else "HOLD"
+    if pnl is not None and pnl >= 25 and action in {"HOLD", "PROTECT", "WATCH_CLOSELY"}:
+        action = "PARTIAL_TP"
+    if pnl is not None and pnl <= -25 and action not in {"EXIT"}:
+        action = "REDUCE"
+    if risk in {"HIGH", "CRITICAL"} and liq > 0 and liq < 15000 and action not in {"EXIT"}:
+        action = "REDUCE"
+    if "DEAD" in health or "SCAM" in health:
+        action = "EXIT"
+
+    urgency = "action_now" if action in {"EXIT", "REDUCE", "PROTECT", "PARTIAL_TP", "NO_CHASE"} else "watch"
+    trim = "none"
+    if action == "PARTIAL_TP":
+        trim = "33-50%" if pnl is not None and pnl >= 60 else "25-33%"
+    elif action == "REDUCE":
+        trim = "50%" if pnl is None or pnl > -45 else "all"
+    elif action == "EXIT":
+        trim = "all"
+
+    missing_price = not bool(levels.get("current_price"))
+    reason_parts = []
+    if missing_price:
+        reason_parts.append("missing price snapshot, only status-level advice available")
+    elif pnl is not None:
+        reason_parts.append(f"pnl {pnl:+.0f}%")
+    if risk in {"HIGH", "CRITICAL"}:
+        reason_parts.append("risk HIGH")
+    if liq > 0 and liq < 15000:
+        reason_parts.append("weak liquidity")
+    if "TRAP" in health or action == "PROTECT":
+        reason_parts.append("trap pressure detected")
+    if action == "PARTIAL_TP":
+        reason_parts.append("target zone reached, protect gains after impulse")
     elif action == "NO_CHASE":
-        reason = "strong move already extended; avoid vertical add"
-    elif action in {"ADD_ONLY_PULLBACK", "WAIT_PULLBACK"}:
-        reason = "quality acceptable, scale only on pullbacks"
-    elif action in {"REDUCE", "EXIT"}:
-        reason = "risk elevated: health/liquidity deterioration"
-    elif action == "HOLD":
-        reason = "trend still alive, but avoid late risk"
-    rounded_pnl = round(float(pnl), 1) if pnl is not None else "na"
-    tp_bucket = "-".join(tp[:2]) if tp else "na"
-    protect_bucket = str(protect or "na")
-    dedupe_key = f"position_analysis:{symbol}:{action}:{risk}:{rounded_pnl}:{round(score,1)}:{tp_bucket}:{protect_bucket}"
+        reason_parts.append("price extended, no add until pullback")
+    elif action in {"REDUCE", "EXIT"} and not missing_price:
+        reason_parts.append("reduce exposure")
+    reason = ", ".join(reason_parts) if reason_parts else "no material deterioration"
+
+    dedupe_key = f"position_analysis:{symbol}:{action}:{risk}:{round(parse_float(pnl,0.0),1) if pnl is not None else 'na'}:{round(score,1)}:{levels.get('confidence')}"
     return {
         "symbol": symbol,
         "action": action,
@@ -9745,37 +9831,37 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
         "urgency": urgency,
         "pnl_pct": pnl,
         "score": score,
-        "entry": entry if entry > 0 else None,
-        "price": price if price > 0 else None,
-        "tp": tp,
-        "protect": protect,
-        "add_zone": add_zone,
+        "entry": levels.get("entry_price"),
+        "price": levels.get("current_price"),
+        "trim": trim,
+        "levels": levels,
         "reason": reason,
-        "critical": bool(critical),
+        "critical": action == "EXIT",
         "dedupe_key": dedupe_key,
     }
 
 
 def build_position_action_plan(row: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     analysis = analyze_position_for_tg(row, context.get("monitoring_row") if isinstance(context, dict) else None, context)
+    levels = dict(analysis.get("levels") or {})
     action = str(analysis.get("action") or "HOLD").upper()
-    reduce_size = "none"
-    if action in {"PARTIAL_TP", "TAKE_PROFIT", "REDUCE"}:
-        reduce_size = "25%" if str(analysis.get("risk") or "").upper() in {"LOW", "MEDIUM"} else "33%"
-    elif action == "EXIT":
-        reduce_size = "all"
-    no_add = not bool(analysis.get("add_zone"))
+    unavailable = "unavailable – missing price snapshot"
+    add_zone_low = levels.get("add_zone_low")
+    add_zone_high = levels.get("add_zone_high")
+    add_zone_text = unavailable if levels.get("current_price") is None else f"{_fmt_price_level(add_zone_low, unavailable)} / {_fmt_price_level(add_zone_high, unavailable)}"
     return {
         "action": "TAKE_PROFIT" if action == "PARTIAL_TP" else action,
         "position_size": "normal",
-        "reduce_size": reduce_size,
-        "tp1": (analysis.get("tp") or [""])[0] if analysis.get("tp") else "",
-        "tp2": (analysis.get("tp") or ["", ""])[1] if len(analysis.get("tp") or []) > 1 else "",
-        "protect": str(analysis.get("protect") or ""),
-        "invalidation": str(analysis.get("protect") or ""),
-        "add_zone": list(analysis.get("add_zone") or []),
-        "no_add": no_add,
-        "reason": str(analysis.get("reason") or ""),
+        "reduce_size": str(analysis.get("trim") or "none"),
+        "tp1": _fmt_price_level(levels.get("tp1"), unavailable),
+        "tp2": _fmt_price_level(levels.get("tp2"), unavailable),
+        "protect": _fmt_price_level(levels.get("protect"), unavailable),
+        "invalidation": _fmt_price_level(levels.get("invalidation"), unavailable),
+        "add_zone": add_zone_text,
+        "no_add": action == "NO_CHASE",
+        "reason": str(analysis.get("reason") or unavailable),
+        "data_quality": str(levels.get("confidence") or "low"),
+        "levels_source": str(levels.get("source") or "fallback"),
     }
 
 
@@ -9794,6 +9880,7 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
             continue
         key = canonical_token_key(row)
         analysis = analyze_position_for_tg(row, mon_map.get(key or ""), {})
+        analysis["plan"] = build_position_action_plan(row, {"monitoring_row": mon_map.get(key or "") or {}})
         dedupe_keys.append(str(analysis.get("dedupe_key") or ""))
         if str(analysis.get("dedupe_key") or "") not in last_keys:
             changed_keys.add(str(analysis.get("dedupe_key") or ""))
@@ -9837,9 +9924,8 @@ def format_tg_position_analysis(analysis: Dict[str, Any]) -> str:
             lines.extend([
                 f"• {item['symbol']} · {item['action'].replace('_',' ')}",
                 f"  {pnl} · risk {item.get('risk','UNKNOWN')}",
-                f"  {'no add.' if not item.get('add_zone') else 'add only: ' + ' / '.join(item.get('add_zone') or [])} "
-                f"{('TP: ' + '–'.join(item.get('tp') or [])) if item.get('tp') else ''} "
-                f"{('protect ' + str(item.get('protect') or '')) if item.get('protect') else ''}".strip(),
+                f"  trim {item.get('trim','none')}. TP: {item.get('plan',{}).get('tp1','n/a')} / {item.get('plan',{}).get('tp2','n/a')}. protect <{item.get('plan',{}).get('protect','n/a')}",
+                f"  {'no add.' if item.get('plan',{}).get('no_add') else 'add zone: ' + str(item.get('plan',{}).get('add_zone') or 'n/a')}"
                 f"  why: {str(item.get('reason') or '')}",
                 "",
             ])
@@ -9848,9 +9934,8 @@ def format_tg_position_analysis(analysis: Dict[str, Any]) -> str:
         for item in watch:
             lines.extend([
                 f"• {item['symbol']} · {item['action'].replace('_',' ')}",
-                f"  {('no add.' if not item.get('add_zone') else 'add only: ' + ' / '.join(item.get('add_zone') or []))} "
-                f"{('TP: ' + '–'.join(item.get('tp') or [])) if item.get('tp') else ''} "
-                f"{('protect ' + str(item.get('protect') or '')) if item.get('protect') else ''}".strip(),
+                f"  trim {item.get('trim','none')}. TP: {item.get('plan',{}).get('tp1','n/a')} / {item.get('plan',{}).get('tp2','n/a')}. protect <{item.get('plan',{}).get('protect','n/a')}",
+                f"  {'no add.' if item.get('plan',{}).get('no_add') else 'add zone: ' + str(item.get('plan',{}).get('add_zone') or 'n/a')}"
                 f"  why: {str(item.get('reason') or '')}",
             ])
     lines.extend(["", f"✅ No urgent change", f"• {int(parse_float(analysis.get('skipped_count',0),0.0))} positions skipped / unchanged"])
@@ -15295,7 +15380,8 @@ def page_portfolio():
                 st.write(f"TP1 / TP2: {plan.get('tp1','n/a')} / {plan.get('tp2','n/a')}")
                 st.write(f"Protect: {plan.get('protect','n/a')}")
                 st.write(f"Invalidation: {plan.get('invalidation','n/a')}")
-                st.write(f"Add zone: {' / '.join(plan.get('add_zone') or []) if plan.get('add_zone') else 'no add'}")
+                st.write(f"Add zone: {plan.get('add_zone','no add')}")
+                st.write(f"Data quality: {plan.get('data_quality','low')}")
                 st.write(f"Reason: {plan.get('reason','n/a')}")
             if unified.get("health_override_active"):
                 health_copy = str(health.get("health_label", "UNKNOWN")).replace("_", " ")
