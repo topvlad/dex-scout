@@ -5635,6 +5635,62 @@ def manual_add_token_to_monitoring(
     }
 
 
+
+
+def manual_add_token_to_portfolio(raw_input: str, chain: str, note: str = "", also_monitoring: bool = False, high_risk_watch: bool = False) -> Dict[str, Any]:
+    parsed = parse_manual_token_input(raw_input, chain)
+    if not parsed.get("ok"):
+        return {"failed": 1, "errors": ["invalid_input"]}
+    chain_norm = str(parsed.get("chain") or normalize_chain_name(chain or ""))
+    base_addr = str(parsed.get("token_addr") or "")
+    if not base_addr:
+        return {"failed": 1, "errors": ["no_addr"]}
+    key = addr_key(chain_norm, base_addr)
+
+    portfolio_rows = load_portfolio()
+    existing_active = any(str(r.get("active","1")).strip()=="1" and addr_key(r.get("chain",""), r.get("base_token_address",""))==key for r in portfolio_rows)
+    if existing_active:
+        out={"portfolio_existing":1,"portfolio_added":0,"failed":0}
+    else:
+        best = None
+        try:
+            best = best_pair_for_token_cached(chain_norm, base_addr)
+        except Exception:
+            best = None
+        symbol = str(safe_get(best, "baseToken", "symbol", default="") or "").strip() if isinstance(best, dict) else ""
+        name = str(safe_get(best, "baseToken", "name", default="") or "").strip() if isinstance(best, dict) else ""
+        if not symbol:
+            symbol = (base_addr[:4] + "…" + base_addr[-4:]) if len(base_addr) > 10 else base_addr
+        row = {k:"" for k in PORTFOLIO_FIELDS}
+        row.update({
+            "ts_added": now_utc_str(), "chain": chain_norm, "base_symbol": symbol, "quote_symbol": "USDC",
+            "base_token_address": base_addr, "pair_address": str(parsed.get("pair_addr") or safe_get(best, "pairAddress", default="") or ""),
+            "entry_price": str(parse_float(safe_get(best, "priceUsd", default=0), 0.0)), "score_init": "0", "active":"1",
+            "note": (f"{note} | {name}".strip(" |")), "source_url": str(parsed.get("dex_url") or safe_get(best, "url", default="") or ""),
+            "source":"manual"
+        })
+        portfolio_rows.insert(0,row)
+        save_portfolio(portfolio_rows)
+        verify_rows = load_portfolio()
+        present = any(str(r.get("active","1")).strip()=="1" and addr_key(r.get("chain",""), r.get("base_token_address",""))==key for r in verify_rows)
+        if not present:
+            return {"portfolio_added":0,"portfolio_existing":0,"failed":1,"errors":["portfolio_verify_failed"]}
+        out={"portfolio_added":1,"portfolio_existing":0,"failed":0}
+
+    if also_monitoring:
+        mres = manual_add_token_to_monitoring(raw_input=raw_input, chain=chain_norm, note=note, tags=["high_risk_watch" if high_risk_watch else "manual_watch"], source="manual", score=0.0)
+        mstatus = str(mres.get("status") or "")
+        if mstatus in ("OK","OK_DEFERRED","REACTIVATED"):
+            out["monitoring_added"] = 1
+            out["monitoring_existing"] = 0
+        elif mstatus in ("EXISTS_ACTIVE","EXISTS_ARCHIVED"):
+            out["monitoring_added"] = 0
+            out["monitoring_existing"] = 1
+        else:
+            out["monitoring_added"] = 0
+            out["monitoring_existing"] = 0
+            out["failed"] = int(out.get("failed",0))+1
+    return out
 def archive_monitoring(
     chain: str,
     base_addr: str,
@@ -13448,34 +13504,41 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.rerun()
         st.caption("Clears monitoring.csv. Does not restore history automatically.")
 
-    st.markdown("### Manual add to Monitoring")
-    m1, m2, m3 = st.columns([2, 5, 3])
-    with m1:
-        manual_chain = st.selectbox("chain", ["solana", "bsc"], index=0, key="manual_mon_chain")
-    with m2:
-        manual_raw = st.text_input("CA / pair address / DexScreener URL", key="manual_mon_input")
-    with m3:
-        manual_high_risk = st.checkbox("Mark as high-risk watch", value=False, key="manual_mon_high_risk")
-    manual_note = st.text_input("note (optional)", key="manual_mon_note")
-    if st.button("Add to Monitoring", key="manual_add_submit", use_container_width=False):
-        manual_tag = "manual_watch,high_risk_watch" if manual_high_risk else "manual_watch"
-        res = canonical_add_to_monitoring(
-            chain=manual_chain,
-            raw_input=manual_raw,
-            note=manual_note,
-            tag=manual_tag,
-            source_label="manual",
-        )
-        if res.get("status") in {"OK", "OK_DEFERRED", "EXISTS_ACTIVE", "REACTIVATED"}:
-            st.success(f"Monitoring: {res.get('status')}")
-            if res.get("warning"):
-                st.warning(str(res.get("warning")))
-            if res.get("dex_url"):
-                link_button("Dex", str(res.get("dex_url")), use_container_width=False, key=f"manual_dex_{hkey(str(res.get('dex_url')))}")
+    st.markdown("### Manual add to Portfolio")
+    manual_chain = st.selectbox("chain", ["solana", "bsc"], index=0, key="manual_port_chain")
+    manual_raw = st.text_input("CA / pair address / DexScreener URL", key="manual_port_input")
+    manual_note = st.text_input("optional note", key="manual_port_note")
+    manual_also_monitor = st.checkbox("also add to Monitoring", value=True, key="manual_port_add_mon")
+    manual_high_risk = st.checkbox("mark as high-risk watch", value=False, key="manual_port_high_risk")
+    bulk_raw = st.text_area("Bulk add CAs to Portfolio (one CA / URL per line)", value="", key="manual_port_bulk")
+    if st.button("Add to Portfolio", key="manual_port_submit", use_container_width=False):
+        lines = [manual_raw] + [x.strip() for x in str(bulk_raw or "").splitlines() if x.strip()]
+        totals = {"portfolio_added": 0, "portfolio_existing": 0, "monitoring_added": 0, "monitoring_existing": 0, "failed": 0}
+        for line in lines:
+            if not str(line or "").strip():
+                continue
+            res = manual_add_token_to_portfolio(
+                raw_input=str(line),
+                chain=manual_chain,
+                note=manual_note,
+                also_monitoring=manual_also_monitor,
+                high_risk_watch=manual_high_risk,
+            )
+            for k in totals:
+                totals[k] += int(res.get(k, 0) or 0)
+        if totals["portfolio_added"] > 0 or totals["portfolio_existing"] > 0:
+            st.success(
+                f"portfolio_added={totals['portfolio_added']} "
+                f"portfolio_existing={totals['portfolio_existing']} "
+                f"monitoring_added={totals['monitoring_added']} "
+                f"monitoring_existing={totals['monitoring_existing']} "
+                f"failed={totals['failed']}"
+            )
             load_monitoring_rows_cached.clear()
+            load_portfolio_rows_cached.clear()
             request_rerun()
         else:
-            st.warning(f"Manual add failed: {res.get('status')}")
+            st.warning(f"failed={totals['failed']} portfolio_added=0")
 
     if not active_rows:
         st.info("Monitoring is empty. Run scanner now to fetch and save tokens.")
