@@ -9735,7 +9735,9 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
     elif action == "HOLD":
         reason = "trend still alive, but avoid late risk"
     rounded_pnl = round(float(pnl), 1) if pnl is not None else "na"
-    dedupe_key = f"position_analysis:{symbol}:{action}:{risk}:{rounded_pnl}:{round(score,1)}"
+    tp_bucket = "-".join(tp[:2]) if tp else "na"
+    protect_bucket = str(protect or "na")
+    dedupe_key = f"position_analysis:{symbol}:{action}:{risk}:{rounded_pnl}:{round(score,1)}:{tp_bucket}:{protect_bucket}"
     return {
         "symbol": symbol,
         "action": action,
@@ -9754,6 +9756,29 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
     }
 
 
+def build_position_action_plan(row: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    analysis = analyze_position_for_tg(row, context.get("monitoring_row") if isinstance(context, dict) else None, context)
+    action = str(analysis.get("action") or "HOLD").upper()
+    reduce_size = "none"
+    if action in {"PARTIAL_TP", "TAKE_PROFIT", "REDUCE"}:
+        reduce_size = "25%" if str(analysis.get("risk") or "").upper() in {"LOW", "MEDIUM"} else "33%"
+    elif action == "EXIT":
+        reduce_size = "all"
+    no_add = not bool(analysis.get("add_zone"))
+    return {
+        "action": "TAKE_PROFIT" if action == "PARTIAL_TP" else action,
+        "position_size": "normal",
+        "reduce_size": reduce_size,
+        "tp1": (analysis.get("tp") or [""])[0] if analysis.get("tp") else "",
+        "tp2": (analysis.get("tp") or ["", ""])[1] if len(analysis.get("tp") or []) > 1 else "",
+        "protect": str(analysis.get("protect") or ""),
+        "invalidation": str(analysis.get("protect") or ""),
+        "add_zone": list(analysis.get("add_zone") or []),
+        "no_add": no_add,
+        "reason": str(analysis.get("reason") or ""),
+    }
+
+
 def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_rows: List[Dict[str, Any]], scanner_state: Dict[str, Any], tg_state: Dict[str, Any], now_ts: float) -> Dict[str, Any]:
     _ = scanner_state
     _ = tg_state
@@ -9762,27 +9787,36 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
     watch: List[Dict[str, Any]] = []
     skipped = 0
     dedupe_keys: List[str] = []
+    last_keys = set(str(x) for x in (tg_state.get("last_position_analysis_dedupe_keys") or []))
+    changed_keys: Set[str] = set()
     for row in portfolio_rows:
         if str(row.get("active", "1")).strip() != "1":
             continue
         key = canonical_token_key(row)
         analysis = analyze_position_for_tg(row, mon_map.get(key or ""), {})
         dedupe_keys.append(str(analysis.get("dedupe_key") or ""))
+        if str(analysis.get("dedupe_key") or "") not in last_keys:
+            changed_keys.add(str(analysis.get("dedupe_key") or ""))
         if analysis["urgency"] == "action_now":
             action_now.append(analysis)
         elif analysis["urgency"] == "watch":
             watch.append(analysis)
         else:
             skipped += 1
+    material_action_now = [x for x in action_now if str(x.get("dedupe_key") or "") in changed_keys]
+    material_watch = [x for x in watch if str(x.get("dedupe_key") or "") in changed_keys]
+    visible_count = len(material_action_now[:TG_POSITION_ANALYSIS_MAX_ACTION]) + len(material_watch[:TG_POSITION_ANALYSIS_MAX_WATCH])
+    total_active = len([r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"])
     return {
-        "action_now": action_now[:TG_POSITION_ANALYSIS_MAX_ACTION],
-        "watch": watch[:TG_POSITION_ANALYSIS_MAX_WATCH],
-        "no_urgent_change_count": max(0, len(portfolio_rows) - len(action_now) - len(watch)),
-        "skipped_count": skipped,
+        "action_now": material_action_now[:TG_POSITION_ANALYSIS_MAX_ACTION],
+        "watch": material_watch[:TG_POSITION_ANALYSIS_MAX_WATCH],
+        "no_urgent_change_count": max(0, total_active - visible_count),
+        "skipped_count": max(0, total_active - visible_count),
         "generated_ts": now_utc_str(),
         "quiet_hours": _is_tg_quiet_hours(now_ts),
-        "has_critical": any(bool(x.get("critical")) for x in (action_now + watch)),
+        "has_critical": any(bool(x.get("critical")) for x in (material_action_now + material_watch)),
         "dedupe_keys": dedupe_keys,
+        "material_change_count": len(changed_keys),
     }
 
 
@@ -9819,7 +9853,7 @@ def format_tg_position_analysis(analysis: Dict[str, Any]) -> str:
                 f"{('protect ' + str(item.get('protect') or '')) if item.get('protect') else ''}".strip(),
                 f"  why: {str(item.get('reason') or '')}",
             ])
-    lines.extend(["", f"✅ No urgent change", f"• {int(parse_float(analysis.get('no_urgent_change_count',0),0.0))} positions skipped: no material change"])
+    lines.extend(["", f"✅ No urgent change", f"• {int(parse_float(analysis.get('skipped_count',0),0.0))} positions skipped / unchanged"])
     txt = html.escape("\n".join(lines).strip())
     return txt[:TG_POSITION_ANALYSIS_MAX_CHARS]
 def _compact_notification_diagnostics(stats: Dict[str, Any]) -> Dict[str, Any]:
@@ -9903,7 +9937,8 @@ def run_auto_notifications(
         elif due_pa and not has_urgent:
             hb_dt = parse_ts(state.get("last_position_analysis_heartbeat_ts")) if isinstance(state, dict) else None
             hb_due = hb_dt is None or (now_ts - hb_dt.timestamp()) >= 12 * 3600
-            if hb_due and send_telegram("Portfolio check: no urgent changes.", parse_mode="HTML"):
+            n_positions = len([r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"])
+            if hb_due and send_telegram(f"Portfolio check: no urgent changes across {n_positions} positions.", parse_mode="HTML"):
                 state["last_position_analysis_heartbeat_ts"] = now_utc_str()
                 state["last_position_analysis_reason"] = "heartbeat_no_urgent"
     portfolio_events = build_portfolio_meaningful_events(port_rows, monitoring_rows, state)
@@ -15253,6 +15288,15 @@ def page_portfolio():
             st.markdown(f"### {portfolio_action_badge(unified['final_action'])}")
             st.markdown(f"**Recommended action: {unified['final_action']}**")
             st.caption(f"Reason: {unified['final_reason']}")
+            plan = build_position_action_plan(r, {"monitoring_row": best or {}})
+            with st.expander("Action plan", expanded=False):
+                st.write(f"Suggested action: {plan.get('action','HOLD')}")
+                st.write(f"Size / trim: {plan.get('position_size','unknown')} / {plan.get('reduce_size','none')}")
+                st.write(f"TP1 / TP2: {plan.get('tp1','n/a')} / {plan.get('tp2','n/a')}")
+                st.write(f"Protect: {plan.get('protect','n/a')}")
+                st.write(f"Invalidation: {plan.get('invalidation','n/a')}")
+                st.write(f"Add zone: {' / '.join(plan.get('add_zone') or []) if plan.get('add_zone') else 'no add'}")
+                st.write(f"Reason: {plan.get('reason','n/a')}")
             if unified.get("health_override_active"):
                 health_copy = str(health.get("health_label", "UNKNOWN")).replace("_", " ")
                 st.caption(f"⚠ Health override: {health_copy} → {unified.get('health_override_action', unified['final_action'])}")
@@ -15397,9 +15441,16 @@ def page_portfolio():
 
         # Sparklines for portfolio too (requested)
         with st.expander("Dynamics (sparklines)", expanded=False):
-            if not hist:
+            dyn_cache_key = f"portfolio_dyn_{hkey(base_addr, chain)}"
+            if st.button("Load dynamics history", key=f"p_dyn_load_{idx}_{hkey(base_addr, chain)}"):
+                st.session_state[dyn_cache_key] = load_token_dynamics_history(r, limit=STREAMLIT_HISTORY_RENDER_LIMIT)
+            loaded_hist = st.session_state.get(dyn_cache_key)
+            if loaded_hist is None:
+                st.caption("Click Load dynamics history to fetch matching snapshots for this token.")
+            elif not loaded_hist:
                 st.info("No snapshots yet.")
             else:
+                hist = list(loaded_hist)
                 dfh = pd.DataFrame(hist).copy()
                 dfh["ts_utc"] = pd.to_datetime(dfh.get("ts_utc", ""), errors="coerce")
                 dfh = dfh.sort_values("ts_utc")

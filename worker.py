@@ -297,6 +297,12 @@ def _record_pulse_history_after_cycle() -> Dict[str, Any]:
         for row in active_monitoring_rows
         if app.canonical_token_key(row)
     }
+    portfolio_rows = app.load_portfolio()
+    active_portfolio_rows = [r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"]
+    for row in active_portfolio_rows:
+        key = app.canonical_token_key(row)
+        if key:
+            active_keys.add(key)
     result = app.record_live_pulse_history_from_candidates(
         active_monitoring_keys=active_keys,
         chain_filter="all",
