@@ -5117,6 +5117,84 @@ def load_monitoring_history(limit_rows: int = 8000) -> List[Dict[str, Any]]:
     return rows[-limit_rows:]
 
 
+def _extract_ca_from_dex_url(url: str) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(text)
+        parts = [p for p in str(parsed.path or "").split("/") if p]
+        if len(parts) >= 3 and str(parts[1]).lower() in {"token", "pair"}:
+            return str(parts[2] or "").strip()
+        if len(parts) >= 2:
+            return str(parts[1] or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _history_aliases_from_row(row: Dict[str, Any], include_url: bool = False) -> Set[str]:
+    aliases: Set[str] = set()
+    fields = ["symbol", "token", "token_addr", "ca", "address", "pair_address", "base_addr"]
+    for field in fields:
+        value = str(row.get(field) or "").strip()
+        if value:
+            aliases.add(value)
+    base_token = row.get("baseToken")
+    if isinstance(base_token, dict):
+        base_addr = str(base_token.get("address") or "").strip()
+        if base_addr:
+            aliases.add(base_addr)
+    if include_url:
+        url_addr = _extract_ca_from_dex_url(str(row.get("url") or row.get("dex_url") or row.get("dexscreener_url") or ""))
+        if url_addr:
+            aliases.add(url_addr)
+    return aliases
+
+
+def _history_alias_overlap(chain: str, row_aliases: Set[str], hist_aliases: Set[str]) -> bool:
+    chain_norm = normalize_chain_name(chain)
+    if not chain_norm:
+        return False
+    for left in row_aliases:
+        for right in hist_aliases:
+            l = str(left or "").strip()
+            r = str(right or "").strip()
+            if not l or not r:
+                continue
+            looks_like_addr = (len(l) >= 20 and len(r) >= 20)
+            if l == r:
+                return True
+            if chain_norm != "solana" and addr_key(chain_norm, l) == addr_key(chain_norm, r):
+                return True
+            if not looks_like_addr and l.lower() == r.lower():
+                return True
+    return False
+
+
+def load_token_dynamics_history(row: Dict[str, Any], limit: int = 120) -> List[Dict[str, Any]]:
+    chain = normalize_chain_name(token_chain(row))
+    if not chain:
+        return []
+    source = "d1" if USE_D1 else ("supabase" if USE_SUPABASE else "local")
+    rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
+    aliases = _history_aliases_from_row(row, include_url=True)
+    if not aliases:
+        return []
+    matched: List[Dict[str, Any]] = []
+    for h in rows:
+        if normalize_chain_name(str(h.get("chain") or "")) != chain:
+            continue
+        if not _history_alias_overlap(chain, aliases, _history_aliases_from_row(h)):
+            continue
+        matched.append(dict(h))
+    matched.sort(key=lambda x: parse_ts(x.get("ts_utc")) or datetime.min)
+    trimmed = matched[-max(2, int(limit or 120)):]
+    st.session_state["_last_dynamics_history_source"] = source
+    return trimmed
+
+
 def flush_monitoring_history_buffer(force: bool = False) -> int:
     global _MON_HISTORY_BUFFER_LAST_FLUSH_TS
     if not _MON_HISTORY_BUFFER:
@@ -13738,11 +13816,31 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 else:
                     st.caption("Raw internals hidden (debug mode only).")
 
-            hist = (item.get("hist", []) or [])[-STREAMLIT_HISTORY_RENDER_LIMIT:]
-            if hist:
-                _track_history_load()
             with dynamics_tab:
-                render_monitoring_sparklines(hist)
+                token_key = canonical_token_key(r) or canonical_entity_key(token_chain(r), token_ca(r))
+                cache_key = f"_dyn_hist_{token_key}"
+                loaded = cache_key in st.session_state
+                if st.button("Load dynamics history", key=f"dyn_load_{token_key}", use_container_width=False):
+                    st.session_state[cache_key] = load_token_dynamics_history(r, limit=STREAMLIT_HISTORY_RENDER_LIMIT)
+                    loaded = True
+                hist = st.session_state.get(cache_key, []) if loaded else []
+                if loaded and hist:
+                    _track_history_load()
+                row_aliases = _history_aliases_from_row(r, include_url=True)
+                history_total = len(hist) if loaded else 0
+                matched_rows = len(hist) if loaded else 0
+                last_ts = str((hist[-1] or {}).get("ts_utc") or "n/a") if loaded and hist else "n/a"
+                source = str(st.session_state.get("_last_dynamics_history_source", "n/a"))
+                st.caption(
+                    f"debug: token_key={token_key or 'n/a'} | aliases_count={len(row_aliases)} | "
+                    f"history_rows_total={history_total} | matched_rows={matched_rows} | source={source} | last_history_ts={last_ts}"
+                )
+                if not loaded:
+                    st.caption("Click Load dynamics history to fetch matching snapshots for this token.")
+                elif len(hist) < 2:
+                    st.caption("History loaded, but fewer than 2 matching snapshots found.")
+                else:
+                    render_monitoring_sparklines(hist[-STREAMLIT_HISTORY_RENDER_LIMIT:])
 
     st.subheader("Live pulse candidates")
     st.caption("Live candidates behind glass (read-only layer). Confirmed Monitoring below remains the settled active layer.")
