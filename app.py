@@ -154,6 +154,7 @@ PULSE_SPARKLINE_LOG_LAST_TS: Dict[str, float] = {}
 _CSV_BACKUP_STATE: Dict[str, Dict[str, Any]] = {}
 _MON_HISTORY_BUFFER: List[Dict[str, Any]] = []
 _MON_HISTORY_BUFFER_LAST_FLUSH_TS: float = 0.0
+_MON_HISTORY_HOURLY_DEDUP_KEYS: Set[str] = set()
 _MON_HISTORY_REMOTE_BACKUP_LAST_TS: float = 0.0
 _STORAGE_METRICS: Dict[str, int] = {"writes": 0, "roundtrip_checks": 0}
 SUPABASE_STORAGE_READ_CACHE_TTL_SEC = max(5, _env_int("SUPABASE_STORAGE_READ_CACHE_TTL_SEC", 600))
@@ -4786,6 +4787,11 @@ MON_FIELDS = [
 HIST_FIELDS = [
     "ts_utc",
     "chain",
+    "canonical_token_key",
+    "symbol",
+    "ca",
+    "token_addr",
+    "pair_address",
     "base_symbol",
     "base_addr",
     "pair_addr",
@@ -4804,6 +4810,9 @@ HIST_FIELDS = [
     "entry_reason",
     "timing_label",
     "risk_level",
+    "source",
+    "recommendation",
+    "status",
 ]
 
 
@@ -5296,6 +5305,56 @@ def append_monitoring_history(row: Dict[str, Any]):
     payload = {k: hist_row.get(k, "") for k in HIST_FIELDS}
     _MON_HISTORY_BUFFER.append(payload)
     flush_monitoring_history_buffer(force=False)
+
+
+def append_token_history_snapshot(row: Dict[str, Any], source: str, now_ts: Optional[datetime] = None) -> bool:
+    ts_dt = now_ts if isinstance(now_ts, datetime) else datetime.now(timezone.utc)
+    ts_utc = ts_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    chain = token_chain(row)
+    token_key = canonical_token_key(row)
+    if not chain or not token_key:
+        return False
+    source_norm = str(source or "").strip().lower()
+    if source_norm not in {"monitoring", "portfolio", "live_pulse"}:
+        source_norm = "monitoring"
+    hour_bucket = ts_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H")
+    dedup_key = f"{token_key}|{source_norm}|{hour_bucket}"
+    if dedup_key in _MON_HISTORY_HOURLY_DEDUP_KEYS:
+        return False
+    existing_rows = load_monitoring_history(limit_rows=10000)
+    for existing in existing_rows:
+        ex_key = canonical_token_key(existing)
+        ex_source = str(existing.get("source") or "").strip().lower()
+        ex_ts = parse_ts(existing.get("ts_utc"))
+        ex_hour = ex_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H") if ex_ts else ""
+        if ex_key == token_key and ex_source == source_norm and ex_hour == hour_bucket:
+            _MON_HISTORY_HOURLY_DEDUP_KEYS.add(dedup_key)
+            return False
+    best = row.get("_best_pair") if isinstance(row.get("_best_pair"), dict) else {}
+    snapshot = {
+        "ts_utc": ts_utc,
+        "chain": chain,
+        "canonical_token_key": token_key,
+        "symbol": str(row.get("symbol") or row.get("base_symbol") or row.get("token") or "").strip().upper(),
+        "ca": token_ca(row),
+        "token_addr": token_ca(row),
+        "pair_address": str(row.get("pair_address") or row.get("pair_addr") or safe_get(best, "pairAddress", default="") or "").strip(),
+        "base_symbol": str(row.get("symbol") or row.get("base_symbol") or "").strip().upper(),
+        "base_addr": token_ca(row),
+        "pair_addr": str(row.get("pair_address") or row.get("pair_addr") or safe_get(best, "pairAddress", default="") or "").strip(),
+        "price_usd": str(parse_float(row.get("price_usd", safe_get(best, "priceUsd", default=0)), 0.0)),
+        "score_live": str(parse_float(row.get("score_live", row.get("entry_score", row.get("score", 0))), 0.0)),
+        "risk_level": str(row.get("risk_level") or row.get("risk") or ""),
+        "recommendation": str(row.get("entry_action") or row.get("recommendation") or row.get("decision") or ""),
+        "decision": str(row.get("decision") or row.get("entry_action") or ""),
+        "status": str(row.get("status") or row.get("entry_status") or ""),
+        "liq_usd": str(parse_float(row.get("liq_usd", safe_get(best, "liquidity", "usd", default=0)), 0.0)),
+        "vol24_usd": str(parse_float(row.get("vol24_usd", safe_get(best, "volume", "h24", default=0)), 0.0)),
+        "source": source_norm,
+    }
+    append_monitoring_history(snapshot)
+    _MON_HISTORY_HOURLY_DEDUP_KEYS.add(dedup_key)
+    return True
 
 
 def classify_health_bucket(health: Dict[str, Any]) -> str:
@@ -13996,7 +14055,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 if loaded and hist:
                     _track_history_load()
                 row_aliases = _history_aliases_from_row(r, include_url=True)
-                history_total = len(hist) if loaded else 0
+                history_total = int(st.session_state.get("_last_dynamics_history_total", 0)) if loaded else 0
                 matched_rows = len(hist) if loaded else 0
                 last_ts = str((hist[-1] or {}).get("ts_utc") or "n/a") if loaded and hist else "n/a"
                 source = str(st.session_state.get("_last_dynamics_history_source", "n/a"))
@@ -14006,6 +14065,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 )
                 if not loaded:
                     st.caption("Click Load dynamics history to fetch matching snapshots for this token.")
+                elif history_total == 0:
+                    st.caption("No history snapshots exist yet. Run monitor_cycle or create baseline snapshots.")
+                elif len(hist) == 1:
+                    st.caption("Only one snapshot found. Sparkline needs at least 2.")
                 elif len(hist) < 2:
                     st.caption("History loaded, but fewer than 2 matching snapshots found.")
                 else:
