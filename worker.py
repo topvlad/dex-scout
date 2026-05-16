@@ -4,6 +4,7 @@ import socket
 import time
 import traceback
 import uuid
+from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any, Callable, Dict, Optional
 
@@ -258,6 +259,17 @@ def _run_monitor_cycle() -> Dict[str, Any]:
         portfolio_rows=portfolio_rows,
         max_scans=3,
     )
+    ts_now = datetime.now(timezone.utc)
+    monitoring_written = 0
+    for row in app.build_active_monitoring_rows(monitoring_rows):
+        if app.append_token_history_snapshot(row, source="monitoring", now_ts=ts_now):
+            monitoring_written += 1
+    portfolio_written = 0
+    for row in portfolio_rows:
+        if app.append_token_history_snapshot(row, source="portfolio", now_ts=ts_now):
+            portfolio_written += 1
+    app.flush_monitoring_history_buffer(force=True)
+    monitor_result["history_snapshots"] = {"monitoring": monitoring_written, "portfolio": portfolio_written}
     pulse_result = _record_pulse_history_after_cycle_safe()
     return {"monitor": monitor_result, "pulse_history": pulse_result}
 
