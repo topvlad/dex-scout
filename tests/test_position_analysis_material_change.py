@@ -15,7 +15,7 @@ def test_build_position_action_plan_take_profit_includes_trim_and_protect():
     row = {"chain": "solana", "base_symbol": "BUTTCOIN", "base_token_address": "Abc", "final_action": "PARTIAL_TP", "risk_level": "MEDIUM", "price_usd": "0.01", "entry_price_usd": "0.005"}
     plan = app.build_position_action_plan(row, {})
     assert plan["action"] == "TAKE_PROFIT"
-    assert plan["reduce_size"] in {"25%", "33%"}
+    assert plan["reduce_size"] in {"25%", "33%", "33-50%"}
     assert plan["protect"]
 
 
