@@ -3020,6 +3020,36 @@ def detect_position_health(row: Dict[str, Any], hist: List[Dict[str, Any]]) -> D
     }
 
 
+def build_unified_token_analysis(
+    token_key: str,
+    monitoring_row: Optional[Dict[str, Any]] = None,
+    portfolio_row: Optional[Dict[str, Any]] = None,
+    history_rows: Optional[List[Dict[str, Any]]] = None,
+    context: str = "monitoring",
+) -> Dict[str, Any]:
+    row = dict(portfolio_row or monitoring_row or {})
+    source = "portfolio" if str(context or "").lower().startswith("portfolio") else "monitoring"
+    unified = compute_unified_recommendation(row, source=source, hist=history_rows or [])
+    health = unified.get("health", {}) if isinstance(unified.get("health"), dict) else {}
+    risk = str(row.get("risk_level") or row.get("risk") or health.get("health_label") or "UNKNOWN").upper()
+    score = parse_float(row.get("score", row.get("entry_score", 0)), 0.0)
+    entry_action = str(row.get("entry_action") or row.get("entry") or "WATCH").upper().replace(" ", "_")
+    if entry_action in {"ENTRY_NOW", "READY"}:
+        entry_action = "EARLY"
+    elif entry_action in {"WATCH_PULLBACK", "TRACK", "WAIT", "WATCH"}:
+        entry_action = "WATCH" if entry_action != "WAIT" else "WAIT"
+    elif entry_action in {"AVOID", "INVALID", "NO_ENTRY"}:
+        entry_action = "NO ENTRY"
+    pos = str(unified.get("final_action") or "HOLD").upper().replace(" ", "_")
+    mapping = {"TAKE_PROFIT":"PARTIAL_TP","WATCH_CLOSELY":"PROTECT","TRACK_ONLY":"HOLD","WAIT_FOR_PULLBACK":"HOLD","ENTER_NOW":"HOLD","NO_ENTRY":"REVIEW"}
+    pos = mapping.get(pos, pos)
+    reason = str(unified.get("final_reason") or "")
+    if source == "portfolio" and (not history_rows or parse_float(row.get("price_usd", row.get("current_price", 0)), 0.0) <= 0):
+        pos = "REVIEW"
+        reason = "insufficient position data"
+    return {"entry_action": entry_action, "position_action": pos, "risk": risk, "score": float(score), "reason": reason, "data_quality": str(health.get("health_label") or "UNKNOWN"), "source": "unified"}
+
+
 def compute_unified_recommendation(
     row: Dict[str, Any],
     source: str,
@@ -5173,26 +5203,37 @@ def _history_alias_overlap(chain: str, row_aliases: Set[str], hist_aliases: Set[
     return False
 
 
-def load_token_dynamics_history(row: Dict[str, Any], limit: int = 120) -> List[Dict[str, Any]]:
-    chain = normalize_chain_name(token_chain(row))
-    if not chain:
-        return []
+def load_token_history_snapshots(token_key: str, limit: int = 240) -> Dict[str, Any]:
     source = "d1" if USE_D1 else ("supabase" if USE_SUPABASE else "local")
-    rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
-    aliases = _history_aliases_from_row(row, include_url=True)
-    if not aliases:
-        return []
-    matched: List[Dict[str, Any]] = []
-    for h in rows:
-        if normalize_chain_name(str(h.get("chain") or "")) != chain:
-            continue
-        if not _history_alias_overlap(chain, aliases, _history_aliases_from_row(h)):
-            continue
-        matched.append(dict(h))
-    matched.sort(key=lambda x: parse_ts(x.get("ts_utc")) or datetime.min)
-    trimmed = matched[-max(2, int(limit or 120)):]
-    st.session_state["_last_dynamics_history_source"] = source
-    return trimmed
+    mon_rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
+    reco_rows = load_csv(PORTFOLIO_RECO_LOG_CSV, PORTFOLIO_RECO_LOG_FIELDS) if os.path.exists(local_fallback_path(PORTFOLIO_RECO_LOG_CSV)) else []
+    all_rows = list(mon_rows) + list(reco_rows)
+    matches = [dict(r) for r in all_rows if canonical_token_key(r) == token_key]
+
+    deduped: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    for row in matches:
+        chain = normalize_chain_name(str(row.get("chain") or ""))
+        row_token_key = canonical_token_key(row)
+        ca = str(row.get("token_addr") or row.get("base_addr") or row.get("base_token_address") or row.get("ca") or row.get("address") or "").strip()
+        symbol = str(row.get("symbol") or row.get("base_symbol") or row.get("token") or "").strip().upper()
+        identity = row_token_key or ca or symbol
+        ts_utc = str(row.get("ts_utc") or "").strip()
+        row_type = str(row.get("source_row_type") or row.get("source") or "").strip().lower()
+        dkey = (chain, identity, ts_utc, row_type)
+        if dkey not in deduped:
+            deduped[dkey] = row
+
+    unique_rows = list(deduped.values())
+    unique_rows.sort(key=lambda x: parse_ts(x.get("ts_utc")) or datetime.min)
+    return {"source": source, "total_history_rows": len(all_rows), "matched_rows": unique_rows[-max(1, int(limit or 240)):]} 
+
+
+def load_token_dynamics_history(row: Dict[str, Any], limit: int = 120) -> List[Dict[str, Any]]:
+    token_key = canonical_token_key(row)
+    payload = load_token_history_snapshots(token_key, limit=max(1, limit))
+    st.session_state["_last_dynamics_history_source"] = payload.get("source", "unknown")
+    st.session_state["_last_dynamics_history_total"] = int(payload.get("total_history_rows", 0))
+    return list(payload.get("matched_rows", []))
 
 
 def flush_monitoring_history_buffer(force: bool = False) -> int:
@@ -8658,11 +8699,19 @@ def digest_source_mode() -> str:
 
 
 def canonical_token_key(row: Dict[str, Any]) -> str:
-    chain = token_chain(row)
-    ca = token_ca(row)
-    if not chain or not ca:
+    chain = normalize_chain_name(token_chain(row))
+    if not chain:
         return ""
-    return f"{chain}|{addr_store(chain, ca)}"
+    ca = str(row.get("token_addr") or row.get("base_addr") or row.get("base_token_address") or row.get("ca") or row.get("address") or token_ca(row) or "").strip()
+    pair = str(row.get("pair_address") or row.get("pairAddress") or row.get("pair") or "").strip()
+    symbol = str(row.get("symbol") or row.get("base_symbol") or row.get("token") or "").strip().upper()
+    if ca:
+        return f"{chain}|ca:{addr_store(chain, ca)}"
+    if pair:
+        return f"{chain}|pair:{addr_store(chain, pair)}"
+    if symbol:
+        return f"{chain}|sym:{symbol}"
+    return ""
 
 
 def canonical_entity_key(chain: str, ca: str) -> str:
@@ -15534,7 +15583,7 @@ def page_portfolio():
             if loaded_hist is None:
                 st.caption("Click Load dynamics history to fetch matching snapshots for this token.")
             elif not loaded_hist:
-                st.info("No snapshots yet.")
+                st.info("no matching snapshots found")
             else:
                 hist = list(loaded_hist)
                 dfh = pd.DataFrame(hist).copy()
