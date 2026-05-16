@@ -5209,8 +5209,23 @@ def load_token_history_snapshots(token_key: str, limit: int = 240) -> Dict[str, 
     reco_rows = load_csv(PORTFOLIO_RECO_LOG_CSV, PORTFOLIO_RECO_LOG_FIELDS) if os.path.exists(local_fallback_path(PORTFOLIO_RECO_LOG_CSV)) else []
     all_rows = list(mon_rows) + list(reco_rows)
     matches = [dict(r) for r in all_rows if canonical_token_key(r) == token_key]
-    matches.sort(key=lambda x: parse_ts(x.get("ts_utc")) or datetime.min)
-    return {"source": source, "total_history_rows": len(all_rows), "matched_rows": matches[-max(1,int(limit or 240)):]} 
+
+    deduped: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    for row in matches:
+        chain = normalize_chain_name(str(row.get("chain") or ""))
+        row_token_key = canonical_token_key(row)
+        ca = str(row.get("token_addr") or row.get("base_addr") or row.get("base_token_address") or row.get("ca") or row.get("address") or "").strip()
+        symbol = str(row.get("symbol") or row.get("base_symbol") or row.get("token") or "").strip().upper()
+        identity = row_token_key or ca or symbol
+        ts_utc = str(row.get("ts_utc") or "").strip()
+        row_type = str(row.get("source_row_type") or row.get("source") or "").strip().lower()
+        dkey = (chain, identity, ts_utc, row_type)
+        if dkey not in deduped:
+            deduped[dkey] = row
+
+    unique_rows = list(deduped.values())
+    unique_rows.sort(key=lambda x: parse_ts(x.get("ts_utc")) or datetime.min)
+    return {"source": source, "total_history_rows": len(all_rows), "matched_rows": unique_rows[-max(1, int(limit or 240)):]} 
 
 
 def load_token_dynamics_history(row: Dict[str, Any], limit: int = 120) -> List[Dict[str, Any]]:
