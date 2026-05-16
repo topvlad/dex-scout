@@ -259,17 +259,28 @@ def _run_monitor_cycle() -> Dict[str, Any]:
         portfolio_rows=portfolio_rows,
         max_scans=3,
     )
+    history_stats: Dict[str, Any] = {"monitoring": 0, "portfolio": 0}
     ts_now = datetime.now(timezone.utc)
-    monitoring_written = 0
-    for row in app.build_active_monitoring_rows(monitoring_rows):
-        if app.append_token_history_snapshot(row, source="monitoring", now_ts=ts_now):
-            monitoring_written += 1
-    portfolio_written = 0
-    for row in portfolio_rows:
-        if app.append_token_history_snapshot(row, source="portfolio", now_ts=ts_now):
-            portfolio_written += 1
-    app.flush_monitoring_history_buffer(force=True)
-    monitor_result["history_snapshots"] = {"monitoring": monitoring_written, "portfolio": portfolio_written}
+    try:
+        append_fn = getattr(app, "append_token_history_snapshot", None)
+        if callable(append_fn):
+            for row in app.build_active_monitoring_rows(monitoring_rows):
+                if append_fn(row, source="monitoring", now_ts=ts_now):
+                    history_stats["monitoring"] += 1
+            for row in portfolio_rows:
+                if append_fn(row, source="portfolio", now_ts=ts_now):
+                    history_stats["portfolio"] += 1
+        flush_fn = getattr(app, "flush_monitoring_history_buffer", None)
+        if callable(flush_fn):
+            try:
+                flush_fn(force=True)
+            except Exception as flush_exc:
+                history_stats["history_flush_error"] = f"{type(flush_exc).__name__}:{flush_exc}"
+        else:
+            history_stats["history_flush_error"] = "missing_flush_monitoring_history_buffer"
+    except Exception as history_exc:
+        history_stats["history_snapshot_error"] = f"{type(history_exc).__name__}:{history_exc}"
+    monitor_result["history_snapshots"] = history_stats
     pulse_result = _record_pulse_history_after_cycle_safe()
     return {"monitor": monitor_result, "pulse_history": pulse_result}
 
