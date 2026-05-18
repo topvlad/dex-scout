@@ -3029,26 +3029,18 @@ def build_unified_token_analysis(
     context: str = "monitoring",
 ) -> Dict[str, Any]:
     row = dict(portfolio_row or monitoring_row or {})
-    source = "portfolio" if str(context or "").lower().startswith("portfolio") else "monitoring"
-    unified = compute_unified_recommendation(row, source=source, hist=history_rows or [])
-    health = unified.get("health", {}) if isinstance(unified.get("health"), dict) else {}
-    risk = str(row.get("risk_level") or row.get("risk") or health.get("health_label") or "UNKNOWN").upper()
-    score = parse_float(row.get("score", row.get("entry_score", 0)), 0.0)
-    entry_action = str(row.get("entry_action") or row.get("entry") or "WATCH").upper().replace(" ", "_")
-    if entry_action in {"ENTRY_NOW", "READY"}:
-        entry_action = "EARLY"
-    elif entry_action in {"WATCH_PULLBACK", "TRACK", "WAIT", "WATCH"}:
-        entry_action = "WATCH" if entry_action != "WAIT" else "WAIT"
-    elif entry_action in {"AVOID", "INVALID", "NO_ENTRY"}:
-        entry_action = "NO ENTRY"
-    pos = str(unified.get("final_action") or "HOLD").upper().replace(" ", "_")
-    mapping = {"TAKE_PROFIT":"PARTIAL_TP","WATCH_CLOSELY":"PROTECT","TRACK_ONLY":"HOLD","WAIT_FOR_PULLBACK":"HOLD","ENTER_NOW":"HOLD","NO_ENTRY":"REVIEW"}
-    pos = mapping.get(pos, pos)
-    reason = str(unified.get("final_reason") or "")
-    if source == "portfolio" and (not history_rows or parse_float(row.get("price_usd", row.get("current_price", 0)), 0.0) <= 0):
-        pos = "REVIEW"
-        reason = "insufficient position data"
-    return {"entry_action": entry_action, "position_action": pos, "risk": risk, "score": float(score), "reason": reason, "data_quality": str(health.get("health_label") or "UNKNOWN"), "source": "unified"}
+    facts = build_token_facts(row, monitoring_row=monitoring_row, portfolio_row=portfolio_row, history_rows=history_rows or [])
+    facts["in_portfolio"] = bool(portfolio_row) or str(context or "").lower().startswith("portfolio")
+    verdict = build_unified_verdict(facts, context=context)
+    return {
+        "entry_action": verdict["entry_action"],
+        "position_action": verdict["position_action"],
+        "risk": verdict["risk"],
+        "score": float(facts.get("score") or 0.0),
+        "reason": verdict["reason"],
+        "data_quality": facts.get("health", "UNKNOWN"),
+        "source": verdict.get("source", "unified_verdict"),
+    }
 
 
 def compute_unified_recommendation(
@@ -5212,12 +5204,93 @@ def _history_alias_overlap(chain: str, row_aliases: Set[str], hist_aliases: Set[
     return False
 
 
-def load_token_history_snapshots(token_key: str, limit: int = 240) -> Dict[str, Any]:
+def history_row_matches_token(current_row: Dict[str, Any], history_row: Dict[str, Any]) -> bool:
+    chain = normalize_chain_name(str(current_row.get("chain") or ""))
+    hist_chain = normalize_chain_name(str(history_row.get("chain") or ""))
+    if chain and hist_chain and chain != hist_chain:
+        return False
+    current_aliases = _history_aliases_from_row(current_row, include_url=True)
+    history_aliases = _history_aliases_from_row(history_row, include_url=True)
+    current_ca = token_ca(current_row)
+    history_ca = token_ca(history_row)
+    if chain == "solana":
+        if current_ca and history_ca:
+            return current_ca == history_ca
+    elif current_ca and history_ca and addr_key(chain, current_ca) == addr_key(chain, history_ca):
+        return True
+    if _history_alias_overlap(chain or hist_chain, current_aliases, history_aliases):
+        return True
+    current_symbol = str(current_row.get("symbol") or "").strip().lower()
+    history_symbol = str(history_row.get("symbol") or "").strip().lower()
+    if current_symbol and history_symbol and current_symbol == history_symbol and chain:
+        # only fallback when history CA is missing
+        return not history_ca
+    return False
+
+
+def build_token_facts(row, monitoring_row=None, portfolio_row=None, history_rows=None) -> dict:
+    base = dict(row or portfolio_row or monitoring_row or {})
+    hist = history_rows or []
+    health = detect_token_health(base, hist)
+    reasons = [str(health.get("health_reason") or "").strip()] if health.get("health_reason") else []
+    if health.get("is_low_liq"):
+        reasons.append("liquidity_missing_or_low")
+    if health.get("is_untradeable"):
+        reasons.append("no_recent_flow_or_untradeable")
+    hlabel = str(health.get("health_label") or "UNKNOWN").upper()
+    mapped = "OK"
+    if hlabel in {"DEAD", "UNTRADEABLE"}:
+        mapped = "UNTRADEABLE"
+    elif "COLLAPSE" in hlabel or parse_float(base.get("price_change_h24", 0), 0) <= -70:
+        mapped = "POST_COLLAPSE"
+        reasons.append("post_pump_collapse")
+    elif hlabel in {"LOW_LIQ", "STALE", "COLD"}:
+        mapped = "CAUTION"
+    elif hlabel == "UNKNOWN":
+        mapped = "UNKNOWN"
+    return {
+        "token_key": canonical_token_key(base),
+        "chain": normalize_chain_name(str(base.get("chain") or "")),
+        "symbol": str(base.get("symbol") or "").strip(),
+        "ca": token_ca(base),
+        "pair_address": str(base.get("pair_address") or base.get("pair") or "").strip(),
+        "price": parse_float(base.get("price_usd", base.get("price")), None),
+        "liquidity_usd": parse_float(base.get("liquidity_usd", base.get("liquidity")), None),
+        "volume_h24": parse_float(base.get("volume_h24", base.get("vol24")), None),
+        "price_change_h24": parse_float(base.get("price_change_h24", base.get("change_24h")), None),
+        "score": parse_float(base.get("score", base.get("entry_score")), None),
+        "health": mapped,
+        "health_reasons": [r for r in reasons if r],
+    }
+
+
+def build_unified_verdict(facts, context) -> dict:
+    ctx = str(context or "monitoring").lower()
+    health = str(facts.get("health") or "UNKNOWN").upper()
+    reasons = ", ".join(facts.get("health_reasons") or []) or "no_reasons"
+    if health == "UNTRADEABLE":
+        return {"entry_action": "NO_ENTRY", "position_action": "EXIT", "risk": "HIGH", "reason": f"untradeable: {reasons}", "source": "unified_verdict"}
+    if health == "POST_COLLAPSE":
+        return {"entry_action": "NO_ENTRY", "position_action": "EXIT", "risk": "HIGH", "reason": f"post_collapse: {reasons}", "source": "unified_verdict"}
+    if health == "UNKNOWN":
+        return {"entry_action": "WATCH", "position_action": "REVIEW", "risk": "UNKNOWN", "reason": "missing/uncertain data", "source": "unified_verdict"}
+    in_portfolio = bool(facts.get("in_portfolio")) or "portfolio" in ctx
+    if in_portfolio:
+        return {"entry_action": "WATCH", "position_action": "HOLD", "risk": "MEDIUM", "reason": "In portfolio · position verdict: HOLD (entry blocked because token already held / position risk differs)", "source": "unified_verdict"}
+    return {"entry_action": "EARLY", "position_action": "HOLD", "risk": "LOW", "reason": "healthy setup", "source": "unified_verdict"}
+
+
+def load_token_history_snapshots(token_key: str, limit: int = 240, current_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     source = "d1" if USE_D1 else ("supabase" if USE_SUPABASE else "local")
     mon_rows = load_csv(MON_HISTORY_CSV, HIST_FIELDS)
     reco_rows = load_csv(PORTFOLIO_RECO_LOG_CSV, PORTFOLIO_RECO_LOG_FIELDS) if os.path.exists(local_fallback_path(PORTFOLIO_RECO_LOG_CSV)) else []
     all_rows = list(mon_rows) + list(reco_rows)
-    matches = [dict(r) for r in all_rows if canonical_token_key(r) == token_key]
+    row_basis = dict(current_row or {})
+    matches = []
+    for r in all_rows:
+        rdict = dict(r)
+        if canonical_token_key(rdict) == token_key or history_row_matches_token(row_basis, rdict):
+            matches.append(rdict)
 
     deduped: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
     for row in matches:
@@ -5239,7 +5312,7 @@ def load_token_history_snapshots(token_key: str, limit: int = 240) -> Dict[str, 
 
 def load_token_dynamics_history(row: Dict[str, Any], limit: int = 120) -> List[Dict[str, Any]]:
     token_key = canonical_token_key(row)
-    payload = load_token_history_snapshots(token_key, limit=max(1, limit))
+    payload = load_token_history_snapshots(token_key, limit=max(1, limit), current_row=row)
     st.session_state["_last_dynamics_history_source"] = payload.get("source", "unknown")
     st.session_state["_last_dynamics_history_total"] = int(payload.get("total_history_rows", 0))
     return list(payload.get("matched_rows", []))
@@ -14059,14 +14132,19 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 matched_rows = len(hist) if loaded else 0
                 last_ts = str((hist[-1] or {}).get("ts_utc") or "n/a") if loaded and hist else "n/a"
                 source = str(st.session_state.get("_last_dynamics_history_source", "n/a"))
+                sample_history_keys = [canonical_token_key(h) for h in hist[:5] if canonical_token_key(h)]
+                sample_symbol_matches = [str(h.get("symbol") or "").strip() for h in hist[:5] if str(h.get("symbol") or "").strip()]
                 st.caption(
-                    f"debug: token_key={token_key or 'n/a'} | aliases_count={len(row_aliases)} | "
-                    f"history_rows_total={history_total} | matched_rows={matched_rows} | source={source} | last_history_ts={last_ts}"
+                    f"debug: token_key={token_key or 'n/a'} | current_aliases={sorted(list(row_aliases))[:5]} | "
+                    f"history_rows_total={history_total} | matched_rows={matched_rows} | source={source} | "
+                    f"sample_history_keys={sample_history_keys} | sample_symbol_matches={sample_symbol_matches} | last_history_ts={last_ts}"
                 )
                 if not loaded:
                     st.caption("Click Load dynamics history to fetch matching snapshots for this token.")
                 elif history_total == 0:
                     st.caption("No history snapshots exist yet. Run monitor_cycle or create baseline snapshots.")
+                elif history_total > 0 and matched_rows == 0:
+                    st.warning("History exists, but token identity did not match. Run repair_token_keys_and_history.")
                 elif len(hist) == 1:
                     st.caption("Only one snapshot found. Sparkline needs at least 2.")
                 elif len(hist) < 2:
