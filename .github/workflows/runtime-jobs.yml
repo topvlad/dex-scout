@@ -19,6 +19,15 @@ on:
           - digest_cycle
           - outcome_cycle
           - maintenance_cycle
+      admin_task:
+        description: "Optional admin task"
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - repair_token_keys_and_history
+          - create_history_baseline_snapshots
 
 permissions:
   contents: read
@@ -28,6 +37,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+
+  admin-task:
+    name: Run admin task
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.admin_task != 'none' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUNBUFFERED: "1"
+      STORAGE_BACKEND: ${{ vars.STORAGE_BACKEND || 'supabase' }}
+      D1_PROXY_URL: ${{ vars.D1_PROXY_URL }}
+      D1_PROXY_TOKEN: ${{ secrets.D1_PROXY_TOKEN }}
+      D1_TIMEOUT_SEC: ${{ vars.D1_TIMEOUT_SEC || '12' }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run selected admin task
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ github.event.inputs.admin_task }}" in
+            repair_token_keys_and_history)
+              python scripts/repair_token_keys_and_history.py --apply
+              ;;
+            create_history_baseline_snapshots)
+              python scripts/create_history_baseline_snapshots.py
+              ;;
+            *)
+              echo "No admin task selected"
+              ;;
+          esac
   plan:
     name: Plan matrix
     runs-on: ubuntu-latest
@@ -93,6 +144,7 @@ jobs:
 
   run:
     name: Run ${{ matrix.job_mode }}
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.admin_task == 'none' }}
     needs: plan
     runs-on: ubuntu-latest
     strategy:
