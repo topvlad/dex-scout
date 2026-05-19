@@ -203,7 +203,11 @@ def _run_scan_cycle() -> Dict[str, Any]:
         chain_reason = (
             f"ignored_requested_chain:{requested_chain}:scan_cycle_uses_rotation"
         )
-    if pending:
+    stale_pending = False
+    pending_ts = app.parse_ts(runtime_before.get("scan_request_ts")) if hasattr(app, "parse_ts") else None
+    if pending and pending_ts:
+        stale_pending = (datetime.now(timezone.utc) - pending_ts).total_seconds() > (90 * 60)
+    if pending and not stale_pending:
         seeds_raw = str(params.get("seeds_raw") or SCANNER_SEEDS or str(app.DEFAULT_SEEDS))
         max_items = int(app.parse_float(params.get("max_items", SCANNER_MAX_ITEMS), SCANNER_MAX_ITEMS))
         use_birdeye_trending = bool(params.get("use_birdeye_trending", USE_BIRDEYE_TRENDING))
@@ -223,8 +227,11 @@ def _run_scan_cycle() -> Dict[str, Any]:
             use_birdeye_trending=use_birdeye_trending,
             birdeye_limit=birdeye_limit,
         )
+        status = "failed" if scan_result.get("error") else "success"
+        if not scan_result.get("error") and not scan_result.get("stats"):
+            status = "empty"
         updates = {
-            "last_scan_status": "ok" if not scan_result.get("error") else "error",
+            "last_scan_status": status,
             "last_scan_stats": scan_result.get("stats", {}),
             "last_scan_ts": app.now_utc_str(),
         }
@@ -241,8 +248,28 @@ def _run_scan_cycle() -> Dict[str, Any]:
         if pending:
             updates["scan_request_pending"] = False
             updates["scan_request_processed_ts"] = app.now_utc_str()
+            updates["scan_request_status"] = "stale_cleared" if stale_pending else "processed"
+            if stale_pending:
+                updates["scan_request_last_clear_reason"] = "stale_pending_over_90m"
         if hasattr(app, "update_worker_runtime_state"):
             app.update_worker_runtime_state(updates=updates)
+    try:
+        monitoring_rows = app.load_monitoring()
+        portfolio_rows = app.load_portfolio()
+        active_monitoring_rows = app.build_active_monitoring_rows(monitoring_rows)
+        active_keys = {app.canonical_token_key(r) for r in active_monitoring_rows if app.canonical_token_key(r)}
+        payload = app.build_live_pulse_candidates_payload(
+            monitoring_rows=monitoring_rows,
+            portfolio_rows=portfolio_rows,
+            active_monitoring_keys=active_keys,
+            chain_filter="all",
+            limit=15,
+        )
+        if payload.get("final_count", 0) == 0:
+            payload["last_empty_reason"] = "api_empty" if payload.get("raw_seen", 0) == 0 else "all_filtered_scam_gate"
+        app.update_worker_runtime_state(updates={"live_pulse_candidates": payload})
+    except Exception as pulse_exc:
+        app.update_worker_runtime_state(updates={"live_pulse_candidates": {"source": "d1", "final_candidates": [], "final_count": 0, "last_empty_reason": f"worker_failed:{type(pulse_exc).__name__}"}})
     pulse_result = _record_pulse_history_after_cycle_safe()
     return {"scan": scan_result, "pulse_history": pulse_result}
 

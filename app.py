@@ -12081,7 +12081,7 @@ def _upsert_scan_cycle_request(
                 timeout=10,
             )
             if resp.status_code in {200, 201, 202, 204}:
-                dispatch_status = "ok"
+                dispatch_status = "sent"
                 dispatched_ts = now_ts
                 dispatch_message = "Scan request accepted and runtime job dispatched."
             else:
@@ -12091,8 +12091,8 @@ def _upsert_scan_cycle_request(
             dispatch_error = f"{type(e).__name__}: {e}"
             dispatch_message = "Scan request saved. Automatic pickup will happen on schedule."
     else:
-        dispatch_status = "token_missing"
-        dispatch_message = "Scan request saved. Automatic pickup will happen on schedule."
+        dispatch_status = "not_configured"
+        dispatch_message = "Scan queued for scheduled runtime scan (GitHub dispatch not configured)."
 
     cooldown_until_ts = ""
     if cooldown_sec > 0:
@@ -12101,6 +12101,9 @@ def _upsert_scan_cycle_request(
         updates={
             "scan_request": payload,
             "scan_request_pending": True,
+            "scan_request_status": "queued",
+            "scan_request_source": "ui",
+            "scan_request_requested_ts": now_ts,
             "scan_request_ts": now_ts,
             "scan_request_dispatched_ts": dispatched_ts or str(runtime_before.get("scan_request_dispatched_ts") or ""),
             "scan_request_dispatch_status": dispatch_status,
@@ -13514,6 +13517,34 @@ def build_market_pulse_cards(
     return selected_cards
 
 
+def build_live_pulse_candidates_payload(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: List[Dict[str, Any]],
+    active_monitoring_keys: Set[str],
+    chain_filter: str = "all",
+    limit: int = 15,
+) -> Dict[str, Any]:
+    cards = build_market_pulse_cards(
+        monitoring_rows=monitoring_rows,
+        portfolio_rows=portfolio_rows,
+        active_monitoring_keys=active_monitoring_keys,
+        chain_filter=chain_filter,
+        limit=limit,
+        record_pulse_history=False,
+    )
+    stats = st.session_state.get("last_pulse_ui_stats", {}) if isinstance(st.session_state.get("last_pulse_ui_stats"), dict) else {}
+    return {
+        "source": "d1",
+        "last_scan_ts": now_utc_str(),
+        "raw_seen": int(parse_float(stats.get("raw_seen", 0), 0)),
+        "duplicate_filtered": int(parse_float(stats.get("duplicate_filtered", stats.get("filtered_out", 0)), 0)),
+        "scam_filtered": int(parse_float(stats.get("scam_blocked", stats.get("last_pulse_scam_blocked", 0)), 0)),
+        "final_count": int(len(cards)),
+        "blocked_reasons": stats.get("last_pulse_scam_reasons", {}) if isinstance(stats.get("last_pulse_scam_reasons"), dict) else {},
+        "final_candidates": cards,
+    }
+
+
 # =============================
 # Pages
 # =============================
@@ -14138,15 +14169,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     active_monitoring_keys = {canonical_token_key(r) for r in active_rows_all if canonical_token_key(r)}
     pulse_cards: List[Dict[str, Any]] = []
-    if not STREAMLIT_FAST_UI_MODE:
-        pulse_cards = build_market_pulse_cards(
-            monitoring_rows=rows,
-            portfolio_rows=portfolio_rows,
-            active_monitoring_keys=active_monitoring_keys,
-            chain_filter=chain_filter,
-            limit=8,
-            record_pulse_history=False,
-        )
+    runtime_scan = get_worker_runtime_state()
+    pulse_payload = runtime_scan.get("live_pulse_candidates") if isinstance(runtime_scan.get("live_pulse_candidates"), dict) else {}
+    if isinstance(pulse_payload.get("final_candidates"), list):
+        pulse_cards = list(pulse_payload.get("final_candidates") or [])
 
     priority_cards = render_dedupe(priority_cards)
     portfolio_linked_cards = render_dedupe(portfolio_linked_cards)
@@ -14290,7 +14316,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     st.subheader("Live pulse candidates")
     st.caption("Live candidates behind glass (read-only layer). Confirmed Monitoring below remains the settled active layer.")
-    pulse_runtime = st.session_state.get("last_pulse_ui_stats", {}) if isinstance(st.session_state.get("last_pulse_ui_stats"), dict) else {}
+    pulse_runtime = pulse_payload if isinstance(pulse_payload, dict) else {}
     st.caption(
         f"raw_seen={int(parse_float(pulse_runtime.get('raw_seen', 0), 0))} • "
         f"duplicate_filtered={int(parse_float(pulse_runtime.get('duplicate_filtered', pulse_runtime.get('filtered_out', 0)), 0))} • "
@@ -14305,7 +14331,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     if STREAMLIT_FAST_UI_MODE:
         st.caption("Fast UI mode: pulse/history enrichment is disabled by default.")
     elif not pulse_cards:
-        st.caption("No clean Live Pulse candidates after filtering.")
+        st.caption(f"No clean Live Pulse candidates after filtering. reason={pulse_runtime.get('last_empty_reason') or 'scan_not_run'}")
     elif len(pulse_cards) < LIVE_PULSE_TARGET_MIN:
         st.caption(f"Only {len(pulse_cards)} clean candidates found after filtering.")
     pulse_symbol_counts: Dict[str, int] = {}
