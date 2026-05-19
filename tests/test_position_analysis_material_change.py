@@ -26,3 +26,18 @@ def test_unchanged_hold_not_material_after_dedupe_seen():
     out = app.build_tg_position_analysis([row], [], {}, tg_state, now_ts=0)
     assert out["action_now"] == []
     assert out["watch"] == []
+
+
+def test_critical_exit_not_suppressed_by_dedupe_key():
+    row = {
+        "active": "1",
+        "chain": "solana",
+        "base_symbol": "EXIT1",
+        "base_token_address": "ExitAddr1",
+        "final_action": "EXIT",
+        "health_label": "UNTRADEABLE",
+    }
+    analyzed = app.analyze_position_for_tg(row, None, {})
+    tg_state = {"last_position_analysis_dedupe_keys": [analyzed["dedupe_key"]]}
+    out = app.build_tg_position_analysis([row], [], {}, tg_state, now_ts=0)
+    assert len(out["action_now"]) == 1

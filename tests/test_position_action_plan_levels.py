@@ -43,3 +43,31 @@ def test_tg_format_take_profit_has_tp_protect_trim():
     assert "trim" in text
     assert "TP:" in text
     assert "protect" in text
+
+
+def test_missing_price_exit_stays_action_now_and_no_unavailable_spam():
+    row = {
+        "active": "1",
+        "chain": "solana",
+        "base_symbol": "RUG",
+        "base_token_address": "RUG1",
+        "final_action": "EXIT",
+        "health_label": "UNTRADEABLE",
+        "health_reasons": ["UNTRADEABLE – no liquidity and no recent flow"],
+    }
+    analysis = app.build_tg_position_analysis([row], [], {}, {"last_position_analysis_dedupe_keys": []}, now_ts=0)
+    assert analysis["action_now"]
+    text = app.format_tg_position_analysis(analysis)
+    assert "RUG · EXIT" in text
+    assert "No urgent change" not in text
+    assert "TP unavailable" not in text
+    assert "protect unavailable" not in text
+
+
+def test_missing_price_hold_is_skipped_and_summarized():
+    row = {"active": "1", "chain": "solana", "base_symbol": "WAIT", "base_token_address": "WAIT1", "final_action": "HOLD"}
+    analysis = app.build_tg_position_analysis([row], [], {}, {"last_position_analysis_dedupe_keys": []}, now_ts=0)
+    assert analysis["action_now"] == []
+    assert analysis["watch"] == []
+    text = app.format_tg_position_analysis(analysis)
+    assert "positions skipped: missing price snapshot" in text
