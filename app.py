@@ -9872,6 +9872,64 @@ def _extract_price_value(*sources: Any) -> Tuple[Optional[float], str]:
     return None, "fallback"
 
 
+
+
+def _match_row_by_identity(target: Dict[str, Any], rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    key = canonical_token_key(target)
+    ca = str(token_ca(target) or "").strip().lower()
+    sym = str(target.get("base_symbol") or "").strip().upper()
+    chain = str(token_chain(target) or target.get("chain") or "").strip().lower()
+    for r in rows or []:
+        if key and canonical_token_key(r) == key:
+            return r
+    for r in rows or []:
+        r_ca = str(token_ca(r) or "").strip().lower()
+        if ca and r_ca and ca == r_ca:
+            return r
+    for r in rows or []:
+        r_sym = str(r.get("base_symbol") or "").strip().upper()
+        r_chain = str(token_chain(r) or r.get("chain") or "").strip().lower()
+        if sym and chain and r_sym == sym and r_chain == chain:
+            return r
+    return None
+
+
+def resolve_position_price_context(portfolio_row, monitoring_rows, history_rows, scanner_state) -> Dict[str, Any]:
+    row = portfolio_row if isinstance(portfolio_row, dict) else {}
+    mon = _match_row_by_identity(row, monitoring_rows if isinstance(monitoring_rows, list) else []) or {}
+    hist_match = _match_row_by_identity(row, history_rows if isinstance(history_rows, list) else []) or {}
+    reco_rows = load_csv(PORTFOLIO_RECO_LOG_CSV, PORTFOLIO_RECO_LOG_FIELDS)
+    reco_match = _match_row_by_identity(row, reco_rows if isinstance(reco_rows, list) else []) or {}
+    scanner_match = {}
+    if isinstance(scanner_state, dict):
+        scanner_match = _match_row_by_identity(row, list(scanner_state.get("rows") or [])) or {}
+
+    price, source = _extract_price_value(
+        ("portfolio", row.get("current_price")), ("portfolio", row.get("price")), ("portfolio", row.get("price_usd")), ("portfolio", row.get("last_price")),
+        ("monitoring", mon.get("priceUsd")), ("monitoring", mon.get("price_usd")), ("monitoring", mon.get("pair_price")),
+        ("history", hist_match.get("priceUsd")), ("history", hist_match.get("price_usd")),
+        ("history", reco_match.get("priceUsd")), ("history", reco_match.get("price_usd")),
+        ("scanner_state", scanner_match.get("priceUsd")), ("scanner_state", scanner_match.get("price_usd")),
+    )
+    entry_price, _ = _extract_price_value(("entry", row.get("avg_entry_price")), ("entry", row.get("entry_price")), ("entry", row.get("entry_price_usd")))
+    liq, _ = _extract_price_value(("liq", row.get("liq_usd")), ("liq", row.get("liquidity_usd")), ("liq", mon.get("liquidity_usd")), ("liq", (mon.get("liquidity") or {}).get("usd") if isinstance(mon.get("liquidity"), dict) else mon.get("liquidity")))
+    vol, _ = _extract_price_value(("vol", mon.get("volume_h24")), ("vol", mon.get("volume24h")), ("vol", (mon.get("volume") or {}).get("h24") if isinstance(mon.get("volume"), dict) else None))
+
+    missing_fields=[]
+    if not price: missing_fields.append("price")
+    if not entry_price: missing_fields.append("entry_price")
+    if not liq: missing_fields.append("liquidity_usd")
+    if not vol: missing_fields.append("volume_h24")
+    quality = "good" if len(missing_fields) <= 1 and price else ("partial" if price else "missing")
+    return {
+        "price": price,
+        "entry_price": entry_price,
+        "liquidity_usd": liq,
+        "volume_h24": vol,
+        "price_source": source if price else "missing",
+        "data_quality": quality,
+        "missing_fields": missing_fields,
+    }
 def _fmt_price_level(value: Optional[float], unavailable_text: str) -> str:
     if value is None or value <= 0:
         return unavailable_text
@@ -9882,15 +9940,22 @@ def build_position_levels(row: Dict[str, Any], context: Dict[str, Any]) -> Dict[
     row = row if isinstance(row, dict) else {}
     mon = (context or {}).get("monitoring_row") if isinstance(context, dict) else {}
     mon = mon if isinstance(mon, dict) else {}
-    current_price, source = _extract_price_value(
-        ("stored_price", row.get("price_usd")),
-        ("stored_price", row.get("current_price")),
-        ("stored_price", row.get("last_price")),
-        ("pair_snapshot", row.get("pair_price")),
-        ("pair_snapshot", mon.get("priceUsd")),
-        ("pair_snapshot", mon.get("price_usd")),
-    )
-    entry_price, _ = _extract_price_value(
+    price_ctx = (context or {}).get("price_context") if isinstance(context, dict) else {}
+    price_ctx = price_ctx if isinstance(price_ctx, dict) else {}
+    current_price = parse_float(price_ctx.get("price"), 0.0) or None
+    source = str(price_ctx.get("price_source") or "fallback")
+    entry_price = parse_float(price_ctx.get("entry_price"), 0.0) or None
+    if current_price is None:
+        current_price, source = _extract_price_value(
+            ("stored_price", row.get("price_usd")),
+            ("stored_price", row.get("current_price")),
+            ("stored_price", row.get("last_price")),
+            ("pair_snapshot", row.get("pair_price")),
+            ("pair_snapshot", mon.get("priceUsd")),
+            ("pair_snapshot", mon.get("price_usd")),
+        )
+    if entry_price is None:
+        entry_price, _ = _extract_price_value(
         ("entry_price", row.get("avg_entry_price")),
         ("entry_price", row.get("entry_price")),
         ("entry_price", row.get("entry_price_usd")),
@@ -9937,7 +10002,11 @@ def build_position_levels(row: Dict[str, Any], context: Dict[str, Any]) -> Dict[
     score = parse_float(row.get("score", row.get("entry_score", 0)), 0.0)
     risk = str(row.get("risk") or row.get("risk_level") or "").upper()
     health = str(row.get("health_label") or "").upper()
-    if source == "fallback" or not current_price:
+    if not current_price:
+        levels["confidence"] = "missing"
+    elif source in {"history", "scanner_state"}:
+        levels["confidence"] = "partial"
+    elif source == "fallback":
         levels["confidence"] = "low"
     elif risk in {"HIGH", "CRITICAL"} or "UNTRADEABLE" in health:
         levels["confidence"] = "low"
@@ -9951,6 +10020,7 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
     mon = monitoring_row if isinstance(monitoring_row, dict) else {}
     symbol = str(row.get("base_symbol") or mon.get("base_symbol") or "TOKEN").strip().upper()
     levels = build_position_levels(row, {**(context or {}), "monitoring_row": mon})
+    data_quality = str((context or {}).get("price_context", {}).get("data_quality") or levels.get("confidence") or "missing")
     pnl = levels.get("pnl_pct")
     score = parse_float(row.get("score", row.get("entry_score", mon.get("entry_score", 0))), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or mon.get("risk_level") or "UNKNOWN").upper()
@@ -9975,7 +10045,13 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
     if "DEAD" in health or "SCAM" in health:
         action = "EXIT"
 
+    missing_price = (data_quality == "missing") or (not bool(levels.get("current_price")))
     urgency = "action_now" if action in {"EXIT", "REDUCE", "PROTECT", "PARTIAL_TP", "NO_CHASE"} else "watch"
+    if missing_price:
+        urgency = "none"
+        action = "REVIEW_DATA"
+    elif data_quality == "partial" and urgency == "watch" and risk not in {"HIGH", "CRITICAL"}:
+        urgency = "none"
     trim = "none"
     if action == "PARTIAL_TP":
         trim = "33-50%" if pnl is not None and pnl >= 60 else "25-33%"
@@ -9984,7 +10060,6 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
     elif action == "EXIT":
         trim = "all"
 
-    missing_price = not bool(levels.get("current_price"))
     reason_parts = []
     if missing_price:
         reason_parts.append("missing price snapshot, only status-level advice available")
@@ -10019,6 +10094,8 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
         "reason": reason,
         "critical": action == "EXIT",
         "dedupe_key": dedupe_key,
+        "data_quality": data_quality,
+        "price_source": str((context or {}).get("price_context", {}).get("price_source") or levels.get("source") or "missing"),
     }
 
 
@@ -10026,7 +10103,7 @@ def build_position_action_plan(row: Dict[str, Any], context: Dict[str, Any]) -> 
     analysis = analyze_position_for_tg(row, context.get("monitoring_row") if isinstance(context, dict) else None, context)
     levels = dict(analysis.get("levels") or {})
     action = str(analysis.get("action") or "HOLD").upper()
-    unavailable = "unavailable – missing price snapshot"
+    unavailable = ""
     add_zone_low = levels.get("add_zone_low")
     add_zone_high = levels.get("add_zone_high")
     add_zone_text = unavailable if levels.get("current_price") is None else f"{_fmt_price_level(add_zone_low, unavailable)} / {_fmt_price_level(add_zone_high, unavailable)}"
@@ -10040,7 +10117,7 @@ def build_position_action_plan(row: Dict[str, Any], context: Dict[str, Any]) -> 
         "invalidation": _fmt_price_level(levels.get("invalidation"), unavailable),
         "add_zone": add_zone_text,
         "no_add": action == "NO_CHASE",
-        "reason": str(analysis.get("reason") or unavailable),
+        "reason": str(analysis.get("reason") or "no material deterioration"),
         "data_quality": str(levels.get("confidence") or "low"),
         "levels_source": str(levels.get("source") or "fallback"),
     }
@@ -10053,15 +10130,22 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
     action_now: List[Dict[str, Any]] = []
     watch: List[Dict[str, Any]] = []
     skipped = 0
+    missing_price_positions: List[str] = []
+    price_sources: Dict[str, int] = {}
     dedupe_keys: List[str] = []
     last_keys = set(str(x) for x in (tg_state.get("last_position_analysis_dedupe_keys") or []))
     changed_keys: Set[str] = set()
+    history_rows = load_monitoring_history(limit_rows=25000)
     for row in portfolio_rows:
         if str(row.get("active", "1")).strip() != "1":
             continue
         key = canonical_token_key(row)
-        analysis = analyze_position_for_tg(row, mon_map.get(key or ""), {})
-        analysis["plan"] = build_position_action_plan(row, {"monitoring_row": mon_map.get(key or "") or {}})
+        mon_row = mon_map.get(key or "") or {}
+        price_context = resolve_position_price_context(row, monitoring_rows, history_rows, scanner_state)
+        analysis = analyze_position_for_tg(row, mon_row, {"price_context": price_context})
+        analysis["plan"] = build_position_action_plan(row, {"monitoring_row": mon_row, "price_context": price_context})
+        src = str(analysis.get("price_source") or "missing")
+        price_sources[src] = int(price_sources.get(src, 0)) + 1
         dedupe_keys.append(str(analysis.get("dedupe_key") or ""))
         if str(analysis.get("dedupe_key") or "") not in last_keys:
             changed_keys.add(str(analysis.get("dedupe_key") or ""))
@@ -10071,6 +10155,8 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
             watch.append(analysis)
         else:
             skipped += 1
+            if str(analysis.get("data_quality") or "") == "missing":
+                missing_price_positions.append(str(analysis.get("symbol") or "TOKEN"))
     material_action_now = [x for x in action_now if str(x.get("dedupe_key") or "") in changed_keys]
     material_watch = [x for x in watch if str(x.get("dedupe_key") or "") in changed_keys]
     visible_count = len(material_action_now[:TG_POSITION_ANALYSIS_MAX_ACTION]) + len(material_watch[:TG_POSITION_ANALYSIS_MAX_WATCH])
@@ -10085,6 +10171,11 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
         "has_critical": any(bool(x.get("critical")) for x in (material_action_now + material_watch)),
         "dedupe_keys": dedupe_keys,
         "material_change_count": len(changed_keys),
+        "portfolio_active": total_active,
+        "priced_positions": max(0, total_active - len(missing_price_positions)),
+        "missing_price_positions": len(missing_price_positions),
+        "price_sources": price_sources,
+        "skipped_missing_price_symbols": missing_price_positions[:25],
     }
 
 
@@ -10113,13 +10204,19 @@ def format_tg_position_analysis(analysis: Dict[str, Any]) -> str:
     if watch:
         lines.append("⚠️ Watch")
         for item in watch:
-            lines.extend([
-                f"• {item['symbol']} · {item['action'].replace('_',' ')}",
-                f"  trim {item.get('trim','none')}. TP: {item.get('plan',{}).get('tp1','n/a')} / {item.get('plan',{}).get('tp2','n/a')}. protect <{item.get('plan',{}).get('protect','n/a')}",
-                f"  {'no add.' if item.get('plan',{}).get('no_add') else 'add zone: ' + str(item.get('plan',{}).get('add_zone') or 'n/a')}"
-                f"  why: {str(item.get('reason') or '')}",
-            ])
-    lines.extend(["", f"✅ No urgent change", f"• {int(parse_float(analysis.get('skipped_count',0),0.0))} positions skipped / unchanged"])
+            lines.append(f"• {item['symbol']} · {item['action'].replace('_',' ')}")
+            if item.get('price'):
+                lines.extend([
+                    f"  trim {item.get('trim','none')}. TP: {item.get('plan',{}).get('tp1','n/a')} / {item.get('plan',{}).get('tp2','n/a')}. protect <{item.get('plan',{}).get('protect','n/a')}",
+                    f"  {'no add.' if item.get('plan',{}).get('no_add') else 'add zone: ' + str(item.get('plan',{}).get('add_zone') or 'n/a')}"
+                    f"  why: {str(item.get('reason') or '')}",
+                ])
+    skipped_missing = int(parse_float(analysis.get('missing_price_positions',0),0.0))
+    lines.extend(["", f"✅ No urgent change"])
+    if skipped_missing > 0:
+        lines.append(f"• {skipped_missing} positions skipped: missing price snapshot")
+    else:
+        lines.append(f"• {int(parse_float(analysis.get('skipped_count',0),0.0))} positions skipped / unchanged")
     txt = html.escape("\n".join(lines).strip())
     return txt[:TG_POSITION_ANALYSIS_MAX_CHARS]
 def _compact_notification_diagnostics(stats: Dict[str, Any]) -> Dict[str, Any]:
