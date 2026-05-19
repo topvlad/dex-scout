@@ -10045,11 +10045,29 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
     if "DEAD" in health or "SCAM" in health:
         action = "EXIT"
 
+    critical_health_markers = {"UNTRADEABLE", "SCAM", "DEAD", "LIQUIDITY_COLLAPSE"}
+    critical_reason_markers = ("UNTRADEABLE", "SCAM", "DEAD", "LIQUIDITY_COLLAPSE", "NO LIQUIDITY", "NO RECENT FLOW")
+    health_reasons_raw = row.get("health_reasons") or mon.get("health_reasons") or []
+    if isinstance(health_reasons_raw, str):
+        health_reasons = [health_reasons_raw]
+    elif isinstance(health_reasons_raw, list):
+        health_reasons = [str(x) for x in health_reasons_raw if str(x).strip()]
+    else:
+        health_reasons = []
+    health_reason_text = " ".join([health] + health_reasons).upper()
+    critical_action = (
+        action in {"EXIT", "REDUCE", "PROTECT", "PARTIAL_TP"}
+        or any(marker in health for marker in critical_health_markers)
+        or any(marker in health_reason_text for marker in critical_reason_markers)
+    )
+
     missing_price = (data_quality == "missing") or (not bool(levels.get("current_price")))
     urgency = "action_now" if action in {"EXIT", "REDUCE", "PROTECT", "PARTIAL_TP", "NO_CHASE"} else "watch"
-    if missing_price:
+    if missing_price and not critical_action:
         urgency = "none"
         action = "REVIEW_DATA"
+    elif missing_price and critical_action:
+        urgency = "action_now"
     elif data_quality == "partial" and urgency == "watch" and risk not in {"HIGH", "CRITICAL"}:
         urgency = "none"
     trim = "none"
@@ -10061,7 +10079,7 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
         trim = "all"
 
     reason_parts = []
-    if missing_price:
+    if missing_price and not critical_action:
         reason_parts.append("missing price snapshot, only status-level advice available")
     elif pnl is not None:
         reason_parts.append(f"pnl {pnl:+.0f}%")
@@ -10077,7 +10095,15 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
         reason_parts.append("price extended, no add until pullback")
     elif action in {"REDUCE", "EXIT"} and not missing_price:
         reason_parts.append("reduce exposure")
-    reason = ", ".join(reason_parts) if reason_parts else "no material deterioration"
+    if missing_price and critical_action:
+        if health_reasons:
+            reason = " / ".join(health_reasons)
+        elif health:
+            reason = health
+        else:
+            reason = "UNTRADEABLE – no liquidity and no recent flow"
+    else:
+        reason = ", ".join(reason_parts) if reason_parts else "no material deterioration"
 
     dedupe_key = f"position_analysis:{symbol}:{action}:{risk}:{round(parse_float(pnl,0.0),1) if pnl is not None else 'na'}:{round(score,1)}:{levels.get('confidence')}"
     return {
@@ -10092,7 +10118,7 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
         "trim": trim,
         "levels": levels,
         "reason": reason,
-        "critical": action == "EXIT",
+        "critical": bool(critical_action),
         "dedupe_key": dedupe_key,
         "data_quality": data_quality,
         "price_source": str((context or {}).get("price_context", {}).get("price_source") or levels.get("source") or "missing"),
@@ -10157,7 +10183,10 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
             skipped += 1
             if str(analysis.get("data_quality") or "") == "missing":
                 missing_price_positions.append(str(analysis.get("symbol") or "TOKEN"))
-    material_action_now = [x for x in action_now if str(x.get("dedupe_key") or "") in changed_keys]
+    material_action_now = [
+        x for x in action_now
+        if bool(x.get("critical")) or str(x.get("dedupe_key") or "") in changed_keys
+    ]
     material_watch = [x for x in watch if str(x.get("dedupe_key") or "") in changed_keys]
     visible_count = len(material_action_now[:TG_POSITION_ANALYSIS_MAX_ACTION]) + len(material_watch[:TG_POSITION_ANALYSIS_MAX_WATCH])
     total_active = len([r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"])
@@ -10193,6 +10222,15 @@ def format_tg_position_analysis(analysis: Dict[str, Any]) -> str:
         lines.append("🚨 Action now")
         for item in action_now:
             pnl = f"pnl {item['pnl_pct']:+.0f}%" if item.get("pnl_pct") is not None else "pnl n/a"
+            missing_price = str(item.get("data_quality") or "") == "missing" or not bool(item.get("price"))
+            if missing_price and bool(item.get("critical")):
+                lines.extend([
+                    f"• {item['symbol']} · {item['action'].replace('_',' ')}",
+                    f"  reason: {str(item.get('reason') or '')}",
+                    "  levels unavailable: missing price snapshot",
+                    "",
+                ])
+                continue
             lines.extend([
                 f"• {item['symbol']} · {item['action'].replace('_',' ')}",
                 f"  {pnl} · risk {item.get('risk','UNKNOWN')}",
@@ -10212,7 +10250,8 @@ def format_tg_position_analysis(analysis: Dict[str, Any]) -> str:
                     f"  why: {str(item.get('reason') or '')}",
                 ])
     skipped_missing = int(parse_float(analysis.get('missing_price_positions',0),0.0))
-    lines.extend(["", f"✅ No urgent change"])
+    if not action_now:
+        lines.extend(["", f"✅ No urgent change"])
     if skipped_missing > 0:
         lines.append(f"• {skipped_missing} positions skipped: missing price snapshot")
     else:
