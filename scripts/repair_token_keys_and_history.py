@@ -1,11 +1,11 @@
 import argparse
 import csv
-import shutil
-import sys
-from pathlib import Path
 import io
 import os
+import shutil
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
