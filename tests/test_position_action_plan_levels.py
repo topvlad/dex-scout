@@ -21,8 +21,11 @@ def test_levels_take_profit_with_trim_and_levels():
 def test_no_price_explicit_unavailable_not_blank():
     row = {"base_symbol": "NOPRICE", "final_action": "WATCH CLOSELY"}
     plan = app.build_position_action_plan(row, {})
-    assert "unavailable" in plan["tp1"]
-    assert "unavailable" in plan["protect"]
+    assert plan["tp1"] == ""
+    assert plan["tp2"] == ""
+    assert plan["protect"] == ""
+    assert plan["add_zone"] == ""
+    assert plan["data_quality"] == "missing"
     assert "missing price snapshot" in plan["reason"]
 
 

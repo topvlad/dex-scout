@@ -4,7 +4,7 @@ import app
 def test_position_analysis_skipped_count_respects_visible_limit():
     portfolio = []
     for i in range(9):
-        portfolio.append({"active": "1", "chain": "solana", "base_symbol": f"T{i}", "base_token_address": f"Addr{i}", "final_action": "HOLD", "risk_level": "LOW", "entry_score": "10", "price_usd": "1"})
+        portfolio.append({"active": "1", "chain": "solana", "base_symbol": f"T{i}", "base_token_address": f"Addr{i}", "final_action": "WATCH CLOSELY", "risk_level": "MEDIUM", "entry_score": "10", "price_usd": "1"})
     tg_state = {"last_position_analysis_dedupe_keys": []}
     out = app.build_tg_position_analysis(portfolio, [], {}, tg_state, now_ts=0)
     # watch list is capped, so others are skipped/unchanged

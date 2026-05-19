@@ -10050,7 +10050,7 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
     if missing_price:
         urgency = "none"
         action = "REVIEW_DATA"
-    elif data_quality == "partial" and action not in {"EXIT", "REDUCE", "PROTECT"} and risk not in {"HIGH", "CRITICAL"}:
+    elif data_quality == "partial" and urgency == "watch" and risk not in {"HIGH", "CRITICAL"}:
         urgency = "none"
     trim = "none"
     if action == "PARTIAL_TP":
