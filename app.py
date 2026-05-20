@@ -10125,6 +10125,17 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
     }
 
 
+def is_material_portfolio_action(row: Dict[str, Any], analysis: Dict[str, Any]) -> bool:
+    material_actions = {"EXIT", "REDUCE", "TAKE_PROFIT", "PARTIAL_TP", "PROTECT", "CLOSE", "TRIM"}
+    values = [
+        str((row or {}).get("final_action") or "").upper().replace(" ", "_"),
+        str((row or {}).get("recommended_action") or "").upper().replace(" ", "_"),
+        str((row or {}).get("position_action") or "").upper().replace(" ", "_"),
+        str((analysis or {}).get("action") or "").upper().replace(" ", "_"),
+    ]
+    return any(v in material_actions for v in values)
+
+
 def build_position_action_plan(row: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     analysis = analyze_position_for_tg(row, context.get("monitoring_row") if isinstance(context, dict) else None, context)
     levels = dict(analysis.get("levels") or {})
@@ -10157,6 +10168,7 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
     watch: List[Dict[str, Any]] = []
     skipped = 0
     missing_price_positions: List[str] = []
+    material_rows_from_ui = 0
     price_sources: Dict[str, int] = {}
     dedupe_keys: List[str] = []
     last_keys = set(str(x) for x in (tg_state.get("last_position_analysis_dedupe_keys") or []))
@@ -10169,6 +10181,16 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
         mon_row = mon_map.get(key or "") or {}
         price_context = resolve_position_price_context(row, monitoring_rows, history_rows, scanner_state)
         analysis = analyze_position_for_tg(row, mon_row, {"price_context": price_context})
+        row_action = str(row.get("final_action") or row.get("recommended_action") or row.get("position_action") or "").upper().replace(" ", "_")
+        if row_action == "TAKE_PROFIT":
+            row_action = "PARTIAL_TP"
+        material_from_ui = is_material_portfolio_action(row, analysis)
+        if material_from_ui:
+            material_rows_from_ui += 1
+            if row_action:
+                analysis["action"] = row_action
+            analysis["urgency"] = "action_now"
+            analysis["critical"] = True
         analysis["plan"] = build_position_action_plan(row, {"monitoring_row": mon_row, "price_context": price_context})
         src = str(analysis.get("price_source") or "missing")
         price_sources[src] = int(price_sources.get(src, 0)) + 1
@@ -10183,10 +10205,14 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
             skipped += 1
             if str(analysis.get("data_quality") or "") == "missing":
                 missing_price_positions.append(str(analysis.get("symbol") or "TOKEN"))
+    action_now_count_before_dedupe = len(action_now)
     material_action_now = [
         x for x in action_now
-        if bool(x.get("critical")) or str(x.get("dedupe_key") or "") in changed_keys
+        if bool(x.get("critical")) or str(x.get("dedupe_key") or "") in changed_keys or is_material_portfolio_action({}, x)
     ]
+    if material_rows_from_ui > 0 and not material_action_now:
+        material_action_now = [x for x in action_now if is_material_portfolio_action({}, x)]
+    action_now_count_after_dedupe = len(material_action_now)
     material_watch = [x for x in watch if str(x.get("dedupe_key") or "") in changed_keys]
     visible_count = len(material_action_now[:TG_POSITION_ANALYSIS_MAX_ACTION]) + len(material_watch[:TG_POSITION_ANALYSIS_MAX_WATCH])
     total_active = len([r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"])
@@ -10205,6 +10231,10 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
         "missing_price_positions": len(missing_price_positions),
         "price_sources": price_sources,
         "skipped_missing_price_symbols": missing_price_positions[:25],
+        "active_portfolio_rows": total_active,
+        "material_rows_from_ui": material_rows_from_ui,
+        "action_now_count_before_dedupe": action_now_count_before_dedupe,
+        "action_now_count_after_dedupe": action_now_count_after_dedupe,
     }
 
 
@@ -10318,6 +10348,7 @@ def run_auto_notifications(
     last_pa_ts = parse_ts(state.get("last_position_analysis_sent_ts")) if isinstance(state, dict) else None
     due_pa = (last_pa_ts is None) or ((now_ts - last_pa_ts.timestamp()) >= interval_sec)
     has_urgent = bool(position_analysis.get("action_now") or position_analysis.get("watch"))
+    has_material_rows = int(parse_float(position_analysis.get("material_rows_from_ui", 0), 0.0)) > 0
     if _is_tg_quiet_hours(now_ts):
         state["last_position_analysis_suppressed_ts"] = now_utc_str()
         state["pending_position_analysis_summary"] = position_analysis
@@ -10340,7 +10371,14 @@ def run_auto_notifications(
             hb_dt = parse_ts(state.get("last_position_analysis_heartbeat_ts")) if isinstance(state, dict) else None
             hb_due = hb_dt is None or (now_ts - hb_dt.timestamp()) >= 12 * 3600
             n_positions = len([r for r in portfolio_rows if str(r.get("active", "1")).strip() == "1"])
-            if hb_due and send_telegram(f"Portfolio check: no urgent changes across {n_positions} positions.", parse_mode="HTML"):
+            if has_material_rows:
+                state["last_position_analysis_reason"] = "heartbeat_suppressed_material_rows"
+                state["heartbeat_suppressed_reason"] = "material_rows_from_ui"
+                msg = format_tg_position_analysis(position_analysis)
+                if send_telegram(msg, parse_mode="HTML"):
+                    state["last_position_analysis_sent_ts"] = now_utc_str()
+                    state["last_position_analysis_dedupe_keys"] = list(position_analysis.get("dedupe_keys") or [])
+            elif hb_due and send_telegram(f"Portfolio check: no urgent changes across {n_positions} positions.", parse_mode="HTML"):
                 state["last_position_analysis_heartbeat_ts"] = now_utc_str()
                 state["last_position_analysis_reason"] = "heartbeat_no_urgent"
     portfolio_events = build_portfolio_meaningful_events(port_rows, monitoring_rows, state)
