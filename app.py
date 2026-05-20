@@ -13562,12 +13562,14 @@ def build_live_pulse_candidates_payload(
     chain_filter: str = "all",
     limit: int = 15,
 ) -> Dict[str, Any]:
+    min_target = max(1, int(LIVE_PULSE_TARGET_MIN))
+    max_target = max(min_target, int(LIVE_PULSE_TARGET_MAX))
     cards = build_market_pulse_cards(
         monitoring_rows=monitoring_rows,
         portfolio_rows=portfolio_rows,
         active_monitoring_keys=active_monitoring_keys,
         chain_filter=chain_filter,
-        limit=limit,
+        limit=min(max(int(limit or max_target), min_target), max_target),
         record_pulse_history=False,
     )
     stats = st.session_state.get("last_pulse_ui_stats", {}) if isinstance(st.session_state.get("last_pulse_ui_stats"), dict) else {}
@@ -13581,6 +13583,41 @@ def build_live_pulse_candidates_payload(
         "blocked_reasons": stats.get("last_pulse_scam_reasons", {}) if isinstance(stats.get("last_pulse_scam_reasons"), dict) else {},
         "final_candidates": cards,
     }
+
+
+def _priority_hard_gate_reasons(row: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    health = str(row.get("health_label") or "").upper()
+    status = str(row.get("entry_status") or row.get("status") or "").upper()
+    action = str(row.get("final_action") or row.get("entry_action") or "").upper()
+    liq = parse_float(row.get("liq_usd", row.get("liquidity", row.get("liquidity_usd", 0))), 0.0)
+    vol24 = parse_float(row.get("vol24_usd", row.get("vol24_init", 0)), 0.0)
+    pc24 = parse_float(row.get("pc24h", row.get("price_change_h24", 0)), 0.0)
+    reason_text = " ".join([
+        health,
+        status,
+        action,
+        str(row.get("entry_reason") or ""),
+        str(row.get("archived_reason") or ""),
+        str(row.get("lifecycle") or ""),
+    ]).upper()
+    if "POST_PUMP_COLLAPSE" in reason_text or "EXTREME_PUMP_THEN_DUMP" in reason_text:
+        reasons.append("post_pump_collapse")
+    if "UNTRADEABLE" in reason_text:
+        reasons.append("untradeable")
+    if any(x in reason_text for x in ("DEAD", "SCAM", "TOXIC")):
+        reasons.append("dead_or_scam")
+    if any(x in reason_text for x in ("NO LIQUIDITY", "NO_LIQUIDITY")) or liq <= 0:
+        reasons.append("no_liquidity")
+    if any(x in reason_text for x in ("NO RECENT FLOW", "NO_RECENT_FLOW")) or vol24 <= 0:
+        reasons.append("no_recent_flow")
+    if liq > 0 and vol24 > 0 and (vol24 / max(liq, 1.0)) < 0.08:
+        reasons.append("liquidity_volume_decay")
+    if pc24 <= -24.0 and liq < 15_000:
+        reasons.append("24h_collapse_low_liq")
+    if status in {"NO_ENTRY", "AVOID"}:
+        reasons.append("no_entry")
+    return sorted(set(reasons))
 
 
 # =============================
@@ -14178,8 +14215,12 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         c["is_portfolio_active"] = in_pf
         weak_score = float(c.get("ui_visible_score", 0.0)) < 90
         is_review = str(c.get("ui_badge", "")).upper() == "REVIEW" or c.get("ui_bucket") == "review" or weak_score
+        hard_gate_reasons = _priority_hard_gate_reasons(row)
+        c["hard_gate_reasons"] = hard_gate_reasons
         if in_pf:
             portfolio_linked_cards.append(c)
+        elif hard_gate_reasons:
+            dead_cards.append(c)
         elif STREAMLIT_FAST_UI_MODE and (not run_review_analysis) and (is_dead or is_review):
             hidden_review_dead_count += 1
             continue
@@ -14357,10 +14398,13 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     pulse_runtime = pulse_payload if isinstance(pulse_payload, dict) else {}
     st.caption(
         f"raw_seen={int(parse_float(pulse_runtime.get('raw_seen', 0), 0))} • "
+        f"normalized={int(parse_float((pulse_runtime.get('scan_debug', {}) or {}).get('normalized_candidates', 0), 0))} • "
         f"duplicate_filtered={int(parse_float(pulse_runtime.get('duplicate_filtered', pulse_runtime.get('filtered_out', 0)), 0))} • "
         f"scam_blocked={int(parse_float(pulse_runtime.get('scam_blocked', pulse_runtime.get('last_pulse_scam_blocked', 0)), 0))} • "
+        f"archived_blocked={int(parse_float(((pulse_runtime.get('scan_debug', {}) or {}).get('rejected_candidates', {}) or {}).get('archive', 0), 0))} • "
         f"clean_candidates={int(parse_float(pulse_runtime.get('clean_candidates', 0), 0))} • "
-        f"refill_attempts={int(parse_float(pulse_runtime.get('refill_attempts', 0), 0))}"
+        f"refill_attempts={int(parse_float(pulse_runtime.get('refill_attempts', 0), 0))} • "
+        f"final_count={int(parse_float(pulse_runtime.get('final_count', len(pulse_cards)), len(pulse_cards)))}"
     )
     reason_stats = pulse_runtime.get("last_pulse_scam_reasons", {}) if isinstance(pulse_runtime.get("last_pulse_scam_reasons"), dict) else {}
     if reason_stats:
@@ -14369,7 +14413,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     if STREAMLIT_FAST_UI_MODE:
         st.caption("Fast UI mode: pulse/history enrichment is disabled by default.")
     elif not pulse_cards:
-        st.caption(f"No clean Live Pulse candidates after filtering. reason={pulse_runtime.get('last_empty_reason') or 'scan_not_run'}")
+        st.warning(f"Live Pulse empty because: {pulse_runtime.get('last_empty_reason') or 'scan_not_run'}")
     elif len(pulse_cards) < LIVE_PULSE_TARGET_MIN:
         st.caption(f"Only {len(pulse_cards)} clean candidates found after filtering.")
     pulse_symbol_counts: Dict[str, int] = {}
