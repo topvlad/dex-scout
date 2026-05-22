@@ -265,8 +265,28 @@ def _run_scan_cycle() -> Dict[str, Any]:
             chain_filter="all",
             limit=15,
         )
+        stats = scan_result.get("stats", {}) if isinstance(scan_result.get("stats"), dict) else {}
+        payload["scan_debug"] = {
+            "raw_candidates": int(stats.get("seen", payload.get("raw_seen", 0)) or 0),
+            "normalized_candidates": int(stats.get("updated_active", 0) or 0),
+            "rejected_candidates": {
+                "scam": int(payload.get("scam_filtered", 0) or 0),
+                "archive": int(stats.get("skipped_archived", 0) or 0),
+                "duplicate": int(payload.get("duplicate_filtered", 0) or 0),
+            },
+            "final_candidates": int(payload.get("final_count", 0) or 0),
+        }
         if payload.get("final_count", 0) == 0:
-            payload["last_empty_reason"] = "api_empty" if payload.get("raw_seen", 0) == 0 else "all_filtered_scam_gate"
+            if scan_result.get("error"):
+                payload["last_empty_reason"] = "worker_error"
+            elif payload.get("raw_seen", 0) <= 0:
+                payload["last_empty_reason"] = "source_api_empty"
+            elif payload.get("scam_filtered", 0) >= payload.get("raw_seen", 0):
+                payload["last_empty_reason"] = "all_filtered_scam"
+            elif payload.get("duplicate_filtered", 0) >= payload.get("raw_seen", 0):
+                payload["last_empty_reason"] = "all_filtered_duplicate"
+            else:
+                payload["last_empty_reason"] = "scanner_returned_no_candidates"
         app.update_worker_runtime_state(updates={"live_pulse_candidates": payload})
     except Exception as pulse_exc:
         app.update_worker_runtime_state(updates={"live_pulse_candidates": {"source": "d1", "final_candidates": [], "final_count": 0, "last_empty_reason": f"worker_failed:{type(pulse_exc).__name__}"}})
@@ -308,6 +328,25 @@ def _run_monitor_cycle() -> Dict[str, Any]:
     except Exception as history_exc:
         history_stats["history_snapshot_error"] = f"{type(history_exc).__name__}:{history_exc}"
     monitor_result["history_snapshots"] = history_stats
+    hard_gate_archived = 0
+    hard_gate_reasons: Dict[str, int] = {}
+    hard_gate_symbols: List[str] = []
+    for row in app.build_active_monitoring_rows(monitoring_rows):
+        reasons = app._priority_hard_gate_reasons(row)
+        if not reasons:
+            continue
+        chain = app.token_chain(row)
+        base_addr = app.token_ca(row)
+        if chain and base_addr:
+            archived = app.archive_monitoring(chain, base_addr, reason=f"hard_gate:{'|'.join(reasons)}", revisit_days=0)
+            if archived:
+                hard_gate_archived += 1
+                for reason in reasons:
+                    hard_gate_reasons[reason] = int(hard_gate_reasons.get(reason, 0) or 0) + 1
+                hard_gate_symbols.append(str(row.get("base_symbol") or "UNKNOWN").upper())
+    monitor_result["hard_gate_archived"] = int(hard_gate_archived)
+    monitor_result["hard_gate_reasons"] = hard_gate_reasons
+    monitor_result["hard_gate_symbols"] = hard_gate_symbols[:25]
     pulse_result = _record_pulse_history_after_cycle_safe()
     return {"monitor": monitor_result, "pulse_history": pulse_result}
 

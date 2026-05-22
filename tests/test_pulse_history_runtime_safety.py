@@ -36,6 +36,18 @@ class ScanMonitorStub(PulseFailAppStub):
     def run_priority_scanner_cycle(self, **kwargs):
         return {"ok": True, "mode": "monitor"}
 
+    def _priority_hard_gate_reasons(self, row):
+        return []
+
+    def token_chain(self, row):
+        return "solana"
+
+    def token_ca(self, row):
+        return ""
+
+    def archive_monitoring(self, chain, base_addr, reason="", revisit_days=0):
+        return False
+
 
 def test_pulse_history_safe_wrapper_nonblocking(monkeypatch):
     monkeypatch.setattr(worker, "app", PulseFailAppStub())
