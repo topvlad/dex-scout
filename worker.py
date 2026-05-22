@@ -8,6 +8,14 @@ from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any, Callable, Dict, Optional
 
+# ============================================================
+# PRODUCTION ENTRY POINT — one-shot job dispatcher
+# Usage: JOB_MODE=scan_cycle python worker.py
+# Available JOB_MODE values: scan_cycle, monitor_cycle,
+#   notify_cycle, digest_cycle, outcome_cycle
+# Locking: acquire_lock() per job mode prevents duplicate runs.
+# ============================================================
+
 os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
 
 BASE_REQUIRED_ENV_VARS = (

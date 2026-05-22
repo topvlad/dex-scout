@@ -1,3 +1,10 @@
+# ============================================================
+# LEGACY FILE — not imported by any active codepath as of v0.5.6
+# Original role: passes_safe_filters() + score_row() primitives.
+# Scoring logic now lives entirely inside app.py (entry engine v1).
+# Retained for reference. Safe to delete after verification.
+# ============================================================
+
 # scoring.py
 from config import (
     MIN_LIQ_USD, MIN_TXNS_M5, MAX_ABS_PRICECHANGE_M5, MAX_PRICECHANGE_H1, MIN_VOLUME_M5,
@@ -48,4 +55,3 @@ def score_row(row: dict) -> float:
         score -= 5
 
     return float(score)
-

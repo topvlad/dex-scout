@@ -1,3 +1,10 @@
+# ============================================================
+# LEGACY FILE — not imported by any active codepath as of v0.5.6
+# Original role: in-memory WatchItem store with TTL and cooldown.
+# Alert logic now lives entirely inside app.py (run_auto_notifications).
+# Retained for reference. Safe to delete after verification.
+# ============================================================
+
 # alerts.py
 
 import time

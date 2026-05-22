@@ -1,4 +1,4 @@
-# app.py — DEX Scout v0.4.12
+# app.py — DEX Scout (see VERSION constant below)
 # ядро: Scout → Monitoring → Archive (+ Portfolio)
 # - Scout: показує тільки re-eligible токени (не в Monitoring active, не в Portfolio active), і НЕ показує "NO ENTRY"
 # - Monitoring: тільки WATCH/WAIT. Сортування: priority → momentum → time since added
@@ -124,7 +124,6 @@ DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 SMART_WALLET_FILE = os.path.join(DATA_DIR, "smart_wallets.json")
 ENTRY_MODE = "aggressive"
-TEMP_DISABLE_BEST_PAIR = False
 USE_HEAVY_MIGRATION_CHECK = not WORKER_FAST_MODE
 LOW_EGRESS_MODE = str(os.getenv("LOW_EGRESS_MODE", "true")).strip().lower() in {"1", "true", "yes", "on"}
 STORAGE_VERIFY_MODE = str(
@@ -163,6 +162,7 @@ APP_STORAGE_MAX_SAFE_BYTES = max(50_000, _env_int("APP_STORAGE_MAX_SAFE_BYTES", 
 TG_STATE_SENT_EVENTS_MAX = max(100, _env_int("TG_STATE_SENT_EVENTS_MAX", 500))
 TG_STATE_TOKEN_STATE_MAX = max(200, _env_int("TG_STATE_TOKEN_STATE_MAX", 1000))
 SCANNER_STATE_RECENT_CANDIDATES_MAX = max(50, _env_int("SCANNER_STATE_RECENT_CANDIDATES_MAX", 200))
+MAX_BACKUP_SNAPSHOTS = max(5, _env_int("MAX_BACKUP_SNAPSHOTS", 10))
 _SB_READ_CACHE: Dict[str, Tuple[float, Optional[str]]] = {}
 _SB_BUDGET: Dict[str, Any] = {
     "supabase_bytes_read_est": 0,
@@ -1309,6 +1309,7 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
             - Extra CSV columns are dropped in the returned payload.
             - If omitted, rows are returned as-is from csv.DictReader.
     """
+    # fields parameter retained for call-site compatibility; used only for schema normalization.
     ensure_storage()
     key = storage_key_for_path(path)
     fallback = local_fallback_path(path)
@@ -1475,22 +1476,8 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
     if _app_storage_remote_ok():
         ok = sb_put_storage(key, content)
         if ok:
-            do_verify = _should_verify_roundtrip(key=key, payload_len=len(content))
-            if do_verify:
-                _STORAGE_METRICS["roundtrip_checks"] = int(_STORAGE_METRICS.get("roundtrip_checks", 0) or 0) + 1
-                check = sb_get_storage(key)
-                if check == content:
-                    debug_log(f"storage_store_verified key={key} backend={_active_storage_source_label()} mode={STORAGE_VERIFY_MODE}")
-                    st.session_state["_save_badge"] = "💾 saved (remote round-trip verified)"
-                else:
-                    check_len = len(check) if isinstance(check, str) else 0
-                    debug_log(
-                        f"storage_store_mismatch key={key} backend={_active_storage_source_label()} expected_len={len(content)} got_len={check_len}"
-                    )
-                    st.session_state["_save_badge"] = "⚠️ saved local, remote write ok (round-trip mismatch)"
-            else:
-                debug_log(f"storage_store_verified_skipped key={key} backend={_active_storage_source_label()} mode={STORAGE_VERIFY_MODE}")
-                st.session_state["_save_badge"] = "💾 saved (remote write, verify skipped)"
+            debug_log(f"supabase_store_ok key={key}")
+            st.session_state["_save_badge"] = "💾 saved (supabase)"
         else:
             debug_log(f"storage_store_failed_local_kept key={key} backend={_active_storage_source_label()}")
             st.session_state["_save_badge"] = "⚠️ saved local, remote write failed"
@@ -1529,9 +1516,39 @@ def backup_csv_snapshot(path: str, rows: List[Dict[str, Any]], fieldnames: List[
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         backup_key = f"backup/{ts}_{key}"
         sb_put_storage(backup_key, content)
+        # Rotate: keep only the N most recent backups for this key
+        _rotate_backup_snapshots(key)
         _CSV_BACKUP_STATE[key] = {"ts": now_ts, "len": len(content), "hash": digest}
     except Exception:
         pass
+
+
+def _rotate_backup_snapshots(base_key: str) -> None:
+    """Delete oldest backup entries for base_key, keeping MAX_BACKUP_SNAPSHOTS."""
+    try:
+        rows, status = _sb_select_rows(
+            table="app_storage",
+            filters={"key": f"like.backup/%_{base_key}"},
+            select="key",
+            limit=200,
+        )
+        if not rows:
+            return
+        keys_sorted = sorted(str(r.get("key") or "") for r in rows if r.get("key"))
+        excess = keys_sorted[: max(0, len(keys_sorted) - MAX_BACKUP_SNAPSHOTS)]
+        for old_key in excess:
+            try:
+                requests.delete(
+                    f"{SUPABASE_URL}/rest/v1/app_storage",
+                    headers=_sb_headers(),
+                    params={"key": f"eq.{old_key}"},
+                    timeout=8,
+                )
+                debug_log(f"backup_rotated key={old_key}")
+            except Exception:
+                pass
+    except Exception as e:
+        debug_log(f"backup_rotate_exception base_key={base_key} err={type(e).__name__}:{e}")
 
 
 def append_csv(path: str, row: Dict[str, Any], fieldnames: List[str]):
@@ -2390,8 +2407,6 @@ def fetch_token_pairs(chain: str, token_address: str, priority_hint: str = "norm
 
 @st.cache_data(ttl=60, max_entries=500)
 def best_pair_for_token(chain: str, token_address: str) -> Optional[Dict[str, Any]]:
-    if TEMP_DISABLE_BEST_PAIR:
-        return None
     try:
         pools = fetch_token_pairs(chain, token_address, priority_hint=str(_PAIR_FETCH_PRIORITY_HINT or "normal"))
     except Exception:
@@ -15416,11 +15431,11 @@ def alert_pipeline_reliability_checks() -> List[str]:
         if key not in runtime:
             issues.append(f"runtime key missing: {key}")
     try:
-        worker_src = Path(os.path.join(os.path.dirname(__file__), "scanner_worker.py")).read_text(encoding="utf-8")
+        worker_src = Path(os.path.join(os.path.dirname(__file__), "worker.py")).read_text(encoding="utf-8")
     except Exception:
         worker_src = ""
     if "run_auto_notifications(" not in worker_src:
-        issues.append("worker loop does not call run_auto_notifications")
+        issues.append("worker runtime does not call run_auto_notifications")
     return issues
 
 
@@ -16222,7 +16237,7 @@ def main():
             st.cache_data.clear()
             request_rerun()
         st.markdown("### Background runtime")
-        st.caption("Alerts/notifications are emitted by scanner_worker.py (background service), not by this UI tab.")
+        st.caption("Alerts/notifications are emitted by worker.py jobs (background service), not by this UI tab.")
         runtime = get_worker_runtime_state(state=scan_state)
         liveness = runtime_liveness(runtime)
         st.caption(

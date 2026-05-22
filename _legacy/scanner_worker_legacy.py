@@ -1,3 +1,8 @@
+# ============================================================
+# LEGACY FILE — continuous loop worker, superseded by worker.py + JOB_MODE
+# Retained for reference. Safe to delete after verification.
+# ============================================================
+
 import os
 os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
 
