@@ -64,3 +64,48 @@ def test_dispatch_map_validation_catches_non_callable():
     import pytest
     with pytest.raises(RuntimeError, match='invalid_job_dispatch_non_callable:bad'):
         worker.validate_job_dispatch({'ok': lambda: {}, 'bad': 'nope'})
+
+
+def test_duplicate_lock_path_does_not_write_running_heartbeat(monkeypatch):
+    class DuplicateStub(AppStub):
+        def __init__(self):
+            super().__init__()
+            self.heartbeats = []
+
+        def get_worker_runtime_state(self):
+            return {'modes': {'scan_cycle': {'last_job_status': 'running', 'last_job_started_epoch': time.time()}}}
+
+        def update_job_heartbeat(self, **kwargs):
+            self.heartbeats.append(kwargs)
+            return {'ok': True}
+
+    import time
+    stub = DuplicateStub()
+    monkeypatch.setattr(worker, 'app', stub)
+    monkeypatch.setattr(worker, '_update_worker_runtime_with_mode_state', lambda **kwargs: {'ok': True})
+    rc = worker.run_job_mode('scan_cycle')
+    assert rc == 3
+    assert [h['status'] for h in stub.heartbeats] == ['duplicate_guard']
+    assert 'started' not in [h['status'] for h in stub.heartbeats]
+
+
+def test_lock_acquisition_failure_surfaces_locked_not_running(monkeypatch):
+    class LockFailStub(AppStub):
+        def __init__(self):
+            super().__init__()
+            self.heartbeats = []
+
+        def acquire_lock(self, **kwargs):
+            return {'ok': False, 'code': 'backend_down', 'detail': 'nope'}
+
+        def update_job_heartbeat(self, **kwargs):
+            self.heartbeats.append(kwargs)
+            return {'ok': True}
+
+    stub = LockFailStub()
+    monkeypatch.setattr(worker, 'app', stub)
+    monkeypatch.setattr(worker, '_update_worker_runtime_with_mode_state', lambda **kwargs: {'ok': True})
+    rc = worker.run_job_mode('scan_cycle')
+    assert rc == 3
+    assert [h['status'] for h in stub.heartbeats] == ['lock_failed']
+    assert 'started' not in [h['status'] for h in stub.heartbeats]

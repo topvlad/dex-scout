@@ -140,3 +140,84 @@ def test_remove_contract_atomicish_monitoring_save_fail_reports_partial(monkeypa
     assert out['portfolio_saved'] is True
     assert out['monitoring_saved'] is False
     assert out['error'] == 'monitoring_save_failed'
+
+
+def test_find_token_meta_uses_ttl_cache(monkeypatch):
+    tg_webhook._clear_token_meta_cache()
+    calls = {'monitoring': 0, 'portfolio': 0}
+
+    def load_monitoring():
+        calls['monitoring'] += 1
+        return [{'chain': 'bsc', 'base_addr': 'abcdefghijklmnopqrst', 'symbol': 'AAA'}]
+
+    def load_portfolio():
+        calls['portfolio'] += 1
+        return []
+
+    monkeypatch.setattr(tg_webhook, 'IMPORT_FAILED', False)
+    monkeypatch.setattr(tg_webhook, 'BOOTSTRAP_ERROR', {})
+    monkeypatch.setattr(tg_webhook, 'load_monitoring', load_monitoring)
+    monkeypatch.setattr(tg_webhook, 'load_portfolio', load_portfolio)
+    monkeypatch.setattr(tg_webhook.time, 'time', lambda: 1000.0)
+    assert tg_webhook.find_token_meta('bsc', 'abcdefghijklmnopqrst')['symbol'] == 'AAA'
+    assert tg_webhook.find_token_meta('bsc', 'abcdefghijklmnopqrst')['symbol'] == 'AAA'
+    assert calls == {'monitoring': 1, 'portfolio': 1}
+
+
+def test_find_token_meta_cache_expires_and_alias_fields(monkeypatch):
+    tg_webhook._clear_token_meta_cache()
+    calls = {'monitoring': 0, 'portfolio': 0}
+    now = {'value': 1000.0}
+
+    def load_monitoring():
+        calls['monitoring'] += 1
+        return []
+
+    def load_portfolio():
+        calls['portfolio'] += 1
+        return [{'chain': 'bsc', 'pair_address': 'ABCDEFGHIJKLMNOPQRST', 'base_symbol': f"P{calls['portfolio']}"}]
+
+    monkeypatch.setattr(tg_webhook, 'IMPORT_FAILED', False)
+    monkeypatch.setattr(tg_webhook, 'BOOTSTRAP_ERROR', {})
+    monkeypatch.setattr(tg_webhook, 'load_monitoring', load_monitoring)
+    monkeypatch.setattr(tg_webhook, 'load_portfolio', load_portfolio)
+    monkeypatch.setattr(tg_webhook.time, 'time', lambda: now['value'])
+    assert tg_webhook.find_token_meta('bsc', 'abcdefghijklmnopqrst')['symbol'] == 'P1'
+    now['value'] += tg_webhook.TG_META_CACHE_TTL_SEC + 1
+    assert tg_webhook.find_token_meta('bsc', 'abcdefghijklmnopqrst')['symbol'] == 'P2'
+    assert calls == {'monitoring': 2, 'portfolio': 2}
+
+
+def test_find_token_meta_solana_case_behavior(monkeypatch):
+    tg_webhook._clear_token_meta_cache()
+    monkeypatch.setattr(tg_webhook, 'IMPORT_FAILED', False)
+    monkeypatch.setattr(tg_webhook, 'BOOTSTRAP_ERROR', {})
+    monkeypatch.setattr(tg_webhook, 'load_monitoring', lambda: [{'chain': 'solana', 'base_addr': 'AbCdEfGhIjKlMnOpQrSt', 'symbol': 'SOLX'}])
+    monkeypatch.setattr(tg_webhook, 'load_portfolio', lambda: [])
+    assert tg_webhook.find_token_meta('solana', 'AbCdEfGhIjKlMnOpQrSt')['symbol'] == 'SOLX'
+    assert tg_webhook.find_token_meta('solana', 'abcdefghijklmnopqrst') == {'symbol': '', 'name': ''}
+
+
+def test_import_status_endpoint_healthy_and_failure(monkeypatch):
+    client = TestClient(tg_webhook.app)
+    monkeypatch.setattr(tg_webhook, 'IMPORT_FAILED', False)
+    monkeypatch.setattr(tg_webhook, 'IMPORT_ERROR', '')
+    monkeypatch.setattr(tg_webhook, 'BOOTSTRAP_ERROR', {})
+    assert client.get('/_import_status').json() == {'ok': True, 'import_failed': False, 'error': '', 'bootstrap_error': {}}
+    monkeypatch.setattr(tg_webhook, 'IMPORT_FAILED', True)
+    monkeypatch.setattr(tg_webhook, 'IMPORT_ERROR', 'boom')
+    monkeypatch.setattr(tg_webhook, 'BOOTSTRAP_ERROR', {'exception_text': 'boom'})
+    data = client.get('/_import_status').json()
+    assert data['ok'] is False
+    assert data['import_failed'] is True
+    assert data['error'] == 'boom'
+
+
+def test_callback_chain_whitelist_and_override(monkeypatch):
+    monkeypatch.setattr(tg_webhook, 'VALID_CHAINS', {'solana', 'bsc'})
+    assert tg_webhook._validate_callback_data('pf', 'solana', 'AbCdEfGhIjKlMnOpQrSt')[0]
+    assert tg_webhook._validate_callback_data('pf', 'bsc', 'abcdefghijklmnopqrst')[0]
+    assert tg_webhook._validate_callback_data('pf', 'eth', 'abcdefghijklmnopqrst')[1] == 'invalid_chain'
+    monkeypatch.setattr(tg_webhook, 'VALID_CHAINS', {'eth'})
+    assert tg_webhook._validate_callback_data('pf', 'eth', 'abcdefghijklmnopqrst')[0]
+    assert tg_webhook._validate_callback_data('pf', 'bsc', 'abcdefghijklmnopqrst')[1] == 'invalid_chain'
