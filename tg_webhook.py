@@ -1,4 +1,7 @@
+import hmac
 import os
+import re
+import time
 from html import escape
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -6,6 +9,30 @@ import requests
 from fastapi import FastAPI, HTTPException, Request, Response
 
 BOOTSTRAP_ERROR: Dict[str, str] = {}
+IMPORT_FAILED = False
+IMPORT_ERROR = ""
+CALLBACK_ID_TTL_SECONDS = 24 * 60 * 60
+CALLBACK_ID_MAX_ITEMS = 5000
+TG_STATE: Dict[str, Dict[str, float]] = {"processed_callback_ids": {}}
+CA_RE = re.compile(r"^[a-zA-Z0-9]{20,64}$")
+ACTION_ALIASES = {
+    "pf": "pf",
+    "pf_add": "pf",
+    "portfolio": "pf",
+    "portfolio_add": "pf",
+    "discovery_pf_add": "pf",
+    "mn": "mn",
+    "mon_add": "mn",
+    "monitor": "mn",
+    "monitor_add": "mn",
+    "discovery_mon_add": "mn",
+    "rm": "rm",
+    "remove": "rm",
+    "delete": "rm",
+    "archive": "rm",
+}
+from config import CHAINS_DEFAULT
+VALID_CHAINS = {str(c or "").strip().lower() for c in CHAINS_DEFAULT if str(c or "").strip()}
 
 try:
     from app import (
@@ -19,6 +46,7 @@ try:
         get_worker_runtime_state,
         load_monitoring,
         load_portfolio,
+        load_tg_state,
         normalize_chain_name,
         normalize_timing_label,
         now_utc_str,
@@ -26,11 +54,14 @@ try:
         parse_float,
         save_monitoring,
         save_portfolio,
+        save_tg_state,
         send_telegram,
         suppress_token,
         trigger_digest_notification,
     )
 except Exception as e:
+    IMPORT_FAILED = True
+    IMPORT_ERROR = str(e)
     BOOTSTRAP_ERROR = {
         "module": "app",
         "helper": "bootstrap_import",
@@ -54,9 +85,20 @@ except Exception as e:
         _ = chain
         return str(addr or "").strip()
 
+    def load_tg_state() -> Dict[str, Any]:
+        return TG_STATE
+
+    def save_tg_state(state: Dict[str, Any]) -> None:
+        TG_STATE.clear()
+        TG_STATE.update(state)
+
+
+def _app_import_failed_response() -> Dict[str, Any]:
+    return {"ok": False, "error": "app_import_failed", "detail": IMPORT_ERROR or BOOTSTRAP_ERROR.get("exception_text", "")}
+
 
 def _require_bootstrap() -> None:
-    if BOOTSTRAP_ERROR:
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
         raise RuntimeError(
             "bootstrap_unavailable:"
             f"{BOOTSTRAP_ERROR.get('helper')}:"
@@ -78,7 +120,8 @@ def tg_token() -> str:
 
 def summary_key_ok(value: str) -> bool:
     expected = os.getenv("TG_SUMMARY_KEY", "").strip()
-    return bool(expected) and value == expected
+    supplied = str(value or "")
+    return bool(expected) and hmac.compare_digest(supplied, expected)
 
 
 def tg_api(method: str, payload: dict) -> dict:
@@ -110,35 +153,125 @@ def _touch_active(row: Dict[str, Any], note: str) -> None:
     row["note"] = note
 
 
+ADDR_ALIAS_FIELDS = (
+    "base_token_address",
+    "base_addr",
+    "token_addr",
+    "token_address",
+    "ca",
+    "address",
+    "pair_address",
+)
+
+
+def _row_matches_token(row: Dict[str, Any], chain: str, ca: str) -> bool:
+    row_chain = normalize_chain_name(row.get("chain", ""))
+    norm_chain, norm_ca = _norm_contract(chain, ca)
+    if not row_chain or row_chain != norm_chain or not norm_ca:
+        return False
+    for field in ADDR_ALIAS_FIELDS:
+        value = str(row.get(field) or "").strip()
+        if value and addr_store(norm_chain, value) == norm_ca:
+            return True
+    return False
+
+
+def _save_result_ok(result: Any) -> bool:
+    if result is None:
+        return True
+    if isinstance(result, dict):
+        return bool(result.get("ok", True))
+    return bool(result)
+
+
+def _processed_callback_store(state: Dict[str, Any]) -> Dict[str, float]:
+    store = state.setdefault("processed_callback_ids", {})
+    if not isinstance(store, dict):
+        store = {}
+        state["processed_callback_ids"] = store
+    return store
+
+
+def _prune_processed_callback_ids(state: Dict[str, Any], now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    store = _processed_callback_store(state)
+    expired = [cb_id for cb_id, ts in store.items() if now - float(ts or 0.0) > CALLBACK_ID_TTL_SECONDS]
+    for cb_id in expired:
+        store.pop(cb_id, None)
+    overflow = len(store) - CALLBACK_ID_MAX_ITEMS
+    if overflow > 0:
+        oldest = sorted(store.items(), key=lambda kv: kv[1])[:overflow]
+        for cb_id, _ in oldest:
+            store.pop(cb_id, None)
+
+
+def _load_callback_state() -> Dict[str, Any]:
+    try:
+        state = load_tg_state()
+        if isinstance(state, dict):
+            return state
+    except Exception as e:
+        print(f"[TG_WEBHOOK] callback state load fallback {type(e).__name__}: {e}", flush=True)
+    return TG_STATE
+
+
+def _save_callback_state(state: Dict[str, Any]) -> None:
+    try:
+        save_tg_state(state)
+    except Exception as e:
+        print(f"[TG_WEBHOOK] callback state save fallback {type(e).__name__}: {e}", flush=True)
+        TG_STATE.clear()
+        TG_STATE.update(state)
+
+
+def _mark_callback_processed(cb_id: Any) -> bool:
+    cb_key = str(cb_id or "").strip()
+    if not cb_key:
+        return False
+    now = time.time()
+    state = _load_callback_state()
+    _prune_processed_callback_ids(state, now)
+    store = _processed_callback_store(state)
+    if cb_key in store:
+        _save_callback_state(state)
+        return True
+    store[cb_key] = now
+    _prune_processed_callback_ids(state, now)
+    _save_callback_state(state)
+    return False
+
+def _canonical_callback_action(action: str) -> str:
+    return ACTION_ALIASES.get(str(action or "").strip()) or ""
+
+
+def _validate_callback_data(action: str, chain: str, ca: str) -> Tuple[bool, str, str, str]:
+    canonical_action = _canonical_callback_action(action)
+    if not canonical_action:
+        return False, "invalid_action", "", ""
+    norm_chain = normalize_chain_name(chain)
+    if norm_chain not in VALID_CHAINS:
+        return False, "invalid_chain", "", ""
+    norm_ca = addr_store(norm_chain, ca)
+    if not CA_RE.fullmatch(norm_ca):
+        return False, "invalid_ca", "", ""
+    return True, canonical_action, norm_chain, norm_ca
+
 def find_token_meta(chain: str, ca: str) -> Dict[str, str]:
-    chain = normalize_chain_name(chain)
-    ca_norm = addr_store(chain, ca)
-
-    def match_addr(row: Dict[str, Any]) -> bool:
-        vals = [
-            row.get("base_addr"),
-            row.get("base_token_address"),
-            row.get("ca"),
-            row.get("address"),
-        ]
-        return any(addr_store(chain, str(v or "")) == ca_norm for v in vals if str(v or "").strip())
-
     for row in load_monitoring():
-        if match_addr(row):
+        if _row_matches_token(row, chain, ca):
             return {
                 "symbol": str(row.get("base_symbol") or row.get("symbol") or "").strip(),
                 "name": str(row.get("name") or row.get("base_symbol") or row.get("symbol") or "").strip(),
             }
 
     for row in load_portfolio():
-        if match_addr(row):
+        if _row_matches_token(row, chain, ca):
             return {
                 "symbol": str(row.get("base_symbol") or row.get("symbol") or "").strip(),
                 "name": str(row.get("name") or row.get("base_symbol") or row.get("symbol") or "").strip(),
             }
 
     return {"symbol": "", "name": ""}
-
 
 def add_contract_to_portfolio(chain: str, ca: str) -> bool:
     chain = normalize_chain_name(chain)
@@ -148,12 +281,9 @@ def add_contract_to_portfolio(chain: str, ca: str) -> bool:
 
     rows = load_portfolio()
     for row in rows:
-        row_chain = normalize_chain_name(row.get("chain", ""))
-        vals = [row.get("base_token_address"), row.get("base_addr"), row.get("ca"), row.get("address")]
-        if row_chain == chain and any(addr_store(chain, str(v or "")) == ca for v in vals if str(v or "").strip()):
+        if _row_matches_token(row, chain, ca):
             _touch_active(row, "added_from_tg_callback")
-            save_portfolio(rows)
-            return True
+            return _save_result_ok(save_portfolio(rows))
 
     new_row: Dict[str, Any] = {k: "" for k in PORTFOLIO_FIELDS}
     new_row.update(
@@ -167,9 +297,7 @@ def add_contract_to_portfolio(chain: str, ca: str) -> bool:
         }
     )
     rows.append(new_row)
-    save_portfolio(rows)
-    return True
-
+    return _save_result_ok(save_portfolio(rows))
 
 def add_contract_to_monitoring(chain: str, ca: str) -> bool:
     chain = normalize_chain_name(chain)
@@ -183,37 +311,82 @@ def add_contract_to_monitoring(chain: str, ca: str) -> bool:
     return str(res.get("status") or "") in {"OK", "OK_DEFERRED", "EXISTS_ACTIVE", "REACTIVATED"}
 
 
-def remove_contract_everywhere(chain: str, ca: str) -> bool:
+def remove_contract_everywhere_atomicish(chain: str, ca: str) -> dict:
     chain = normalize_chain_name(chain)
     ca = addr_store(chain, ca)
+    result = {
+        "ok": False,
+        "portfolio_changed": False,
+        "monitoring_changed": False,
+        "portfolio_saved": False,
+        "monitoring_saved": False,
+        "error": None,
+    }
     if not chain or not ca:
-        return False
+        result["error"] = "invalid_contract"
+        return result
 
-    p_rows = load_portfolio()
+    try:
+        p_rows = load_portfolio()
+        m_rows = load_monitoring()
+    except Exception as e:
+        result["error"] = f"load_failed:{type(e).__name__}:{e}"
+        return result
+
     for row in p_rows:
-        row_chain = normalize_chain_name(row.get("chain", ""))
-        vals = [row.get("base_token_address"), row.get("base_addr"), row.get("ca"), row.get("address")]
-        if row_chain == chain and any(addr_store(chain, str(v or "")) == ca for v in vals if str(v or "").strip()):
+        if _row_matches_token(row, chain, ca):
             row["active"] = "0"
             row["archived"] = "1"
             row["note"] = "removed_from_tg_callback"
             row["updated_at"] = now_utc_str()
-    save_portfolio(p_rows)
+            result["portfolio_changed"] = True
 
-    m_rows = load_monitoring()
     for row in m_rows:
-        row_chain = normalize_chain_name(row.get("chain", ""))
-        vals = [row.get("base_addr"), row.get("base_token_address"), row.get("ca"), row.get("address")]
-        if row_chain == chain and any(addr_store(chain, str(v or "")) == ca for v in vals if str(v or "").strip()):
+        if _row_matches_token(row, chain, ca):
             row["active"] = "0"
             row["archived"] = "1"
             row["status"] = "ARCHIVED"
             row["archived_reason"] = "removed_from_tg_callback"
             row["updated_at"] = now_utc_str()
-    save_monitoring(m_rows)
+            result["monitoring_changed"] = True
 
-    return True
+    try:
+        result["portfolio_saved"] = True if not result["portfolio_changed"] else _save_result_ok(save_portfolio(p_rows))
+    except Exception as e:
+        result["portfolio_saved"] = False
+        result["error"] = f"portfolio_save_failed:{type(e).__name__}:{e}"
+        return result
+    if not result["portfolio_saved"]:
+        result["error"] = "portfolio_save_failed"
+        return result
 
+    if result["portfolio_changed"]:
+        try:
+            persisted = any(_row_matches_token(row, chain, ca) and str(row.get("active") or "") == "0" and str(row.get("archived") or "") == "1" for row in load_portfolio())
+        except Exception as e:
+            result["error"] = f"portfolio_verify_failed:{type(e).__name__}:{e}"
+            return result
+        if not persisted:
+            result["portfolio_saved"] = False
+            result["error"] = "portfolio_verify_failed"
+            return result
+
+    try:
+        result["monitoring_saved"] = True if not result["monitoring_changed"] else _save_result_ok(save_monitoring(m_rows))
+    except Exception as e:
+        result["monitoring_saved"] = False
+        result["error"] = f"monitoring_save_failed:{type(e).__name__}:{e}"
+        return result
+    if not result["monitoring_saved"]:
+        result["error"] = "monitoring_save_failed"
+        return result
+
+    result["ok"] = True
+    return result
+
+
+def remove_contract_everywhere(chain: str, ca: str) -> bool:
+    return bool(remove_contract_everywhere_atomicish(chain, ca).get("ok"))
 
 def _status_text(action: str, chain: str, ca: str) -> str:
     chain_label = normalize_chain_name(chain).upper()
@@ -240,25 +413,31 @@ def _do_action(action: str) -> Callable[[str, str], bool]:
 
 @app.get("/")
 def root():
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+        return _app_import_failed_response()
     return {"ok": True, "service": "dex-scout-tg-webhook"}
 
 
 @app.get("/health")
 def health():
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+        return _app_import_failed_response()
     return {"ok": True}
 
 
 @app.head("/health")
 def health_head():
-    return Response(status_code=200)
+    return Response(status_code=500 if (IMPORT_FAILED or BOOTSTRAP_ERROR) else 200)
 
 
 @app.get("/runtime")
 def runtime():
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+        return _app_import_failed_response()
     try:
         _raise_bootstrap_http_500()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception:
+        return _app_import_failed_response()
     try:
         runtime_state = get_worker_runtime_state() or {}
         if not isinstance(runtime_state, dict):
@@ -301,11 +480,12 @@ def runtime():
 
 @app.post("/tg_webhook")
 async def tg_webhook(req: Request):
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+        return _app_import_failed_response()
     try:
         _raise_bootstrap_http_500()
-    except Exception as e:
-        print(f"[tg_webhook] runtime bootstrap error: {type(e).__name__}: {e}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception:
+        return _app_import_failed_response()
     try:
         data = await req.json()
         cb = data.get("callback_query")
@@ -329,27 +509,52 @@ async def tg_webhook(req: Request):
             )
             return {"ok": True, "ignored": True, "reason": "bad_callback_data"}
 
-        action, chain, ca = parts[0].strip(), parts[1].strip(), parts[2].strip()
-        chain = normalize_chain_name(chain)
-        ca = addr_store(chain, ca)
+        action, raw_chain, raw_ca = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        valid, action_or_reason, chain, ca = _validate_callback_data(action, raw_chain, raw_ca)
+        if not valid:
+            tg_api(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": cb_id,
+                    "text": "Rejected",
+                    "show_alert": False,
+                },
+            )
+            return {"ok": False, "error": action_or_reason}
+
+        duplicate = _mark_callback_processed(cb_id)
+        if duplicate:
+            tg_api(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": cb_id,
+                    "text": "Already processed",
+                    "show_alert": False,
+                },
+            )
+            return {"ok": True, "duplicate": True}
+
         entity_key = canonical_entity_key(chain, ca)
-        print(f"[TG_WEBHOOK] callback raw={raw} action={action} chain={chain} ca={ca} entity_key={entity_key}", flush=True)
+        print(f"[TG_WEBHOOK] callback raw={raw} action={action_or_reason} chain={chain} ca={ca} entity_key={entity_key}", flush=True)
 
         meta = find_token_meta(chain, ca)
         token_label = meta.get("symbol") or meta.get("name") or ca[:8]
         print(f"[TG_WEBHOOK] token_label={token_label}", flush=True)
 
         result_text = "Ignored"
-        if action in ("pf", "pf_add", "portfolio", "portfolio_add", "discovery_pf_add"):
-            add_contract_to_portfolio(chain, ca)
-            result_text = "Added to portfolio"
-        elif action in ("mn", "mon_add", "monitor", "monitor_add", "discovery_mon_add"):
-            add_contract_to_monitoring(chain, ca)
-            result_text = "Added to monitoring"
-        elif action in ("rm", "remove", "delete", "archive"):
-            remove_contract_everywhere(chain, ca)
-            suppress_token(chain, ca, reason="manual_remove_from_tg", days=30)
-            result_text = "Removed / archived"
+        action_ok = False
+        if action_or_reason == "pf":
+            action_ok = add_contract_to_portfolio(chain, ca)
+            result_text = "Added to portfolio" if action_ok else "Portfolio add failed"
+        elif action_or_reason == "mn":
+            action_ok = add_contract_to_monitoring(chain, ca)
+            result_text = "Added to monitoring" if action_ok else "Monitoring add failed"
+        elif action_or_reason == "rm":
+            remove_result = remove_contract_everywhere_atomicish(chain, ca)
+            action_ok = bool(remove_result.get("ok"))
+            if action_ok:
+                suppress_token(chain, ca, reason="manual_remove_from_tg", days=30)
+            result_text = "Removed / archived" if action_ok else f"Remove failed: {remove_result.get('error') or 'unknown'}"
 
         print(f"[TG_WEBHOOK] result={result_text}", flush=True)
 
@@ -394,11 +599,11 @@ async def tg_webhook(req: Request):
                         "reply_markup": {"inline_keyboard": []},
                     },
                 )
+        return {"ok": action_ok}
 
     except Exception as e:
         print(f"[tg_webhook] error: {type(e).__name__}: {e}", flush=True)
-
-    return {"ok": True}
+        return {"ok": False, "error": "callback_failed", "detail": str(e)}
 
 
 @app.post("/tg/webhook")
@@ -408,10 +613,12 @@ async def tg_webhook_alias(req: Request):
 
 @app.get("/tg/summary")
 def tg_summary(key: str):
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+        return _app_import_failed_response()
     try:
         _raise_bootstrap_http_500()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception:
+        return _app_import_failed_response()
     if not summary_key_ok(key):
         return {"ok": False, "error": "forbidden"}
     result = trigger_digest_notification(trigger_source="tg_summary", cooldown_seconds=3600, force=False)
@@ -425,10 +632,12 @@ def tg_summary(key: str):
 
 @app.get("/tg/digest")
 def tg_digest(key: str, force: int = 0):
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+        return _app_import_failed_response()
     try:
         _raise_bootstrap_http_500()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception:
+        return _app_import_failed_response()
     if not summary_key_ok(key):
         return {"ok": False, "error": "forbidden"}
     result = trigger_digest_notification(

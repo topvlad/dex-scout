@@ -1,11 +1,16 @@
 # dex.py
 import requests
 from typing import List, Dict, Any
+from urllib.parse import quote
 
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search/?q={q}"
 
 def fetch_pairs_by_query(q: str, timeout: int = 15) -> List[Dict[str, Any]]:
-    r = requests.get(DEXSCREENER_SEARCH.format(q=q), timeout=timeout)
+    query = str(q or "").strip()
+    if not query:
+        return []
+    encoded_q = quote(query, safe="")
+    r = requests.get(DEXSCREENER_SEARCH.format(q=encoded_q), timeout=timeout)
     r.raise_for_status()
     data = r.json()
     return data.get("pairs", []) or []
@@ -70,12 +75,12 @@ def normalize_pair(p: Dict[str, Any]) -> Dict[str, Any]:
 def _to_float(x):
     try:
         return float(x) if x is not None else None
-    except:
+    except (TypeError, ValueError):
         return None
 
 def _to_int(x):
     try:
         return int(x) if x is not None else 0
-    except:
+    except (TypeError, ValueError):
         return 0
 

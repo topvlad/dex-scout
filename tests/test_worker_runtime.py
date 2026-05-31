@@ -58,3 +58,9 @@ def test_early_runner_exception_still_releases_lock(monkeypatch):
     rc = worker.run_job_mode('scan_cycle')
     assert rc == 1
     assert stub.released, 'lock must be released in finally'
+
+
+def test_dispatch_map_validation_catches_non_callable():
+    import pytest
+    with pytest.raises(RuntimeError, match='invalid_job_dispatch_non_callable:bad'):
+        worker.validate_job_dispatch({'ok': lambda: {}, 'bad': 'nope'})

@@ -34,3 +34,26 @@ def test_build_alerts_respects_threshold_and_cooldown(monkeypatch):
     # immediate second run should cooldown-skip
     out2 = alerts.build_alerts(store, min_score=6)
     assert out2 == []
+
+
+def test_purge_expired_does_not_sort_under_cap(monkeypatch):
+    monkeypatch.setattr(alerts, '_now', lambda: 1000.0)
+    store = {('bsc', 'p1'): alerts.WatchItem(1.0, 999.0, 0.0, {'score': 1})}
+    import builtins
+    original_sorted = builtins.sorted
+    monkeypatch.setattr(builtins, 'sorted', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('unexpected sort')))
+    try:
+        alerts.purge_expired(store)
+    finally:
+        monkeypatch.setattr(builtins, 'sorted', original_sorted)
+    assert ('bsc', 'p1') in store
+
+
+def test_purge_expired_overflow_purges_oldest(monkeypatch):
+    monkeypatch.setattr(alerts, '_now', lambda: 1000.0)
+    store = {}
+    for i in range(alerts.WATCH_MAX_ITEMS + 1):
+        store[('bsc', f'p{i}')] = alerts.WatchItem(1.0, float(100 + i), 0.0, {'score': i})
+    alerts.purge_expired(store)
+    assert len(store) == alerts.WATCH_MAX_ITEMS
+    assert ('bsc', 'p0') not in store
