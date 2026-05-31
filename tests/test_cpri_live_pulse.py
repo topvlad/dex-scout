@@ -53,6 +53,7 @@ def test_fake_scan_all_rejected_writes_blocked_reasons(monkeypatch):
 
 
 def test_worker_exception_writes_failed_live_pulse_payload(monkeypatch):
+    monkeypatch.setattr(worker, "app", app)
     writes = []
     monkeypatch.setattr(app, "get_worker_runtime_state", lambda *a, **k: {})
     monkeypatch.setattr(app, "maybe_run_rotating_scanner", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))

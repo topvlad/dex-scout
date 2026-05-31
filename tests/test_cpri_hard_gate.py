@@ -3,6 +3,7 @@ import worker
 
 
 def test_monitor_cycle_archives_hard_gated_rows(monkeypatch):
+    monkeypatch.setattr(worker, "app", app)
     rows = [{"active": "1", "chain": "solana", "base_addr": "milk", "base_symbol": "MILKERS", "status": "UNTRADEABLE", "liq_usd": "0", "vol24_usd": "0"}]
     archived = []
     monkeypatch.setattr(app, "load_monitoring", lambda: rows)
@@ -12,6 +13,7 @@ def test_monitor_cycle_archives_hard_gated_rows(monkeypatch):
     monkeypatch.setattr(app, "flush_monitoring_history_buffer", lambda *a, **k: None)
     monkeypatch.setattr(app, "build_active_monitoring_rows", lambda r: [x for x in r if x.get("active") == "1"])
     monkeypatch.setattr(app, "archive_monitoring", lambda chain, base_addr, reason, revisit_days=0: archived.append((chain, base_addr, reason)) or True)
+    monkeypatch.setattr(app, "update_worker_runtime_state", lambda *args, **kwargs: {"ok": True})
     monkeypatch.setattr(worker, "_record_pulse_history_after_cycle_safe", lambda: {})
     out = worker._run_monitor_cycle()
     assert out["monitor"]["hard_gate_archived"] == 1
