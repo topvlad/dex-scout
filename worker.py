@@ -230,6 +230,8 @@ def _run_scan_cycle() -> Dict[str, Any]:
     updates: Dict[str, Any] = {}
     status = "empty"
     try:
+        if pending:
+            updates["scan_request_worker_consumed_ts"] = app.now_utc_str()
         scan_result = app.maybe_run_rotating_scanner(
             seeds_raw=seeds_raw,
             max_items=max_items,
@@ -237,20 +239,22 @@ def _run_scan_cycle() -> Dict[str, Any]:
             birdeye_limit=birdeye_limit,
         )
         status = "failed" if scan_result.get("error") else "success"
-        if not scan_result.get("error") and not scan_result.get("stats"):
+        stats = scan_result.get("stats", {}) if isinstance(scan_result.get("stats", {}), dict) else {}
+        if not scan_result.get("error") and (not stats or int(app.parse_float(stats.get("seen", stats.get("raw_seen", 0)), 0)) <= 0):
             status = "empty"
-        updates = {
+        updates.update({
             "last_scan_status": status,
-            "last_scan_stats": scan_result.get("stats", {}),
+            "last_scan_stats": stats,
             "last_scan_ts": app.now_utc_str(),
-        }
+        })
     except Exception as exc:
         status = "failed"
-        updates = {
-            "last_scan_status": f"error:scan_cycle_exception:{type(exc).__name__}",
+        updates.update({
+            "last_scan_status": "failed",
+            "last_scan_error": f"scan_cycle_exception:{type(exc).__name__}:{exc}",
             "last_scan_stats": {},
             "last_scan_ts": app.now_utc_str(),
-        }
+        })
         scan_result = {"error": f"{type(exc).__name__}: {exc}", "stats": {}}
     finally:
         if chain_reason:

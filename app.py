@@ -11037,10 +11037,12 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     counts = {"added": 0, "updated_active": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "skipped_wrong_chain": 0, "skipped_major": 0, "skipped_suppressed": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
     counts["raw_seen"] = len(pairs)
+    counts["raw_candidates"] = [dict(r) for r in pairs[:LIVE_PULSE_RAW_MAX] if isinstance(r, dict)]
     debug_log(f"ingest_pairs_raw={len(pairs)}")
     normalized = [r for r in pairs if r is not None]
     normalized = normalized[: max(30, MAX_KEEP)]
     counts["normalized"] = len(normalized)
+    counts["normalized_candidates"] = [dict(r) for r in normalized[:LIVE_PULSE_RAW_MAX] if isinstance(r, dict)]
     debug_log(f"ingest_pairs_normalized={len(normalized)}")
     debug_log(f"ingest_pairs_signalworthy={len([r for r in normalized if is_signal_worthy(r)])}")
     ranked = []
@@ -11275,6 +11277,14 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     save_smart_wallets(smart_wallets)
     debug_log(f"RAW: {len(pairs)}")
     debug_log(f"NORMALIZED: {len(normalized)}")
+    final_rows = []
+    for r in monitoring_rows:
+        r_chain = normalize_chain_name(r.get("chain") or r.get("chainId"))
+        r_addr = addr_store(r_chain, token_ca(r)) if r_chain else ""
+        if r_chain and r_addr and f"{r_chain}:{r_addr}" in seen_token_keys:
+            final_rows.append(r)
+    counts["final_count"] = int(counts.get("added", 0) or 0)
+    counts["final_candidates"] = [dict(r) for r in final_rows[:LIVE_PULSE_TARGET_MAX] if isinstance(r, dict)]
     debug_log(f"FINAL: {counts['added']}")
     return counts
 
@@ -13496,6 +13506,7 @@ def build_market_pulse_cards(
     chain_filter: str = "all",
     limit: int = 8,
     record_pulse_history: Optional[bool] = None,
+    candidate_pool: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     if record_pulse_history is None:
         record_pulse_history = bool(WORKER_FAST_MODE)
@@ -13513,7 +13524,10 @@ def build_market_pulse_cards(
         if str(k or "").strip()
     }
     active_keys = {_normalize_live_pulse_key(k) for k in (active_monitoring_keys or set()) if str(k or "").strip()}
-    discovery_pool = build_discovery_candidate_pool(monitoring_rows=monitoring_rows, portfolio_rows=portfolio_rows, limit=raw_depth_limit)
+    if candidate_pool is not None:
+        discovery_pool = [dict(r) for r in candidate_pool if isinstance(r, dict)]
+    else:
+        discovery_pool = build_discovery_candidate_pool(monitoring_rows=monitoring_rows, portfolio_rows=portfolio_rows, limit=raw_depth_limit)
     pulse_cards: List[Dict[str, Any]] = []
     seen: Set[str] = set()
     low_liq_skipped = 0
@@ -13668,6 +13682,38 @@ def _live_pulse_empty_reason(status: str, raw_seen: int, final_count: int, block
     return "scanner_returned_no_candidates"
 
 
+
+
+def _live_pulse_candidate_rows_from_scan(scan_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(scan_result, dict):
+        return []
+    stats = scan_result.get("stats", {}) if isinstance(scan_result.get("stats"), dict) else {}
+    candidates = scan_result.get("final_candidates") or scan_result.get("normalized_candidates") or stats.get("normalized_candidates") or scan_result.get("raw_candidates") or stats.get("raw_candidates") or []
+    rows: List[Dict[str, Any]] = []
+    for item in list(candidates or []):
+        if not isinstance(item, dict):
+            continue
+        row = item
+        if not (row.get("chain") or row.get("base_addr") or row.get("base_symbol")) and (row.get("chainId") or row.get("baseToken")):
+            try:
+                normalized = normalize_pair_row(row)
+                row = normalized if isinstance(normalized, dict) else item
+            except Exception:
+                row = item
+        row = dict(row)
+        if not row.get("chain") and row.get("chainId"):
+            row["chain"] = normalize_chain_name(row.get("chainId"))
+        if not row.get("base_addr"):
+            addr = safe_get(row, "baseToken", "address", default="") or row.get("base_token_address") or row.get("address") or row.get("pairAddress")
+            if addr:
+                row["base_addr"] = str(addr).strip()
+        if not row.get("base_symbol"):
+            sym = safe_get(row, "baseToken", "symbol", default="") or row.get("symbol")
+            if sym:
+                row["base_symbol"] = str(sym).strip()
+        rows.append(row)
+    return rows
+
 def build_live_pulse_candidates_payload(
     monitoring_rows: List[Dict[str, Any]],
     portfolio_rows: List[Dict[str, Any]],
@@ -13679,6 +13725,8 @@ def build_live_pulse_candidates_payload(
 ) -> Dict[str, Any]:
     min_target = max(1, int(LIVE_PULSE_TARGET_MIN))
     max_target = max(min_target, int(LIVE_PULSE_TARGET_MAX))
+    scan_result = scan_result or {}
+    candidate_rows = _live_pulse_candidate_rows_from_scan(scan_result)
     cards = build_market_pulse_cards(
         monitoring_rows=monitoring_rows,
         portfolio_rows=portfolio_rows,
@@ -13686,9 +13734,9 @@ def build_live_pulse_candidates_payload(
         chain_filter=chain_filter,
         limit=min(max(int(limit or max_target), min_target), max_target),
         record_pulse_history=False,
+        candidate_pool=candidate_rows if candidate_rows else None,
     )
     stats = st.session_state.get("last_pulse_ui_stats", {}) if isinstance(st.session_state.get("last_pulse_ui_stats"), dict) else {}
-    scan_result = scan_result or {}
     scan_stats = scan_result.get("stats", {}) if isinstance(scan_result.get("stats"), dict) else {}
     raw_candidates = list(scan_result.get("raw_candidates") or scan_stats.get("raw_candidates") or []) if isinstance(scan_result, dict) else []
     normalized_candidates = list(scan_result.get("normalized_candidates") or scan_stats.get("normalized_candidates") or []) if isinstance(scan_result, dict) else []
@@ -15733,6 +15781,37 @@ def render_debug_panel():
             f"empty={runtime.get('notification_empty_cycles', 0)} | "
             f"blocked={runtime.get('notification_blocked_cycles', 0)} | "
             f"failed={runtime.get('notification_failed_cycles', 0)}"
+        )
+
+        st.write("### Scan request")
+        st.caption(
+            f"pending={runtime.get('scan_request_pending', False)} | "
+            f"requested_ts={runtime.get('scan_request_ts') or '—'} | "
+            f"worker_consumed_ts={runtime.get('scan_request_worker_consumed_ts') or '—'} | "
+            f"processed_ts={runtime.get('scan_request_processed_ts') or '—'} | "
+            f"last_scan_status={runtime.get('last_scan_status') or '—'} | "
+            f"last_empty_reason={runtime.get('last_empty_reason') or '—'}"
+        )
+
+        st.write("### Live Pulse")
+        pulse_debug = live_pulse_storage_read()
+        pulse_reasons = pulse_debug.get("blocked_reasons", {}) if isinstance(pulse_debug.get("blocked_reasons", {}), dict) else {}
+        pulse_top_reasons = dict(sorted(pulse_reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]) if pulse_reasons else {}
+        st.caption(
+            f"raw_seen={pulse_debug.get('raw_seen', 0)} | "
+            f"normalized={pulse_debug.get('normalized', 0)} | "
+            f"clean_candidates={pulse_debug.get('clean_candidates', 0)} | "
+            f"final_count={pulse_debug.get('final_count', 0)} | "
+            f"refill_attempts={pulse_debug.get('refill_attempts', 0)} | "
+            f"sources_tried={pulse_debug.get('sources_tried', [])} | "
+            f"top_blocked_reasons={pulse_top_reasons}"
+        )
+
+        st.write("### Hard gate")
+        st.caption(
+            f"hard_gate_archived={runtime.get('hard_gate_archived', 0)} | "
+            f"hard_gate_reasons={runtime.get('hard_gate_reasons', {}) or {}} | "
+            f"hard_gate_symbols={runtime.get('hard_gate_symbols', []) or []}"
         )
 
         st.write("---")
