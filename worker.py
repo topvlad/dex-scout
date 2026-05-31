@@ -228,6 +228,7 @@ def _run_scan_cycle() -> Dict[str, Any]:
         birdeye_limit = BIRDEYE_LIMIT
     scan_result: Dict[str, Any] = {}
     updates: Dict[str, Any] = {}
+    status = "empty"
     try:
         scan_result = app.maybe_run_rotating_scanner(
             seeds_raw=seeds_raw,
@@ -244,6 +245,7 @@ def _run_scan_cycle() -> Dict[str, Any]:
             "last_scan_ts": app.now_utc_str(),
         }
     except Exception as exc:
+        status = "failed"
         updates = {
             "last_scan_status": f"error:scan_cycle_exception:{type(exc).__name__}",
             "last_scan_stats": {},
@@ -272,32 +274,33 @@ def _run_scan_cycle() -> Dict[str, Any]:
             active_monitoring_keys=active_keys,
             chain_filter="all",
             limit=15,
+            scan_result=scan_result,
+            status=status,
         )
-        stats = scan_result.get("stats", {}) if isinstance(scan_result.get("stats"), dict) else {}
-        payload["scan_debug"] = {
-            "raw_candidates": int(stats.get("seen", payload.get("raw_seen", 0)) or 0),
-            "normalized_candidates": int(stats.get("updated_active", 0) or 0),
-            "rejected_candidates": {
-                "scam": int(payload.get("scam_filtered", 0) or 0),
-                "archive": int(stats.get("skipped_archived", 0) or 0),
-                "duplicate": int(payload.get("duplicate_filtered", 0) or 0),
-            },
-            "final_candidates": int(payload.get("final_count", 0) or 0),
-        }
-        if payload.get("final_count", 0) == 0:
-            if scan_result.get("error"):
-                payload["last_empty_reason"] = "worker_error"
-            elif payload.get("raw_seen", 0) <= 0:
-                payload["last_empty_reason"] = "source_api_empty"
-            elif payload.get("scam_filtered", 0) >= payload.get("raw_seen", 0):
-                payload["last_empty_reason"] = "all_filtered_scam"
-            elif payload.get("duplicate_filtered", 0) >= payload.get("raw_seen", 0):
-                payload["last_empty_reason"] = "all_filtered_duplicate"
-            else:
-                payload["last_empty_reason"] = "scanner_returned_no_candidates"
-        app.update_worker_runtime_state(updates={"live_pulse_candidates": payload})
+        app.live_pulse_storage_write(payload)
+        app.update_worker_runtime_state(updates={"live_pulse_candidates": payload, "last_empty_reason": payload.get("last_empty_reason", "")})
     except Exception as pulse_exc:
-        app.update_worker_runtime_state(updates={"live_pulse_candidates": {"source": "d1", "final_candidates": [], "final_count": 0, "last_empty_reason": f"worker_failed:{type(pulse_exc).__name__}"}})
+        failed_payload = {
+            "ts_utc": app.now_utc_str(),
+            "source": "scan_cycle",
+            "status": "failed",
+            "raw_seen": 0,
+            "normalized": 0,
+            "clean_candidates": 0,
+            "final_count": 0,
+            "refill_attempts": 0,
+            "last_empty_reason": "worker_failed",
+            "sources_tried": [],
+            "blocked_reasons": {"worker_failed": 1},
+            "final_candidates": [],
+            "rejected_candidates": [],
+            "debug": {"error": f"{type(pulse_exc).__name__}: {pulse_exc}"},
+        }
+        try:
+            app.live_pulse_storage_write(failed_payload)
+        except Exception:
+            pass
+        app.update_worker_runtime_state(updates={"live_pulse_candidates": failed_payload, "last_empty_reason": "worker_failed"})
     pulse_result = _record_pulse_history_after_cycle_safe()
     return {"scan": scan_result, "pulse_history": pulse_result}
 
@@ -340,8 +343,10 @@ def _run_monitor_cycle() -> Dict[str, Any]:
     hard_gate_reasons: Dict[str, int] = {}
     hard_gate_symbols: List[str] = []
     for row in app.build_active_monitoring_rows(monitoring_rows):
-        reasons = app._priority_hard_gate_reasons(row)
-        if not reasons:
+        portfolio_row = app.find_active_portfolio_row(row, portfolio_rows) if hasattr(app, "find_active_portfolio_row") else {}
+        gate = app.hard_gate_monitoring_row(row, portfolio_row=portfolio_row) if hasattr(app, "hard_gate_monitoring_row") else {"blocked": False, "reason": "", "flags": []}
+        reasons = [str(r) for r in str(gate.get("reason") or "").split("|") if str(r).strip()]
+        if not gate.get("blocked"):
             continue
         chain = app.token_chain(row)
         base_addr = app.token_ca(row)
@@ -355,6 +360,14 @@ def _run_monitor_cycle() -> Dict[str, Any]:
     monitor_result["hard_gate_archived"] = int(hard_gate_archived)
     monitor_result["hard_gate_reasons"] = hard_gate_reasons
     monitor_result["hard_gate_symbols"] = hard_gate_symbols[:25]
+    try:
+        app.update_worker_runtime_state(updates={
+            "hard_gate_archived": int(hard_gate_archived),
+            "hard_gate_reasons": hard_gate_reasons,
+            "hard_gate_symbols": hard_gate_symbols[:25],
+        })
+    except Exception:
+        pass
     pulse_result = _record_pulse_history_after_cycle_safe()
     return {"monitor": monitor_result, "pulse_history": pulse_result}
 

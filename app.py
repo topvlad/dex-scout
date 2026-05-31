@@ -1703,6 +1703,8 @@ LIVE_PULSE_TARGET_MIN = max(1, _env_int("LIVE_PULSE_TARGET_MIN", 5))
 LIVE_PULSE_TARGET_MAX = max(LIVE_PULSE_TARGET_MIN, _env_int("LIVE_PULSE_TARGET_MAX", 15))
 LIVE_PULSE_RAW_MAX = max(1, _env_int("LIVE_PULSE_RAW_MAX", 200))
 LIVE_PULSE_REFILL_BATCH_SIZE = max(1, _env_int("LIVE_PULSE_REFILL_BATCH_SIZE", 50))
+LIVE_PULSE_REFILL_MAX_ATTEMPTS = max(0, _env_int("LIVE_PULSE_REFILL_MAX_ATTEMPTS", 3))
+LIVE_PULSE_STORAGE_KEY = "live_pulse_candidates.json"
 MIN_TXNS_5M = 5
 MIN_VOL_5M = 1500
 MAX_KEEP = int(os.getenv("SCANNER_MAX_KEEP", "80"))
@@ -11034,9 +11036,11 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     preset = PRESETS.get(window_name, PRESETS.get("Wide Net (explore)", {}))
     counts = {"added": 0, "updated_active": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "skipped_wrong_chain": 0, "skipped_major": 0, "skipped_suppressed": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
+    counts["raw_seen"] = len(pairs)
     debug_log(f"ingest_pairs_raw={len(pairs)}")
     normalized = [r for r in pairs if r is not None]
     normalized = normalized[: max(30, MAX_KEEP)]
+    counts["normalized"] = len(normalized)
     debug_log(f"ingest_pairs_normalized={len(normalized)}")
     debug_log(f"ingest_pairs_signalworthy={len([r for r in normalized if is_signal_worthy(r)])}")
     ranked = []
@@ -13432,6 +13436,59 @@ def evaluate_live_pulse_scam_gate(row_or_payload: Dict[str, Any]) -> Dict[str, A
     return {"blocked": severity == "block", "score": round(score, 2), "reasons": reasons, "severity": severity}
 
 
+def _normalize_live_pulse_key(key: str) -> str:
+    key = str(key or "").strip().replace(":", "|")
+    if "|ca|" in key:
+        parts = key.split("|", 2)
+        if len(parts) == 3:
+            return f"{parts[0]}|ca:{parts[2]}"
+    parts = key.split("|", 1)
+    if len(parts) == 2 and parts[0] in ALLOWED_CHAINS and not any(parts[1].startswith(prefix) for prefix in ("ca:", "pair:", "sym:")):
+        return f"{parts[0]}|ca:{parts[1]}"
+    return key
+
+
+def _live_pulse_reject(row: Dict[str, Any], reason: str, rejected: List[Dict[str, Any]], blocked_reasons: Dict[str, int]) -> None:
+    reason = str(reason or "unknown_empty").strip() or "unknown_empty"
+    blocked_reasons[reason] = int(blocked_reasons.get(reason, 0) or 0) + 1
+    rejected.append({
+        "chain": token_chain(row),
+        "base_addr": token_ca(row),
+        "base_symbol": str(row.get("base_symbol") or row.get("symbol") or "").strip(),
+        "reason": reason,
+    })
+
+
+def live_pulse_storage_read() -> Dict[str, Any]:
+    raw = storage_read_text(LIVE_PULSE_STORAGE_KEY)
+    if not raw:
+        return {
+            "ts_utc": "",
+            "source": "scan_cycle",
+            "status": "empty",
+            "raw_seen": 0,
+            "normalized": 0,
+            "clean_candidates": 0,
+            "final_count": 0,
+            "refill_attempts": 0,
+            "last_empty_reason": "scan_not_run",
+            "sources_tried": [],
+            "blocked_reasons": {},
+            "final_candidates": [],
+            "rejected_candidates": [],
+            "debug": {},
+        }
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {"status": "failed", "last_empty_reason": "worker_failed", "debug": {"decode_error": True}}
+
+
+def live_pulse_storage_write(payload: Dict[str, Any]) -> bool:
+    return storage_write_text(LIVE_PULSE_STORAGE_KEY, json.dumps(payload or {}, ensure_ascii=False, default=str))
+
+
 def build_market_pulse_cards(
     monitoring_rows: List[Dict[str, Any]],
     portfolio_rows: List[Dict[str, Any]],
@@ -13445,71 +13502,84 @@ def build_market_pulse_cards(
     scan_state = scanner_state_load() or {}
     queue_state = scan_state.get("queue_state", {}) if isinstance(scan_state.get("queue_state"), dict) else {}
     runtime = scan_state.get("worker_runtime", {}) if isinstance(scan_state.get("worker_runtime"), dict) else {}
-    runtime_keys = {str(k or "").replace(":", "|") for k in list(runtime.get("last_candidate_keys", []) or []) if str(k or "").strip()}
-    queue_keys = {str(k or "").replace(":", "|") for k in queue_state.keys() if str(k or "").strip()}
+    runtime_keys = {_normalize_live_pulse_key(k) for k in list(runtime.get("last_candidate_keys", []) or []) if str(k or "").strip()}
+    queue_keys = {_normalize_live_pulse_key(k) for k in queue_state.keys() if str(k or "").strip()}
     requested_limit = max(1, int(limit or LIVE_PULSE_TARGET_MAX))
     render_limit = min(requested_limit, LIVE_PULSE_TARGET_MAX)
     raw_depth_limit = max(1, int(LIVE_PULSE_RAW_MAX))
     recent_shown_keys = {
-        str(k or "").replace(":", "|")
+        _normalize_live_pulse_key(k)
         for k in list(runtime.get("last_pulse_recent_keys", []) or [])
         if str(k or "").strip()
     }
+    active_keys = {_normalize_live_pulse_key(k) for k in (active_monitoring_keys or set()) if str(k or "").strip()}
     discovery_pool = build_discovery_candidate_pool(monitoring_rows=monitoring_rows, portfolio_rows=portfolio_rows, limit=raw_depth_limit)
     pulse_cards: List[Dict[str, Any]] = []
     seen: Set[str] = set()
     low_liq_skipped = 0
-    filtered_out = 0
+    duplicate_filtered = 0
     scam_blocked = 0
-    scam_reasons: Dict[str, int] = {}
     refill_attempts = 0
     scan_cursor = 0
-    while scan_cursor < len(discovery_pool) and scan_cursor < raw_depth_limit:
+    batch_attempts = 0
+    sources_tried: List[str] = []
+    rejected_candidates: List[Dict[str, Any]] = []
+    blocked_reasons: Dict[str, int] = {}
+    max_batches = max(1, 1 + int(LIVE_PULSE_REFILL_MAX_ATTEMPTS))
+    while scan_cursor < len(discovery_pool) and scan_cursor < raw_depth_limit and batch_attempts < max_batches:
         if len(pulse_cards) >= LIVE_PULSE_TARGET_MAX:
             break
-        refill_attempts += 1
+        batch_attempts += 1
+        if batch_attempts > 1:
+            refill_attempts += 1
+        sources_tried.append(f"discovery_pool:{batch_attempts}")
         batch_end = min(scan_cursor + LIVE_PULSE_REFILL_BATCH_SIZE, len(discovery_pool), raw_depth_limit)
         for row in discovery_pool[scan_cursor:batch_end]:
             key = canonical_token_key(row)
+            key_norm = _normalize_live_pulse_key(key)
             chain = token_chain(row)
-            if not key or key in seen:
-                filtered_out += 1
+            if not key_norm or key_norm in seen:
+                duplicate_filtered += 1
+                _live_pulse_reject(row, "all_filtered_duplicate", rejected_candidates, blocked_reasons)
                 continue
-            if key in active_monitoring_keys:
-                filtered_out += 1
+            if key_norm in active_keys:
+                duplicate_filtered += 1
+                _live_pulse_reject(row, "all_filtered_duplicate", rejected_candidates, blocked_reasons)
                 continue
-            if key in recent_shown_keys:
-                filtered_out += 1
+            if key_norm in recent_shown_keys:
+                duplicate_filtered += 1
+                _live_pulse_reject(row, "all_filtered_duplicate", rejected_candidates, blocked_reasons)
                 continue
             if chain_filter in {"bsc", "solana"} and chain != chain_filter:
+                _live_pulse_reject(row, "scanner_returned_no_candidates", rejected_candidates, blocked_reasons)
                 continue
-            seen.add(key)
-            queue_row = queue_state.get(key.replace("|", ":"), {}) if isinstance(queue_state, dict) else {}
+            seen.add(key_norm)
+            queue_row = queue_state.get(key_norm.replace("|ca:", ":"), {}) if isinstance(queue_state, dict) else {}
             freshness_min = _pulse_freshness_minutes(row, queue_row if isinstance(queue_row, dict) else {})
             score = parse_float(row.get("entry_score", row.get("priority_score", row.get("score", 0))), 0.0)
             timing_label = normalize_timing_label(row.get("timing_label") or row.get("entry_status") or row.get("status") or "NEUTRAL")
             timing_bonus = 6.0 if timing_label in {"EARLY", "READY"} else (2.0 if timing_label == "NEUTRAL" else 0.0)
             freshness_bonus = max(0.0, 18.0 - min(freshness_min, 180.0) / 10.0)
-            novelty_bonus = (8.0 if key in runtime_keys else 0.0) + (4.0 if key in queue_keys else 0.0)
+            novelty_bonus = (8.0 if key_norm in runtime_keys else 0.0) + (4.0 if key_norm in queue_keys else 0.0)
             pulse_sort = score + freshness_bonus + novelty_bonus + timing_bonus
             best = best_pair_for_token_cached(chain, token_ca(row)) if chain and token_ca(row) else None
             row["_best_pair"] = best if isinstance(best, dict) else {}
             liq_usd = _pulse_card_liquidity_usd(best if isinstance(best, dict) else None, row)
             if liq_usd < PULSE_MIN_LIQ_USD:
                 low_liq_skipped += 1
-                filtered_out += 1
+                _live_pulse_reject(row, "all_filtered_hard_gate", rejected_candidates, blocked_reasons)
                 continue
             scam_eval = evaluate_live_pulse_scam_gate(row)
             if bool(scam_eval.get("blocked")):
-                filtered_out += 1
                 scam_blocked += 1
-                for reason in list(scam_eval.get("reasons", []) or []):
-                    scam_reasons[reason] = int(scam_reasons.get(reason, 0) or 0) + 1
+                reasons = list(scam_eval.get("reasons", []) or []) or ["scam"]
+                for reason in reasons:
+                    _live_pulse_reject(row, "all_filtered_scam" if reason == "scam" else str(reason), rejected_candidates, blocked_reasons)
                 continue
             pulse_cards.append(
                 {
                     "row": row,
-                    "key": key,
+                    "key": key_norm,
                     "chain": chain,
                     "score": round(score, 2),
                     "timing": timing_label,
@@ -13533,11 +13603,11 @@ def build_market_pulse_cards(
                 "timing_label": timing_label,
             }
             if record_pulse_history:
-                _append_pulse_history_point(key, point)
+                _append_pulse_history_point(key_norm, point)
             if len(pulse_cards) >= LIVE_PULSE_TARGET_MAX:
                 break
         scan_cursor = batch_end
-        if len(pulse_cards) >= LIVE_PULSE_TARGET_MIN and refill_attempts >= 1:
+        if len(pulse_cards) >= LIVE_PULSE_TARGET_MIN:
             break
     pulse_cards.sort(
         key=lambda x: (
@@ -13553,14 +13623,19 @@ def build_market_pulse_cards(
         card["mini_sparkline"] = _pulse_card_mini_sparkline(row)
     st.session_state["last_pulse_ui_stats"] = {
         "raw_seen": int(min(scan_cursor, raw_depth_limit)),
-        "duplicate_filtered": int(filtered_out),
-        "filtered_out": int(filtered_out),
+        "normalized": int(len(discovery_pool)),
+        "duplicate_filtered": int(duplicate_filtered),
+        "filtered_out": int(len(rejected_candidates)),
         "last_pulse_scam_blocked": int(scam_blocked),
         "scam_blocked": int(scam_blocked),
-        "last_pulse_scam_reasons": dict(scam_reasons),
+        "last_pulse_scam_reasons": dict(blocked_reasons),
+        "blocked_reasons": dict(blocked_reasons),
+        "rejected_candidates": rejected_candidates[:50],
         "clean_candidates": int(len(pulse_cards)),
         "final_pulse_candidates": int(len(selected_cards)),
         "refill_attempts": int(refill_attempts),
+        "sources_tried": sources_tried,
+        "low_liq_skipped": int(low_liq_skipped),
     }
     if low_liq_skipped > 0:
         debug_log(
@@ -13568,10 +13643,29 @@ def build_market_pulse_cards(
         )
     if record_pulse_history:
         _flush_pulse_history_buffer()
-    if scam_reasons:
-        top = sorted(scam_reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]
-        debug_log("pulse_scam_gate_reasons " + ", ".join(f"{k}={v}" for k, v in top))
+    if blocked_reasons:
+        top = sorted(blocked_reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        debug_log("pulse_blocked_reasons " + ", ".join(f"{k}={v}" for k, v in top))
     return selected_cards
+
+def _live_pulse_empty_reason(status: str, raw_seen: int, final_count: int, blocked_reasons: Dict[str, int], error: str = "") -> str:
+    if str(status) == "failed" or error:
+        return "worker_failed"
+    if final_count > 0:
+        return ""
+    if raw_seen <= 0:
+        return "source_api_empty"
+    if blocked_reasons:
+        top_reason = sorted(blocked_reasons.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+        if top_reason in {
+            "all_filtered_archive",
+            "all_filtered_scam",
+            "all_filtered_duplicate",
+            "all_filtered_hard_gate",
+            "scanner_returned_no_candidates",
+        }:
+            return top_reason
+    return "scanner_returned_no_candidates"
 
 
 def build_live_pulse_candidates_payload(
@@ -13580,6 +13674,8 @@ def build_live_pulse_candidates_payload(
     active_monitoring_keys: Set[str],
     chain_filter: str = "all",
     limit: int = 15,
+    scan_result: Optional[Dict[str, Any]] = None,
+    status: str = "success",
 ) -> Dict[str, Any]:
     min_target = max(1, int(LIVE_PULSE_TARGET_MIN))
     max_target = max(min_target, int(LIVE_PULSE_TARGET_MAX))
@@ -13592,26 +13688,101 @@ def build_live_pulse_candidates_payload(
         record_pulse_history=False,
     )
     stats = st.session_state.get("last_pulse_ui_stats", {}) if isinstance(st.session_state.get("last_pulse_ui_stats"), dict) else {}
+    scan_result = scan_result or {}
+    scan_stats = scan_result.get("stats", {}) if isinstance(scan_result.get("stats"), dict) else {}
+    raw_candidates = list(scan_result.get("raw_candidates") or scan_stats.get("raw_candidates") or []) if isinstance(scan_result, dict) else []
+    normalized_candidates = list(scan_result.get("normalized_candidates") or scan_stats.get("normalized_candidates") or []) if isinstance(scan_result, dict) else []
+    rejected_candidates = list(stats.get("rejected_candidates") or [])
+    if isinstance(scan_result.get("rejected_candidates"), list):
+        rejected_candidates = list(scan_result.get("rejected_candidates") or []) + rejected_candidates
+    raw_seen = int(parse_float(scan_stats.get("seen", 0), 0))
+    if raw_candidates:
+        raw_seen = max(raw_seen, len(raw_candidates))
+    raw_seen = max(raw_seen, int(parse_float(stats.get("raw_seen", 0), 0)))
+    normalized = int(parse_float(scan_stats.get("normalized", scan_stats.get("updated_active", 0)), 0))
+    if normalized_candidates:
+        normalized = max(normalized, len(normalized_candidates))
+    normalized = max(normalized, int(parse_float(stats.get("normalized", 0), 0)))
+    blocked_reasons = stats.get("blocked_reasons", stats.get("last_pulse_scam_reasons", {})) if isinstance(stats.get("blocked_reasons", stats.get("last_pulse_scam_reasons", {})), dict) else {}
+    if int(parse_float(scan_stats.get("skipped_archived", 0), 0)) > 0:
+        blocked_reasons = dict(blocked_reasons)
+        blocked_reasons["all_filtered_archive"] = int(blocked_reasons.get("all_filtered_archive", 0) or 0) + int(parse_float(scan_stats.get("skipped_archived", 0), 0))
+    clean_candidates = int(parse_float(stats.get("clean_candidates", len(cards)), len(cards)))
+    final_count = int(len(cards))
+    payload_status = str(status or "success")
+    if final_count <= 0 and payload_status == "success":
+        payload_status = "empty"
+    error = str(scan_result.get("error") or "") if isinstance(scan_result, dict) else ""
+    last_empty_reason = _live_pulse_empty_reason(payload_status, raw_seen, final_count, blocked_reasons, error=error)
     return {
-        "source": "d1",
+        "ts_utc": now_utc_str(),
+        "source": "scan_cycle",
+        "status": payload_status,
+        "raw_seen": raw_seen,
+        "normalized": normalized,
+        "clean_candidates": clean_candidates,
+        "final_count": final_count,
+        "refill_attempts": int(parse_float(stats.get("refill_attempts", 0), 0)),
+        "last_empty_reason": last_empty_reason,
+        "sources_tried": list(stats.get("sources_tried") or []),
+        "blocked_reasons": blocked_reasons,
+        "final_candidates": cards,
+        "rejected_candidates": rejected_candidates[:100],
+        "debug": {
+            "scan_stats": scan_stats,
+            "error": error,
+            "raw_candidates_count": len(raw_candidates),
+            "normalized_candidates_count": len(normalized_candidates),
+            "target_min": int(min_target),
+            "target_max": int(max_target),
+        },
+        # backward-compatible aliases used by older UI/tests
         "last_scan_ts": now_utc_str(),
-        "raw_seen": int(parse_float(stats.get("raw_seen", 0), 0)),
         "duplicate_filtered": int(parse_float(stats.get("duplicate_filtered", stats.get("filtered_out", 0)), 0)),
         "scam_filtered": int(parse_float(stats.get("scam_blocked", stats.get("last_pulse_scam_blocked", 0)), 0)),
-        "final_count": int(len(cards)),
-        "blocked_reasons": stats.get("last_pulse_scam_reasons", {}) if isinstance(stats.get("last_pulse_scam_reasons"), dict) else {},
-        "final_candidates": cards,
+        "scan_debug": {
+            "raw_candidates": raw_seen,
+            "normalized_candidates": normalized,
+            "rejected_candidates": blocked_reasons,
+            "final_candidates": final_count,
+        },
     }
 
 
-def _priority_hard_gate_reasons(row: Dict[str, Any]) -> List[str]:
+MATERIAL_PORTFOLIO_ACTIONS = {"EXIT", "REDUCE", "TAKE_PROFIT", "PARTIAL_TP", "PROTECT", "CLOSE", "TRIM", "TAKE PROFIT"}
+
+
+def normalize_material_portfolio_action(value: Any) -> str:
+    action = str(value or "").strip().upper()
+    action_us = action.replace(" ", "_")
+    if action_us == "TAKE_PROFIT":
+        return "TAKE PROFIT"
+    if action_us in MATERIAL_PORTFOLIO_ACTIONS:
+        return action_us
+    return action
+
+
+def find_active_portfolio_row(row: Dict[str, Any], portfolio_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    key = canonical_token_key(row)
+    for p in portfolio_rows or []:
+        if str(p.get("active", "1")).strip() != "1":
+            continue
+        if key and canonical_token_key(p) == key:
+            return p
+    return {}
+
+
+def hard_gate_monitoring_row(row: Dict[str, Any], portfolio_row: Optional[Dict[str, Any]] = None, history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    _ = history
     reasons: List[str] = []
+    flags: List[str] = []
     health = str(row.get("health_label") or "").upper()
     status = str(row.get("entry_status") or row.get("status") or "").upper()
     action = str(row.get("final_action") or row.get("entry_action") or "").upper()
-    liq = parse_float(row.get("liq_usd", row.get("liquidity", row.get("liquidity_usd", 0))), 0.0)
+    liq = parse_float(row.get("liq_usd", row.get("liquidity", row.get("liquidity_usd", row.get("liq_init", 0)))), 0.0)
     vol24 = parse_float(row.get("vol24_usd", row.get("vol24_init", 0)), 0.0)
-    pc24 = parse_float(row.get("pc24h", row.get("price_change_h24", 0)), 0.0)
+    pc24 = parse_float(row.get("pc24h", row.get("price_change_h24", row.get("pc24", 0))), 0.0)
+    pc1h = parse_float(row.get("pc1h", row.get("price_change_h1", 0)), 0.0)
     reason_text = " ".join([
         health,
         status,
@@ -13619,12 +13790,15 @@ def _priority_hard_gate_reasons(row: Dict[str, Any]) -> List[str]:
         str(row.get("entry_reason") or ""),
         str(row.get("archived_reason") or ""),
         str(row.get("lifecycle") or ""),
+        str(row.get("risk_flags") or ""),
+        str(row.get("toxic_flags") or ""),
+        str(row.get("why") or ""),
     ]).upper()
     if "POST_PUMP_COLLAPSE" in reason_text or "EXTREME_PUMP_THEN_DUMP" in reason_text:
         reasons.append("post_pump_collapse")
-    if "UNTRADEABLE" in reason_text:
+    if "UNTRADEABLE" in reason_text or status == "UNTRADEABLE" or action == "UNTRADEABLE":
         reasons.append("untradeable")
-    if any(x in reason_text for x in ("DEAD", "SCAM", "TOXIC")):
+    if any(x in reason_text for x in ("DEAD", "SCAM", "TOXIC", "HONEYPOT", "RUG")):
         reasons.append("dead_or_scam")
     if any(x in reason_text for x in ("NO LIQUIDITY", "NO_LIQUIDITY")) or liq <= 0:
         reasons.append("no_liquidity")
@@ -13632,11 +13806,28 @@ def _priority_hard_gate_reasons(row: Dict[str, Any]) -> List[str]:
         reasons.append("no_recent_flow")
     if liq > 0 and vol24 > 0 and (vol24 / max(liq, 1.0)) < 0.08:
         reasons.append("liquidity_volume_decay")
-    if pc24 <= -24.0 and liq < 15_000:
+    if (pc24 <= -24.0 or pc1h <= -20.0) and liq < 15_000:
         reasons.append("24h_collapse_low_liq")
-    if status in {"NO_ENTRY", "AVOID"}:
+    if status in {"NO_ENTRY", "AVOID"} or action == "NO_ENTRY":
         reasons.append("no_entry")
-    return sorted(set(reasons))
+    pf_action = ""
+    if portfolio_row:
+        pf_action = normalize_material_portfolio_action(portfolio_row.get("final_action") or portfolio_row.get("recommended_action") or portfolio_row.get("position_action"))
+        mon_label = str(row.get("entry_status") or row.get("status") or row.get("timing_label") or "").upper()
+        if pf_action in {"EXIT", "REDUCE"} and mon_label in {"WATCH", "EARLY", "READY", "ACTIVE"}:
+            reasons.append("portfolio_verdict_conflict")
+            flags.append(f"portfolio_{pf_action.lower().replace(' ', '_')}")
+    reasons = sorted(set(reasons))
+    action_out = "KEEP"
+    if any(r in reasons for r in ("dead_or_scam", "no_liquidity", "post_pump_collapse", "untradeable", "portfolio_verdict_conflict")):
+        action_out = "ARCHIVE"
+    elif reasons:
+        action_out = "NO_ENTRY"
+    return {"blocked": bool(reasons), "action": action_out, "reason": "|".join(reasons), "flags": flags + reasons}
+
+
+def _priority_hard_gate_reasons(row: Dict[str, Any]) -> List[str]:
+    return list(hard_gate_monitoring_row(row).get("flags") or [])
 
 
 # =============================
@@ -13958,7 +14149,8 @@ def page_scout(cfg: Dict[str, Any]):
 
 def page_monitoring(auto_cfg: Dict[str, Any]):
     page_t0 = time.perf_counter()
-    UI_RENDER_READONLY = bool(STREAMLIT_FAST_UI_MODE)
+    # Normal Streamlit renders must be read-only for archive/dead state changes; workers own archival writes.
+    UI_RENDER_READONLY = True
     perf_counts: Dict[str, int] = {
         "history_load_count": 0,
         "journal_load_count": 0,
@@ -14069,10 +14261,18 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         f"dispatch_error={runtime_scan.get('scan_request_dispatch_error') or '-'}"
     )
     st.caption(
+        f"worker_consumed_ts={runtime_scan.get('scan_request_worker_consumed_ts') or runtime_scan.get('scan_request_dispatched_ts') or '-'} • "
         f"processed_ts={runtime_scan.get('scan_request_processed_ts') or '-'} • "
         f"last_scan_status={runtime_scan.get('last_scan_status') or '-'} • "
+        f"last_empty_reason={runtime_scan.get('last_empty_reason') or '-'} • "
         f"last_scan_stats={runtime_scan.get('last_scan_stats') or {}}"
     )
+    st.caption(
+        f"Hard gate: archived={runtime_scan.get('hard_gate_archived', 0)} • "
+        f"reasons={runtime_scan.get('hard_gate_reasons', {}) or {}} • "
+        f"symbols={runtime_scan.get('hard_gate_symbols', []) or []}"
+    )
+
     st.caption(
         f"Added: {stats.get('added', 0)} • "
         f"Skipped active: {stats.get('skipped_active', 0)} • "
@@ -14230,15 +14430,24 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     for c in cards_all:
         is_dead = c.get("ui_bucket") == "dead"
         row = c.get("row", {})
-        in_pf = is_in_portfolio_active(row, portfolio_rows)
+        portfolio_row = find_active_portfolio_row(row, portfolio_rows)
+        in_pf = bool(portfolio_row) or is_in_portfolio_active(row, portfolio_rows)
         c["is_portfolio_active"] = in_pf
+        if portfolio_row:
+            pf_action = normalize_material_portfolio_action(portfolio_row.get("final_action") or portfolio_row.get("recommended_action") or portfolio_row.get("position_action") or "HOLD")
+            c["portfolio_display_label"] = f"In portfolio · position verdict: {pf_action or 'HOLD'}"
+            if pf_action in {"EXIT", "REDUCE", "TAKE PROFIT", "PARTIAL_TP", "PROTECT", "CLOSE", "TRIM"}:
+                c["ui_badge"] = f"PORTFOLIO {pf_action}"
+                c["decision"] = f"Portfolio {pf_action}"
         weak_score = float(c.get("ui_visible_score", 0.0)) < 90
         is_review = str(c.get("ui_badge", "")).upper() == "REVIEW" or c.get("ui_bucket") == "review" or weak_score
-        hard_gate_reasons = _priority_hard_gate_reasons(row)
+        hard_gate = hard_gate_monitoring_row(row, portfolio_row=portfolio_row)
+        hard_gate_reasons = list(hard_gate.get("flags") or [])
         c["hard_gate_reasons"] = hard_gate_reasons
+        c["hard_gate_reason"] = str(hard_gate.get("reason") or "")
         if in_pf:
             portfolio_linked_cards.append(c)
-        elif hard_gate_reasons:
+        elif hard_gate.get("blocked"):
             dead_cards.append(c)
         elif STREAMLIT_FAST_UI_MODE and (not run_review_analysis) and (is_dead or is_review):
             hidden_review_dead_count += 1
@@ -14268,7 +14477,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     active_monitoring_keys = {canonical_token_key(r) for r in active_rows_all if canonical_token_key(r)}
     pulse_cards: List[Dict[str, Any]] = []
     runtime_scan = get_worker_runtime_state()
-    pulse_payload = runtime_scan.get("live_pulse_candidates") if isinstance(runtime_scan.get("live_pulse_candidates"), dict) else {}
+    pulse_payload = live_pulse_storage_read()
     if isinstance(pulse_payload.get("final_candidates"), list):
         pulse_cards = list(pulse_payload.get("final_candidates") or [])
 
@@ -14307,7 +14516,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             st.caption(f"Suggested size: {unified.get('size_hint', 'WATCH ONLY')}")
             st.caption(short_caption)
             if item.get("is_portfolio_active"):
-                st.caption("In portfolio • still monitored")
+                st.caption(str(item.get("portfolio_display_label") or "In portfolio · position verdict: HOLD"))
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -14417,7 +14626,7 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
     pulse_runtime = pulse_payload if isinstance(pulse_payload, dict) else {}
     st.caption(
         f"raw_seen={int(parse_float(pulse_runtime.get('raw_seen', 0), 0))} • "
-        f"normalized={int(parse_float((pulse_runtime.get('scan_debug', {}) or {}).get('normalized_candidates', 0), 0))} • "
+        f"normalized={int(parse_float(pulse_runtime.get('normalized', (pulse_runtime.get('scan_debug', {}) or {}).get('normalized_candidates', 0)), 0))} • "
         f"duplicate_filtered={int(parse_float(pulse_runtime.get('duplicate_filtered', pulse_runtime.get('filtered_out', 0)), 0))} • "
         f"scam_blocked={int(parse_float(pulse_runtime.get('scam_blocked', pulse_runtime.get('last_pulse_scam_blocked', 0)), 0))} • "
         f"archived_blocked={int(parse_float(((pulse_runtime.get('scan_debug', {}) or {}).get('rejected_candidates', {}) or {}).get('archive', 0), 0))} • "
@@ -14425,10 +14634,11 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         f"refill_attempts={int(parse_float(pulse_runtime.get('refill_attempts', 0), 0))} • "
         f"final_count={int(parse_float(pulse_runtime.get('final_count', len(pulse_cards)), len(pulse_cards)))}"
     )
-    reason_stats = pulse_runtime.get("last_pulse_scam_reasons", {}) if isinstance(pulse_runtime.get("last_pulse_scam_reasons"), dict) else {}
+    reason_stats = pulse_runtime.get("blocked_reasons", pulse_runtime.get("last_pulse_scam_reasons", {})) if isinstance(pulse_runtime.get("blocked_reasons", pulse_runtime.get("last_pulse_scam_reasons", {})), dict) else {}
     if reason_stats:
         top_reasons = sorted(reason_stats.items(), key=lambda kv: kv[1], reverse=True)[:3]
-        st.caption("scam gate reasons: " + " • ".join(f"{k}={v}" for k, v in top_reasons))
+        st.caption("blocked top reasons: " + " • ".join(f"{k}={v}" for k, v in top_reasons))
+    st.caption("sources_tried: " + (", ".join(map(str, pulse_runtime.get("sources_tried") or [])) or "-"))
     if STREAMLIT_FAST_UI_MODE:
         st.caption("Fast UI mode: pulse/history enrichment is disabled by default.")
     elif not pulse_cards:
@@ -14618,7 +14828,10 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
                 chain = (r.get("chain") or "").strip().lower()
                 flags = item.get("ui_flags") or []
                 st.write(f"{name} ({chain}) • {item.get('decision', 'DEAD')}")
+                gate_reason = str(item.get("hard_gate_reason") or "")
                 st.caption("Flags: " + (" • ".join(flags) if flags else "none"))
+                if gate_reason:
+                    st.caption(f"Hard gate: {gate_reason}")
 
 def page_archive():
     st.title("Archive")
