@@ -459,11 +459,28 @@ JOB_DISPATCH: Dict[str, Callable[[], Dict[str, Any]]] = {
 }
 
 
+def validate_job_dispatch(dispatch: Dict[str, Any] | None = None) -> None:
+    dispatch = JOB_DISPATCH if dispatch is None else dispatch
+    bad = [str(name) for name, runner in dispatch.items() if not callable(runner)]
+    if bad:
+        raise RuntimeError(f"invalid_job_dispatch_non_callable:{','.join(sorted(bad))}")
+
+
+validate_job_dispatch(JOB_DISPATCH)
+
+
 def run_job_mode(job_mode: str) -> int:
     assert app is not None
     mode = str(job_mode or "").strip().lower()
     lock_key = None
     owner = f"{socket.gethostname()}:{os.getpid()}"
+    try:
+        validate_job_dispatch(JOB_DISPATCH)
+    except RuntimeError as e:
+        reason = str(e)
+        print(f"[worker] safe-fail: {reason}", flush=True)
+        return 2
+
     runner = JOB_DISPATCH.get(mode)
 
     if runner is None:

@@ -40,12 +40,8 @@ def purge_expired(store: Dict[Key, WatchItem]) -> None:
     for k in dead:
         store.pop(k, None)
 
-    # FIX #4: use >= so the cap is enforced even when len == WATCH_MAX_ITEMS.
-    # Previously `> WATCH_MAX_ITEMS` meant the store could sit exactly at the
-    # limit indefinitely without ever evicting the oldest entry.
-    if len(store) >= WATCH_MAX_ITEMS:
-        # Remove oldest entries until we are below the cap.
-        excess = len(store) - WATCH_MAX_ITEMS + 1  # +1 to make room for next upsert
+    if len(store) > WATCH_MAX_ITEMS:
+        excess = len(store) - WATCH_MAX_ITEMS
         oldest = sorted(store.items(), key=lambda kv: kv[1].last_seen)[:excess]
         for k, _ in oldest:
             store.pop(k, None)
