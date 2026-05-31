@@ -8,6 +8,8 @@ from typing import Any, Callable, Dict, List, Tuple
 import requests
 from fastapi import FastAPI, HTTPException, Request, Response
 
+from runtime_core import addr_store, canonical_entity_key, normalize_chain_name, now_utc_str
+
 BOOTSTRAP_ERROR: Dict[str, str] = {}
 IMPORT_FAILED = False
 IMPORT_ERROR = ""
@@ -58,8 +60,6 @@ try:
     from app import (
         MON_FIELDS,
         PORTFOLIO_FIELDS,
-        addr_store,
-        canonical_entity_key,
         build_active_monitoring_rows,
         build_notification_candidates,
         get_job_heartbeats_snapshot,
@@ -67,11 +67,8 @@ try:
         load_monitoring,
         load_portfolio,
         load_tg_state,
-        normalize_chain_name,
         normalize_timing_label,
-        now_utc_str,
         manual_add_token_to_monitoring,
-        parse_float,
         save_monitoring,
         save_portfolio,
         save_tg_state,
@@ -98,12 +95,6 @@ except Exception as e:
     MON_FIELDS = ["chain", "base_addr", "active", "archived", "status", "updated_at", "note", "archived_reason"]
     PORTFOLIO_FIELDS = ["chain", "base_token_address", "active", "archived", "updated_at", "note"]
 
-    def normalize_chain_name(raw_chain: Any) -> str:
-        return str(raw_chain or "").strip().lower()
-
-    def addr_store(chain: str, addr: str) -> str:
-        _ = chain
-        return str(addr or "").strip()
 
     def load_tg_state() -> Dict[str, Any]:
         return TG_STATE
