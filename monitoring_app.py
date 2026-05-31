@@ -10,24 +10,53 @@
 
 import os
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List
 
 import requests
 import streamlit as st
+
+from config import (
+    MONITORING_DROP_MAX_PC1H_NEG,
+    MONITORING_DROP_MIN_LIQ_USD,
+    MONITORING_DROP_MIN_VOL24_USD,
+    MONITORING_DROP_MIN_VOL5_USD,
+    MONITORING_SCORE_LIQ_CAP,
+    MONITORING_SCORE_LIQ_SCALE,
+    MONITORING_SCORE_PC1H_ABS_CAP,
+    MONITORING_SCORE_PC1H_WEIGHT,
+    MONITORING_SCORE_PC5_ABS_CAP,
+    MONITORING_SCORE_PC5_WEIGHT,
+    MONITORING_SCORE_VOL24_CAP,
+    MONITORING_SCORE_VOL24_SCALE,
+    MONITORING_SCORE_VOL5_CAP,
+    MONITORING_SCORE_VOL5_SCALE,
+)
 
 VERSION = "0.1"
 DEX_BASE = "https://api.dexscreener.com"
 DATA_DIR = "data"
 MONITORING_CSV = os.path.join(DATA_DIR, "monitoring.csv")
 HISTORY_CSV = os.path.join(DATA_DIR, "monitoring_history.csv")
+MONITORING_FIELDS = [
+    "ts_added",
+    "chain",
+    "base_symbol",
+    "base_addr",
+    "pair_addr",
+    "score_init",
+    "liq_init",
+    "vol24_init",
+    "vol5_init",
+    "active",
+]
 
 
 # -----------------------------
 # Utils
 # -----------------------------
 def now_utc() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def safe_float(x, default=0.0):
@@ -59,21 +88,7 @@ def ensure_storage():
 
     if not os.path.exists(MONITORING_CSV):
         with open(MONITORING_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "ts_added",
-                    "chain",
-                    "base_symbol",
-                    "base_addr",
-                    "pair_addr",
-                    "score_init",
-                    "liq_init",
-                    "vol24_init",
-                    "vol5_init",
-                    "active",
-                ],
-            )
+            w = csv.DictWriter(f, fieldnames=MONITORING_FIELDS)
             w.writeheader()
 
     if not os.path.exists(HISTORY_CSV):
@@ -103,8 +118,9 @@ def load_monitoring() -> List[Dict[str, Any]]:
 
 
 def save_monitoring(rows: List[Dict[str, Any]]):
+    fieldnames = list(rows[0].keys()) if rows else MONITORING_FIELDS
     with open(MONITORING_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows:
             w.writerow(r)
@@ -147,11 +163,11 @@ def monitoring_score(liq, vol24, vol5, pc1h, pc5) -> float:
     'Is this token worth surviving WAIT?'
     """
     s = 0.0
-    s += min(liq / 2000, 200)
-    s += min(vol24 / 8000, 200)
-    s += min(vol5 / 1500, 200)
-    s += max(min(pc1h, 30), -30) * 2
-    s += max(min(pc5, 20), -20) * 1.5
+    s += min(liq / MONITORING_SCORE_LIQ_SCALE, MONITORING_SCORE_LIQ_CAP)
+    s += min(vol24 / MONITORING_SCORE_VOL24_SCALE, MONITORING_SCORE_VOL24_CAP)
+    s += min(vol5 / MONITORING_SCORE_VOL5_SCALE, MONITORING_SCORE_VOL5_CAP)
+    s += max(min(pc1h, MONITORING_SCORE_PC1H_ABS_CAP), -MONITORING_SCORE_PC1H_ABS_CAP) * MONITORING_SCORE_PC1H_WEIGHT
+    s += max(min(pc5, MONITORING_SCORE_PC5_ABS_CAP), -MONITORING_SCORE_PC5_ABS_CAP) * MONITORING_SCORE_PC5_WEIGHT
     return round(s, 2)
 
 
@@ -159,13 +175,13 @@ def should_drop(liq, vol24, vol5, pc1h) -> bool:
     """
     Hard auto-drop rules (NO MERCY)
     """
-    if liq < 3000:
+    if liq < MONITORING_DROP_MIN_LIQ_USD:
         return True
-    if vol24 < 4000:
+    if vol24 < MONITORING_DROP_MIN_VOL24_USD:
         return True
-    if vol5 < 150:
+    if vol5 < MONITORING_DROP_MIN_VOL5_USD:
         return True
-    if pc1h < -12:
+    if pc1h < MONITORING_DROP_MAX_PC1H_NEG:
         return True
     return False
 

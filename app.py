@@ -3714,9 +3714,9 @@ def solana_unverified_heuristic(p: Dict[str, Any]) -> bool:
     if (p.get("chainId") or "").lower() != "solana":
         return False
 
-    liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
-    vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
-    pc1h = float(safe_get(p, "priceChange", "h1", default=0) or 0)
+    liq = parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0)
+    vol24 = parse_float(safe_get(p, "volume", "h24", default=0), 0.0)
+    pc1h = parse_float(safe_get(p, "priceChange", "h1", default=0), 0.0)
     age = pair_age_minutes(p)
 
     very_new_or_unknown = (age is None) or (age < 60)
@@ -3737,13 +3737,15 @@ def solana_unverified_heuristic(p: Dict[str, Any]) -> bool:
 def score_pair(p: Optional[Dict[str, Any]]) -> float:
     if not p:
         return 0.0
-    liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
-    vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
-    vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
-    pc5 = float(safe_get(p, "priceChange", "m5", default=0) or 0)
-    pc1h = float(safe_get(p, "priceChange", "h1", default=0) or 0)
-    buys5 = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
-    sells5 = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
+    # Keep active recommendation math unchanged; parse_float only prevents malformed
+    # upstream numeric fields from aborting a scan cycle.
+    liq = parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0)
+    vol24 = parse_float(safe_get(p, "volume", "h24", default=0), 0.0)
+    vol5 = parse_float(safe_get(p, "volume", "m5", default=0), 0.0)
+    pc5 = parse_float(safe_get(p, "priceChange", "m5", default=0), 0.0)
+    pc1h = parse_float(safe_get(p, "priceChange", "h1", default=0), 0.0)
+    buys5 = int(parse_float(safe_get(p, "txns", "m5", "buys", default=0), 0.0))
+    sells5 = int(parse_float(safe_get(p, "txns", "m5", "sells", default=0), 0.0))
     trades5 = buys5 + sells5
 
     s = 0.0
@@ -4396,13 +4398,15 @@ def build_trade_hint(p: Optional[Dict[str, Any]]) -> Tuple[str, List[str]]:
     if not p:
         return "NO DATA", []
 
-    liq = float(safe_get(p, "liquidity", "usd", default=0) or 0)
-    vol24 = float(safe_get(p, "volume", "h24", default=0) or 0)
-    vol5 = float(safe_get(p, "volume", "m5", default=0) or 0)
-    pc5 = float(safe_get(p, "priceChange", "m5", default=0) or 0)
-    pc1h = float(safe_get(p, "priceChange", "h1", default=0) or 0)
-    buys5 = int(safe_get(p, "txns", "m5", "buys", default=0) or 0)
-    sells5 = int(safe_get(p, "txns", "m5", "sells", default=0) or 0)
+    # Keep active recommendation math unchanged; parse_float only prevents malformed
+    # upstream numeric fields from aborting a scan cycle.
+    liq = parse_float(safe_get(p, "liquidity", "usd", default=0), 0.0)
+    vol24 = parse_float(safe_get(p, "volume", "h24", default=0), 0.0)
+    vol5 = parse_float(safe_get(p, "volume", "m5", default=0), 0.0)
+    pc5 = parse_float(safe_get(p, "priceChange", "m5", default=0), 0.0)
+    pc1h = parse_float(safe_get(p, "priceChange", "h1", default=0), 0.0)
+    buys5 = int(parse_float(safe_get(p, "txns", "m5", "buys", default=0), 0.0))
+    sells5 = int(parse_float(safe_get(p, "txns", "m5", "sells", default=0), 0.0))
     trades5 = buys5 + sells5
 
     if liq >= 250_000:

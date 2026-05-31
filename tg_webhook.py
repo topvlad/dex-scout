@@ -32,7 +32,27 @@ ACTION_ALIASES = {
     "archive": "rm",
 }
 from config import CHAINS_DEFAULT
-VALID_CHAINS = {str(c or "").strip().lower() for c in CHAINS_DEFAULT if str(c or "").strip()}
+try:
+    from config import TG_CALLBACK_VALID_CHAINS
+except ImportError:
+    TG_CALLBACK_VALID_CHAINS = CHAINS_DEFAULT
+VALID_CHAINS = {str(c or "").strip().lower() for c in TG_CALLBACK_VALID_CHAINS if str(c or "").strip()}
+
+
+def _env_int_bounded(name: str, default: int, min_value: int, max_value: int) -> int:
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = default
+    return max(min_value, min(max_value, value))
+
+
+TG_META_CACHE_TTL_SEC = _env_int_bounded("TG_META_CACHE_TTL_SEC", 30, 5, 120)
+TG_META_CACHE: Dict[str, Any] = {"ts": 0.0, "index": {}}
 
 try:
     from app import (
@@ -256,22 +276,67 @@ def _validate_callback_data(action: str, chain: str, ca: str) -> Tuple[bool, str
         return False, "invalid_ca", "", ""
     return True, canonical_action, norm_chain, norm_ca
 
+def _clear_token_meta_cache() -> None:
+    TG_META_CACHE["ts"] = 0.0
+    TG_META_CACHE["index"] = {}
+
+
+def _token_meta_index_key(chain: str, ca: str) -> str:
+    norm_chain, norm_ca = _norm_contract(chain, ca)
+    if not norm_chain or not norm_ca:
+        return ""
+    return f"{norm_chain}:{norm_ca}"
+
+
+def _meta_from_row(row: Dict[str, Any], source: str) -> Dict[str, str]:
+    symbol = str(row.get("base_symbol") or row.get("symbol") or "").strip()
+    name = str(row.get("name") or row.get("base_name") or symbol or "").strip()
+    return {"symbol": symbol, "name": name, "source": source}
+
+
+def _index_meta_rows(index: Dict[str, Dict[str, str]], rows: List[Dict[str, Any]], source: str) -> None:
+    for row in rows:
+        norm_chain = normalize_chain_name(row.get("chain", ""))
+        if not norm_chain:
+            continue
+        meta = _meta_from_row(row, source)
+        for field in ADDR_ALIAS_FIELDS:
+            value = str(row.get(field) or "").strip()
+            if not value:
+                continue
+            norm_ca = addr_store(norm_chain, value)
+            if not norm_ca:
+                continue
+            index.setdefault(f"{norm_chain}:{norm_ca}", meta)
+
+
+def _build_token_meta_index() -> Dict[str, Dict[str, str]]:
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+        return {}
+    index: Dict[str, Dict[str, str]] = {}
+    _index_meta_rows(index, load_monitoring(), "monitoring")
+    _index_meta_rows(index, load_portfolio(), "portfolio")
+    return index
+
+
 def find_token_meta(chain: str, ca: str) -> Dict[str, str]:
-    for row in load_monitoring():
-        if _row_matches_token(row, chain, ca):
-            return {
-                "symbol": str(row.get("base_symbol") or row.get("symbol") or "").strip(),
-                "name": str(row.get("name") or row.get("base_symbol") or row.get("symbol") or "").strip(),
-            }
+    key = _token_meta_index_key(chain, ca)
+    if not key:
+        return {"symbol": "", "name": ""}
 
-    for row in load_portfolio():
-        if _row_matches_token(row, chain, ca):
-            return {
-                "symbol": str(row.get("base_symbol") or row.get("symbol") or "").strip(),
-                "name": str(row.get("name") or row.get("base_symbol") or row.get("symbol") or "").strip(),
-            }
+    now = time.time()
+    cache_ts = float(TG_META_CACHE.get("ts") or 0.0)
+    index = TG_META_CACHE.get("index")
+    if not isinstance(index, dict) or (now - cache_ts) >= TG_META_CACHE_TTL_SEC:
+        index = _build_token_meta_index()
+        if not (IMPORT_FAILED or BOOTSTRAP_ERROR):
+            TG_META_CACHE["ts"] = now
+            TG_META_CACHE["index"] = index
 
-    return {"symbol": "", "name": ""}
+    meta = index.get(key) if isinstance(index, dict) else None
+    if not isinstance(meta, dict):
+        return {"symbol": "", "name": ""}
+    return {"symbol": str(meta.get("symbol") or ""), "name": str(meta.get("name") or "")}
 
 def add_contract_to_portfolio(chain: str, ca: str) -> bool:
     chain = normalize_chain_name(chain)
@@ -409,6 +474,17 @@ def _do_action(action: str) -> Callable[[str, str], bool]:
         "mn": add_contract_to_monitoring,
         "rm": remove_contract_everywhere,
     }.get(action, lambda _chain, _ca: False)
+
+
+@app.get("/_import_status")
+def import_status():
+    failed = bool(IMPORT_FAILED or BOOTSTRAP_ERROR)
+    return {
+        "ok": not failed,
+        "import_failed": bool(IMPORT_FAILED),
+        "error": IMPORT_ERROR or BOOTSTRAP_ERROR.get("exception_text", ""),
+        "bootstrap_error": dict(BOOTSTRAP_ERROR),
+    }
 
 
 @app.get("/")

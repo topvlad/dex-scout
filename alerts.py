@@ -32,16 +32,17 @@ def make_key(row: dict) -> Key:
     return (row.get("chain") or "", row.get("pairAddress") or "")
 
 
-def purge_expired(store: Dict[Key, WatchItem]) -> None:
-    """Drop items older than TTL."""
+def purge_expired(store: Dict[Key, WatchItem], reserve_slot: bool = False) -> None:
+    """Drop expired items and enforce cap, optionally reserving one insert slot."""
     ttl = WATCH_TTL_MINUTES * 60
     t = _now()
     dead = [k for k, v in store.items() if (t - v.last_seen) > ttl]
     for k in dead:
         store.pop(k, None)
 
-    if len(store) > WATCH_MAX_ITEMS:
-        excess = len(store) - WATCH_MAX_ITEMS
+    limit = WATCH_MAX_ITEMS - 1 if reserve_slot else WATCH_MAX_ITEMS
+    if len(store) > limit:
+        excess = len(store) - limit
         oldest = sorted(store.items(), key=lambda kv: kv[1].last_seen)[:excess]
         for k, _ in oldest:
             store.pop(k, None)
@@ -55,6 +56,8 @@ def upsert_watchlist(store: Dict[Key, WatchItem], rows: List[dict]) -> None:
         if not k[0] or not k[1]:
             continue
         if k not in store:
+            if len(store) >= WATCH_MAX_ITEMS:
+                purge_expired(store, reserve_slot=True)
             store[k] = WatchItem(first_seen=t, last_seen=t, last_alert=0.0, data=r)
         else:
             item = store[k]

@@ -57,3 +57,42 @@ def test_purge_expired_overflow_purges_oldest(monkeypatch):
     alerts.purge_expired(store)
     assert len(store) == alerts.WATCH_MAX_ITEMS
     assert ('bsc', 'p0') not in store
+
+
+def test_purge_at_cap_without_reserve_does_not_remove_or_sort(monkeypatch):
+    monkeypatch.setattr(alerts, '_now', lambda: 1000.0)
+    store = {
+        ('bsc', f'p{i}'): alerts.WatchItem(1.0, float(100 + i), 0.0, {'score': i})
+        for i in range(alerts.WATCH_MAX_ITEMS)
+    }
+    import builtins
+    original_sorted = builtins.sorted
+    monkeypatch.setattr(builtins, 'sorted', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('unexpected sort')))
+    try:
+        alerts.purge_expired(store, reserve_slot=False)
+    finally:
+        monkeypatch.setattr(builtins, 'sorted', original_sorted)
+    assert len(store) == alerts.WATCH_MAX_ITEMS
+
+
+def test_purge_at_cap_with_reserve_removes_oldest(monkeypatch):
+    monkeypatch.setattr(alerts, '_now', lambda: 1000.0)
+    store = {
+        ('bsc', f'p{i}'): alerts.WatchItem(1.0, float(100 + i), 0.0, {'score': i})
+        for i in range(alerts.WATCH_MAX_ITEMS)
+    }
+    alerts.purge_expired(store, reserve_slot=True)
+    assert len(store) == alerts.WATCH_MAX_ITEMS - 1
+    assert ('bsc', 'p0') not in store
+
+
+def test_upsert_at_cap_does_not_exceed_watch_max(monkeypatch):
+    monkeypatch.setattr(alerts, '_now', lambda: 1000.0)
+    store = {
+        ('bsc', f'p{i}'): alerts.WatchItem(1.0, float(100 + i), 0.0, {'score': i})
+        for i in range(alerts.WATCH_MAX_ITEMS)
+    }
+    alerts.upsert_watchlist(store, [{'chain': 'bsc', 'pairAddress': 'new', 'score': 999}])
+    assert len(store) == alerts.WATCH_MAX_ITEMS
+    assert ('bsc', 'new') in store
+    assert ('bsc', 'p0') not in store
