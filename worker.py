@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any, Callable, Dict, Optional
 
+from runtime_core import _env_bool, _env_int, now_utc_str, parse_float
+
 # ============================================================
 # PRODUCTION ENTRY POINT — one-shot job dispatcher
 # Usage: JOB_MODE=scan_cycle python worker.py
@@ -63,27 +65,6 @@ def _missing_required_env() -> list[str]:
 
 
 app: Optional[Any] = None
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = str(os.getenv(name, "")).strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.getenv(name, "")).strip().lower()
-    if not raw:
-        return default
-    if raw in {"1", "true", "yes", "y", "on"}:
-        return True
-    if raw in {"0", "false", "no", "n", "off"}:
-        return False
-    return default
 
 
 SCANNER_SEEDS = os.getenv("SCANNER_SEEDS", "")
@@ -217,9 +198,9 @@ def _run_scan_cycle() -> Dict[str, Any]:
         stale_pending = (datetime.now(timezone.utc) - pending_ts).total_seconds() > (90 * 60)
     if pending and not stale_pending:
         seeds_raw = str(params.get("seeds_raw") or SCANNER_SEEDS or str(app.DEFAULT_SEEDS))
-        max_items = int(app.parse_float(params.get("max_items", SCANNER_MAX_ITEMS), SCANNER_MAX_ITEMS))
+        max_items = int(parse_float(params.get("max_items", SCANNER_MAX_ITEMS), SCANNER_MAX_ITEMS))
         use_birdeye_trending = bool(params.get("use_birdeye_trending", USE_BIRDEYE_TRENDING))
-        birdeye_limit = int(app.parse_float(params.get("birdeye_limit", BIRDEYE_LIMIT), BIRDEYE_LIMIT))
+        birdeye_limit = int(parse_float(params.get("birdeye_limit", BIRDEYE_LIMIT), BIRDEYE_LIMIT))
     else:
         # Scheduled autonomous scan path (backward compatible behavior).
         seeds_raw = SCANNER_SEEDS or str(app.DEFAULT_SEEDS)
@@ -231,7 +212,7 @@ def _run_scan_cycle() -> Dict[str, Any]:
     status = "empty"
     try:
         if pending:
-            updates["scan_request_worker_consumed_ts"] = app.now_utc_str()
+            updates["scan_request_worker_consumed_ts"] = now_utc_str()
         scan_result = app.maybe_run_rotating_scanner(
             seeds_raw=seeds_raw,
             max_items=max_items,
@@ -240,12 +221,12 @@ def _run_scan_cycle() -> Dict[str, Any]:
         )
         status = "failed" if scan_result.get("error") else "success"
         stats = scan_result.get("stats", {}) if isinstance(scan_result.get("stats", {}), dict) else {}
-        if not scan_result.get("error") and (not stats or int(app.parse_float(stats.get("seen", stats.get("raw_seen", 0)), 0)) <= 0):
+        if not scan_result.get("error") and (not stats or int(parse_float(stats.get("seen", stats.get("raw_seen", 0)), 0)) <= 0):
             status = "empty"
         updates.update({
             "last_scan_status": status,
             "last_scan_stats": stats,
-            "last_scan_ts": app.now_utc_str(),
+            "last_scan_ts": now_utc_str(),
         })
     except Exception as exc:
         status = "failed"
@@ -253,7 +234,7 @@ def _run_scan_cycle() -> Dict[str, Any]:
             "last_scan_status": "failed",
             "last_scan_error": f"scan_cycle_exception:{type(exc).__name__}:{exc}",
             "last_scan_stats": {},
-            "last_scan_ts": app.now_utc_str(),
+            "last_scan_ts": now_utc_str(),
         })
         scan_result = {"error": f"{type(exc).__name__}: {exc}", "stats": {}}
     finally:
@@ -261,7 +242,7 @@ def _run_scan_cycle() -> Dict[str, Any]:
             updates["last_scan_status"] = f"{updates['last_scan_status']}:{chain_reason}"
         if pending:
             updates["scan_request_pending"] = False
-            updates["scan_request_processed_ts"] = app.now_utc_str()
+            updates["scan_request_processed_ts"] = now_utc_str()
             updates["scan_request_status"] = "stale_cleared" if stale_pending else "processed"
             if stale_pending:
                 updates["scan_request_last_clear_reason"] = "stale_pending_over_90m"
@@ -285,7 +266,7 @@ def _run_scan_cycle() -> Dict[str, Any]:
         app.update_worker_runtime_state(updates={"live_pulse_candidates": payload, "last_empty_reason": payload.get("last_empty_reason", "")})
     except Exception as pulse_exc:
         failed_payload = {
-            "ts_utc": app.now_utc_str(),
+            "ts_utc": now_utc_str(),
             "source": "scan_cycle",
             "status": "failed",
             "raw_seen": 0,
@@ -388,7 +369,7 @@ def _record_pulse_history_after_cycle_safe() -> Dict[str, Any]:
                 updates={
                     "pulse_history_writer_ok": False,
                     "pulse_history_writer_reason": reason,
-                    "pulse_history_writer_error_ts": app.now_utc_str(),
+                    "pulse_history_writer_error_ts": now_utc_str(),
                 }
             )
             app.update_job_heartbeat(
@@ -508,7 +489,7 @@ def run_job_mode(job_mode: str) -> int:
             mode_updates={
                 "last_job_status": "invalid",
                 "last_job_reason": reason,
-                "last_error_ts": app.now_utc_str(),
+                "last_error_ts": now_utc_str(),
                 "last_error_reason": reason,
             },
             global_updates={
@@ -528,7 +509,7 @@ def run_job_mode(job_mode: str) -> int:
     runtime = app.get_worker_runtime_state()
     mode_state = _runtime_mode_state(runtime, mode)
     prev_status = str(mode_state.get("last_job_status") or "").strip().lower()
-    prev_started_epoch = float(app.parse_float(mode_state.get("last_job_started_epoch", 0.0), 0.0))
+    prev_started_epoch = float(parse_float(mode_state.get("last_job_started_epoch", 0.0), 0.0))
     age_sec = max(0.0, time.time() - prev_started_epoch) if prev_started_epoch > 0 else 0.0
     stale_run = bool(prev_status == "running" and age_sec >= JOB_STALE_RUN_SEC)
     if stale_run:
@@ -538,7 +519,7 @@ def run_job_mode(job_mode: str) -> int:
             mode_updates={
                 "last_job_status": "aborted",
                 "last_job_reason": "stale_aborted",
-                "last_job_finished_ts": app.now_utc_str(),
+                "last_job_finished_ts": now_utc_str(),
                 "last_job_finished_epoch": time.time(),
                 "last_error_reason": f"stale_recovered:prev_mode={mode}:age_sec={int(age_sec)}",
             },
@@ -566,7 +547,7 @@ def run_job_mode(job_mode: str) -> int:
             mode_updates={
                 "last_job_status": "skipped_duplicate_run",
                 "last_job_reason": reason,
-                "last_error_ts": app.now_utc_str(),
+                "last_error_ts": now_utc_str(),
                 "last_error_reason": reason,
                 "last_lock_code": "duplicate_run_guard",
             },
@@ -599,9 +580,9 @@ def run_job_mode(job_mode: str) -> int:
             mode=mode,
             owner=owner,
             mode_updates={
-                "last_stale_lock_ts": app.now_utc_str(),
+                "last_stale_lock_ts": now_utc_str(),
                 "last_job_reason": (
-                    f"stale_lock_replaced:{lock_key}:age_sec={int(app.parse_float(lock_status.get('stale_age_sec'), 0.0))}"
+                    f"stale_lock_replaced:{lock_key}:age_sec={int(parse_float(lock_status.get('stale_age_sec'), 0.0))}"
                 ),
             },
         )
@@ -622,7 +603,7 @@ def run_job_mode(job_mode: str) -> int:
             mode_updates={
                 "last_job_status": "skipped_locked",
                 "last_job_reason": reason,
-                "last_error_ts": app.now_utc_str(),
+                "last_error_ts": now_utc_str(),
                 "last_error_reason": reason,
                 "last_lock_code": code,
             },
@@ -641,7 +622,7 @@ def run_job_mode(job_mode: str) -> int:
         return 3
 
     start_epoch = time.time()
-    start_ts = app.now_utc_str()
+    start_ts = now_utc_str()
     run_id = str(uuid.uuid4())
     job_start_token = run_id
     runtime = app.get_worker_runtime_state()
@@ -701,7 +682,7 @@ def run_job_mode(job_mode: str) -> int:
             updates={
                 "last_job_status": "finished",
                 "last_job_reason": "ok",
-                "last_job_finished_ts": app.now_utc_str(),
+                "last_job_finished_ts": now_utc_str(),
                 "last_job_finished_epoch": end_epoch,
                 "last_job_duration_sec": duration_sec,
             },
@@ -724,17 +705,17 @@ def run_job_mode(job_mode: str) -> int:
             owner=owner,
             run_id=run_id,
             updates={
-                "last_error_ts": app.now_utc_str(),
+                "last_error_ts": now_utc_str(),
                 "last_error_reason": "terminated_signal",
                 "last_job_status": "aborted",
                 "last_job_reason": "terminated_signal",
-                "last_job_finished_ts": app.now_utc_str(),
+                "last_job_finished_ts": now_utc_str(),
                 "last_job_finished_epoch": end_epoch,
                 "last_job_duration_sec": round(max(0.0, end_epoch - start_epoch), 3),
             },
             global_updates={
                 "worker_status": "job_terminated",
-                "last_error_ts": app.now_utc_str(),
+                "last_error_ts": now_utc_str(),
                 "last_error_reason": "terminated_signal",
             },
         )
@@ -754,15 +735,15 @@ def run_job_mode(job_mode: str) -> int:
             owner=owner,
             run_id=run_id,
             updates={
-                "last_error_ts": app.now_utc_str(),
+                "last_error_ts": now_utc_str(),
                 "last_error_reason": reason,
                 "last_job_status": "failed",
                 "last_job_reason": reason,
-                "last_job_finished_ts": app.now_utc_str(),
+                "last_job_finished_ts": now_utc_str(),
             },
             global_updates={
                 "worker_status": "job_failed",
-                "last_error_ts": app.now_utc_str(),
+                "last_error_ts": now_utc_str(),
                 "last_error_reason": reason,
             },
         )
@@ -822,7 +803,7 @@ def main() -> int:
         app.update_worker_runtime_state(
             updates={
                 "worker_status": "runtime_contract_error",
-                "last_error_ts": app.now_utc_str(),
+                "last_error_ts": now_utc_str(),
                 "last_error_reason": reason,
             }
         )
