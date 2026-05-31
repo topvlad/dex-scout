@@ -22,6 +22,7 @@ def test_heartbeat_suppressed_when_material_row_exists(monkeypatch):
     monkeypatch.setattr(app, "save_tg_state", lambda state: None)
     monkeypatch.setattr(app, "build_notification_candidates", lambda m, p: ([], []))
     monkeypatch.setattr(app, "build_portfolio_meaningful_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(app, "_is_tg_quiet_hours", lambda now_ts: False)
     row = {"active": "1", "chain": "solana", "base_symbol": "ZEREBRO", "base_token_address": "z1", "final_action": "REDUCE"}
     app.run_auto_notifications({}, [], [row], cycle_context={}, trigger_model="ui_scan_sync")
     assert sent

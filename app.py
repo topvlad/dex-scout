@@ -44,6 +44,31 @@ import requests
 import streamlit as st
 import pandas as pd
 import config as app_config
+from runtime_core import (
+    _env_bool as runtime_env_bool,
+    _env_float as runtime_env_float,
+    _env_int as runtime_env_int,
+    addr_store as runtime_addr_store,
+    canonical_entity_key as runtime_canonical_entity_key,
+    normalize_chain_name as runtime_normalize_chain_name,
+    now_utc_str as runtime_now_utc_str,
+    parse_float as runtime_parse_float,
+    parse_int as runtime_parse_int,
+    safe_get as runtime_safe_get,
+)
+from storage_core import (
+    JOB_HEARTBEATS_TABLE,
+    JOB_RUNS_TABLE,
+    LOCKS_TABLE,
+    RUNTIME_REQUIRED_TABLES,
+    RUNTIME_STATE_TABLE,
+    TG_STATE_TABLE,
+    d1_configured as storage_d1_configured,
+    normalize_storage_backend,
+    runtime_status as storage_runtime_status,
+    storage_key_for_path as core_storage_key_for_path,
+    supabase_configured as storage_supabase_configured,
+)
 
 WORKER_FAST_MODE = os.getenv("DEX_SCOUT_WORKER_MODE", "0") == "1"
 
@@ -52,33 +77,15 @@ if not WORKER_FAST_MODE:
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = str(os.getenv(name, "")).strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
+    return runtime_env_int(name, default)
 
 
 def _env_float(name: str, default: float) -> float:
-    raw = str(os.getenv(name, "")).strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
+    return runtime_env_float(name, default)
+
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.getenv(name, "")).strip().lower()
-    if not raw:
-        return default
-    if raw in {"1", "true", "yes", "y", "on"}:
-        return True
-    if raw in {"0", "false", "no", "n", "off"}:
-        return False
-    return default
+    return runtime_env_bool(name, default)
 
 
 def _maybe_autorefresh(interval_ms: int, key: str):
@@ -583,38 +590,26 @@ SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 SUPABASE_ANON_KEY = _get_secret("SUPABASE_ANON_KEY", "").strip()
 
 raw_storage_backend = _get_secret("STORAGE_BACKEND", os.getenv("STORAGE_BACKEND", "supabase")).strip().lower()
-STORAGE_BACKEND = raw_storage_backend if raw_storage_backend in {"supabase", "d1", "local"} else "supabase"
+STORAGE_BACKEND = normalize_storage_backend(raw_storage_backend)
 
 USE_D1 = STORAGE_BACKEND == "d1"
 D1_PROXY_URL = _get_secret("D1_PROXY_URL", "").strip().rstrip("/")
 D1_PROXY_TOKEN = _get_secret("D1_PROXY_TOKEN", "").strip()
 D1_TIMEOUT_SEC = max(1, _secret_int("D1_TIMEOUT_SEC", 12))
 
-USE_SUPABASE = STORAGE_BACKEND == "supabase" and bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+USE_SUPABASE = storage_supabase_configured(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, STORAGE_BACKEND)
 STREAMLIT_FAST_UI_MODE = _secret_bool("STREAMLIT_FAST_UI_MODE", True)
 STREAMLIT_ACTIVE_RENDER_LIMIT = max(1, _secret_int("STREAMLIT_ACTIVE_RENDER_LIMIT", 30))
 STREAMLIT_ARCHIVE_PREVIEW_LIMIT = max(10, _secret_int("STREAMLIT_ARCHIVE_PREVIEW_LIMIT", 50))
 STREAMLIT_HISTORY_RENDER_LIMIT = max(10, _secret_int("STREAMLIT_HISTORY_RENDER_LIMIT", 200))
 STREAMLIT_DISABLE_LIVE_PAIR_ENRICH_ON_RENDER = _secret_bool("STREAMLIT_DISABLE_LIVE_PAIR_ENRICH_ON_RENDER", True)
 
-RUNTIME_STATE_TABLE = "runtime_state"
-LOCKS_TABLE = "locks"
-TG_STATE_TABLE = "tg_state"
-JOB_HEARTBEATS_TABLE = "job_heartbeats"
-JOB_RUNS_TABLE = "job_runs"
-RUNTIME_REQUIRED_TABLES: Tuple[str, ...] = (
-    RUNTIME_STATE_TABLE,
-    LOCKS_TABLE,
-    TG_STATE_TABLE,
-    JOB_HEARTBEATS_TABLE,
-)
-
 def _sb_ok() -> bool:
     return bool(USE_SUPABASE)
 
 
 def _d1_ok() -> bool:
-    return bool(USE_D1 and D1_PROXY_URL and D1_PROXY_TOKEN)
+    return storage_d1_configured(D1_PROXY_URL, D1_PROXY_TOKEN, STORAGE_BACKEND)
 
 
 def d1_request(method: str, path: str, json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -770,14 +765,7 @@ def is_supabase_unavailable_status(status: Dict[str, Any]) -> bool:
 
 
 def _runtime_status(ok: bool, code: str, message: str = "", **extra: Any) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "ok": bool(ok),
-        "code": str(code or "unknown"),
-        "message": str(message or ""),
-    }
-    if extra:
-        payload.update(extra)
-    return payload
+    return storage_runtime_status(ok, code, message, **extra)
 
 
 def _sb_select_rows(
@@ -964,9 +952,7 @@ def sb_put_storage(key: str, content: str) -> bool:
         return False
 
 def storage_key_for_path(path: str) -> str:
-    # keep it stable and short: data/monitoring.csv -> monitoring.csv
-    base = os.path.basename(path)
-    return base or path
+    return core_storage_key_for_path(path)
 
 
 def _is_monitoring_history_key(key: str) -> bool:
@@ -1244,7 +1230,7 @@ def ensure_storage():
 
 
 def now_utc_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    return runtime_now_utc_str()
 
 
 def now_utc_iso() -> str:
@@ -1685,8 +1671,7 @@ CHAIN_MAP = {
 
 
 def normalize_chain_name(raw_chain: Any) -> str:
-    value = str(raw_chain or "").strip().lower()
-    return CHAIN_MAP.get(value, value)
+    return runtime_normalize_chain_name(raw_chain)
 
 
 NAME_OK_RE = re.compile(r"^[\w\-\.\$\s]{1,40}$", re.UNICODE)
@@ -1835,36 +1820,19 @@ def addr_key(chain: str, addr: str) -> str:
 
 
 def addr_store(chain: str, addr: str) -> str:
-    c = (chain or "").lower().strip()
-    a = (addr or "").strip()
-    if not a:
-        return ""
-    if c == "solana":
-        return a
-    return a.lower()
+    return runtime_addr_store(chain, addr)
 
 
 def safe_get(d: Dict[str, Any], *path, default=None):
-    cur: Any = d
-    for p in path:
-        if not isinstance(cur, dict) or p not in cur:
-            return default
-        cur = cur[p]
-    return cur
+    return runtime_safe_get(d, *path, default=default)
 
 
 def parse_float(x, default=0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return float(default)
+    return runtime_parse_float(x, default)
 
 
 def parse_int(x, default=0) -> int:
-    try:
-        return int(float(x))
-    except Exception:
-        return int(default)
+    return runtime_parse_int(x, default)
 
 
 def pct_change(a: float, b: float) -> float:
@@ -8868,11 +8836,7 @@ def canonical_token_key(row: Dict[str, Any]) -> str:
 
 
 def canonical_entity_key(chain: str, ca: str) -> str:
-    norm_chain = normalize_chain_name(chain)
-    norm_ca = addr_store(norm_chain, ca)
-    if not norm_chain or not norm_ca:
-        return ""
-    return f"{norm_chain}|{norm_ca}"
+    return runtime_canonical_entity_key(chain, ca)
 
 
 def _discovery_candidate_eligible(
