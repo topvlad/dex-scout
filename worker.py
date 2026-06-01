@@ -6,7 +6,9 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 import json
-from typing import Any, Callable, Dict, Optional
+import csv
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 from runtime_core import _env_bool, _env_int, now_utc_str, parse_float
 
@@ -45,6 +47,24 @@ def _load_app():
     import app_runtime_facade
     return app_runtime_facade
 
+
+
+
+def _safe_config_presence() -> Dict[str, Any]:
+    backend = str(os.getenv("STORAGE_BACKEND", "supabase")).strip().lower() or "supabase"
+    if backend not in {"supabase", "d1", "local"}:
+        backend = "supabase"
+    return {
+        "storage_backend": backend,
+        "storage_backend_present": bool(str(os.getenv("STORAGE_BACKEND", "")).strip()),
+        "d1_configured": bool(str(os.getenv("D1_PROXY_URL", "")).strip()) and bool(str(os.getenv("D1_PROXY_TOKEN", "")).strip()),
+        "tg_configured": bool(str(os.getenv("TG_BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))).strip()) and bool(str(os.getenv("TG_CHAT_ID", "")).strip()),
+        "runtime_jobs_enabled": not _env_bool("RUNTIME_JOBS_DISABLED", False),
+    }
+
+
+def _json_print(prefix: str, payload: Dict[str, Any]) -> None:
+    print(f"{prefix} {json.dumps(payload, sort_keys=True, default=str)}", flush=True)
 
 def _runtime_preflight(import_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     import_state = dict(import_state or {})
@@ -486,6 +506,40 @@ def validate_job_dispatch(dispatch: Dict[str, Any] | None = None) -> None:
 validate_job_dispatch(JOB_DISPATCH)
 
 
+
+
+def _job_dry_run_enabled() -> bool:
+    return _env_bool("JOB_DRY_RUN", False)
+
+
+def _dry_run_validate_job_mode(mode: str, runner: Optional[Callable[[], Dict[str, Any]]]) -> int:
+    lock_key = f"job_mode:{mode}" if mode else ""
+    if runner is None:
+        reason = f"unknown_job_mode:{mode or 'empty'}"
+        _json_print("[worker] dry_run", {
+            "ok": False,
+            "status": "invalid_mode",
+            "reason": reason,
+            "job_mode": mode,
+            "lock_key_computable": bool(lock_key),
+            "allowed_modes": sorted(JOB_DISPATCH.keys()),
+        })
+        return 2
+    _json_print("[worker] dry_run", {
+        "ok": True,
+        "status": "dry_run_validated",
+        "reason": "runner_facade_import_and_lock_key_validated",
+        "job_mode": mode,
+        "runner_resolved": True,
+        "facade_import_ok": app is not None,
+        "lock_key_computable": bool(lock_key),
+        "lock_key": lock_key,
+        "writes": False,
+        "telegram_send": False,
+        "scan": False,
+    })
+    return 0
+
 def run_job_mode(job_mode: str) -> int:
     assert app is not None
     mode = str(job_mode or "").strip().lower()
@@ -499,6 +553,9 @@ def run_job_mode(job_mode: str) -> int:
         return 2
 
     runner = JOB_DISPATCH.get(mode)
+
+    if _job_dry_run_enabled():
+        return _dry_run_validate_job_mode(mode, runner)
 
     if runner is None:
         reason = f"unknown_job_mode:{mode or 'empty'}"
@@ -782,6 +839,185 @@ def run_job_mode(job_mode: str) -> int:
             app.release_lock(lock_key=lock_key, owner=owner)
 
 
+
+
+def _status_ok(status: Any) -> bool:
+    if isinstance(status, dict):
+        code = str(status.get("code") or "").lower()
+        return bool(status.get("ok")) or code.startswith("not_found") or code.endswith("disabled")
+    return bool(status)
+
+
+def _read_table_contract(module: Any, table: str) -> bool:
+    backend = _safe_config_presence()["storage_backend"]
+    if backend == "local":
+        return True
+    checker = getattr(module, "check_runtime_contract", None)
+    if not callable(checker):
+        return False
+    return bool(checker(required_tables=[table]).get("ok"))
+
+
+
+
+def _read_storage_text_no_write(module: Any, key: str) -> str:
+    normalized_key = module.storage_key_for_path(key) if hasattr(module, "storage_key_for_path") else os.path.basename(str(key))
+    try:
+        remote_ok = bool(module._app_storage_remote_ok()) if hasattr(module, "_app_storage_remote_ok") else False
+    except Exception:
+        remote_ok = False
+    if remote_ok and hasattr(module, "sb_get_storage"):
+        content = module.sb_get_storage(normalized_key)
+        return str(content or "")
+    data_dir = str(getattr(module, "DATA_DIR", "data"))
+    candidates = [os.path.join(data_dir, normalized_key), str(key)]
+    local_fallback_path = getattr(module, "local_fallback_path", None)
+    if callable(local_fallback_path):
+        candidates.insert(0, local_fallback_path(os.path.join(data_dir, normalized_key)))
+    for candidate in candidates:
+        try:
+            if candidate and os.path.exists(candidate):
+                return Path(candidate).read_text(encoding="utf-8")
+        except Exception:
+            continue
+    return ""
+
+
+def _json_dict_from_storage_no_write(module: Any, key: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    try:
+        raw = _read_storage_text_no_write(module, key)
+        data = json.loads(raw or "{}")
+        return data if isinstance(data, dict) else dict(default or {})
+    except Exception:
+        return dict(default or {})
+
+
+def _csv_row_count_from_storage_no_write(module: Any, key: str) -> int:
+    raw = _read_storage_text_no_write(module, key)
+    if not raw.strip():
+        return 0
+    return len(list(csv.DictReader(raw.splitlines())))
+
+def run_runtime_smoke_read_only(module: Optional[Any] = None) -> Dict[str, Any]:
+    module = module or app or _load_app()
+    errors: List[str] = []
+    summary: Dict[str, Any] = {
+        "ok": False,
+        "storage_backend": _safe_config_presence()["storage_backend"],
+        "storage_backend_reachable": False,
+        "runtime_state_ok": False,
+        "heartbeats_ok": False,
+        "notification_journal_ok": False,
+        "live_pulse_ok": False,
+        "monitoring_rows": 0,
+        "portfolio_rows": 0,
+        "tg_state_ok": False,
+        "errors": errors,
+    }
+    try:
+        contract = module.check_runtime_contract() if hasattr(module, "check_runtime_contract") else {"ok": False, "code": "missing_check_runtime_contract"}
+        summary["storage_backend_reachable"] = _status_ok(contract)
+        if not summary["storage_backend_reachable"]:
+            errors.append(f"storage_contract:{contract.get('code') if isinstance(contract, dict) else 'failed'}")
+    except Exception as exc:
+        errors.append(f"storage_contract_exception:{type(exc).__name__}")
+    try:
+        _state, status = module.read_runtime_state()
+        summary["runtime_state_ok"] = _status_ok(status)
+        if not summary["runtime_state_ok"]:
+            errors.append(f"runtime_state:{status.get('code') if isinstance(status, dict) else 'failed'}")
+    except Exception as exc:
+        errors.append(f"runtime_state_exception:{type(exc).__name__}")
+    try:
+        summary["heartbeats_ok"] = _read_table_contract(module, "job_heartbeats")
+        if not summary["heartbeats_ok"]:
+            errors.append("job_heartbeats_unreadable")
+    except Exception as exc:
+        errors.append(f"job_heartbeats_exception:{type(exc).__name__}")
+    try:
+        journal_key = str(getattr(module, "NOTIFICATION_EVENT_JOURNAL_KEY", "notification_event_journal.json"))
+        journal = _json_dict_from_storage_no_write(module, journal_key, {"version": 1, "events": {}})
+        summary["notification_journal_ok"] = isinstance(journal, dict)
+        if not summary["notification_journal_ok"]:
+            errors.append("notification_journal_bad_payload")
+    except Exception as exc:
+        errors.append(f"notification_journal_exception:{type(exc).__name__}")
+    try:
+        pulse_key = str(getattr(module, "LIVE_PULSE_STORAGE_KEY", "live_pulse_candidates.json"))
+        pulse = _json_dict_from_storage_no_write(module, pulse_key, {"status": "empty"})
+        summary["live_pulse_ok"] = isinstance(pulse, dict)
+        if not summary["live_pulse_ok"]:
+            errors.append("live_pulse_bad_payload")
+    except Exception as exc:
+        errors.append(f"live_pulse_exception:{type(exc).__name__}")
+    try:
+        monitoring_key = str(getattr(module, "MONITORING_CSV", "monitoring.csv"))
+        summary["monitoring_rows"] = _csv_row_count_from_storage_no_write(module, monitoring_key)
+    except Exception as exc:
+        errors.append(f"monitoring_exception:{type(exc).__name__}")
+    try:
+        portfolio_key = str(getattr(module, "PORTFOLIO_CSV", "portfolio.csv"))
+        summary["portfolio_rows"] = _csv_row_count_from_storage_no_write(module, portfolio_key)
+    except Exception as exc:
+        errors.append(f"portfolio_exception:{type(exc).__name__}")
+    try:
+        tg_key = str(getattr(module, "TG_STATE_KEY", "tg_state.json"))
+        tg_state = _json_dict_from_storage_no_write(module, tg_key, {})
+        summary["tg_state_ok"] = isinstance(tg_state, dict)
+        if not summary["tg_state_ok"]:
+            errors.append("tg_state_bad_payload")
+    except Exception as exc:
+        errors.append(f"tg_state_exception:{type(exc).__name__}")
+    summary["ok"] = not errors and all(bool(summary[k]) for k in ("storage_backend_reachable", "runtime_state_ok", "heartbeats_ok", "notification_journal_ok", "live_pulse_ok", "tg_state_ok"))
+    return summary
+
+
+def _sequence_step(job_mode: str, *, dry_run: bool, allow_tg_send: bool, allow_scan: bool) -> Dict[str, Any]:
+    started = time.time()
+    if job_mode in {"notify_cycle", "digest_cycle"} and not allow_tg_send:
+        return {"job_mode": job_mode, "status": "skipped", "reason": "allow_tg_send_false", "duration_sec": 0.0, "ok": True}
+    if job_mode == "scan_cycle" and not allow_scan:
+        return {"job_mode": job_mode, "status": "skipped", "reason": "allow_scan_false", "duration_sec": 0.0, "ok": True}
+    old_dry = os.environ.get("JOB_DRY_RUN")
+    if dry_run:
+        os.environ["JOB_DRY_RUN"] = "true"
+    try:
+        rc = run_job_mode(job_mode)
+        status = "dry_run_validated" if dry_run and rc == 0 else ("finished" if rc == 0 else "failed")
+        reason = "dry_run_no_writes_no_tg_no_scan" if dry_run and rc == 0 else ("ok" if rc == 0 else f"exit_{rc}")
+        return {"job_mode": job_mode, "status": status, "reason": reason, "duration_sec": round(max(0.0, time.time() - started), 3), "ok": rc == 0}
+    finally:
+        if dry_run:
+            if old_dry is None:
+                os.environ.pop("JOB_DRY_RUN", None)
+            else:
+                os.environ["JOB_DRY_RUN"] = old_dry
+
+
+def run_safe_runtime_sequence(*, dry_run: bool = True, allow_tg_send: bool = False, allow_scan: bool = False) -> Dict[str, Any]:
+    steps = [
+        _sequence_step("maintenance_cycle", dry_run=dry_run, allow_tg_send=allow_tg_send, allow_scan=allow_scan),
+        _sequence_step("monitor_cycle", dry_run=dry_run, allow_tg_send=allow_tg_send, allow_scan=allow_scan),
+        _sequence_step("notify_cycle", dry_run=dry_run, allow_tg_send=allow_tg_send, allow_scan=allow_scan),
+        _sequence_step("digest_cycle", dry_run=dry_run, allow_tg_send=allow_tg_send, allow_scan=allow_scan),
+        _sequence_step("outcome_cycle", dry_run=dry_run, allow_tg_send=allow_tg_send, allow_scan=allow_scan),
+        _sequence_step("scan_cycle", dry_run=dry_run, allow_tg_send=allow_tg_send, allow_scan=allow_scan),
+    ]
+    return {"ok": all(bool(step.get("ok")) for step in steps), "steps": steps}
+
+
+def build_runtime_smoke_summary(*, mode: str, dry_run: bool, allow_tg_send: bool, allow_scan: bool, steps: Any = None) -> Dict[str, Any]:
+    return {
+        "commit_sha": os.getenv("GITHUB_SHA", ""),
+        "workflow_mode": str(mode),
+        "dry_run": bool(dry_run),
+        "allow_tg_send": bool(allow_tg_send),
+        "allow_scan": bool(allow_scan),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "config": _safe_config_presence(),
+        "steps": steps if steps is not None else [],
+    }
+
 def main() -> int:
     global app
     app = _load_app()
@@ -790,6 +1026,10 @@ def main() -> int:
     if not import_state.get("ok"):
         print(f"[worker] app_import_failed type={import_state.get('exception_type')} error={import_state.get('error')}", flush=True)
         return 2
+
+    if _job_dry_run_enabled():
+        job_mode = os.getenv("JOB_MODE", "").strip().lower()
+        return run_job_mode(job_mode=job_mode)
 
     missing_env = _missing_required_env()
     if missing_env:
