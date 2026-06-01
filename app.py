@@ -44,6 +44,7 @@ import requests
 import streamlit as st
 import pandas as pd
 import config as app_config
+import notification_core
 from runtime_core import (
     _env_bool as runtime_env_bool,
     _env_float as runtime_env_float,
@@ -8035,12 +8036,15 @@ def save_tg_state(state: Dict[str, Any]) -> None:
         print(f"[TG] save state fail {type(e).__name__}: {e}", flush=True)
 
 
-MATERIAL_PORTFOLIO_ACTIONS = {"EXIT", "REDUCE", "TAKE_PROFIT", "PARTIAL_TP", "PROTECT", "CLOSE", "TRIM"}
+MATERIAL_PORTFOLIO_ACTIONS = notification_core.MATERIAL_PORTFOLIO_ACTIONS
+
+
+def normalize_notification_action(value: Any) -> str:
+    return notification_core.normalize_notification_action(value)
 
 
 def _normalize_action_token(value: Any) -> str:
-    raw = str(value or "").strip().upper().replace(" ", "_").replace("-", "_")
-    return re.sub(r"[^A-Z0-9_]+", "_", raw).strip("_")
+    return normalize_notification_action(value)
 
 
 def _notification_journal_default() -> Dict[str, Any]:
@@ -8073,31 +8077,14 @@ def _event_sort_ts(event: Dict[str, Any]) -> float:
 
 
 def trim_notification_event_journal(journal: Dict[str, Any], max_events: Optional[int] = None) -> int:
-    events = journal.get("events") if isinstance(journal.get("events"), dict) else {}
-    limit = max(1, int(max_events or NOTIFICATION_EVENT_JOURNAL_MAX))
-    if len(events) <= limit:
-        return 0
-    overflow = len(events) - limit
-    removable_statuses = ("sent", "skipped")
-    removed: List[str] = []
-    for statuses in (removable_statuses, ("pending",), ("failed",)):
-        if len(removed) >= overflow:
-            break
-        candidates = [
-            (k, _event_sort_ts(v if isinstance(v, dict) else {}))
-            for k, v in events.items()
-            if isinstance(v, dict) and str(v.get("send_status") or "").strip().lower() in statuses
-        ]
-        candidates.sort(key=lambda x: x[1])
-        for key, _ts in candidates:
-            if len(removed) >= overflow:
-                break
-            removed.append(key)
-    for key in removed:
-        events.pop(key, None)
-    journal["events"] = events
-    journal["notification_journal_trimmed"] = int(journal.get("notification_journal_trimmed", 0) or 0) + len(removed)
-    return len(removed)
+    return notification_core.trim_notification_event_journal(
+        journal,
+        max_events=max_events or NOTIFICATION_EVENT_JOURNAL_MAX,
+    )
+
+
+def summarize_notification_event_journal(journal: Dict[str, Any]) -> Dict[str, Any]:
+    return notification_core.summarize_notification_event_journal(journal)
 
 
 def save_notification_event_journal(journal: Dict[str, Any]) -> bool:
@@ -8120,25 +8107,18 @@ def save_notification_event_journal(journal: Dict[str, Any]) -> bool:
 
 def notification_event_journal_counts(journal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     j = journal if isinstance(journal, dict) else load_notification_event_journal()
-    events = j.get("events") if isinstance(j.get("events"), dict) else {}
-    counts = {"sent": 0, "skipped_duplicate": 0, "failed": 0, "journal_size": len(events), "last_failed_reason": ""}
-    last_failed_ts = -1.0
-    for ev in events.values():
-        if not isinstance(ev, dict):
-            continue
-        status = str(ev.get("send_status") or "").strip().lower()
-        reason = str(ev.get("last_reason") or "").strip().lower()
-        if status == "sent":
-            counts["sent"] += 1
-        if status == "skipped" and reason == "skipped_duplicate":
-            counts["skipped_duplicate"] += 1
-        if status == "failed":
-            counts["failed"] += 1
-            ts = _event_sort_ts(ev)
-            if ts >= last_failed_ts:
-                last_failed_ts = ts
-                counts["last_failed_reason"] = str(ev.get("send_error") or ev.get("last_reason") or "")
-    return counts
+    summary = summarize_notification_event_journal(j)
+    return {
+        "sent": int(summary.get("sent_count", 0) or 0),
+        "skipped_duplicate": int(summary.get("skipped_count", 0) or 0),
+        "failed": int(summary.get("failed_count", 0) or 0),
+        "pending": int(summary.get("pending_count", 0) or 0),
+        "journal_size": int(summary.get("journal_size", 0) or 0),
+        "last_sent_ts": str(summary.get("last_sent_ts") or ""),
+        "last_failed_ts": str(summary.get("last_failed_ts") or ""),
+        "last_failed_reason": str(summary.get("last_failed_reason") or ""),
+        "trimmed": int(summary.get("trimmed_count", 0) or 0),
+    }
 
 
 def _notification_event_base(
@@ -8170,6 +8150,82 @@ def _notification_event_base(
     }
 
 
+def _notification_ts_from_epoch(now_ts: Optional[float] = None) -> str:
+    if now_ts is None:
+        return now_utc_str()
+    try:
+        return datetime.utcfromtimestamp(float(now_ts)).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return now_utc_str()
+
+
+def _notification_event_payload(
+    event_key: str,
+    emission_key: str,
+    event_type: str,
+    row: Optional[Dict[str, Any]] = None,
+    source: str = "notify_cycle",
+    reason: str = "",
+) -> Dict[str, Any]:
+    row = row if isinstance(row, dict) else {}
+    return {
+        "event_key": str(event_key or ""),
+        "emission_key": str(emission_key or ""),
+        "event_type": str(event_type or ""),
+        "row": row,
+        "source": str(source or "notify_cycle"),
+        "reason": str(reason or ""),
+        "token_key": canonical_token_key(row) or build_token_state_key(row),
+        "chain": str(token_chain(row) or row.get("chain") or ""),
+        "token_addr": str(token_ca(row) or row.get("token_address") or row.get("base_token_address") or ""),
+    }
+
+
+def _save_notification_journal_after_core_update(journal: Dict[str, Any]) -> bool:
+    trim_notification_event_journal(journal)
+    return save_notification_event_journal(journal)
+
+
+def record_notification_pending(
+    event_key: str,
+    emission_key: str,
+    event_type: str,
+    row: Optional[Dict[str, Any]] = None,
+    source: str = "notify_cycle",
+    reason: str = "",
+    now_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+    journal = load_notification_event_journal()
+    event = _notification_event_payload(event_key, emission_key, event_type, row=row, source=source, reason=reason)
+    entry = notification_core.record_notification_pending(journal, event, event_key, _notification_ts_from_epoch(now_ts))
+    _save_notification_journal_after_core_update(journal)
+    return entry
+
+
+def record_notification_sent(event_key: str, reason: str = "sent", now_ts: Optional[float] = None) -> Dict[str, Any]:
+    journal = load_notification_event_journal()
+    entry = notification_core.record_notification_sent(journal, event_key, _notification_ts_from_epoch(now_ts), reason=reason)
+    _save_notification_journal_after_core_update(journal)
+    return entry
+
+
+def record_notification_failed(event_key: str, reason: str = "send_failed", send_error: str = "", now_ts: Optional[float] = None) -> Dict[str, Any]:
+    journal = load_notification_event_journal()
+    entry = notification_core.record_notification_failed(journal, event_key, _notification_ts_from_epoch(now_ts), reason=reason, send_error=send_error)
+    _save_notification_journal_after_core_update(journal)
+    return entry
+
+
+def should_skip_notification_event(event_key: str, now_ts: Optional[float] = None, retry_cooldown_seconds: Optional[int] = None) -> Dict[str, Any]:
+    journal = load_notification_event_journal()
+    return notification_core.should_skip_notification_event(
+        journal,
+        event_key,
+        _notification_ts_from_epoch(now_ts),
+        int(retry_cooldown_seconds or NOTIFICATION_EVENT_RETRY_COOLDOWN_SECONDS),
+    )
+
+
 def record_notification_event_status(
     event_key: str,
     emission_key: str,
@@ -8181,26 +8237,26 @@ def record_notification_event_status(
     send_error: str = "",
 ) -> Dict[str, Any]:
     journal = load_notification_event_journal()
-    events = journal.setdefault("events", {})
-    existing = events.get(event_key) if isinstance(events.get(event_key), dict) else {}
-    event = {**_notification_event_base(event_key, emission_key, event_type, row=row, source=source, reason=reason), **existing}
-    event["event_key"] = event_key
-    event["emission_key"] = emission_key
-    event["event_type"] = event_type
-    event["last_seen_ts"] = now_utc_str()
-    event["send_status"] = status
-    event["last_reason"] = reason
-    if send_error:
-        event["send_error"] = send_error
-    if status == "sent":
-        event["send_ts"] = now_utc_str()
-        event["send_error"] = ""
-    events[event_key] = event
+    event = _notification_event_payload(event_key, emission_key, event_type, row=row, source=source, reason=reason)
+    now_str = now_utc_str()
+    if str(status or "").strip().lower() == "sent":
+        entry = notification_core.record_notification_sent(journal, event_key, now_str, reason=reason or "sent")
+    elif str(status or "").strip().lower() == "failed":
+        entry = notification_core.record_notification_failed(journal, event_key, now_str, reason=reason or "send_failed", send_error=send_error)
+    elif str(status or "").strip().lower() == "pending":
+        entry = notification_core.record_notification_pending(journal, event, event_key, now_str)
+    else:
+        events = journal.setdefault("events", {})
+        existing = events.get(event_key) if isinstance(events.get(event_key), dict) else _notification_event_base(event_key, emission_key, event_type, row=row, source=source, reason=reason)
+        entry = {**existing, "event_key": event_key, "emission_key": emission_key, "event_type": event_type, "last_seen_ts": now_str, "send_status": status, "last_reason": reason}
+        if send_error:
+            entry["send_error"] = send_error
+        events[event_key] = entry
     trimmed = trim_notification_event_journal(journal)
     save_notification_event_journal(journal)
     counts = notification_event_journal_counts(journal)
     counts["trimmed"] = trimmed
-    return {"status": status, "reason": reason, "event": event, "counts": counts}
+    return {"status": status, "reason": reason, "event": entry, "counts": counts}
 
 
 def notification_send_once(
@@ -8218,51 +8274,34 @@ def notification_send_once(
 ) -> Dict[str, Any]:
     now_ts = float(now_ts if now_ts is not None else time.time())
     retry_cooldown_seconds = max(60, int(retry_cooldown_seconds or NOTIFICATION_EVENT_RETRY_COOLDOWN_SECONDS))
-    journal = load_notification_event_journal()
-    events = journal.setdefault("events", {})
-    existing = events.get(event_key) if isinstance(events.get(event_key), dict) else {}
-    if str(existing.get("send_status") or "").lower() == "sent":
-        event = {**_notification_event_base(event_key, emission_key, event_type, row=row, source=source, reason=reason), **existing}
-        event["last_seen_ts"] = now_utc_str()
-        event["last_reason"] = "skipped_duplicate"
-        events[event_key] = event
-        save_notification_event_journal(journal)
-        return {"sent": False, "status": "skipped", "reason": "skipped_duplicate", "event": event, "counts": notification_event_journal_counts(journal)}
-    if str(existing.get("send_status") or "").lower() == "failed":
-        last_dt = parse_ts(existing.get("last_seen_ts") or existing.get("send_ts") or existing.get("first_seen_ts"))
-        if last_dt and (now_ts - last_dt.timestamp()) < retry_cooldown_seconds:
-            event = {**_notification_event_base(event_key, emission_key, event_type, row=row, source=source, reason=reason), **existing}
-            event["last_seen_ts"] = now_utc_str()
-            event["last_reason"] = "retry_cooldown"
-            events[event_key] = event
-            save_notification_event_journal(journal)
-            return {"sent": False, "status": "skipped", "reason": "retry_cooldown", "event": event, "counts": notification_event_journal_counts(journal)}
-    event = {**_notification_event_base(event_key, emission_key, event_type, row=row, source=source, reason=reason), **existing}
-    event["last_seen_ts"] = now_utc_str()
-    event["send_status"] = "pending"
-    event["last_reason"] = reason or "send_started"
-    event["send_attempts"] = int(parse_float(event.get("send_attempts", 0), 0.0)) + 1
-    event["send_error"] = ""
-    events[event_key] = event
-    save_notification_event_journal(journal)
+    event_payload = _notification_event_payload(event_key, emission_key, event_type, row=row, source=source, reason=reason)
+    guard = notification_core.guard_notification_event(
+        event_payload,
+        load_notification_event_journal,
+        save_notification_event_journal,
+        _notification_ts_from_epoch(now_ts),
+        retry_cooldown_seconds,
+        NOTIFICATION_EVENT_JOURNAL_MAX,
+    )
+    if not guard.get("ok"):
+        journal = load_notification_event_journal()
+        events = journal.get("events") if isinstance(journal.get("events"), dict) else {}
+        event = events.get(event_key) if isinstance(events.get(event_key), dict) else {}
+        reason_out = "retry_cooldown" if guard.get("decision") == "skip_retry_cooldown" else str(guard.get("reason") or guard.get("decision") or "blocked")
+        return {"sent": False, "status": "skipped", "reason": reason_out, "event": event, "counts": notification_event_journal_counts(journal)}
 
     if reply_markup is None:
         ok = bool(send_telegram(text, parse_mode=parse_mode))
     else:
         ok = bool(send_telegram(text, parse_mode=parse_mode, reply_markup=reply_markup))
-    event["last_seen_ts"] = now_utc_str()
+
+    journal = load_notification_event_journal()
     if ok:
-        event["send_status"] = "sent"
-        event["send_ts"] = now_utc_str()
-        event["send_error"] = ""
-        event["last_reason"] = reason or "sent"
+        event = notification_core.record_notification_sent(journal, event_key, _notification_ts_from_epoch(now_ts), reason=reason or "sent")
         status = "sent"
     else:
-        event["send_status"] = "failed"
-        event["send_error"] = "send_telegram_false"
-        event["last_reason"] = reason or "send_failed"
+        event = notification_core.record_notification_failed(journal, event_key, _notification_ts_from_epoch(now_ts), reason=reason or "send_failed", send_error="send_telegram_false")
         status = "failed"
-    events[event_key] = event
     trimmed = trim_notification_event_journal(journal)
     save_notification_event_journal(journal)
     counts = notification_event_journal_counts(journal)
@@ -8280,25 +8319,37 @@ def build_notification_event_key(
     action: str = "",
 ) -> str:
     row = row if isinstance(row, dict) else {}
-    event_type_norm = str(event_type or "").strip().lower()
-    chain = str(token_chain(row) or row.get("chain") or "").strip().lower()
-    addr = str(token_ca(row) or row.get("token_address") or row.get("base_token_address") or "").strip().lower()
-    action_bucket = _normalize_action_token(action or (unified or {}).get("final_action") or row.get("final_action") or row.get("entry_action") or row.get("entry") or (signal or {}).get("bucket") or "NONE")
-    verdict = _normalize_action_token(row.get("verdict") or row.get("health_label") or row.get("risk_level") or row.get("risk") or "NA")
-    bucket_norm = re.sub(r"[^a-zA-Z0-9_:-]+", "_", str(bucket or "").strip()).strip("_") or "stable"
-    return f"{event_type_norm}|{source}|{chain}|{addr}|{action_bucket}|{verdict}|{bucket_norm}"
+    return notification_core.build_notification_event_key(
+        {
+            "event_type": event_type,
+            "source": source,
+            "row": row,
+            "chain": token_chain(row) or row.get("chain") or "",
+            "token_address": token_ca(row) or row.get("token_address") or row.get("base_token_address") or "",
+            "signal": signal if isinstance(signal, dict) else {},
+            "unified": unified if isinstance(unified, dict) else {},
+            "bucket": bucket,
+            "action": action,
+        }
+    )
 
 
 def build_digest_event_key(digest_path: str, now_ts: Optional[float] = None, heartbeat_hours: int = 12) -> str:
     now_ts = float(now_ts if now_ts is not None else time.time())
     bucket = int(now_ts // max(3600, int(heartbeat_hours or 12) * 3600))
-    return f"digest|{str(digest_path or 'digest').strip().lower()}|bucket:{bucket}"
+    return notification_core.build_notification_event_key(
+        {"event_type": "digest", "source": "digest", "digest_path": str(digest_path or "digest").strip().lower()},
+        bucket_ts=str(bucket),
+    )
 
 
 def build_heartbeat_event_key(kind: str, now_ts: Optional[float] = None, heartbeat_hours: int = 12) -> str:
     now_ts = float(now_ts if now_ts is not None else time.time())
     bucket = int(now_ts // max(3600, int(heartbeat_hours or 12) * 3600))
-    return f"health_warning|heartbeat|{str(kind or 'heartbeat').strip().lower()}|bucket:{bucket}"
+    return notification_core.build_notification_event_key(
+        {"event_type": "health_warning", "source": "heartbeat", "heartbeat_kind": str(kind or "heartbeat").strip().lower()},
+        bucket_ts=str(bucket),
+    )
 
 
 def reset_tg_state() -> None:
@@ -8552,7 +8603,17 @@ def build_emission_key(
     reason_bucket = normalize_alert_reason_bucket(row, unified=unified)
     current_ts = float(now_ts if now_ts is not None else time.time())
     cooldown_bucket = emission_cooldown_bucket(current_ts, cooldown_seconds)
-    return f"{source}|{chain}|{addr}|{event_type}|{action_bucket}|{reason_bucket}|{cooldown_bucket}"
+    return notification_core.build_emission_key(
+        {
+            "source": source,
+            "chain": chain,
+            "token_address": addr,
+            "event_type": event_type,
+            "action_bucket": action_bucket,
+            "reason_bucket": reason_bucket,
+        },
+        cooldown_bucket,
+    )
 
 
 def is_duplicate_emission(state: Dict[str, Any], emission_key: str, now_ts: float, cooldown_seconds: int) -> bool:
@@ -10440,15 +10501,15 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
     }
 
 
-def is_material_portfolio_action(row: Dict[str, Any], analysis: Dict[str, Any]) -> bool:
-    values = [
-        _normalize_action_token((row or {}).get("final_action")),
-        _normalize_action_token((row or {}).get("recommended_action")),
-        _normalize_action_token((row or {}).get("position_action")),
-        _normalize_action_token((row or {}).get("entry_action")),
-        _normalize_action_token((analysis or {}).get("action")),
-    ]
-    return any(v in MATERIAL_PORTFOLIO_ACTIONS for v in values)
+def is_material_portfolio_action(row: Any, analysis: Optional[Dict[str, Any]] = None) -> bool:
+    if analysis is None:
+        return notification_core.is_material_portfolio_action(row)
+    payload: Dict[str, Any] = {}
+    if isinstance(row, dict):
+        payload.update(row)
+    if isinstance(analysis, dict):
+        payload.update({k: v for k, v in analysis.items() if k in {"action", "bucket", "final_action", "recommended_action", "position_action", "entry_action"}})
+    return notification_core.is_material_portfolio_action(payload)
 
 
 def build_position_action_plan(row: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
@@ -14154,7 +14215,7 @@ def build_live_pulse_candidates_payload(
     }
 
 
-MATERIAL_PORTFOLIO_ACTIONS = {"EXIT", "REDUCE", "TAKE_PROFIT", "PARTIAL_TP", "PROTECT", "CLOSE", "TRIM", "TAKE PROFIT"}
+MATERIAL_PORTFOLIO_ACTIONS = notification_core.MATERIAL_PORTFOLIO_ACTIONS
 
 
 def normalize_material_portfolio_action(value: Any) -> str:
@@ -16129,18 +16190,15 @@ def render_debug_panel():
                 f"send_fail={int(parse_float(counters.get('send_fail', 0), 0.0))}"
             )
             st.caption(
-                f"notification_journal: sent={int(parse_float(counters.get('sent', 0), 0.0))} | "
-                f"skipped_duplicate={int(parse_float(counters.get('skipped_duplicate', 0), 0.0))} | "
-                f"failed={int(parse_float(counters.get('failed', 0), 0.0))} | "
+                "Notification journal: "
                 f"size={int(parse_float(counters.get('journal_size', runtime.get('notification_journal_size', 0)), 0.0))} | "
-                f"last_failed={counters.get('last_failed_reason') or '—'}"
-            )
-            st.caption(
-                f"notification_journal: sent={int(parse_float(counters.get('sent', 0), 0.0))} | "
-                f"skipped_duplicate={int(parse_float(counters.get('skipped_duplicate', 0), 0.0))} | "
+                f"sent={int(parse_float(counters.get('sent', 0), 0.0))} | "
                 f"failed={int(parse_float(counters.get('failed', 0), 0.0))} | "
-                f"size={int(parse_float(counters.get('journal_size', runtime.get('notification_journal_size', 0)), 0.0))} | "
-                f"last_failed={counters.get('last_failed_reason') or '—'}"
+                f"pending={int(parse_float(counters.get('pending', 0), 0.0))} | "
+                f"skipped duplicate={int(parse_float(counters.get('skipped_duplicate', 0), 0.0))} | "
+                f"last sent={counters.get('last_sent_ts') or '—'} | "
+                f"last failed reason={counters.get('last_failed_reason') or '—'} | "
+                f"trimmed={int(parse_float(counters.get('trimmed', runtime.get('notification_journal_trimmed', 0)), 0.0))}"
             )
         blocked_reasons = runtime.get("last_notification_block_reasons") or {}
         if isinstance(blocked_reasons, dict) and blocked_reasons:
@@ -16946,6 +17004,17 @@ def main():
                 f"sent={int(parse_float(counters.get('sent', 0), 0.0))} | "
                 f"blocked={int(parse_float(counters.get('blocked', 0), 0.0))} | "
                 f"send_fail={int(parse_float(counters.get('send_fail', 0), 0.0))}"
+            )
+            st.caption(
+                "Notification journal: "
+                f"size={int(parse_float(counters.get('journal_size', runtime.get('notification_journal_size', 0)), 0.0))} | "
+                f"sent={int(parse_float(counters.get('sent', 0), 0.0))} | "
+                f"failed={int(parse_float(counters.get('failed', 0), 0.0))} | "
+                f"pending={int(parse_float(counters.get('pending', 0), 0.0))} | "
+                f"skipped duplicate={int(parse_float(counters.get('skipped_duplicate', 0), 0.0))} | "
+                f"last sent={counters.get('last_sent_ts') or '—'} | "
+                f"last failed reason={counters.get('last_failed_reason') or '—'} | "
+                f"trimmed={int(parse_float(counters.get('trimmed', runtime.get('notification_journal_trimmed', 0)), 0.0))}"
             )
         blocked_reasons = runtime.get("last_notification_block_reasons") or {}
         if isinstance(blocked_reasons, dict) and blocked_reasons:
