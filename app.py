@@ -58,6 +58,12 @@ from runtime_core import (
     parse_int as runtime_parse_int,
     safe_get as runtime_safe_get,
 )
+from storage_repository import (
+    StorageRepository,
+    csv_from_text as repo_csv_from_text,
+    csv_to_text as repo_csv_to_text,
+    summarize_storage_result,
+)
 from storage_core import (
     JOB_HEARTBEATS_TABLE,
     JOB_RUNS_TABLE,
@@ -165,6 +171,7 @@ _MON_HISTORY_BUFFER_LAST_FLUSH_TS: float = 0.0
 _MON_HISTORY_HOURLY_DEDUP_KEYS: Set[str] = set()
 _MON_HISTORY_REMOTE_BACKUP_LAST_TS: float = 0.0
 _STORAGE_METRICS: Dict[str, int] = {"writes": 0, "roundtrip_checks": 0}
+_LAST_STORAGE_RESULT: Dict[str, Any] = {}
 SUPABASE_STORAGE_READ_CACHE_TTL_SEC = max(5, _env_int("SUPABASE_STORAGE_READ_CACHE_TTL_SEC", 600))
 SUPABASE_MAX_BLOB_READ_BYTES = max(50_000, _env_int("SUPABASE_MAX_BLOB_READ_BYTES", 500_000))
 APP_STORAGE_MAX_SAFE_BYTES = max(50_000, _env_int("APP_STORAGE_MAX_SAFE_BYTES", 500_000))
@@ -880,7 +887,7 @@ def storage_list_sizes(limit: int = 200) -> List[Dict[str, Any]]:
     out.sort(key=lambda r: int(r.get("bytes") or 0), reverse=True)
     return out
 
-def sb_get_storage(key: str, allow_oversized: bool = False) -> Optional[str]:
+def sb_get_storage(key: str, allow_oversized: bool = False, bypass_cache: bool = False) -> Optional[str]:
     """
     Returns content for key from public.app_storage, or None if not found/readable.
     Reliability refactor: HTTP 4xx/5xx responses degrade to None instead of bubbling up.
@@ -892,7 +899,7 @@ def sb_get_storage(key: str, allow_oversized: bool = False) -> Optional[str]:
     try:
         now_epoch = time.time()
         cached = _SB_READ_CACHE.get(key)
-        if cached and (now_epoch - float(cached[0])) <= SUPABASE_STORAGE_READ_CACHE_TTL_SEC:
+        if (not bypass_cache) and cached and (now_epoch - float(cached[0])) <= SUPABASE_STORAGE_READ_CACHE_TTL_SEC:
             return cached[1]
         if LOW_EGRESS_MODE and not allow_oversized:
             key_size = storage_get_key_size(key)
@@ -1258,22 +1265,12 @@ def parse_ts(ts: Any) -> Optional[datetime]:
         return None
 
 
-def _csv_from_string(content: str) -> List[Dict[str, Any]]:
-    if not content.strip():
-        return []
-    sio = io.StringIO(content)
-    rdr = csv.DictReader(sio)
-    return [row for row in rdr]
+def _csv_from_string(content: str, fields: Optional[List[str]] = None, preserve_extra: bool = True) -> List[Dict[str, Any]]:
+    return repo_csv_from_text(content, fields, preserve_extra=preserve_extra)
 
 
 def _csv_to_string(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
-    sio = io.StringIO()
-    w = csv.DictWriter(sio, fieldnames=fieldnames)
-    w.writeheader()
-    for r in rows:
-        out = {k: r.get(k, "") for k in fieldnames}
-        w.writerow(out)
-    return sio.getvalue()
+    return repo_csv_to_text(rows, fieldnames)
 
 
 def _app_storage_remote_ok() -> bool:
@@ -1286,6 +1283,74 @@ def _active_storage_source_label() -> str:
     if _sb_ok():
         return "supabase"
     return "local_fallback"
+
+
+class _AppRemoteStorageBackend:
+    @property
+    def source(self) -> str:
+        return _active_storage_source_label() if _app_storage_remote_ok() else "none"
+
+    @property
+    def verify_source(self) -> str:
+        return self.source
+
+    def read_text(self, key: str, bypass_cache: bool = False) -> Optional[str]:
+        if not _app_storage_remote_ok():
+            return None
+        return sb_get_storage(storage_key_for_path(key), bypass_cache=bypass_cache)
+
+    def write_text(self, key: str, content: str) -> bool:
+        if not _app_storage_remote_ok():
+            return False
+        return sb_put_storage(storage_key_for_path(key), content)
+
+
+class _LocalTextFallbackBackend:
+    source = "local"
+    verify_source = "local"
+
+    def read_text(self, key: str, bypass_cache: bool = False) -> Optional[str]:
+        fallback = local_fallback_path(os.path.join(DATA_DIR, storage_key_for_path(key)))
+        if not os.path.exists(fallback):
+            return None
+        return Path(fallback).read_text(encoding="utf-8")
+
+    def write_text(self, key: str, content: str) -> bool:
+        fallback = local_fallback_path(os.path.join(DATA_DIR, storage_key_for_path(key)))
+        lockp = fallback + ".lock"
+        with file_lock(lockp):
+            Path(fallback).write_text(str(content or ""), encoding="utf-8")
+        return True
+
+
+def _app_storage_repository(*, verify_mode: Optional[str] = None) -> StorageRepository:
+    return StorageRepository(
+        _AppRemoteStorageBackend(),
+        verify_mode=STORAGE_VERIFY_MODE if verify_mode is None else verify_mode,
+        verify_sample_rate=STORAGE_VERIFY_SAMPLE_RATE,
+    )
+
+
+def _remember_storage_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    global _LAST_STORAGE_RESULT
+    _LAST_STORAGE_RESULT = summarize_storage_result(result or {})
+    _LAST_STORAGE_RESULT["verify_mode"] = STORAGE_VERIFY_MODE
+    _LAST_STORAGE_RESULT["backend"] = _active_storage_source_label()
+    _LAST_STORAGE_RESULT["verification_bypasses_cache"] = bool((result or {}).get("verify_attempted"))
+    return _LAST_STORAGE_RESULT
+
+
+def storage_diagnostics_snapshot() -> Dict[str, Any]:
+    return dict(_LAST_STORAGE_RESULT or {
+        "ok": False,
+        "write_ok": False,
+        "verify_status": "skipped",
+        "verify_source": "none",
+        "error": "",
+        "verify_mode": STORAGE_VERIFY_MODE,
+        "backend": _active_storage_source_label(),
+        "verification_bypasses_cache": False,
+    })
 
 
 def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -1324,7 +1389,7 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
         if content:
             try:
                 st.session_state[f"_storage_source_{key}"] = _active_storage_source_label()
-                rows = _normalize_rows(_csv_from_string(content))
+                rows = _csv_from_string(content, fields, preserve_extra=False)
                 if is_history and not os.path.exists(fallback):
                     try:
                         lockp = fallback + ".lock"
@@ -1342,7 +1407,7 @@ def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, An
             with open(fallback, "r", newline="", encoding="utf-8") as f:
                 debug_log(f"using_local_fallback key={key}")
                 st.session_state[f"_storage_source_{key}"] = "local_fallback"
-                return _normalize_rows(list(csv.DictReader(f)))
+                return _csv_from_string(f.read(), fields, preserve_extra=False)
         except Exception as e:
             debug_log(f"local_fallback_read_failed key={key} err={type(e).__name__}:{e}")
 
@@ -1355,7 +1420,7 @@ def storage_read_text(key: str, default: str = "") -> str:
     key = storage_key_for_path(key)
 
     if _app_storage_remote_ok():
-        content = sb_get_storage(key)
+        content = _app_storage_repository(verify_mode="off").read_text(key)
         if content is not None:
             return str(content)
 
@@ -1368,21 +1433,48 @@ def storage_read_text(key: str, default: str = "") -> str:
     return str(default)
 
 
-def storage_write_text(key: str, text: str) -> None:
+def storage_write_text(key: str, text: str) -> bool:
     ensure_storage()
     key = storage_key_for_path(key)
     content = str(text or "")
 
     fallback = local_fallback_path(os.path.join(DATA_DIR, key))
+    local_ok = True
     try:
         lockp = fallback + ".lock"
         with file_lock(lockp):
             Path(fallback).write_text(content, encoding="utf-8")
     except Exception as e:
+        local_ok = False
         debug_log(f"local_fallback_write_failed key={key} err={type(e).__name__}:{e}")
 
     if _app_storage_remote_ok():
-        sb_put_storage(key, content)
+        result = _app_storage_repository().write_text(key, content)
+        _remember_storage_result(result)
+        if result.get("verify_attempted"):
+            _STORAGE_METRICS["roundtrip_checks"] = int(_STORAGE_METRICS.get("roundtrip_checks", 0) or 0) + 1
+        return bool(result.get("write_ok"))
+    return bool(local_ok)
+
+
+def load_json(key: str, default: Any = None) -> Any:
+    raw = storage_read_text(key, "")
+    if not str(raw or "").strip():
+        return default
+    try:
+        return json.loads(str(raw))
+    except Exception:
+        debug_log(f"storage_json_load_diag key={storage_key_for_path(key)} err=invalid_json")
+        return default
+
+
+def save_json(key: str, payload: Any) -> Dict[str, Any]:
+    try:
+        content = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        content = json.dumps(payload, ensure_ascii=False, sort_keys=False, default=str, separators=(",", ":"))
+    ok = storage_write_text(key, content)
+    return {"ok": bool(ok), "write_ok": bool(ok)}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1408,6 +1500,12 @@ def tg_state_load_cached() -> Dict[str, Any]:
 def storage_metrics_reset() -> None:
     _STORAGE_METRICS["writes"] = 0
     _STORAGE_METRICS["roundtrip_checks"] = 0
+
+
+def _clear_cache_data_func(func: Any) -> None:
+    clear = getattr(func, "clear", None)
+    if callable(clear):
+        clear()
 
 
 def storage_metrics_snapshot() -> Dict[str, int]:
@@ -1452,7 +1550,9 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
             global _MON_HISTORY_REMOTE_BACKUP_LAST_TS
             elapsed = now_ts - float(_MON_HISTORY_REMOTE_BACKUP_LAST_TS or 0.0)
             if elapsed >= MON_HISTORY_REMOTE_BACKUP_INTERVAL_SEC:
-                if sb_put_storage(key, content):
+                result = _app_storage_repository(verify_mode="off").write_text(key, content)
+                _remember_storage_result(result)
+                if result.get("write_ok"):
                     _MON_HISTORY_REMOTE_BACKUP_LAST_TS = now_ts
                     debug_log(f"history_remote_backup_ok bytes={len(content)}")
                 else:
@@ -1462,11 +1562,15 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
         else:
             debug_log(f"history_remote_backup_skipped mode={MON_HISTORY_SUPABASE_MODE}")
         st.session_state["_save_badge"] = "💾 saved (local history hot path)"
-        load_monitoring_rows_cached.clear()
+        _clear_cache_data_func(load_monitoring_rows_cached)
         return
 
     if _app_storage_remote_ok():
-        ok = sb_put_storage(key, content)
+        result = _app_storage_repository().write_text(key, content)
+        _remember_storage_result(result)
+        if result.get("verify_attempted"):
+            _STORAGE_METRICS["roundtrip_checks"] = int(_STORAGE_METRICS.get("roundtrip_checks", 0) or 0) + 1
+        ok = bool(result.get("write_ok"))
         if ok:
             debug_log(f"supabase_store_ok key={key}")
             st.session_state["_save_badge"] = "💾 saved (supabase)"
@@ -1475,10 +1579,10 @@ def save_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]):
             st.session_state["_save_badge"] = "⚠️ saved local, remote write failed"
     else:
         st.session_state["_save_badge"] = "💾 saved (local)"
-    load_monitoring_rows_cached.clear()
-    load_portfolio_rows_cached.clear()
-    scanner_state_load_cached.clear()
-    tg_state_load_cached.clear()
+    _clear_cache_data_func(load_monitoring_rows_cached)
+    _clear_cache_data_func(load_portfolio_rows_cached)
+    _clear_cache_data_func(scanner_state_load_cached)
+    _clear_cache_data_func(tg_state_load_cached)
 
 
 def backup_csv_snapshot(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
