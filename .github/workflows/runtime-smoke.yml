@@ -1,0 +1,155 @@
+name: Runtime Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Smoke mode to run
+        type: choice
+        required: true
+        default: preflight_only
+        options:
+          - preflight_only
+          - health_only
+          - read_only
+          - safe_runtime_sequence
+      dry_run:
+        description: Validate runtime jobs without writes, Telegram sends, or scans
+        type: boolean
+        required: true
+        default: true
+      allow_tg_send:
+        description: Allow notify/digest Telegram sends when dry_run is false
+        type: boolean
+        required: true
+        default: false
+      allow_scan:
+        description: Allow scan_cycle when dry_run is false
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  DEX_SCOUT_WORKER_MODE: "1"
+  STORAGE_BACKEND: ${{ vars.STORAGE_BACKEND || 'supabase' }}
+  RUNTIME_JOBS_DISABLED: ${{ vars.RUNTIME_JOBS_DISABLED || 'false' }}
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+  D1_PROXY_URL: ${{ secrets.D1_PROXY_URL }}
+  D1_PROXY_TOKEN: ${{ secrets.D1_PROXY_TOKEN }}
+  TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+jobs:
+  runtime-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+
+      - name: Compile runtime modules
+        run: |
+          set -euo pipefail
+          files=(app.py worker.py tg_webhook.py app_runtime_facade.py runtime_core.py storage_core.py)
+          if [ -f dash_app.py ]; then files+=(dash_app.py); fi
+          python -m py_compile "${files[@]}"
+
+      - name: Import runtime modules
+        run: |
+          set -euo pipefail
+          DEX_SCOUT_WORKER_MODE=1 python -c "import app; print('app_import_ok')"
+          python -c "import app_runtime_facade; print('facade_import_ok')"
+          python -c "import runtime_core; print('runtime_core_ok')"
+          python -c "import storage_core; print('storage_core_ok')"
+
+      - name: Config presence booleans
+        run: |
+          python - <<'PY'
+          import json
+          import worker
+          print(json.dumps(worker._safe_config_presence(), sort_keys=True))
+          PY
+
+      - name: Run selected smoke mode
+        env:
+          SMOKE_MODE: ${{ inputs.mode }}
+          SMOKE_DRY_RUN: ${{ inputs.dry_run }}
+          SMOKE_ALLOW_TG_SEND: ${{ inputs.allow_tg_send }}
+          SMOKE_ALLOW_SCAN: ${{ inputs.allow_scan }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          import app_runtime_facade
+          import worker
+
+          def as_bool(value, default=False):
+              raw = str(value if value is not None else '').strip().lower()
+              if not raw:
+                  return bool(default)
+              return raw in {'1', 'true', 'yes', 'y', 'on'}
+
+          mode = os.getenv('SMOKE_MODE', 'preflight_only')
+          dry_run = as_bool(os.getenv('SMOKE_DRY_RUN'), True)
+          allow_tg_send = as_bool(os.getenv('SMOKE_ALLOW_TG_SEND'), False)
+          allow_scan = as_bool(os.getenv('SMOKE_ALLOW_SCAN'), False)
+
+          steps = []
+          import_state = app_runtime_facade.load_app_runtime()
+          preflight = worker._runtime_preflight(import_state)
+          steps.append({'name': 'preflight', 'ok': bool(import_state.get('ok')), 'summary': preflight})
+
+          if mode in {'read_only', 'safe_runtime_sequence'}:
+              read_only = worker.run_runtime_smoke_read_only(app_runtime_facade)
+              steps.append({'name': 'read_only', 'ok': bool(read_only.get('ok')), 'summary': read_only})
+              print(json.dumps(read_only, sort_keys=True, default=str))
+
+          if mode == 'safe_runtime_sequence':
+              worker.app = app_runtime_facade
+              sequence = worker.run_safe_runtime_sequence(
+                  dry_run=dry_run,
+                  allow_tg_send=allow_tg_send,
+                  allow_scan=allow_scan,
+              )
+              steps.append({'name': 'safe_runtime_sequence', 'ok': bool(sequence.get('ok')), 'summary': sequence})
+              print(json.dumps(sequence, sort_keys=True, default=str))
+
+          summary = worker.build_runtime_smoke_summary(
+              mode=mode,
+              dry_run=dry_run,
+              allow_tg_send=allow_tg_send,
+              allow_scan=allow_scan,
+              steps=steps,
+          )
+          Path('runtime-smoke-summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True, default=str), encoding='utf-8')
+          print(json.dumps(summary, sort_keys=True, default=str))
+          if not all(bool(step.get('ok')) for step in steps):
+              raise SystemExit(1)
+          PY
+
+      - name: Upload runtime smoke summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-smoke-summary
+          path: runtime-smoke-summary.json
+          if-no-files-found: error
