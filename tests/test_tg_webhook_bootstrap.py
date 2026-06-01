@@ -203,7 +203,13 @@ def test_import_status_endpoint_healthy_and_failure(monkeypatch):
     monkeypatch.setattr(tg_webhook, 'IMPORT_FAILED', False)
     monkeypatch.setattr(tg_webhook, 'IMPORT_ERROR', '')
     monkeypatch.setattr(tg_webhook, 'BOOTSTRAP_ERROR', {})
-    assert client.get('/_import_status').json() == {'ok': True, 'import_failed': False, 'error': '', 'bootstrap_error': {}}
+    data = client.get('/_import_status').json()
+    assert data['ok'] is True
+    assert data['import_failed'] is False
+    assert data['error'] == ''
+    assert data['bootstrap_error'] == {}
+    assert 'worker_fast_mode' in data
+    assert 'app_module_loaded' in data
     monkeypatch.setattr(tg_webhook, 'IMPORT_FAILED', True)
     monkeypatch.setattr(tg_webhook, 'IMPORT_ERROR', 'boom')
     monkeypatch.setattr(tg_webhook, 'BOOTSTRAP_ERROR', {'exception_text': 'boom'})

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DEX Scout Intervention Guide / Runtime Map</title>
+  <style>
+    :root { --bg:#07111f; --panel:#0d1b2e; --panel2:#10243d; --text:#e6edf7; --muted:#9db0c7; --accent:#66e3ff; --good:#46d28a; --warn:#ffd166; --bad:#ff6b6b; --line:#27415f; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; color:var(--text); background:radial-gradient(circle at top left,#17375f 0,#07111f 42%,#050914 100%); }
+    header { padding:34px 28px 20px; border-bottom:1px solid var(--line); background:rgba(5,9,20,.72); position:sticky; top:0; z-index:2; backdrop-filter: blur(10px); }
+    h1 { margin:0 0 8px; font-size:34px; letter-spacing:-.03em; }
+    h2 { margin:0 0 16px; font-size:24px; }
+    h3 { margin:18px 0 8px; color:var(--accent); }
+    p { color:var(--muted); line-height:1.55; }
+    nav { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
+    nav a { color:var(--text); text-decoration:none; border:1px solid var(--line); border-radius:999px; padding:8px 12px; background:rgba(16,36,61,.7); }
+    main { max-width:1180px; margin:0 auto; padding:28px; }
+    section { margin:0 0 28px; padding:24px; border:1px solid var(--line); border-radius:22px; background:linear-gradient(180deg,rgba(13,27,46,.95),rgba(8,17,31,.95)); box-shadow:0 20px 60px rgba(0,0,0,.28); }
+    .banner { border-color:rgba(102,227,255,.55); background:linear-gradient(135deg,rgba(102,227,255,.14),rgba(70,210,138,.08)); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+    .card { padding:16px; border:1px solid var(--line); border-radius:16px; background:rgba(16,36,61,.72); }
+    .score { font-size:30px; font-weight:800; color:var(--accent); }
+    .good { color:var(--good); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+    table { width:100%; border-collapse:collapse; overflow:hidden; border-radius:14px; }
+    th, td { text-align:left; padding:11px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { color:#cfe7ff; background:rgba(102,227,255,.08); }
+    code, pre { color:#d7f7ff; background:#07111f; border:1px solid var(--line); border-radius:10px; padding:2px 6px; }
+    pre { padding:14px; overflow:auto; line-height:1.5; }
+    .flow { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-line; color:#d7f7ff; }
+    .last { font-size:13px; color:var(--muted); border-left:3px solid var(--accent); padding-left:12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>DEX Scout Intervention Guide / Runtime Map</h1>
+    <p>червень 2026 / post-audit runtime map</p>
+    <nav>
+      <a href="#status">Status</a><a href="#architecture">Architecture</a><a href="#findings">Findings</a><a href="#scores">Health Scores</a><a href="#roadmap">🧭 Roadmap</a><a href="#risks">Risks</a><a href="#checks">Regression Checks</a>
+    </nav>
+  </header>
+  <main>
+    <section id="status" class="banner">
+      <h2>Current state</h2>
+      <div class="grid">
+        <div class="card"><b class="good">Completed</b><p>Audit safety patches completed through #270/#272. Runtime import/env/storage stability completed through #273/#275 where merged.</p></div>
+        <div class="card"><b class="warn">Current PR</b><p>#276 worker/webhook facade split: add <code>app_runtime_facade.py</code>, explicit degraded import state, and preflight visibility.</p></div>
+        <div class="card"><b>Next PR</b><p>#277 notification exactly-once event journal.</p></div>
+        <div class="card"><b>Persistence</b><p>D1 is current primary persistence path. Supabase references are historical/legacy unless code explicitly uses them as a fallback.</p></div>
+      </div>
+      <p class="last">Last updated: 2026-06 post-audit runtime-map refresh. This document includes no secrets, tokens, private URLs, or environment values.</p>
+    </section>
+
+    <section id="architecture">
+      <h2>Architecture page</h2>
+      <div class="grid">
+        <div class="card"><h3>Persistence</h3><ul><li>Cloudflare D1 / D1 Worker / <code>app_storage</code></li><li>CSV/local fallback remains available where runtime code supports it.</li><li>Supabase is legacy/fallback only, not the current primary path.</li></ul></div>
+        <div class="card"><h3>Runtime dependency warning</h3><p>Legacy roles still depend on <code>app.py</code> for business functions; #276 introduces lazy <code>app_runtime_facade.py</code> to reduce startup blast radius.</p></div>
+        <div class="card"><h3>Facade target</h3><div class="flow">UI / Streamlit → app.py
+
+Worker → worker.py → app_runtime_facade.py → lazy app.py
+
+Webhook → tg_webhook.py → app_runtime_facade.py → lazy app.py
+
+Dash → dash_app.py → D1 read-only helpers</div></div>
+      </div>
+    </section>
+
+    <section id="findings">
+      <h2>Findings table</h2>
+      <table><thead><tr><th>Status</th><th>Item</th><th>Runtime meaning</th></tr></thead><tbody>
+        <tr><td class="good">Done by prior PRs</td><td>score negative clamp, safe numeric casts, DEX empty query guard, pair_age_hours/core/full, alerts cap/reserve behavior</td><td>Correctness and safety guardrails are no longer active TODO items.</td></tr>
+        <tr><td class="good">Done by prior PRs</td><td>worker lock_key/stale heartbeat regressions, tg_webhook import guard, hmac.compare_digest, callback validation, callback replay guard</td><td>Bootstrap and callback security regressions are already addressed.</td></tr>
+        <tr><td class="good">Done by prior PRs</td><td>addr matching helper, find_token_meta TTL cache, monitoring_app empty save/timezone/config constants</td><td>Operational edge cases moved out of the active-risk list.</td></tr>
+        <tr><td class="good">Done by #273/#275</td><td>app.py WORKER_FAST_MODE guard, safe env parsing, storage verification truth, runtime/storage core extraction where merged</td><td>Import/env/storage stability is post-audit baseline.</td></tr>
+        <tr><td class="warn">Current #276</td><td>worker/webhook lazy facade split, explicit app import failure state, no top-level app.py import crash, preflight visibility</td><td>Reduces blast radius but does not fully decompose business logic.</td></tr>
+        <tr><td>Next</td><td>notification exactly-once event journal, deeper app.py module split, proper table storage if needed</td><td>Remaining architectural hardening.</td></tr>
+      </tbody></table>
+    </section>
+
+    <section id="scores">
+      <h2>Qualitative/operator health scores</h2>
+      <p>These are qualitative operator scores, not objective metrics.</p>
+      <div class="grid">
+        <div class="card"><b>Reliability</b><div class="score">7/10</div><p>Target 8 after #276.</p></div>
+        <div class="card"><b>Security</b><div class="score">8/10</div></div>
+        <div class="card"><b>Correctness</b><div class="score">7/10</div></div>
+        <div class="card"><b>Testability</b><div class="score">6/10</div></div>
+        <div class="card"><b>Persistence</b><div class="score">7/10</div></div>
+        <div class="card"><b>Maintainability</b><div class="score">4/10</div></div>
+        <div class="card"><b>Architecture</b><div class="score">6/10</div><p>Target 7 after facade.</p></div>
+        <div class="card"><b>Feature completeness</b><div class="score">8/10</div></div>
+      </div>
+    </section>
+
+    <section id="roadmap">
+      <h2>🧭 Current roadmap</h2>
+      <ol><li>Completed: Audit safety guardrails — #270/#272</li><li>Completed: Runtime import/env/storage truth — #273</li><li>Completed: Live Pulse payload + hard quarantine — #274</li><li>Completed: Extract runtime/storage core — #275</li><li class="warn">Current: Worker/webhook facade split — #276</li><li>Next: Exactly-once notification event journal — #277</li><li>Further app.py decomposition</li><li>Proper structured storage tables if needed</li></ol>
+    </section>
+
+    <section id="risks">
+      <h2>Risks page</h2>
+      <ul><li>Facade wrappers returning success on import failure.</li><li>Heartbeat/status falsely saying a job succeeded.</li><li>Webhook health hiding degraded app import.</li><li>Wrapper parity drift vs app.py functions.</li><li>app.py business functions still too centralized.</li></ul>
+    </section>
+
+    <section id="checks">
+      <h2>Regression checklist</h2>
+      <pre>python -m py_compile app_runtime_facade.py worker.py tg_webhook.py app.py
+pytest -q
+DEX_SCOUT_WORKER_MODE=1 python -c "import app; print('ok')"
+python -c "import app_runtime_facade; print('ok')"
+GET /_import_status returns no secrets
+Runtime Jobs: maintenance_cycle, monitor_cycle, scan_cycle
+no fake success on forced app import failure test</pre>
+      <p>Secret hygiene: no secrets, no token values, no private runtime URLs. The literal variable names <code>TG_BOT_TOKEN</code>, <code>D1_PROXY_TOKEN</code>, and <code>SUPABASE_SERVICE_ROLE_KEY</code> may appear only in tests/checklists, never with values.</p>
+    </section>
+  </main>
+</body>
+</html>
