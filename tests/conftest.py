@@ -1,13 +1,75 @@
 import asyncio
 import inspect
+import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+STUBS = ROOT / "tests" / "stubs"
+for _path in (str(ROOT), str(STUBS)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+_existing_pythonpath = os.environ.get("PYTHONPATH", "")
+_parts = [p for p in _existing_pythonpath.split(os.pathsep) if p]
+_prefixes = [str(STUBS), str(ROOT)]
+for _prefix in reversed(_prefixes):
+    if _prefix not in _parts:
+        _existing_pythonpath = _prefix + (os.pathsep + _existing_pythonpath if _existing_pythonpath else "")
+        _parts.insert(0, _prefix)
+os.environ["PYTHONPATH"] = _existing_pythonpath
+
+
+def _install_requests_stub() -> None:
+    """Install a tiny requests stub when the optional dependency is absent."""
+    if "requests" in sys.modules:
+        return
+    if importlib.util.find_spec("requests") is not None:
+        return
+
+    class _Response:
+        status_code = 200
+        text = ""
+        content = b""
+        headers = {}
+
+        def __init__(self, json_data=None, status_code=200, text=""):
+            self._json_data = {} if json_data is None else json_data
+            self.status_code = status_code
+            self.text = text
+            self.content = text.encode()
+            self.headers = {}
+
+        def json(self):
+            return self._json_data
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+    def _request(*args, **kwargs):
+        return _Response()
+
+    class _Session:
+        def request(self, *args, **kwargs):
+            return _request(*args, **kwargs)
+        def get(self, *args, **kwargs):
+            return _request(*args, **kwargs)
+        def post(self, *args, **kwargs):
+            return _request(*args, **kwargs)
+
+    stub = types.ModuleType("requests")
+    stub.get = _request
+    stub.post = _request
+    stub.put = _request
+    stub.delete = _request
+    stub.request = _request
+    stub.Session = _Session
+    stub.Response = _Response
+    stub.exceptions = types.SimpleNamespace(RequestException=Exception, Timeout=TimeoutError)
+    sys.modules["requests"] = stub
 
 
 def _install_streamlit_stub() -> None:
@@ -207,6 +269,7 @@ def _install_fastapi_stub() -> None:
     sys.modules["fastapi.testclient"] = testclient_stub
 
 
+_install_requests_stub()
 _install_streamlit_stub()
 _install_pandas_stub()
 _install_fastapi_stub()

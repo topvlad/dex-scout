@@ -5,7 +5,7 @@ import time
 import traceback
 import uuid
 from datetime import datetime, timezone
-from importlib import import_module
+import json
 from typing import Any, Callable, Dict, Optional
 
 from runtime_core import _env_bool, _env_int, now_utc_str, parse_float
@@ -18,7 +18,7 @@ from runtime_core import _env_bool, _env_int, now_utc_str, parse_float
 # Locking: acquire_lock() per job mode prevents duplicate runs.
 # ============================================================
 
-os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
+os.environ.setdefault("DEX_SCOUT_WORKER_MODE", "1")
 
 BASE_REQUIRED_ENV_VARS = (
     "JOB_MODE",
@@ -42,10 +42,29 @@ def _fail_fast(reason: str, exit_code: int) -> int:
 
 
 def _load_app():
-    try:
-        return import_module("app")
-    except Exception as exc:
-        raise RuntimeError(f"import_error:{type(exc).__name__}:{exc}") from exc
+    import app_runtime_facade
+    return app_runtime_facade
+
+
+def _runtime_preflight(import_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    import_state = dict(import_state or {})
+    backend = str(os.getenv("STORAGE_BACKEND", "supabase")).strip().lower() or "supabase"
+    if backend not in {"supabase", "d1", "local"}:
+        backend = "supabase"
+    return {
+        "app_import_ok": bool(import_state.get("ok")),
+        "worker_fast_mode": str(os.getenv("DEX_SCOUT_WORKER_MODE", "")).strip() == "1",
+        "runtime_jobs_enabled": not _env_bool("RUNTIME_JOBS_DISABLED", False),
+        "storage_backend": backend,
+        "d1_config_present": bool(str(os.getenv("D1_PROXY_URL", "")).strip()) and bool(str(os.getenv("D1_PROXY_TOKEN", "")).strip()),
+        "telegram_config_present": bool(str(os.getenv("TG_BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))).strip()) and bool(str(os.getenv("TG_CHAT_ID", "")).strip()),
+    }
+
+
+def _print_preflight(import_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = _runtime_preflight(import_state)
+    print(f"[worker] preflight {json.dumps(payload, sort_keys=True)}", flush=True)
+    return payload
 
 
 def _missing_required_env() -> list[str]:
@@ -766,6 +785,11 @@ def run_job_mode(job_mode: str) -> int:
 def main() -> int:
     global app
     app = _load_app()
+    import_state = app.load_app_runtime()
+    _print_preflight(import_state)
+    if not import_state.get("ok"):
+        print(f"[worker] app_import_failed type={import_state.get('exception_type')} error={import_state.get('error')}", flush=True)
+        return 2
 
     missing_env = _missing_required_env()
     if missing_env:
@@ -826,10 +850,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except RuntimeError as exc:
-        msg = str(exc)
-        if msg.startswith("import_error:"):
-            raise SystemExit(_fail_fast(msg, 11))
-        raise
+    raise SystemExit(main())

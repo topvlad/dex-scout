@@ -9,6 +9,7 @@ import requests
 from fastapi import FastAPI, HTTPException, Request, Response
 
 from runtime_core import addr_store, canonical_entity_key, normalize_chain_name, now_utc_str
+import app_runtime_facade
 
 BOOTSTRAP_ERROR: Dict[str, str] = {}
 IMPORT_FAILED = False
@@ -56,65 +57,119 @@ def _env_int_bounded(name: str, default: int, min_value: int, max_value: int) ->
 TG_META_CACHE_TTL_SEC = _env_int_bounded("TG_META_CACHE_TTL_SEC", 30, 5, 120)
 TG_META_CACHE: Dict[str, Any] = {"ts": 0.0, "index": {}}
 
-try:
-    from app import (
-        MON_FIELDS,
-        PORTFOLIO_FIELDS,
-        build_active_monitoring_rows,
-        build_notification_candidates,
-        get_job_heartbeats_snapshot,
-        get_worker_runtime_state,
-        load_monitoring,
-        load_portfolio,
-        load_tg_state,
-        normalize_timing_label,
-        manual_add_token_to_monitoring,
-        save_monitoring,
-        save_portfolio,
-        save_tg_state,
-        send_telegram,
-        suppress_token,
-        trigger_digest_notification,
-    )
-except Exception as e:
-    IMPORT_FAILED = True
-    IMPORT_ERROR = str(e)
-    BOOTSTRAP_ERROR = {
-        "module": "app",
-        "helper": "bootstrap_import",
-        "exception_type": type(e).__name__,
-        "exception_text": str(e),
-    }
-    print(
-        "[tg_webhook] bootstrap import failed "
-        f"helper={BOOTSTRAP_ERROR['helper']} "
-        f"type={BOOTSTRAP_ERROR['exception_type']} "
-        f"text={BOOTSTRAP_ERROR['exception_text']}",
-        flush=True,
-    )
-    MON_FIELDS = ["chain", "base_addr", "active", "archived", "status", "updated_at", "note", "archived_reason"]
-    PORTFOLIO_FIELDS = ["chain", "base_token_address", "active", "archived", "updated_at", "note"]
+MON_FIELDS = ["chain", "base_addr", "active", "archived", "status", "updated_at", "note", "archived_reason"]
+PORTFOLIO_FIELDS = ["chain", "base_token_address", "active", "archived", "updated_at", "note"]
 
 
-    def load_tg_state() -> Dict[str, Any]:
-        return TG_STATE
+def _facade_state(force_reload: bool = False) -> Dict[str, Any]:
+    state = app_runtime_facade.get_import_state(force_reload=force_reload)
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+        state["ok"] = False
+        state["error"] = IMPORT_ERROR or BOOTSTRAP_ERROR.get("exception_text", state.get("error", ""))
+        state["exception_type"] = BOOTSTRAP_ERROR.get("exception_type", state.get("exception_type", ""))
+    return state
 
-    def save_tg_state(state: Dict[str, Any]) -> None:
+
+def _app_available() -> bool:
+    return bool(_facade_state().get("ok"))
+
+
+def _facade_call(name: str, *args: Any, **kwargs: Any) -> Any:
+    state = _facade_state()
+    if not state.get("ok"):
+        return {
+            "ok": False,
+            "status": "app_import_failed",
+            "error": "app_import_failed",
+            "reason": state.get("error", ""),
+            "exception_type": state.get("exception_type", ""),
+        }
+    module = app_runtime_facade.get_app()
+    if module is None:
+        return {"ok": False, "status": "app_import_failed", "error": "app_import_failed"}
+    return getattr(module, name)(*args, **kwargs)
+
+
+def load_tg_state() -> Dict[str, Any]:
+    result = _facade_call("load_tg_state")
+    return result if isinstance(result, dict) and result.get("status") != "app_import_failed" else TG_STATE
+
+
+def save_tg_state(state: Dict[str, Any]) -> Any:
+    result = _facade_call("save_tg_state", state)
+    if isinstance(result, dict) and result.get("status") == "app_import_failed":
         TG_STATE.clear()
         TG_STATE.update(state)
+    return result
 
+
+def load_monitoring() -> List[Dict[str, Any]]:
+    result = _facade_call("load_monitoring")
+    return result if isinstance(result, list) else []
+
+
+def load_portfolio() -> List[Dict[str, Any]]:
+    result = _facade_call("load_portfolio")
+    return result if isinstance(result, list) else []
+
+
+def save_monitoring(rows: List[Dict[str, Any]]) -> Any:
+    return _facade_call("save_monitoring", rows)
+
+
+def save_portfolio(rows: List[Dict[str, Any]]) -> Any:
+    return _facade_call("save_portfolio", rows)
+
+
+def get_worker_runtime_state() -> Dict[str, Any]:
+    result = app_runtime_facade.get_worker_runtime_state()
+    return result if isinstance(result, dict) else {}
+
+
+def get_job_heartbeats_snapshot() -> Any:
+    return _facade_call("get_job_heartbeats_snapshot")
+
+
+def manual_add_token_to_monitoring(*args: Any, **kwargs: Any) -> Any:
+    return _facade_call("manual_add_token_to_monitoring", *args, **kwargs)
+
+
+def suppress_token(*args: Any, **kwargs: Any) -> Any:
+    return _facade_call("suppress_token", *args, **kwargs)
+
+
+def trigger_digest_notification(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    result = app_runtime_facade.trigger_digest_notification(*args, **kwargs)
+    return result if isinstance(result, dict) else {"ok": False, "error": "bad_digest_result"}
+
+
+def build_active_monitoring_rows(*args: Any, **kwargs: Any) -> Any:
+    return _facade_call("build_active_monitoring_rows", *args, **kwargs)
+
+
+def build_notification_candidates(*args: Any, **kwargs: Any) -> Any:
+    return _facade_call("build_notification_candidates", *args, **kwargs)
+
+
+def normalize_timing_label(*args: Any, **kwargs: Any) -> Any:
+    return _facade_call("normalize_timing_label", *args, **kwargs)
+
+
+def send_telegram(*args: Any, **kwargs: Any) -> Any:
+    return _facade_call("send_telegram", *args, **kwargs)
 
 def _app_import_failed_response() -> Dict[str, Any]:
-    return {"ok": False, "error": "app_import_failed", "detail": IMPORT_ERROR or BOOTSTRAP_ERROR.get("exception_text", "")}
+    state = _facade_state()
+    return {"ok": False, "error": "app_import_failed", "detail": state.get("error", "")}
 
 
 def _require_bootstrap() -> None:
-    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+    state = _facade_state()
+    if not state.get("ok"):
         raise RuntimeError(
             "bootstrap_unavailable:"
-            f"{BOOTSTRAP_ERROR.get('helper')}:"
-            f"{BOOTSTRAP_ERROR.get('exception_type')}:"
-            f"{BOOTSTRAP_ERROR.get('exception_text')}"
+            f"{state.get('exception_type')}:"
+            f"{state.get('error')}"
         )
 
 
@@ -302,7 +357,7 @@ def _index_meta_rows(index: Dict[str, Dict[str, str]], rows: List[Dict[str, Any]
 
 
 def _build_token_meta_index() -> Dict[str, Dict[str, str]]:
-    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+    if not _app_available():
         return {}
     index: Dict[str, Dict[str, str]] = {}
     _index_meta_rows(index, load_monitoring(), "monitoring")
@@ -469,37 +524,41 @@ def _do_action(action: str) -> Callable[[str, str], bool]:
 
 @app.get("/_import_status")
 def import_status():
-    failed = bool(IMPORT_FAILED or BOOTSTRAP_ERROR)
+    state = _facade_state()
+    failed = not bool(state.get("ok"))
     return {
         "ok": not failed,
-        "import_failed": bool(IMPORT_FAILED),
-        "error": IMPORT_ERROR or BOOTSTRAP_ERROR.get("exception_text", ""),
+        "import_failed": failed,
+        "error": str(state.get("error") or ""),
+        "exception_type": str(state.get("exception_type") or ""),
+        "worker_fast_mode": bool(state.get("worker_fast_mode")),
+        "app_module_loaded": bool(state.get("app_module_loaded")),
         "bootstrap_error": dict(BOOTSTRAP_ERROR),
     }
 
 
 @app.get("/")
 def root():
-    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+    if not _app_available():
         return _app_import_failed_response()
     return {"ok": True, "service": "dex-scout-tg-webhook"}
 
 
 @app.get("/health")
 def health():
-    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+    if not _app_available():
         return _app_import_failed_response()
     return {"ok": True}
 
 
 @app.head("/health")
 def health_head():
-    return Response(status_code=500 if (IMPORT_FAILED or BOOTSTRAP_ERROR) else 200)
+    return Response(status_code=500 if not _app_available() else 200)
 
 
 @app.get("/runtime")
 def runtime():
-    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+    if not _app_available():
         return _app_import_failed_response()
     try:
         _raise_bootstrap_http_500()
@@ -547,7 +606,7 @@ def runtime():
 
 @app.post("/tg_webhook")
 async def tg_webhook(req: Request):
-    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+    if not _app_available():
         return _app_import_failed_response()
     try:
         _raise_bootstrap_http_500()
@@ -680,7 +739,7 @@ async def tg_webhook_alias(req: Request):
 
 @app.get("/tg/summary")
 def tg_summary(key: str):
-    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+    if not _app_available():
         return _app_import_failed_response()
     try:
         _raise_bootstrap_http_500()
@@ -699,7 +758,7 @@ def tg_summary(key: str):
 
 @app.get("/tg/digest")
 def tg_digest(key: str, force: int = 0):
-    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+    if not _app_available():
         return _app_import_failed_response()
     try:
         _raise_bootstrap_http_500()
