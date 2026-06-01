@@ -45,6 +45,7 @@ import streamlit as st
 import pandas as pd
 import config as app_config
 import notification_core
+import monitoring_core
 from runtime_core import (
     _env_bool as runtime_env_bool,
     _env_float as runtime_env_float,
@@ -14219,77 +14220,39 @@ MATERIAL_PORTFOLIO_ACTIONS = notification_core.MATERIAL_PORTFOLIO_ACTIONS
 
 
 def normalize_material_portfolio_action(value: Any) -> str:
-    action = str(value or "").strip().upper()
-    action_us = action.replace(" ", "_")
-    if action_us == "TAKE_PROFIT":
-        return "TAKE PROFIT"
-    if action_us in MATERIAL_PORTFOLIO_ACTIONS:
-        return action_us
-    return action
+    return monitoring_core.normalize_material_portfolio_action(value)
 
 
 def find_active_portfolio_row(row: Dict[str, Any], portfolio_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    key = canonical_token_key(row)
-    for p in portfolio_rows or []:
-        if str(p.get("active", "1")).strip() != "1":
-            continue
-        if key and canonical_token_key(p) == key:
-            return p
-    return {}
+    return monitoring_core.find_active_portfolio_row(row, portfolio_rows)
 
 
 def hard_gate_monitoring_row(row: Dict[str, Any], portfolio_row: Optional[Dict[str, Any]] = None, history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    _ = history
-    reasons: List[str] = []
-    flags: List[str] = []
-    health = str(row.get("health_label") or "").upper()
-    status = str(row.get("entry_status") or row.get("status") or "").upper()
-    action = str(row.get("final_action") or row.get("entry_action") or "").upper()
-    liq = parse_float(row.get("liq_usd", row.get("liquidity", row.get("liquidity_usd", row.get("liq_init", 0)))), 0.0)
-    vol24 = parse_float(row.get("vol24_usd", row.get("vol24_init", 0)), 0.0)
-    pc24 = parse_float(row.get("pc24h", row.get("price_change_h24", row.get("pc24", 0))), 0.0)
-    pc1h = parse_float(row.get("pc1h", row.get("price_change_h1", 0)), 0.0)
-    reason_text = " ".join([
-        health,
-        status,
-        action,
-        str(row.get("entry_reason") or ""),
-        str(row.get("archived_reason") or ""),
-        str(row.get("lifecycle") or ""),
-        str(row.get("risk_flags") or ""),
-        str(row.get("toxic_flags") or ""),
-        str(row.get("why") or ""),
-    ]).upper()
-    if "POST_PUMP_COLLAPSE" in reason_text or "EXTREME_PUMP_THEN_DUMP" in reason_text:
-        reasons.append("post_pump_collapse")
-    if "UNTRADEABLE" in reason_text or status == "UNTRADEABLE" or action == "UNTRADEABLE":
-        reasons.append("untradeable")
-    if any(x in reason_text for x in ("DEAD", "SCAM", "TOXIC", "HONEYPOT", "RUG")):
-        reasons.append("dead_or_scam")
-    if any(x in reason_text for x in ("NO LIQUIDITY", "NO_LIQUIDITY")) or liq <= 0:
-        reasons.append("no_liquidity")
-    if any(x in reason_text for x in ("NO RECENT FLOW", "NO_RECENT_FLOW")) or vol24 <= 0:
-        reasons.append("no_recent_flow")
-    if liq > 0 and vol24 > 0 and (vol24 / max(liq, 1.0)) < 0.08:
-        reasons.append("liquidity_volume_decay")
-    if (pc24 <= -24.0 or pc1h <= -20.0) and liq < 15_000:
-        reasons.append("24h_collapse_low_liq")
-    if status in {"NO_ENTRY", "AVOID"} or action == "NO_ENTRY":
-        reasons.append("no_entry")
-    pf_action = ""
-    if portfolio_row:
-        pf_action = normalize_material_portfolio_action(portfolio_row.get("final_action") or portfolio_row.get("recommended_action") or portfolio_row.get("position_action"))
-        mon_label = str(row.get("entry_status") or row.get("status") or row.get("timing_label") or "").upper()
-        if pf_action in {"EXIT", "REDUCE"} and mon_label in {"WATCH", "EARLY", "READY", "ACTIVE"}:
-            reasons.append("portfolio_verdict_conflict")
-            flags.append(f"portfolio_{pf_action.lower().replace(' ', '_')}")
-    reasons = sorted(set(reasons))
-    action_out = "KEEP"
-    if any(r in reasons for r in ("dead_or_scam", "no_liquidity", "post_pump_collapse", "untradeable", "portfolio_verdict_conflict")):
-        action_out = "ARCHIVE"
-    elif reasons:
-        action_out = "NO_ENTRY"
-    return {"blocked": bool(reasons), "action": action_out, "reason": "|".join(reasons), "flags": flags + reasons}
+    return monitoring_core.hard_gate_monitoring_row(row, portfolio_row=portfolio_row, history=history)
+
+
+def build_token_identity(row: Dict[str, Any]) -> Dict[str, str]:
+    return monitoring_core.build_token_identity(row)
+
+
+def row_matches_token(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    return monitoring_core.row_matches_token(left, right)
+
+
+def is_active_monitoring_row(row: Dict[str, Any]) -> bool:
+    return monitoring_core.is_active_monitoring_row(row)
+
+
+def is_active_portfolio_row(row: Dict[str, Any]) -> bool:
+    return monitoring_core.is_active_portfolio_row(row)
+
+
+def should_surface_in_priority(row: Dict[str, Any], portfolio_row: Optional[Dict[str, Any]] = None) -> bool:
+    return monitoring_core.should_surface_in_priority(row, portfolio_row=portfolio_row)
+
+
+def resolve_monitoring_portfolio_state(monitoring_row: Dict[str, Any], portfolio_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return monitoring_core.resolve_monitoring_portfolio_state(monitoring_row, portfolio_row=portfolio_row)
 
 
 def _priority_hard_gate_reasons(row: Dict[str, Any]) -> List[str]:
@@ -16827,7 +16790,7 @@ def main():
     active_portfolio_rows = [
         row
         for row in portfolio_rows
-        if str(row.get("active", row.get("is_active", "1"))).strip().lower() not in {"0", "false", "no"}
+        if is_active_portfolio_row(row)
     ]
     if st.session_state.get("last_scan_ts") != scan_state.get("last_run_ts"):
         st.session_state["last_scan_ts"] = scan_state.get("last_run_ts")
