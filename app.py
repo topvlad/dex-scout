@@ -204,6 +204,10 @@ HEALTH_OVERRIDE_JOURNAL_CSV = os.path.join(DATA_DIR, "health_override_journal.cs
 PORTFOLIO_ACTION_JOURNAL_CSV = os.path.join(DATA_DIR, "portfolio_action_journal.csv")
 TG_STATE_FILE = os.path.join(DATA_DIR, "tg_state.json")
 TG_STATE_KEY = "tg_state.json"
+NOTIFICATION_EVENT_JOURNAL_KEY = "notification_event_journal.json"
+NOTIFICATION_EVENT_JOURNAL_FILE = os.path.join(DATA_DIR, NOTIFICATION_EVENT_JOURNAL_KEY)
+NOTIFICATION_EVENT_JOURNAL_MAX = max(100, _env_int("NOTIFICATION_EVENT_JOURNAL_MAX", 1000))
+NOTIFICATION_EVENT_RETRY_COOLDOWN_SECONDS = max(60, _env_int("NOTIFICATION_EVENT_RETRY_COOLDOWN_SECONDS", 300))
 SUPPRESSED_KEY = "suppressed_tokens.json"
 DEFAULT_ALERT_MODE = "normal"
 ALERT_MODE_REGISTRY = {"quiet", "normal", "aggressive"}
@@ -8031,6 +8035,272 @@ def save_tg_state(state: Dict[str, Any]) -> None:
         print(f"[TG] save state fail {type(e).__name__}: {e}", flush=True)
 
 
+MATERIAL_PORTFOLIO_ACTIONS = {"EXIT", "REDUCE", "TAKE_PROFIT", "PARTIAL_TP", "PROTECT", "CLOSE", "TRIM"}
+
+
+def _normalize_action_token(value: Any) -> str:
+    raw = str(value or "").strip().upper().replace(" ", "_").replace("-", "_")
+    return re.sub(r"[^A-Z0-9_]+", "_", raw).strip("_")
+
+
+def _notification_journal_default() -> Dict[str, Any]:
+    return {"version": 1, "updated_ts": "", "events": {}}
+
+
+def load_notification_event_journal() -> Dict[str, Any]:
+    raw = storage_read_text(NOTIFICATION_EVENT_JOURNAL_KEY)
+    if (not raw) and os.path.exists(NOTIFICATION_EVENT_JOURNAL_FILE):
+        try:
+            raw = Path(NOTIFICATION_EVENT_JOURNAL_FILE).read_text(encoding="utf-8")
+        except Exception:
+            raw = ""
+    try:
+        data = json.loads(raw or "{}")
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    events = data.get("events") if isinstance(data.get("events"), dict) else {}
+    return {"version": 1, "updated_ts": str(data.get("updated_ts") or ""), "events": events}
+
+
+def _event_sort_ts(event: Dict[str, Any]) -> float:
+    for key in ("last_seen_ts", "send_ts", "first_seen_ts"):
+        dt = parse_ts(event.get(key))
+        if dt:
+            return dt.timestamp()
+    return 0.0
+
+
+def trim_notification_event_journal(journal: Dict[str, Any], max_events: Optional[int] = None) -> int:
+    events = journal.get("events") if isinstance(journal.get("events"), dict) else {}
+    limit = max(1, int(max_events or NOTIFICATION_EVENT_JOURNAL_MAX))
+    if len(events) <= limit:
+        return 0
+    overflow = len(events) - limit
+    removable_statuses = ("sent", "skipped")
+    removed: List[str] = []
+    for statuses in (removable_statuses, ("pending",), ("failed",)):
+        if len(removed) >= overflow:
+            break
+        candidates = [
+            (k, _event_sort_ts(v if isinstance(v, dict) else {}))
+            for k, v in events.items()
+            if isinstance(v, dict) and str(v.get("send_status") or "").strip().lower() in statuses
+        ]
+        candidates.sort(key=lambda x: x[1])
+        for key, _ts in candidates:
+            if len(removed) >= overflow:
+                break
+            removed.append(key)
+    for key in removed:
+        events.pop(key, None)
+    journal["events"] = events
+    journal["notification_journal_trimmed"] = int(journal.get("notification_journal_trimmed", 0) or 0) + len(removed)
+    return len(removed)
+
+
+def save_notification_event_journal(journal: Dict[str, Any]) -> bool:
+    journal = journal if isinstance(journal, dict) else _notification_journal_default()
+    journal["version"] = 1
+    journal["updated_ts"] = now_utc_str()
+    trim_notification_event_journal(journal)
+    payload = json.dumps(journal, ensure_ascii=False, separators=(",", ":"))
+    ok = storage_write_text(NOTIFICATION_EVENT_JOURNAL_KEY, payload)
+    if not ok:
+        try:
+            ensure_storage()
+            Path(NOTIFICATION_EVENT_JOURNAL_FILE).write_text(payload, encoding="utf-8")
+            ok = True
+        except Exception as exc:
+            debug_log(f"notification_journal_write_failed:{type(exc).__name__}:{exc}")
+            ok = False
+    return ok
+
+
+def notification_event_journal_counts(journal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    j = journal if isinstance(journal, dict) else load_notification_event_journal()
+    events = j.get("events") if isinstance(j.get("events"), dict) else {}
+    counts = {"sent": 0, "skipped_duplicate": 0, "failed": 0, "journal_size": len(events), "last_failed_reason": ""}
+    last_failed_ts = -1.0
+    for ev in events.values():
+        if not isinstance(ev, dict):
+            continue
+        status = str(ev.get("send_status") or "").strip().lower()
+        reason = str(ev.get("last_reason") or "").strip().lower()
+        if status == "sent":
+            counts["sent"] += 1
+        if status == "skipped" and reason == "skipped_duplicate":
+            counts["skipped_duplicate"] += 1
+        if status == "failed":
+            counts["failed"] += 1
+            ts = _event_sort_ts(ev)
+            if ts >= last_failed_ts:
+                last_failed_ts = ts
+                counts["last_failed_reason"] = str(ev.get("send_error") or ev.get("last_reason") or "")
+    return counts
+
+
+def _notification_event_base(
+    event_key: str,
+    emission_key: str,
+    event_type: str,
+    row: Optional[Dict[str, Any]] = None,
+    source: str = "notify_cycle",
+    reason: str = "",
+) -> Dict[str, Any]:
+    row = row if isinstance(row, dict) else {}
+    token_key = canonical_token_key(row) or build_token_state_key(row)
+    now = now_utc_str()
+    return {
+        "event_key": str(event_key or ""),
+        "emission_key": str(emission_key or ""),
+        "event_type": str(event_type or ""),
+        "token_key": token_key,
+        "chain": str(token_chain(row) or row.get("chain") or ""),
+        "token_addr": str(token_ca(row) or row.get("token_address") or ""),
+        "first_seen_ts": now,
+        "last_seen_ts": now,
+        "send_status": "pending",
+        "send_ts": "",
+        "send_error": "",
+        "send_attempts": 0,
+        "last_reason": str(reason or ""),
+        "source": str(source or "notify_cycle"),
+    }
+
+
+def record_notification_event_status(
+    event_key: str,
+    emission_key: str,
+    event_type: str,
+    status: str,
+    row: Optional[Dict[str, Any]] = None,
+    source: str = "notify_cycle",
+    reason: str = "",
+    send_error: str = "",
+) -> Dict[str, Any]:
+    journal = load_notification_event_journal()
+    events = journal.setdefault("events", {})
+    existing = events.get(event_key) if isinstance(events.get(event_key), dict) else {}
+    event = {**_notification_event_base(event_key, emission_key, event_type, row=row, source=source, reason=reason), **existing}
+    event["event_key"] = event_key
+    event["emission_key"] = emission_key
+    event["event_type"] = event_type
+    event["last_seen_ts"] = now_utc_str()
+    event["send_status"] = status
+    event["last_reason"] = reason
+    if send_error:
+        event["send_error"] = send_error
+    if status == "sent":
+        event["send_ts"] = now_utc_str()
+        event["send_error"] = ""
+    events[event_key] = event
+    trimmed = trim_notification_event_journal(journal)
+    save_notification_event_journal(journal)
+    counts = notification_event_journal_counts(journal)
+    counts["trimmed"] = trimmed
+    return {"status": status, "reason": reason, "event": event, "counts": counts}
+
+
+def notification_send_once(
+    text: str,
+    event_key: str,
+    emission_key: str,
+    event_type: str,
+    row: Optional[Dict[str, Any]] = None,
+    source: str = "notify_cycle",
+    reason: str = "",
+    parse_mode: str = "HTML",
+    reply_markup: Optional[Dict[str, Any]] = None,
+    now_ts: Optional[float] = None,
+    retry_cooldown_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
+    now_ts = float(now_ts if now_ts is not None else time.time())
+    retry_cooldown_seconds = max(60, int(retry_cooldown_seconds or NOTIFICATION_EVENT_RETRY_COOLDOWN_SECONDS))
+    journal = load_notification_event_journal()
+    events = journal.setdefault("events", {})
+    existing = events.get(event_key) if isinstance(events.get(event_key), dict) else {}
+    if str(existing.get("send_status") or "").lower() == "sent":
+        event = {**_notification_event_base(event_key, emission_key, event_type, row=row, source=source, reason=reason), **existing}
+        event["last_seen_ts"] = now_utc_str()
+        event["last_reason"] = "skipped_duplicate"
+        events[event_key] = event
+        save_notification_event_journal(journal)
+        return {"sent": False, "status": "skipped", "reason": "skipped_duplicate", "event": event, "counts": notification_event_journal_counts(journal)}
+    if str(existing.get("send_status") or "").lower() == "failed":
+        last_dt = parse_ts(existing.get("last_seen_ts") or existing.get("send_ts") or existing.get("first_seen_ts"))
+        if last_dt and (now_ts - last_dt.timestamp()) < retry_cooldown_seconds:
+            event = {**_notification_event_base(event_key, emission_key, event_type, row=row, source=source, reason=reason), **existing}
+            event["last_seen_ts"] = now_utc_str()
+            event["last_reason"] = "retry_cooldown"
+            events[event_key] = event
+            save_notification_event_journal(journal)
+            return {"sent": False, "status": "skipped", "reason": "retry_cooldown", "event": event, "counts": notification_event_journal_counts(journal)}
+    event = {**_notification_event_base(event_key, emission_key, event_type, row=row, source=source, reason=reason), **existing}
+    event["last_seen_ts"] = now_utc_str()
+    event["send_status"] = "pending"
+    event["last_reason"] = reason or "send_started"
+    event["send_attempts"] = int(parse_float(event.get("send_attempts", 0), 0.0)) + 1
+    event["send_error"] = ""
+    events[event_key] = event
+    save_notification_event_journal(journal)
+
+    if reply_markup is None:
+        ok = bool(send_telegram(text, parse_mode=parse_mode))
+    else:
+        ok = bool(send_telegram(text, parse_mode=parse_mode, reply_markup=reply_markup))
+    event["last_seen_ts"] = now_utc_str()
+    if ok:
+        event["send_status"] = "sent"
+        event["send_ts"] = now_utc_str()
+        event["send_error"] = ""
+        event["last_reason"] = reason or "sent"
+        status = "sent"
+    else:
+        event["send_status"] = "failed"
+        event["send_error"] = "send_telegram_false"
+        event["last_reason"] = reason or "send_failed"
+        status = "failed"
+    events[event_key] = event
+    trimmed = trim_notification_event_journal(journal)
+    save_notification_event_journal(journal)
+    counts = notification_event_journal_counts(journal)
+    counts["trimmed"] = trimmed
+    return {"sent": ok, "status": status, "reason": event.get("last_reason", ""), "event": event, "counts": counts}
+
+
+def build_notification_event_key(
+    event_type: str,
+    row: Optional[Dict[str, Any]] = None,
+    source: str = "notify_cycle",
+    signal: Optional[Dict[str, str]] = None,
+    unified: Optional[Dict[str, Any]] = None,
+    bucket: str = "",
+    action: str = "",
+) -> str:
+    row = row if isinstance(row, dict) else {}
+    event_type_norm = str(event_type or "").strip().lower()
+    chain = str(token_chain(row) or row.get("chain") or "").strip().lower()
+    addr = str(token_ca(row) or row.get("token_address") or row.get("base_token_address") or "").strip().lower()
+    action_bucket = _normalize_action_token(action or (unified or {}).get("final_action") or row.get("final_action") or row.get("entry_action") or row.get("entry") or (signal or {}).get("bucket") or "NONE")
+    verdict = _normalize_action_token(row.get("verdict") or row.get("health_label") or row.get("risk_level") or row.get("risk") or "NA")
+    bucket_norm = re.sub(r"[^a-zA-Z0-9_:-]+", "_", str(bucket or "").strip()).strip("_") or "stable"
+    return f"{event_type_norm}|{source}|{chain}|{addr}|{action_bucket}|{verdict}|{bucket_norm}"
+
+
+def build_digest_event_key(digest_path: str, now_ts: Optional[float] = None, heartbeat_hours: int = 12) -> str:
+    now_ts = float(now_ts if now_ts is not None else time.time())
+    bucket = int(now_ts // max(3600, int(heartbeat_hours or 12) * 3600))
+    return f"digest|{str(digest_path or 'digest').strip().lower()}|bucket:{bucket}"
+
+
+def build_heartbeat_event_key(kind: str, now_ts: Optional[float] = None, heartbeat_hours: int = 12) -> str:
+    now_ts = float(now_ts if now_ts is not None else time.time())
+    bucket = int(now_ts // max(3600, int(heartbeat_hours or 12) * 3600))
+    return f"health_warning|heartbeat|{str(kind or 'heartbeat').strip().lower()}|bucket:{bucket}"
+
+
 def reset_tg_state() -> None:
     state = {
         "last_signal_run": 0.0,
@@ -8329,7 +8599,11 @@ def classify_monitoring_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
 def classify_portfolio_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     score = parse_float(row.get("entry_score", 0), 0.0)
     risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
-    action = str(row.get("entry_action") or row.get("entry") or "").upper()
+    action = _normalize_action_token(row.get("final_action") or row.get("entry_action") or row.get("entry") or "")
+
+    if action in MATERIAL_PORTFOLIO_ACTIONS:
+        bucket = "EXIT" if action in {"EXIT", "CLOSE"} else "REDUCE"
+        return {"bucket": bucket, "horizon": "now", "action": action.replace("_", " ").title()}
 
     if score <= 0:
         return None
@@ -8346,13 +8620,15 @@ def classify_portfolio_signal(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
     return None
 
 
-def signal_event_key(source: str, row: Dict[str, Any], signal: Dict[str, str]) -> str:
-    foundation = build_emission_key_foundation(source, row, signal)
-    action = str(row.get("entry_action") or row.get("entry") or "").upper()
-    risk = str(row.get("risk_level") or row.get("risk") or "").upper()
+def signal_event_key(source: str, row: Dict[str, Any], signal: Dict[str, str], unified: Optional[Dict[str, Any]] = None) -> str:
+    classification = resolve_tg_alert_classification(source, row, signal, unified=unified)
+    event_type = str(classification.get("event_type") or "")
+    action = _normalize_action_token((unified or {}).get("final_action") or row.get("final_action") or row.get("entry_action") or row.get("entry") or signal.get("bucket") or "")
+    risk = _normalize_action_token(row.get("risk_level") or row.get("risk") or "")
     timing = normalize_timing_label(row.get("timing_label") or "")
     score_bucket = int(parse_float(row.get("entry_score"), 0.0) // 25)
-    return f"{foundation}|{action}|{risk}|{timing}|{score_bucket}"
+    bucket = f"{timing}|score:{score_bucket}"
+    return build_notification_event_key(event_type, row=row, source=str(source or "notify_cycle"), signal=signal, unified=unified, bucket=bucket, action=action or "NONE")
 
 
 def build_token_state_key(row: Dict[str, Any]) -> str:
@@ -8506,6 +8782,16 @@ def journal_actionable_event(
 
         if bool(unified.get("health_override_active")):
             write_health_override_journal_row(base)
+
+        status_norm = str(send_status or "").strip().lower()
+        event_type = str((alert_classification or {}).get("event_type") or "state_transition")
+        if status_norm in {"already_sent", "duplicate", "mode_filtered", "tier_filtered", "no_msg"}:
+            reason = "skipped_duplicate" if status_norm in {"already_sent", "duplicate"} else status_norm
+            record_notification_event_status(event_key, emission_key, event_type, "skipped", row=row, source="notify_cycle", reason=reason)
+        elif status_norm in {"failed", "send_fail"}:
+            record_notification_event_status(event_key, emission_key, event_type, "failed", row=row, source="notify_cycle", reason=send_note or "send_failed", send_error=status_norm)
+        elif status_norm == "sent":
+            record_notification_event_status(event_key, emission_key, event_type, "sent", row=row, source="notify_cycle", reason=send_note or "sent")
     except Exception as exc:
         debug_log(f"journal_write_failed:{type(exc).__name__}:{exc}")
 
@@ -9561,11 +9847,41 @@ def trigger_digest_notification(
         }
 
     text = format_digest_summary_message(digest, trigger_source=trigger_source, actionable_discovery_blocks=actionable_discovery_blocks)
-    summary_ok = send_telegram(text, parse_mode="HTML")
+    digest_event_key = build_digest_event_key(digest_path, now_ts=now_ts, heartbeat_hours=heartbeat_hours)
+    summary_result = notification_send_once(
+        text,
+        event_key=f"{digest_event_key}|summary",
+        emission_key=emission_key,
+        event_type=resolve_event_type("DIGEST"),
+        source="digest_cycle",
+        reason=emit_reason,
+        parse_mode="HTML",
+        now_ts=now_ts,
+    )
+    summary_ok = bool(summary_result.get("sent") or summary_result.get("reason") == "skipped_duplicate")
     block_sent = 0
-    for row in token_blocks:
+    for idx, row in enumerate(token_blocks):
         msg = format_digest_message(row, source=str(row.get("digest_source") or "monitoring"))
-        if send_telegram(msg, parse_mode="HTML", reply_markup=tg_buttons(row)):
+        block_event_key = build_notification_event_key(
+            resolve_event_type("DIGEST"),
+            row=row,
+            source="digest_cycle",
+            bucket=f"{digest_path}:{digest_event_key}:{idx}",
+            action=str(row.get("entry_action") or row.get("entry") or "digest"),
+        )
+        block_result = notification_send_once(
+            msg,
+            event_key=block_event_key,
+            emission_key=f"{emission_key}|block:{idx}",
+            event_type=resolve_event_type("DIGEST"),
+            row=row,
+            source="digest_cycle",
+            reason=emit_reason,
+            parse_mode="HTML",
+            reply_markup=tg_buttons(row),
+            now_ts=now_ts,
+        )
+        if block_result.get("sent") or block_result.get("reason") == "skipped_duplicate":
             block_sent += 1
     ok = bool(summary_ok and (block_sent == len(token_blocks)))
     digest["delivery_debug"] = {
@@ -9684,7 +10000,9 @@ def build_portfolio_meaningful_events(
         if not key:
             continue
         unified = compute_unified_recommendation(row, source="portfolio")
-        action = str(unified.get("final_action") or row.get("entry_action") or "").upper().replace(" ", "_")
+        raw_action = _normalize_action_token(row.get("final_action") or row.get("recommended_action") or row.get("position_action") or row.get("entry_action") or row.get("entry") or "")
+        action = _normalize_action_token(unified.get("final_action") or raw_action or row.get("entry_action") or "")
+        material_action = raw_action in MATERIAL_PORTFOLIO_ACTIONS or action in MATERIAL_PORTFOLIO_ACTIONS
         risk = str(row.get("risk_level") or row.get("risk") or "UNKNOWN").upper()
         score_display = build_notification_semantics(row, source_context="portfolio").get("score_display", "n/a")
         health = str(row.get("health_label") or row.get("status") or "").upper()
@@ -9705,7 +10023,8 @@ def build_portfolio_meaningful_events(
             or mon_linked.get("action")
             or ""
         ).upper().replace(" ", "_")
-        if action in {"REDUCE", "CLOSE", "EXIT", "TAKE_PROFIT", "TRIM"}:
+        if material_action:
+            action = raw_action if raw_action in MATERIAL_PORTFOLIO_ACTIONS else action
             reason = f"action:{action}"
         elif risk in {"HIGH", "CRITICAL"}:
             reason = f"risk:{risk}"
@@ -9722,11 +10041,11 @@ def build_portfolio_meaningful_events(
 
         if not reason:
             continue
-        if risk == "UNKNOWN" or action == "HOLD" or score_display == "n/a":
+        if (not material_action) and (risk == "UNKNOWN" or action == "HOLD" or score_display == "n/a"):
             continue
         price_bucket = round(current, 8) if current > 0 else 0.0
         liq_bucket = int(liq_now // 1000) if liq_now > 0 else 0
-        fp = _short_hash(f"{key}|{action}|{risk}|{reason}|p:{price_bucket}|l:{liq_bucket}|h:{health}", n=16)
+        fp = hkey(f"{key}|{action}|{risk}|{reason}|p:{price_bucket}|l:{liq_bucket}|h:{health}", n=16)
         events[key] = {"row": row, "unified": unified, "fingerprint": fp, "reason": reason, "action": action, "risk": risk}
     return events
 
@@ -9765,7 +10084,18 @@ def maybe_send_tg_suppression_heartbeat(
         f"portfolio active: {int(parse_float(stats.get('portfolio_active', 0), 0.0))}\n"
         f"last reason: {reason_norm}"
     )
-    if send_telegram(text, parse_mode="HTML"):
+    event_key = build_heartbeat_event_key(reason_norm, now_ts=now_ts, heartbeat_hours=TG_SUPPRESSION_HEARTBEAT_HOURS)
+    send_result = notification_send_once(
+        text,
+        event_key=event_key,
+        emission_key=event_key,
+        event_type=resolve_event_type("HEALTH_WARNING"),
+        source="notify_cycle",
+        reason=reason_norm,
+        parse_mode="HTML",
+        now_ts=now_ts,
+    )
+    if send_result.get("sent"):
         now = now_utc_str()
         state["last_heartbeat_ts"] = now
         state["last_portfolio_heartbeat_ts"] = now
@@ -9774,7 +10104,7 @@ def maybe_send_tg_suppression_heartbeat(
         save_tg_state(state)
         out["sent"] = True
         return out
-    out["reason"] = "send_fail"
+    out["reason"] = str(send_result.get("reason") or "send_fail")
     return out
 
 
@@ -10111,14 +10441,14 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
 
 
 def is_material_portfolio_action(row: Dict[str, Any], analysis: Dict[str, Any]) -> bool:
-    material_actions = {"EXIT", "REDUCE", "TAKE_PROFIT", "PARTIAL_TP", "PROTECT", "CLOSE", "TRIM"}
     values = [
-        str((row or {}).get("final_action") or "").upper().replace(" ", "_"),
-        str((row or {}).get("recommended_action") or "").upper().replace(" ", "_"),
-        str((row or {}).get("position_action") or "").upper().replace(" ", "_"),
-        str((analysis or {}).get("action") or "").upper().replace(" ", "_"),
+        _normalize_action_token((row or {}).get("final_action")),
+        _normalize_action_token((row or {}).get("recommended_action")),
+        _normalize_action_token((row or {}).get("position_action")),
+        _normalize_action_token((row or {}).get("entry_action")),
+        _normalize_action_token((analysis or {}).get("action")),
     ]
-    return any(v in material_actions for v in values)
+    return any(v in MATERIAL_PORTFOLIO_ACTIONS for v in values)
 
 
 def build_position_action_plan(row: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
@@ -10346,7 +10676,10 @@ def run_auto_notifications(
         pending_fresh = pending_generated and (now_ts - pending_generated.timestamp()) <= 6 * 3600
         if has_urgent and due_pa and (pending is None or pending_fresh):
             msg = format_tg_position_analysis(to_send)
-            if send_telegram(msg, parse_mode="HTML"):
+            material_bucket = hkey("|".join(str(x) for x in to_send.get("dedupe_keys") or []), n=16)
+            event_key = build_notification_event_key("portfolio_action", source="portfolio_analysis", bucket=f"material:{material_bucket}", action="portfolio_summary")
+            send_result = notification_send_once(msg, event_key=event_key, emission_key=event_key, event_type="portfolio_action", source="notify_cycle", reason="material_portfolio_actions_present", parse_mode="HTML", now_ts=now_ts)
+            if send_result.get("sent"):
                 state["last_position_analysis_sent_ts"] = now_utc_str()
                 state["last_position_analysis_dedupe_keys"] = list(to_send.get("dedupe_keys") or [])
                 state["last_position_analysis_reason"] = "sent_material"
@@ -10360,12 +10693,19 @@ def run_auto_notifications(
                 state["last_position_analysis_reason"] = "heartbeat_suppressed_material_rows"
                 state["heartbeat_suppressed_reason"] = "material_rows_from_ui"
                 msg = format_tg_position_analysis(position_analysis)
-                if send_telegram(msg, parse_mode="HTML"):
+                material_bucket = hkey("|".join(str(x) for x in position_analysis.get("dedupe_keys") or []), n=16)
+                event_key = build_notification_event_key("portfolio_action", source="portfolio_analysis", bucket=f"material:{material_bucket}", action="portfolio_summary")
+                send_result = notification_send_once(msg, event_key=event_key, emission_key=event_key, event_type="portfolio_action", source="notify_cycle", reason="material_portfolio_actions_present", parse_mode="HTML", now_ts=now_ts)
+                if send_result.get("sent"):
                     state["last_position_analysis_sent_ts"] = now_utc_str()
                     state["last_position_analysis_dedupe_keys"] = list(position_analysis.get("dedupe_keys") or [])
-            elif hb_due and send_telegram(f"Portfolio check: no urgent changes across {n_positions} positions.", parse_mode="HTML"):
-                state["last_position_analysis_heartbeat_ts"] = now_utc_str()
-                state["last_position_analysis_reason"] = "heartbeat_no_urgent"
+            elif hb_due:
+                hb_text = f"Portfolio check: no urgent changes across {n_positions} positions."
+                event_key = build_heartbeat_event_key("portfolio_no_urgent", now_ts=now_ts, heartbeat_hours=12)
+                send_result = notification_send_once(hb_text, event_key=event_key, emission_key=event_key, event_type="health_warning", source="notify_cycle", reason="heartbeat_no_urgent", parse_mode="HTML", now_ts=now_ts)
+                if send_result.get("sent"):
+                    state["last_position_analysis_heartbeat_ts"] = now_utc_str()
+                    state["last_position_analysis_reason"] = "heartbeat_no_urgent"
     portfolio_events = build_portfolio_meaningful_events(port_rows, monitoring_rows, state)
     eligible_after_candidate_build = len(mon_rows) + len(port_rows)
 
@@ -10495,7 +10835,7 @@ def run_auto_notifications(
             signal,
             unified=unified,
         )
-        event_key = signal_event_key(source, row, signal)
+        event_key = signal_event_key(source, row, signal, unified=unified)
         emission_key = build_emission_key(
             source,
             row,
@@ -10617,7 +10957,31 @@ def run_auto_notifications(
             )
             continue
 
-        if send_telegram(msg, reply_markup=tg_buttons(row)):
+        send_result = notification_send_once(
+            msg,
+            event_key=event_key,
+            emission_key=emission_key,
+            event_type=str(alert_classification.get("event_type") or "state_transition"),
+            row=row,
+            source="notify_cycle",
+            reason=str(row.get("entry_reason") or signal.get("bucket") or ""),
+            parse_mode="HTML",
+            reply_markup=tg_buttons(row),
+            now_ts=now_ts,
+            retry_cooldown_seconds=cooldown_seconds,
+        )
+        stats["last_event_key"] = event_key
+        stats["last_send_status"] = str(send_result.get("status") or "")
+        stats["last_send_reason"] = str(send_result.get("reason") or "")
+        if send_result.get("reason") == "skipped_duplicate":
+            stats["already_sent"] += 1
+            stats["blocked_reasons"]["skipped_duplicate"] = int(stats["blocked_reasons"].get("skipped_duplicate", 0)) + 1
+            continue
+        if send_result.get("reason") == "retry_cooldown":
+            stats["cooldown"] += 1
+            stats["blocked_reasons"]["retry_cooldown"] = int(stats["blocked_reasons"].get("retry_cooldown", 0)) + 1
+            continue
+        if send_result.get("sent"):
             sent_events[event_key] = now_utc_str()
             mark_emission_sent(state, emission_key, now_ts=now_ts)
             sent_now += 1
@@ -10664,7 +11028,7 @@ def run_auto_notifications(
                 unified=unified,
                 event_key=event_key,
                 emission_key=emission_key,
-                send_status="send_fail",
+                send_status="failed",
             )
 
         if sent_now >= max_per_run:
@@ -10733,7 +11097,18 @@ def run_auto_notifications(
             block_reason = "no_actionable_event"
     if stats["send_fail"] > 0:
         error_reason = f"send_fail:{stats['send_fail']}"
+    journal_snapshot = load_notification_event_journal()
+    journal_counts = notification_event_journal_counts(journal_snapshot)
+    journal_events = journal_snapshot.get("events") if isinstance(journal_snapshot.get("events"), dict) else {}
+    last_journal_event = {}
+    if journal_events:
+        last_journal_event = max(
+            [ev for ev in journal_events.values() if isinstance(ev, dict)],
+            key=lambda ev: _event_sort_ts(ev),
+            default={},
+        )
     diag = _compact_notification_diagnostics(stats)
+    diag["notification_journal"] = journal_counts
     diag_reason = (
         f"pre={diag['pre']} post={diag['post']} sent={diag['sent']} "
         f"fail={diag['send_fail']} dup={diag['duplicate']}"
@@ -10757,6 +11132,13 @@ def run_auto_notifications(
             "last_cycle_status": cycle_status,
             "last_fallback_reason": str(cycle_context.get("fallback_reason") or ""),
             "last_diag_summary": diag_reason,
+            "last_notification_event_key": str((stats.get("last_event_key") or last_journal_event.get("event_key") or "")),
+            "last_notification_send_status": str((stats.get("last_send_status") or last_journal_event.get("send_status") or "")),
+            "last_notification_send_reason": str((stats.get("last_send_reason") or last_journal_event.get("last_reason") or "")),
+            "last_notification_sent_ts": now_utc_str() if int(stats.get("sent", 0) or 0) > 0 else runtime_snapshot.get("last_notification_sent_ts", ""),
+            "last_notification_failed_ts": now_utc_str() if int(stats.get("send_fail", 0) or 0) > 0 else runtime_snapshot.get("last_notification_failed_ts", ""),
+            "notification_journal_size": int(journal_counts.get("journal_size", 0) or 0),
+            "notification_journal_trimmed": int(journal_snapshot.get("notification_journal_trimmed", 0) or 0),
             "last_notification_counters": {
                 "before_filter": int(stats.get("candidates_total_pre_filter", 0) or 0),
                 "after_filter": int(stats.get("post_filter_candidates", 0) or 0),
@@ -10771,6 +11153,10 @@ def run_auto_notifications(
                     + int(stats.get("no_actionable_event", 0) or 0)
                 ),
                 "send_fail": int(stats.get("send_fail", 0) or 0),
+                "skipped_duplicate": int(journal_counts.get("skipped_duplicate", 0) or 0),
+                "failed": int(journal_counts.get("failed", 0) or 0),
+                "journal_size": int(journal_counts.get("journal_size", 0) or 0),
+                "last_failed_reason": str(journal_counts.get("last_failed_reason") or ""),
             },
             "last_notification_block_reasons": {
                 k: int(v or 0)
@@ -11569,6 +11955,13 @@ def worker_runtime_defaults() -> Dict[str, Any]:
         "last_notification_diag": {},
         "last_notification_counters": {},
         "last_notification_block_reasons": {},
+        "last_notification_event_key": "",
+        "last_notification_send_status": "",
+        "last_notification_send_reason": "",
+        "last_notification_sent_ts": "",
+        "last_notification_failed_ts": "",
+        "notification_journal_size": 0,
+        "notification_journal_trimmed": 0,
         "concurrent_mode_overlap": 0,
         "heartbeat_interval_sec": 0,
         "loop_iterations": 0,
@@ -15734,6 +16127,20 @@ def render_debug_panel():
                 f"sent={int(parse_float(counters.get('sent', 0), 0.0))} | "
                 f"blocked={int(parse_float(counters.get('blocked', 0), 0.0))} | "
                 f"send_fail={int(parse_float(counters.get('send_fail', 0), 0.0))}"
+            )
+            st.caption(
+                f"notification_journal: sent={int(parse_float(counters.get('sent', 0), 0.0))} | "
+                f"skipped_duplicate={int(parse_float(counters.get('skipped_duplicate', 0), 0.0))} | "
+                f"failed={int(parse_float(counters.get('failed', 0), 0.0))} | "
+                f"size={int(parse_float(counters.get('journal_size', runtime.get('notification_journal_size', 0)), 0.0))} | "
+                f"last_failed={counters.get('last_failed_reason') or '—'}"
+            )
+            st.caption(
+                f"notification_journal: sent={int(parse_float(counters.get('sent', 0), 0.0))} | "
+                f"skipped_duplicate={int(parse_float(counters.get('skipped_duplicate', 0), 0.0))} | "
+                f"failed={int(parse_float(counters.get('failed', 0), 0.0))} | "
+                f"size={int(parse_float(counters.get('journal_size', runtime.get('notification_journal_size', 0)), 0.0))} | "
+                f"last_failed={counters.get('last_failed_reason') or '—'}"
             )
         blocked_reasons = runtime.get("last_notification_block_reasons") or {}
         if isinstance(blocked_reasons, dict) and blocked_reasons:
