@@ -149,3 +149,18 @@ def test_digest_bucket_event_key_changes_by_bucket():
 
     assert same_a == same_b
     assert same_a != next_bucket
+
+
+def test_app_build_notification_event_key_delegates_to_core(monkeypatch):
+    calls = []
+
+    def fake_build(event, bucket_ts=None):
+        calls.append((event, bucket_ts))
+        return "core-key"
+
+    monkeypatch.setattr(app.notification_core, "build_notification_event_key", fake_build)
+    row = {"chain": "solana", "base_token_address": "Token1", "final_action": "REDUCE"}
+
+    assert app.build_notification_event_key("portfolio", row=row, source="portfolio", bucket="stable") == "core-key"
+    assert calls
+    assert calls[0][0]["event_type"] == "portfolio"
