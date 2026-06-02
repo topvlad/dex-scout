@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib
+import inspect
 import json
 import os
 import subprocess
@@ -172,6 +173,56 @@ def _ui_streamlit_role() -> Dict[str, Any]:
     return _capture_role(run)
 
 
+def _verify_facade_forwarding(facade: ModuleType) -> Dict[str, Any]:
+    """Exercise facade forwarding with a fake app without touching storage or jobs."""
+    errors: List[str] = []
+    captured: Dict[str, Any] = {}
+
+    def update_job_heartbeat(job_name: str, job_mode: str, status: str = "alive", meta: Any = None) -> Dict[str, Any]:
+        captured.update({"job_name": job_name, "job_mode": job_mode, "status": status, "meta": meta})
+        return {"ok": True}
+
+    fake_app = ModuleType("runtime_matrix_fake_app")
+    fake_app.update_job_heartbeat = update_job_heartbeat  # type: ignore[attr-defined]
+
+    with patch.object(facade, "load_app_runtime", lambda force_reload=False: {"ok": True, "app": fake_app}):
+        heartbeat = facade.update_job_heartbeat(
+            job_name="runtime_notify_cycle",
+            job_mode="notify_cycle",
+            status="started",
+            meta={"x": 1},
+        )
+        missing = facade._call_app("missing_matrix_function", _facade_job_mode="notify_cycle")
+
+    if heartbeat != {"ok": True}:
+        errors.append("heartbeat_forward_result_bad")
+    expected = {
+        "job_name": "runtime_notify_cycle",
+        "job_mode": "notify_cycle",
+        "status": "started",
+        "meta": {"x": 1},
+    }
+    if captured != expected:
+        errors.append(f"heartbeat_kwargs_not_forwarded:{captured}")
+    if missing.get("status") != "missing_app_function" or missing.get("function") != "missing_matrix_function":
+        errors.append(f"missing_function_not_structured:{missing}")
+
+    forbidden_internal_names = {"job_mode", "chain", "token_addr", "status", "meta", "action", "event_type"}
+    signature = inspect.signature(facade._call_app)
+    internal_kwargs = [
+        name
+        for name, param in signature.parameters.items()
+        if param.kind is inspect.Parameter.KEYWORD_ONLY and name not in {"_facade_job_mode"}
+    ]
+    collisions = sorted(forbidden_internal_names.intersection(internal_kwargs))
+    if collisions:
+        errors.append(f"facade_internal_kwarg_collision:{','.join(collisions)}")
+    if "_facade_job_mode" not in signature.parameters:
+        errors.append("missing_reserved_facade_job_mode")
+
+    return {"ok": not errors, "errors": errors, "heartbeat": captured, "missing_function": missing}
+
+
 def _worker_role() -> Dict[str, Any]:
     def run() -> Dict[str, Any]:
         os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
@@ -196,7 +247,10 @@ def _worker_role() -> Dict[str, Any]:
             else:
                 errors.append("missing_facade_resolver")
                 break
-        return _role("ok" if not errors else "job_mode_resolution_failed", ok=not errors, errors=errors, job_modes=resolutions)
+        forwarding = _verify_facade_forwarding(facade)
+        errors.extend(forwarding.get("errors", []))
+        status = "ok" if not errors else "worker_preflight_failed"
+        return _role(status, ok=not errors, errors=errors, job_modes=resolutions, facade_forwarding=forwarding)
     return _capture_role(run)
 
 
