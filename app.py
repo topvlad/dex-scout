@@ -14351,6 +14351,10 @@ def should_surface_in_priority(row: Dict[str, Any], portfolio_row: Optional[Dict
     return monitoring_core.should_surface_in_priority(row, portfolio_row=portfolio_row)
 
 
+def build_priority_watchlist_rows(monitoring_rows: List[Dict[str, Any]], portfolio_rows: Optional[List[Dict[str, Any]]] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    return monitoring_core.build_priority_watchlist_rows(monitoring_rows, portfolio_rows)
+
+
 def resolve_monitoring_portfolio_state(monitoring_row: Dict[str, Any], portfolio_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return monitoring_core.resolve_monitoring_portfolio_state(monitoring_row, portfolio_row=portfolio_row)
 
@@ -14676,8 +14680,9 @@ def page_scout(cfg: Dict[str, Any]):
         render_scout_card(p, i)
 
 
-def page_monitoring(auto_cfg: Dict[str, Any]):
+def page_monitoring(auto_cfg: Dict[str, Any], context: Optional[Dict[str, Any]] = None):
     page_t0 = time.perf_counter()
+    context = context if isinstance(context, dict) else {}
     # Normal Streamlit renders must be read-only for archive/dead state changes; workers own archival writes.
     UI_RENDER_READONLY = True
     perf_counts: Dict[str, int] = {
@@ -14945,6 +14950,23 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         c["ui_badge"] = ui["badge"]
         cards_all.append(c)
 
+    def _priority_key(row: Dict[str, Any]) -> str:
+        return canonical_token_key(row) or str(row.get("base_symbol") or row.get("symbol") or extract_name(row) or "").strip().upper()
+
+    priority_watchlist_rows, priority_watchlist_debug = build_priority_watchlist_rows(
+        [c.get("row", {}) for c in cards_all],
+        portfolio_rows,
+    )
+    context["priority_watchlist_rows"] = priority_watchlist_rows
+    context["priority_watchlist_debug"] = priority_watchlist_debug
+    # Temporary compatibility aliases for older page/debug snippets; the
+    # canonical render boundary is context["priority_watchlist_rows"].
+    context["priority_rows"] = priority_watchlist_rows
+    context["priority_watchlist"] = priority_watchlist_rows
+    context["priority_items"] = priority_watchlist_rows
+    context["priority_candidates"] = priority_watchlist_rows
+    priority_watchlist_keys = {_priority_key(r) for r in priority_watchlist_rows if _priority_key(r)}
+
     priority_cards: List[Dict[str, Any]] = []
     portfolio_linked_cards: List[Dict[str, Any]] = []
     hidden_review_dead_count = 0
@@ -14974,6 +14996,9 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
         hard_gate_reasons = list(hard_gate.get("flags") or [])
         c["hard_gate_reasons"] = hard_gate_reasons
         c["hard_gate_reason"] = str(hard_gate.get("reason") or "")
+        priority_key = _priority_key(row)
+        if priority_key and priority_key in priority_watchlist_keys:
+            priority_cards.append(c)
         if in_pf:
             portfolio_linked_cards.append(c)
         elif hard_gate.get("blocked"):
@@ -14985,8 +15010,6 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
             dead_cards.append(c)
         elif is_review and run_review_analysis:
             review_cards.append(c)
-        else:
-            priority_cards.append(c)
 
     if STREAMLIT_FAST_UI_MODE and not run_review_analysis and hidden_review_dead_count > 0:
         st.caption(f"Fast UI mode: {hidden_review_dead_count} review/dead candidates hidden until review analysis is run.")
@@ -15283,8 +15306,32 @@ def page_monitoring(auto_cfg: Dict[str, Any]):
 
     st.markdown("---")
     st.subheader("Priority watchlist")
+    priority_watchlist_debug = context.get("priority_watchlist_debug") if isinstance(context.get("priority_watchlist_debug"), dict) else priority_watchlist_debug
     if not priority_cards:
         st.info("No items in priority watchlist yet.")
+        excluded = priority_watchlist_debug.get("excluded", {}) if isinstance(priority_watchlist_debug, dict) else {}
+        if int(priority_watchlist_debug.get("final_priority_rows", 0) or 0) == 0:
+            if (
+                int(priority_watchlist_debug.get("active_monitoring_rows", 0) or 0) > 0
+                and int(excluded.get("portfolio_linked_policy", 0) or 0) == int(priority_watchlist_debug.get("active_monitoring_rows", 0) or 0)
+            ):
+                st.caption(f"All active rows are portfolio-linked and excluded by policy ({excluded.get('portfolio_linked_policy', 0)}).")
+            st.caption(
+                "Priority diagnostics: "
+                f"source={priority_watchlist_debug.get('source_monitoring_rows', 0)} • "
+                f"active={priority_watchlist_debug.get('active_monitoring_rows', 0)} • "
+                f"watch_early={priority_watchlist_debug.get('eligible_watch_early_rows', 0)} • "
+                f"final={priority_watchlist_debug.get('final_priority_rows', 0)}"
+            )
+            if excluded:
+                excluded_summary = " • ".join(f"{k}={v}" for k, v in excluded.items() if int(v or 0) > 0)
+                st.caption(f"Excluded: {excluded_summary or 'none'}")
+            samples = priority_watchlist_debug.get("top_excluded_samples") if isinstance(priority_watchlist_debug, dict) else []
+            for sample in list(samples or [])[:3]:
+                st.caption(
+                    f"Sample excluded: {sample.get('symbol', 'UNKNOWN')} | "
+                    f"{sample.get('status', '')} | {sample.get('score', '')} | {sample.get('reason', 'unknown')}"
+                )
     for item in priority_cards:
         render_monitoring_card(item)
     perf["render_active_cards"] = time.perf_counter() - perf_t0
@@ -16890,6 +16937,8 @@ def build_ui_context(
         "auto_cfg": dict(auto_cfg or {}),
         "scout_cfg": dict(scout_cfg or {}),
         "runtime_state": dict(runtime_state or {}),
+        "priority_watchlist_rows": [],
+        "priority_watchlist_debug": monitoring_core.empty_priority_watchlist_debug(0),
         "actions": ui_actions,
     }
 
