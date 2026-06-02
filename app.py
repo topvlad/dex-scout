@@ -47,6 +47,7 @@ import config as app_config
 import app_service
 import notification_core
 import monitoring_core
+import portfolio_service
 from runtime_core import (
     _env_bool as runtime_env_bool,
     _env_float as runtime_env_float,
@@ -10604,13 +10605,13 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
 
 def is_material_portfolio_action(row: Any, analysis: Optional[Dict[str, Any]] = None) -> bool:
     if analysis is None:
-        return notification_core.is_material_portfolio_action(row)
+        return portfolio_service.is_material_portfolio_action(row)
     payload: Dict[str, Any] = {}
     if isinstance(row, dict):
         payload.update(row)
     if isinstance(analysis, dict):
         payload.update({k: v for k, v in analysis.items() if k in {"action", "bucket", "final_action", "recommended_action", "position_action", "entry_action"}})
-    return notification_core.is_material_portfolio_action(payload)
+    return portfolio_service.is_material_portfolio_action(payload)
 
 
 def build_position_action_plan(row: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
@@ -10650,6 +10651,12 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
     dedupe_keys: List[str] = []
     last_keys = set(str(x) for x in (tg_state.get("last_position_analysis_dedupe_keys") or []))
     changed_keys: Set[str] = set()
+    active_rows_for_diagnostics = [r for r in portfolio_rows if str((r or {}).get("active", "1")).strip() == "1"]
+    notification_candidate_bridge = portfolio_service.build_portfolio_notification_candidates(
+        active_rows_for_diagnostics,
+        monitoring_rows=monitoring_rows,
+        now_ts=now_utc_str(),
+    )
     history_rows = load_monitoring_history(limit_rows=25000)
     for row in portfolio_rows:
         if str(row.get("active", "1")).strip() != "1":
@@ -10712,6 +10719,14 @@ def build_tg_position_analysis(portfolio_rows: List[Dict[str, Any]], monitoring_
         "material_rows_from_ui": material_rows_from_ui,
         "action_now_count_before_dedupe": action_now_count_before_dedupe,
         "action_now_count_after_dedupe": action_now_count_after_dedupe,
+        "portfolio_action_diagnostics": {
+            "rows_seen": int((notification_candidate_bridge.get("diagnostics") or {}).get("rows_seen", total_active)),
+            "material_count": int(notification_candidate_bridge.get("material_count", material_rows_from_ui)),
+            "missing_price_material": int((notification_candidate_bridge.get("diagnostics") or {}).get("missing_price_material", 0)),
+            "non_material": int((notification_candidate_bridge.get("diagnostics") or {}).get("non_material", 0)),
+            "blocked_no_urgent_heartbeat": bool(notification_candidate_bridge.get("blocked_no_urgent_heartbeat")),
+            "blocked_reason": str(notification_candidate_bridge.get("blocked_reason") or ""),
+        },
     }
 
 
@@ -14319,8 +14334,24 @@ def build_live_pulse_candidates_payload(
 MATERIAL_PORTFOLIO_ACTIONS = notification_core.MATERIAL_PORTFOLIO_ACTIONS
 
 
+def normalize_portfolio_action(value: Any) -> str:
+    return portfolio_service.normalize_portfolio_action(value)
+
+
 def normalize_material_portfolio_action(value: Any) -> str:
-    return monitoring_core.normalize_material_portfolio_action(value)
+    return portfolio_service.normalize_portfolio_action(value)
+
+
+def classify_portfolio_row(row: Dict[str, Any], market_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return portfolio_service.classify_portfolio_row(row, market_snapshot=market_snapshot)
+
+
+def build_portfolio_notification_candidates(
+    portfolio_rows: List[Dict[str, Any]],
+    monitoring_rows: Optional[List[Dict[str, Any]]] = None,
+    now_ts: Optional[str] = None,
+) -> Dict[str, Any]:
+    return portfolio_service.build_portfolio_notification_candidates(portfolio_rows, monitoring_rows=monitoring_rows, now_ts=now_ts)
 
 
 def find_active_portfolio_row(row: Dict[str, Any], portfolio_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -14357,6 +14388,13 @@ def build_priority_watchlist_rows(monitoring_rows: List[Dict[str, Any]], portfol
 
 def resolve_monitoring_portfolio_state(monitoring_row: Dict[str, Any], portfolio_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return monitoring_core.resolve_monitoring_portfolio_state(monitoring_row, portfolio_row=portfolio_row)
+
+
+def resolve_portfolio_monitoring_conflict(
+    portfolio_row: Optional[Dict[str, Any]],
+    monitoring_row: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return portfolio_service.resolve_portfolio_monitoring_conflict(portfolio_row, monitoring_row)
 
 
 def _priority_hard_gate_reasons(row: Dict[str, Any]) -> List[str]:
@@ -16939,6 +16977,14 @@ def build_ui_context(
         "runtime_state": dict(runtime_state or {}),
         "priority_watchlist_rows": [],
         "priority_watchlist_debug": monitoring_core.empty_priority_watchlist_debug(0),
+        "portfolio_action_diagnostics": {
+            "rows_seen": 0,
+            "material_count": 0,
+            "missing_price_material": 0,
+            "non_material": 0,
+            "blocked_no_urgent_heartbeat": False,
+            "blocked_reason": "",
+        },
         "actions": ui_actions,
     }
 
