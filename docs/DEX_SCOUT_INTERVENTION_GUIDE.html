@@ -42,12 +42,12 @@
     <section id="health" class="banner">
       <h2>Current health</h2>
       <div class="grid">
-        <div class="card"><b class="good">Runtime split is active</b><p><code>runtime_core.py</code>, <code>storage_core.py</code>, <code>storage_repository.py</code>, <code>notification_core.py</code>, <code>monitoring_core.py</code>, <code>app_service.py</code>, <code>portfolio_service.py</code>, and <code>app_runtime_facade.py</code> now carry extracted responsibilities.</p></div>
+        <div class="card"><b class="good">Runtime split is active</b><p><code>runtime_core.py</code>, <code>storage_core.py</code>, <code>storage_repository.py</code>, <code>notification_core.py</code>, <code>monitoring_core.py</code>, <code>app_service.py</code>, <code>portfolio_service.py</code>, <code>monitoring_service.py</code>, and <code>app_runtime_facade.py</code> now carry extracted responsibilities.</p></div>
         <div class="card"><b class="warn">Legacy shell remains</b><p><code>app.py</code> is still the Streamlit entrypoint, compatibility wrapper home, UI router, and remaining business-glue layer.</p></div>
         <div class="card"><b>Persistence reality</b><p>Cloudflare D1 via the D1 Worker / <code>app_storage</code> path is the current primary persistence architecture. Local CSV fallback remains where code supports it. Supabase is legacy/fallback only where still present in code.</p></div>
         <div class="card"><b>No secrets</b><p>This guide intentionally documents component names and workflows only; no secrets, private URLs, tokens, or environment values are embedded.</p></div>
       </div>
-      <p class="last">Current PR marker: #289 Portfolio service extraction + action consistency.</p>
+      <p class="last">Current PR marker: #290 Monitoring/archive service extraction.</p>
     </section>
 
     <section id="architecture">
@@ -56,13 +56,13 @@
         <div class="card"><h3>SHARED — Ingest / Normalize</h3><ul><li><code>dex.py</code></li><li><code>config.py</code></li><li><code>runtime_core.py</code> helpers where shared normalization/parsing is relevant</li></ul></div>
         <div class="card"><h3>SHARED — Score / Filter</h3><ul><li><code>scoring.py</code></li><li><code>config.py</code></li><li>Do not change scoring or recommendation semantics during UI-shell work.</li></ul></div>
         <div class="card"><h3>CORE LEGACY SHELL</h3><ul><li><code>app.py</code></li><li>Streamlit entrypoint</li><li>Compatibility wrappers</li><li>UI router</li><li>Remaining business glue</li></ul></div>
-        <div class="card"><h3>EXTRACTED CORE / SERVICE LAYER</h3><ul><li><code>runtime_core.py</code></li><li><code>storage_core.py</code></li><li><code>storage_repository.py</code></li><li><code>notification_core.py</code></li><li><code>monitoring_core.py</code></li><li><code>app_service.py</code></li><li><code>portfolio_service.py</code></li><li><code>app_runtime_facade.py</code></li></ul></div>
+        <div class="card"><h3>EXTRACTED CORE / SERVICE LAYER</h3><ul><li><code>runtime_core.py</code></li><li><code>storage_core.py</code></li><li><code>storage_repository.py</code></li><li><code>notification_core.py</code></li><li><code>monitoring_core.py</code></li><li><code>app_service.py</code></li><li><code>portfolio_service.py</code></li><li><code>monitoring_service.py</code></li><li><code>app_runtime_facade.py</code></li></ul></div>
         <div class="card"><h3>UI</h3><ul><li><code>app.py</code> entrypoint</li><li><code>ui/pages_*.py</code> page render adapters</li><li>Dash dashboard, if present, is a read-only sidecar rather than a write path.</li></ul></div>
         <div class="card"><h3>WORKER</h3><ul><li><code>worker.py</code></li><li><code>app_runtime_facade.py</code></li><li>Lazy <code>app.py</code> import only for remaining business functions.</li></ul></div>
         <div class="card"><h3>WEBHOOK</h3><ul><li><code>tg_webhook.py</code></li><li><code>app_runtime_facade.py</code></li><li>Explicit <code>app_import_failed</code> state for import failures.</li></ul></div>
         <div class="card"><h3>PERSISTENCE</h3><ul><li>Cloudflare D1 / D1 Worker / <code>app_storage</code></li><li>Local CSV fallback if still supported by runtime code</li><li>Supabase only as legacy/fallback if code still supports it</li></ul></div>
         <div class="card"><h3>ALERT / NOTIFICATION</h3><ul><li><code>notification_core.py</code></li><li><code>notification_event_journal</code></li><li>Telegram send remains in <code>app.py</code> for now.</li></ul></div>
-        <div class="card"><h3>MONITORING / PORTFOLIO STATE</h3><ul><li><code>monitoring_core.py</code></li><li><code>portfolio_service.py</code></li><li><code>app.py</code> storage wrappers</li><li>UI display via <code>ui/pages_*.py</code></li></ul></div>
+        <div class="card"><h3>MONITORING / PORTFOLIO STATE</h3><ul><li><code>monitoring_core.py</code></li><li><code>monitoring_service.py</code></li><li><code>portfolio_service.py</code></li><li><code>app.py</code> storage wrappers</li><li>UI display via <code>ui/pages_*.py</code></li></ul></div>
       </div>
       <pre class="flow">Streamlit operator → app.py → ui/pages_*.py → explicit context actions
 Worker → worker.py → app_runtime_facade.py → lazy app.py compatibility functions
@@ -108,15 +108,16 @@ Persistence → storage_repository.py / storage_core.py → D1 Worker app_storag
         <tr><td>#286</td><td>Completed: <code>app.py</code> service facade / business glue reduction</td><td><code>app_service.py</code> is the import-safe service facade for pure runtime, storage, notification, monitoring, Live Pulse, and operator summaries while preserving the current D1 persistence path.</td></tr>
         <tr><td>#287</td><td>Completed: runtime no-fail and service-layer guardrails follow-up</td><td>Keep role checks explicit and preserve D1 persistence, Telegram event-key, storage-key, and worker-order behavior.</td></tr>
         <tr><td>#288</td><td>Completed: Priority watchlist materialization hotfix</td><td>Priority watchlist materialization remains a read/selection consistency fix, not a scoring or scanner-source change.</td></tr>
-        <tr><td>#289</td><td>Current: Portfolio service extraction + action consistency</td><td><code>portfolio_service.py</code> owns import-safe Portfolio action normalization, row classification, notification-candidate diagnostics, and Portfolio/Monitoring material-action conflict resolution.</td></tr>
-        <tr><td>#290</td><td>Next: scanner/live-pulse service extraction or monitoring/archive service extraction</td><td>Continue reducing <code>app.py</code> business glue without moving scanner execution, Telegram sending/templates, scoring weights, D1 schema, storage keys, or runtime job order.</td></tr>
+        <tr><td>#289</td><td>Completed: Portfolio service extraction + action consistency</td><td><code>portfolio_service.py</code> owns import-safe Portfolio action normalization, row classification, notification-candidate diagnostics, and Portfolio/Monitoring material-action conflict resolution.</td></tr>
+        <tr><td>#290</td><td>Current: Monitoring/archive service extraction</td><td><code>monitoring_service.py</code> owns import-safe Monitoring status normalization, row classification, archive-transition planning, Priority diagnostics, and Portfolio conflict exclusion while keeping writes in <code>app.py</code>.</td></tr>
+        <tr><td>#291</td><td>Next: scanner/live-pulse service boundary</td><td>Proceed only after runtime_matrix and monitor_cycle are green; do not move scanner source logic, scoring weights, Telegram templates, D1 schema, storage keys, or runtime job order.</td></tr>
       </tbody></table>
     </section>
 
     <section id="checks">
       <h2>Regression checklist</h2>
       <ul>
-        <li><code>python -m py_compile portfolio_service.py app.py worker.py tg_webhook.py app_runtime_facade.py runtime_core.py storage_core.py storage_repository.py notification_core.py monitoring_core.py app_service.py</code></li>
+        <li><code>python -m py_compile monitoring_service.py portfolio_service.py app.py worker.py tg_webhook.py app_runtime_facade.py runtime_core.py storage_core.py storage_repository.py notification_core.py monitoring_core.py app_service.py</code></li>
         <li><code>pytest -q</code></li>
         <li><code>DEX_SCOUT_WORKER_MODE=1 python -c "import app; print('ok')"</code></li>
         <li><code>python -c "import ui.pages_monitoring; print('ok')"</code></li>

@@ -29,6 +29,7 @@ CORE_MODULES = (
     "storage_repository",
     "notification_core",
     "monitoring_core",
+    "monitoring_service",
     "portfolio_service",
     "app_service",
 )
@@ -316,6 +317,35 @@ def _core_modules_role() -> Dict[str, Any]:
                 errors.append("app_imported_by_core_modules")
             if "streamlit" in sys.modules:
                 errors.append("streamlit_imported_by_core_modules")
+            monitoring_service = sys.modules.get("monitoring_service")
+            if monitoring_service is None:
+                errors.append("monitoring_service_not_imported")
+            else:
+                service_file = str(getattr(monitoring_service, "__file__", "") or "")
+                imported_for_service = {
+                    "streamlit": sys.modules.get("streamlit"),
+                    "app": sys.modules.get("app"),
+                }
+                if imported_for_service["streamlit"] is not None:
+                    errors.append(f"monitoring_service_imported_streamlit:{service_file}")
+                if imported_for_service["app"] is not None:
+                    errors.append(f"monitoring_service_imported_app:{service_file}")
+                watch = getattr(monitoring_service, "classify_monitoring_row")({
+                    "chain": "solana", "base_addr": "watch", "base_symbol": "WATCH", "entry_status": "WATCH", "priority_score": "10"
+                })
+                if not (watch.get("is_active") and watch.get("is_actionable") and watch.get("priority_eligible")):
+                    errors.append(f"monitoring_service_watch_smoke_failed:{watch}")
+                no_entry = getattr(monitoring_service, "classify_monitoring_row")({
+                    "chain": "solana", "base_addr": "no", "base_symbol": "NO", "entry_status": "NO_ENTRY", "priority_score": "10"
+                })
+                if no_entry.get("priority_eligible") or no_entry.get("is_actionable"):
+                    errors.append(f"monitoring_service_no_entry_smoke_failed:{no_entry}")
+                conflict = getattr(monitoring_service, "classify_monitoring_row")(
+                    {"chain": "solana", "base_addr": "exit", "base_symbol": "EXIT", "entry_status": "WATCH", "priority_score": "10"},
+                    {"chain": "solana", "base_token_address": "exit", "base_symbol": "EXIT", "final_action": "EXIT"},
+                )
+                if not conflict.get("portfolio_conflict") or conflict.get("priority_eligible"):
+                    errors.append(f"monitoring_service_portfolio_conflict_smoke_failed:{conflict}")
             portfolio_service = sys.modules.get("portfolio_service")
             if portfolio_service is None:
                 errors.append("portfolio_service_not_imported")
