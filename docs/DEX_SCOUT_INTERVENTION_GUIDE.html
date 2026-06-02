@@ -102,8 +102,9 @@ Persistence → storage_repository.py / storage_core.py → D1 Worker app_storag
       <h2>Roadmap</h2>
       <table><thead><tr><th>PR</th><th>Target</th><th>Guardrail</th></tr></thead><tbody>
         <tr><td>#282</td><td>UI page shell split + guide refresh</td><td>No scanner/recommendation, Telegram template, D1 schema, storage-key, worker-order, or callback-behavior changes.</td></tr>
-        <tr><td>#283</td><td><code>app.py</code> business glue reduction / service facade</td><td>Move behavior behind explicit service/facade boundaries only after tests protect parity.</td></tr>
-        <tr><td>#284</td><td>Structured storage/table migration planning, only if needed</td><td>Plan before migration; preserve D1 Worker and existing storage semantics.</td></tr>
+        <tr><td>#283</td><td>Completed: Streamlit UI page rendering split + guide refresh</td><td>Keep UI adapters import-safe and render-only unless an explicit action callable is invoked.</td></tr>
+        <tr><td>#284</td><td>Current: Runtime no-fail matrix + service facade guardrails</td><td>Check UI, worker, webhook, Dash readonly, and core module roles independently with explicit degraded states.</td></tr>
+        <tr><td>#285</td><td>Next: <code>app.py</code> service facade / business glue reduction</td><td>Move behavior behind explicit service/facade boundaries only after tests protect parity and preserve the current D1 persistence path.</td></tr>
       </tbody></table>
     </section>
 
@@ -116,6 +117,7 @@ Persistence → storage_repository.py / storage_core.py → D1 Worker app_storag
         <li><code>python -c "import ui.pages_monitoring; print('ok')"</code></li>
         <li>Runtime Smoke workflow: <code>preflight_only</code></li>
         <li>Runtime Smoke workflow: <code>read_only</code></li>
+        <li>Runtime no-fail matrix checklist: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, <code>core_modules</code>.</li>
         <li>Streamlit UI opens.</li>
         <li>No write during normal render.</li>
         <li><code>/_import_status</code> returns no secrets.</li>

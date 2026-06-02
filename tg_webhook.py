@@ -528,6 +528,7 @@ def import_status():
     failed = not bool(state.get("ok"))
     return {
         "ok": not failed,
+        "status": "app_import_failed" if failed else "ok",
         "import_failed": failed,
         "error": str(state.get("error") or ""),
         "exception_type": str(state.get("exception_type") or ""),

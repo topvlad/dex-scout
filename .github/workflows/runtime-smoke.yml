@@ -13,6 +13,7 @@ on:
           - health_only
           - read_only
           - safe_runtime_sequence
+          - runtime_matrix
       dry_run:
         description: Validate runtime jobs without writes, Telegram sends, or scans
         type: boolean
@@ -66,9 +67,9 @@ jobs:
       - name: Compile runtime modules
         run: |
           set -euo pipefail
-          files=(app.py worker.py tg_webhook.py app_runtime_facade.py runtime_core.py storage_core.py)
-          if [ -f dash_app.py ]; then files+=(dash_app.py); fi
-          python -m py_compile "${files[@]}"
+          python -m py_compile app.py worker.py tg_webhook.py app_runtime_facade.py runtime_core.py storage_core.py storage_repository.py notification_core.py monitoring_core.py
+          python -m py_compile ui/layout.py ui/pages_scout.py ui/pages_monitoring.py ui/pages_portfolio.py ui/pages_archive.py ui/pages_runtime.py
+          if [ -f dash_app.py ]; then python -m py_compile dash_app.py; fi
 
       - name: Import runtime modules
         run: |
@@ -114,9 +115,21 @@ jobs:
           allow_scan = as_bool(os.getenv('SMOKE_ALLOW_SCAN'), False)
 
           steps = []
-          import_state = app_runtime_facade.load_app_runtime()
-          preflight = worker._runtime_preflight(import_state)
-          steps.append({'name': 'preflight', 'ok': bool(import_state.get('ok')), 'summary': preflight})
+          if mode == 'runtime_matrix':
+              import_state = {'ok': True}
+              preflight = {'runtime_matrix': True}
+          else:
+              import_state = app_runtime_facade.load_app_runtime()
+              preflight = worker._runtime_preflight(import_state)
+              steps.append({'name': 'preflight', 'ok': bool(import_state.get('ok')), 'summary': preflight})
+
+          if mode == 'runtime_matrix':
+              import subprocess
+              rc = subprocess.call(['python', 'scripts/runtime_no_fail_matrix.py', '--json', 'runtime-no-fail-summary.json'])
+              matrix = json.loads(Path('runtime-no-fail-summary.json').read_text(encoding='utf-8'))
+              steps.append({'name': 'runtime_matrix', 'ok': bool(matrix.get('ok')), 'summary': matrix})
+              if rc != 0:
+                  raise SystemExit(rc)
 
           if mode in {'read_only', 'safe_runtime_sequence'}:
               read_only = worker.run_runtime_smoke_read_only(app_runtime_facade)
@@ -152,4 +165,12 @@ jobs:
         with:
           name: runtime-smoke-summary
           path: runtime-smoke-summary.json
+          if-no-files-found: error
+
+      - name: Upload runtime no-fail matrix summary
+        if: always() && inputs.mode == 'runtime_matrix'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-no-fail-summary
+          path: runtime-no-fail-summary.json
           if-no-files-found: error
