@@ -121,12 +121,20 @@ def get_import_state(force_reload: bool = False) -> Dict[str, Any]:
     }
 
 
-def _call_app(name: str, *args: Any, job_mode: str = "", **kwargs: Any) -> Any:
+def _call_app(name: str, *args: Any, _facade_job_mode: str = "", **kwargs: Any) -> Any:
     runtime = load_app_runtime()
     module = runtime.get("app")
     if not runtime.get("ok") or module is None:
-        return _failure_payload(runtime, job_mode=job_mode)
-    fn = getattr(module, name)
+        return _failure_payload(runtime, job_mode=_facade_job_mode)
+    fn = getattr(module, name, None)
+    if not callable(fn):
+        return {
+            "ok": False,
+            "status": "missing_app_function",
+            "function": name,
+            "job_mode": _facade_job_mode,
+            "reason": "app function is missing or not callable",
+        }
     return fn(*args, **kwargs)
 
 
@@ -210,24 +218,24 @@ def release_lock(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
 
 def run_storage_maintenance_cycle(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return _call_app("run_storage_maintenance_cycle", *args, job_mode="maintenance_cycle", **kwargs)
+    return _call_app("run_storage_maintenance_cycle", *args, _facade_job_mode="maintenance_cycle", **kwargs)
 
 
 def trigger_digest_notification(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return _call_app("trigger_digest_notification", *args, job_mode="digest_cycle", **kwargs)
+    return _call_app("trigger_digest_notification", *args, _facade_job_mode="digest_cycle", **kwargs)
 
 
 def evaluate_outcome_journals(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return _call_app("evaluate_outcome_journals", *args, job_mode="outcome_cycle", **kwargs)
+    return _call_app("evaluate_outcome_journals", *args, _facade_job_mode="outcome_cycle", **kwargs)
 
 
 def maybe_run_rotating_scanner(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return _call_app("maybe_run_rotating_scanner", *args, job_mode="scan_cycle", **kwargs)
+    return _call_app("maybe_run_rotating_scanner", *args, _facade_job_mode="scan_cycle", **kwargs)
 
 
 def run_priority_scanner_cycle(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return _call_app("run_priority_scanner_cycle", *args, job_mode="monitor_cycle", **kwargs)
+    return _call_app("run_priority_scanner_cycle", *args, _facade_job_mode="monitor_cycle", **kwargs)
 
 
 def run_auto_notifications(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return _call_app("run_auto_notifications", *args, job_mode="notify_cycle", **kwargs)
+    return _call_app("run_auto_notifications", *args, _facade_job_mode="notify_cycle", **kwargs)
