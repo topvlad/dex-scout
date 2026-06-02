@@ -17,3 +17,12 @@ def test_intervention_guide_does_not_contain_stale_claims_or_secret_values(monke
         assert value not in text
     for stale in ["Немає жодних тестів", "Supabase primary"]:
         assert stale not in text
+
+
+def test_intervention_guide_tracks_runtime_matrix_roadmap():
+    text = Path("docs/DEX_SCOUT_INTERVENTION_GUIDE.html").read_text(encoding="utf-8")
+    assert "runtime facade <code>job_mode</code> kwarg collision fixed" in text
+    assert "#285" in text and "Runtime no-fail matrix + service facade guardrails" in text
+    assert "#286" in text and "service facade / business glue reduction" in text
+    for role in ["ui_streamlit", "worker", "webhook", "dash_readonly", "core_modules"]:
+        assert role in text

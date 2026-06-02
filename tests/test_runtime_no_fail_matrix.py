@@ -68,6 +68,25 @@ def test_dash_role_skips_when_dash_app_absent(monkeypatch):
     assert result["status"] == "skipped_absent"
 
 
+def test_worker_role_verifies_facade_heartbeat_forwarding(monkeypatch):
+    fake_app = SimpleNamespace(
+        maybe_run_rotating_scanner=lambda: None,
+        run_priority_scanner_cycle=lambda: None,
+        run_auto_notifications=lambda: None,
+        trigger_digest_notification=lambda: None,
+        evaluate_outcome_journals=lambda: None,
+        run_storage_maintenance_cycle=lambda: None,
+    )
+    monkeypatch.setattr(app_runtime_facade, "load_app_runtime", lambda force_reload=False: {"ok": True, "app": fake_app})
+
+    result = matrix._worker_role()
+
+    assert result["ok"] is True
+    assert result["facade_forwarding"]["ok"] is True
+    assert result["facade_forwarding"]["heartbeat"]["job_mode"] == "notify_cycle"
+    assert result["facade_forwarding"]["missing_function"]["status"] == "missing_app_function"
+
+
 def test_facade_job_mode_resolver_detects_required_modes(monkeypatch):
     fake_app = SimpleNamespace(
         maybe_run_rotating_scanner=lambda: None,

@@ -109,9 +109,13 @@ def test_ui_render_functions_call_explicit_actions(monkeypatch):
 
 def test_app_imports_in_worker_mode_and_exposes_compat_wrappers(monkeypatch):
     _install_app_import_stubs(monkeypatch)
+    page_config_calls = []
+    sys.modules["streamlit"].set_page_config = lambda *args, **kwargs: page_config_calls.append((args, kwargs))
     monkeypatch.setenv("DEX_SCOUT_WORKER_MODE", "1")
     sys.modules.pop("app", None)
     app = importlib.import_module("app")
+
+    assert page_config_calls == []
 
     for name in [
         "load_monitoring",
