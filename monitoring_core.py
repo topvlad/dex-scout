@@ -7,7 +7,7 @@ import it safely.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 EVM_CHAINS = {"bsc", "eth", "ethereum", "polygon", "arbitrum", "optimism", "base", "avalanche"}
 TOKEN_ADDR_ALIASES = ("base_token_address", "base_addr", "token_addr", "token_address", "ca", "address")
@@ -15,6 +15,7 @@ PAIR_ADDR_ALIASES = ("pair_address", "pairAddress", "pair")
 MATERIAL_PORTFOLIO_ACTIONS = {"EXIT", "REDUCE", "TAKE PROFIT", "TAKE_PROFIT", "PARTIAL_TP", "PROTECT", "CLOSE", "TRIM"}
 NON_MATERIAL_PORTFOLIO_ACTIONS = {"", "HOLD", "WAIT", "WATCH", "WATCH CLOSELY", "HOLD / WATCH CAREFULLY"}
 MONITORING_WATCH_ACTIONS = {"WATCH", "EARLY", "WATCH_PULLBACK", "READY", "ACTIVE", "TRACK", "WAIT"}
+PRIORITY_SCORE_FIELDS = ("priority_score", "ui_visible_score", "visible_score", "score", "entry_score", "score_init")
 INACTIVE_FLAGS = {"0", "false", "no", "n", "inactive", "archived", "closed"}
 ARCHIVED_STATUSES = {"ARCHIVED", "DEAD", "CLOSED", "INACTIVE", "NO_ENTRY", "NO ENTRY", "AVOID", "UNTRADEABLE"}
 ACTIVE_MONITORING_STATUSES = {"", "ACTIVE", "WATCH", "WAIT", "TRACK", "READY", "MONITORING", "EARLY", "WATCH_PULLBACK"}
@@ -205,9 +206,11 @@ def hard_gate_monitoring_row(row: Dict[str, Any], portfolio_row: Optional[Dict[s
         reasons.append("untradeable")
     if any(x in reason_text for x in ("DEAD", "SCAM", "TOXIC", "HONEYPOT", "RUG")):
         reasons.append("dead_or_scam")
-    if any(x in reason_text for x in ("NO LIQUIDITY", "NO_LIQUIDITY")) or liq <= 0:
+    has_liq_metric = any(str(row.get(k, "")).strip() for k in ("liq_usd", "liquidity", "liquidity_usd", "liq_init"))
+    has_vol_metric = any(str(row.get(k, "")).strip() for k in ("vol24_usd", "vol24_init"))
+    if any(x in reason_text for x in ("NO LIQUIDITY", "NO_LIQUIDITY")) or (has_liq_metric and liq <= 0):
         reasons.append("no_liquidity")
-    if any(x in reason_text for x in ("NO RECENT FLOW", "NO_RECENT_FLOW")) or vol24 <= 0:
+    if any(x in reason_text for x in ("NO RECENT FLOW", "NO_RECENT_FLOW")) or (has_vol_metric and vol24 <= 0):
         reasons.append("no_recent_flow")
     if liq > 0 and vol24 > 0 and (vol24 / max(liq, 1.0)) < 0.08:
         reasons.append("liquidity_volume_decay")
@@ -218,7 +221,7 @@ def hard_gate_monitoring_row(row: Dict[str, Any], portfolio_row: Optional[Dict[s
     if portfolio_row:
         pf_action = normalize_material_portfolio_action((portfolio_row or {}).get("final_action") or (portfolio_row or {}).get("recommended_action") or (portfolio_row or {}).get("position_action"))
         mon_label = str(row.get("entry_status") or row.get("status") or row.get("timing_label") or "").upper()
-        if pf_action in {"EXIT", "REDUCE"} and mon_label in {"WATCH", "EARLY", "READY", "ACTIVE"}:
+        if pf_action in MATERIAL_PORTFOLIO_ACTIONS and mon_label in MONITORING_WATCH_ACTIONS:
             reasons.append("portfolio_verdict_conflict")
             flags.append(f"portfolio_{pf_action.lower().replace(' ', '_')}")
     reasons = sorted(set(reasons))
@@ -228,6 +231,130 @@ def hard_gate_monitoring_row(row: Dict[str, Any], portfolio_row: Optional[Dict[s
     elif reasons:
         action_out = "NO_ENTRY"
     return {"blocked": bool(reasons), "action": action_out, "reason": "|".join(reasons), "flags": flags + reasons}
+
+
+def monitoring_action_label(row: Dict[str, Any]) -> str:
+    """Return the normalized Monitoring label used for priority surfacing."""
+    return str(
+        (row or {}).get("entry_status")
+        or (row or {}).get("entry_action")
+        or (row or {}).get("entry")
+        or (row or {}).get("status")
+        or (row or {}).get("final_action")
+        or ""
+    ).strip().upper()
+
+
+def priority_score_value(row: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """Return the first usable priority score and the source field name."""
+    row = row or {}
+    for key in PRIORITY_SCORE_FIELDS:
+        raw = row.get(key)
+        if raw is None or str(raw).strip() == "":
+            continue
+        return _parse_float(raw, 0.0), key
+    return None, ""
+
+
+def empty_priority_watchlist_debug(source_count: int = 0) -> Dict[str, Any]:
+    return {
+        "source_monitoring_rows": int(source_count),
+        "active_monitoring_rows": 0,
+        "eligible_watch_early_rows": 0,
+        "final_priority_rows": 0,
+        "excluded": {
+            "no_entry": 0,
+            "archived": 0,
+            "hard_gated": 0,
+            "portfolio_material_conflict": 0,
+            "portfolio_linked_policy": 0,
+            "missing_score": 0,
+            "below_priority_threshold": 0,
+            "unknown": 0,
+        },
+        "top_excluded_samples": [],
+    }
+
+
+def build_priority_watchlist_rows(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: Optional[List[Dict[str, Any]]] = None,
+    *,
+    max_samples: int = 3,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Build Priority watchlist rows plus compact exclusion diagnostics.
+
+    The function is pure: it does not read storage, write storage, or mutate input
+    rows. Portfolio-linked WATCH/EARLY rows are eligible unless a material
+    portfolio action conflicts with the monitoring label.
+    """
+    rows = list(monitoring_rows or [])
+    portfolios = list(portfolio_rows or [])
+    debug = empty_priority_watchlist_debug(len(rows))
+    priority_rows: List[Dict[str, Any]] = []
+
+    def exclude(row: Dict[str, Any], reason: str, score: Optional[float] = None) -> None:
+        excluded = debug["excluded"]
+        excluded[reason] = int(excluded.get(reason, 0) or 0) + 1
+        samples = debug["top_excluded_samples"]
+        if len(samples) < max_samples:
+            sample_score = score
+            if sample_score is None:
+                sample_score, _ = priority_score_value(row)
+            samples.append({
+                "symbol": str(row.get("base_symbol") or row.get("symbol") or row.get("token") or "").strip() or "UNKNOWN",
+                "status": monitoring_action_label(row),
+                "score": "" if sample_score is None else f"{sample_score:.2f}",
+                "reason": reason,
+            })
+
+    for original in rows:
+        row = dict(original or {})
+        label = monitoring_action_label(row)
+        active = str(row.get("active", row.get("is_active", "1"))).strip().lower()
+        lifecycle = str(row.get("lifecycle") or "").strip().upper()
+        archived_reason = str(row.get("archived_reason") or "").strip()
+        if active in INACTIVE_FLAGS or archived_reason or lifecycle in ARCHIVED_STATUSES or label in {"ARCHIVED", "DEAD", "CLOSED", "INACTIVE"}:
+            exclude(row, "archived")
+            continue
+
+        debug["active_monitoring_rows"] += 1
+
+        if label in {"NO_ENTRY", "NO ENTRY", "AVOID"}:
+            exclude(row, "no_entry")
+            continue
+        if label not in MONITORING_WATCH_ACTIONS:
+            exclude(row, "unknown")
+            continue
+
+        debug["eligible_watch_early_rows"] += 1
+        portfolio_row = find_active_portfolio_row(row, portfolios)
+        gate = hard_gate_monitoring_row(row, portfolio_row=portfolio_row)
+        state = resolve_monitoring_portfolio_state(row, portfolio_row)
+        if (state.get("is_conflict") and state.get("material_portfolio_action")) or "portfolio_verdict_conflict" in str(gate.get("reason") or ""):
+            exclude(row, "portfolio_material_conflict")
+            continue
+        if gate.get("blocked"):
+            exclude(row, "hard_gated")
+            continue
+
+        score, score_field = priority_score_value(row)
+        if score is None:
+            exclude(row, "missing_score")
+            continue
+        if score <= 0:
+            exclude(row, "below_priority_threshold", score)
+            continue
+
+        row["priority_score"] = score
+        row["priority_score_field"] = score_field
+        if portfolio_row:
+            row["is_portfolio_active"] = True
+        priority_rows.append(row)
+
+    priority_rows.sort(key=lambda item: float(item.get("priority_score") or 0.0), reverse=True)
+    debug["final_priority_rows"] = len(priority_rows)
+    return priority_rows, debug
 
 
 def should_surface_in_priority(row: Dict[str, Any], portfolio_row: Optional[Dict[str, Any]] = None) -> bool:
