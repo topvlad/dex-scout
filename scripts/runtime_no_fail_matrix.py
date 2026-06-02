@@ -29,6 +29,7 @@ CORE_MODULES = (
     "storage_repository",
     "notification_core",
     "monitoring_core",
+    "app_service",
 )
 REQUIRED_JOB_MODES = (
     "scan_cycle",
@@ -296,12 +297,13 @@ def _dash_readonly_role() -> Dict[str, Any]:
 
 def _core_modules_role() -> Dict[str, Any]:
     def run() -> Dict[str, Any]:
-        snapshot_names = ("app", *CORE_MODULES)
+        snapshot_names = ("app", "streamlit", *CORE_MODULES)
         snapshot = {name: sys.modules.get(name) for name in snapshot_names}
         imported = []
         errors = []
         try:
             sys.modules.pop("app", None)
+            sys.modules.pop("streamlit", None)
             for name in CORE_MODULES:
                 sys.modules.pop(name, None)
                 try:
@@ -311,6 +313,8 @@ def _core_modules_role() -> Dict[str, Any]:
                     errors.append(f"{name}:{type(exc).__name__}:{_sanitize(exc)}")
             if "app" in sys.modules:
                 errors.append("app_imported_by_core_modules")
+            if "streamlit" in sys.modules:
+                errors.append("streamlit_imported_by_core_modules")
         finally:
             for name in snapshot_names:
                 sys.modules.pop(name, None)

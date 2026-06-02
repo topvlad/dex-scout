@@ -28,6 +28,8 @@ def test_core_modules_role_succeeds_without_importing_app(monkeypatch):
     assert result["ok"] is True
     assert result["status"] == "ok"
     assert "app" not in sys.modules
+    assert "streamlit_imported_by_core_modules" not in result.get("errors", [])
+    assert "app_service" in result.get("modules", [])
 
 
 def test_worker_role_reports_app_import_failed_on_forced_facade_failure(monkeypatch):
