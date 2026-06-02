@@ -64,6 +64,11 @@ from storage_repository import (
     csv_to_text as repo_csv_to_text,
     summarize_storage_result,
 )
+from ui.pages_archive import render_archive_page
+from ui.pages_monitoring import render_monitoring_page
+from ui.pages_portfolio import render_portfolio_page
+from ui.pages_runtime import render_runtime_page
+from ui.pages_scout import render_scout_page
 from storage_core import (
     JOB_HEARTBEATS_TABLE,
     JOB_RUNS_TABLE,
@@ -16838,6 +16843,56 @@ def build_active_monitoring_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, A
     return active_rows
 
 
+
+def build_ui_context(
+    *,
+    selected_page: str = "Monitoring",
+    auto_cfg: Optional[Dict[str, Any]] = None,
+    scout_cfg: Optional[Dict[str, Any]] = None,
+    runtime_state: Optional[Dict[str, Any]] = None,
+    actions: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build the explicit context passed from app.py into UI page modules.
+
+    app.py remains the single Streamlit entrypoint and owner of storage/runtime
+    calls. UI modules receive data plus explicit action callables and must not
+    perform storage writes during normal import/render.
+    """
+    ui_actions: Dict[str, Any] = {
+        "render_scout": page_scout,
+        "render_monitoring": page_monitoring,
+        "render_archive": page_archive,
+        "render_portfolio": page_portfolio,
+        "render_runtime": render_debug_panel,
+        "render_debug_panel": render_debug_panel,
+    }
+    if actions:
+        ui_actions.update(actions)
+    return {
+        "version": VERSION,
+        "storage_backend": STORAGE_BACKEND,
+        "selected_page": selected_page,
+        "auto_cfg": dict(auto_cfg or {}),
+        "scout_cfg": dict(scout_cfg or {}),
+        "runtime_state": dict(runtime_state or {}),
+        "actions": ui_actions,
+    }
+
+
+def render_selected_page(context: Dict[str, Any]) -> None:
+    """Route the selected Streamlit page to an import-safe UI module."""
+    page = str(context.get("selected_page") or "Monitoring")
+    if page == "Scout":
+        render_scout_page(context)
+    elif page == "Monitoring":
+        render_monitoring_page(context)
+    elif page == "Archive":
+        render_archive_page(context)
+    elif page == "Runtime":
+        render_runtime_page(context)
+    else:
+        render_portfolio_page(context)
+
 def main():
     with st.expander("Debug / Telegram", expanded=False):
         st.write("TG ENGINE: NEW V3")
@@ -17139,13 +17194,14 @@ def main():
         portfolio_value_usd=portfolio_value_usd,
     )
 
+    ui_context = build_ui_context(
+        selected_page=page,
+        auto_cfg=auto_cfg,
+        runtime_state=runtime if isinstance(runtime, dict) else {},
+    )
+
     try:
-        if page == "Monitoring":
-            page_monitoring(auto_cfg)
-        elif page == "Archive":
-            page_archive()
-        else:
-            page_portfolio()
+        render_selected_page(ui_context)
     except Exception as e:
         log_error(e)
         st.error(f"Page render error: {e}")
