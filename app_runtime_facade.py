@@ -16,6 +16,35 @@ from typing import Any, Dict, Optional
 _APP_MODULE: Optional[ModuleType] = None
 _LAST_RESULT: Optional[Dict[str, Any]] = None
 
+REQUIRED_WORKER_JOB_MODES = (
+    "scan_cycle",
+    "monitor_cycle",
+    "notify_cycle",
+    "digest_cycle",
+    "outcome_cycle",
+    "maintenance_cycle",
+)
+
+WORKER_JOB_MODE_RUNNERS = {
+    "scan_cycle": "maybe_run_rotating_scanner",
+    "monitor_cycle": "run_priority_scanner_cycle",
+    "notify_cycle": "run_auto_notifications",
+    "digest_cycle": "trigger_digest_notification",
+    "outcome_cycle": "evaluate_outcome_journals",
+    "maintenance_cycle": "run_storage_maintenance_cycle",
+}
+
+_SECRET_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CHAT_ID", "D1_PROXY_URL", "SUPABASE_URL")
+
+
+def _sanitize_error(value: Any, limit: int = 180) -> str:
+    text = str(value or "")
+    for key, secret in os.environ.items():
+        if not secret or not any(hint in key.upper() for hint in _SECRET_ENV_HINTS):
+            continue
+        text = text.replace(str(secret), "[REDACTED]")
+    return text[:limit]
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -29,7 +58,8 @@ def _failure_payload(runtime: Dict[str, Any], job_mode: str = "") -> Dict[str, A
     payload = {
         "ok": False,
         "status": "app_import_failed",
-        "reason": str(runtime.get("error") or "app import failed"),
+        "reason": _sanitize_error(runtime.get("error") or "app import failed"),
+        "error": _sanitize_error(runtime.get("error") or "app import failed"),
         "exception_type": str(runtime.get("exception_type") or ""),
     }
     if job_mode:
@@ -67,7 +97,7 @@ def load_app_runtime(force_reload: bool = False) -> Dict[str, Any]:
         _LAST_RESULT = {
             "ok": False,
             "app": None,
-            "error": str(exc),
+            "error": _sanitize_error(exc),
             "exception_type": type(exc).__name__,
             "loaded_at": loaded_at,
             "worker_fast_mode": _worker_fast_mode(),
@@ -83,7 +113,7 @@ def get_import_state(force_reload: bool = False) -> Dict[str, Any]:
     state = load_app_runtime(force_reload=force_reload)
     return {
         "ok": bool(state.get("ok")),
-        "error": str(state.get("error") or ""),
+        "error": _sanitize_error(state.get("error") or ""),
         "exception_type": str(state.get("exception_type") or ""),
         "loaded_at": str(state.get("loaded_at") or ""),
         "worker_fast_mode": bool(state.get("worker_fast_mode")),
@@ -110,6 +140,49 @@ def _get_app_attr(name: str) -> Any:
             f"{runtime.get('error')}"
         )
     return getattr(module, name)
+
+
+def resolve_worker_job_mode(job_mode: str, *, dry_run: bool = True) -> Dict[str, Any]:
+    """Resolve a worker JOB_MODE through the lazy app facade without running it.
+
+    This is intentionally a preflight-only helper: it validates that the mode is
+    supported and that the corresponding app.py function exists, but it never
+    executes scanner, notification, or storage-writing job logic.
+    """
+    mode = str(job_mode or "").strip().lower()
+    runner_name = WORKER_JOB_MODE_RUNNERS.get(mode)
+    if not runner_name:
+        return {
+            "ok": False,
+            "status": "invalid_mode",
+            "job_mode": mode,
+            "allowed_modes": sorted(WORKER_JOB_MODE_RUNNERS),
+            "dry_run": bool(dry_run),
+        }
+
+    runtime = load_app_runtime()
+    module = runtime.get("app")
+    if not runtime.get("ok") or module is None:
+        payload = _failure_payload(runtime, job_mode=mode)
+        payload["dry_run"] = bool(dry_run)
+        return payload
+
+    if not callable(getattr(module, runner_name, None)):
+        return {
+            "ok": False,
+            "status": "missing_runner",
+            "job_mode": mode,
+            "runner": runner_name,
+            "dry_run": bool(dry_run),
+        }
+
+    return {
+        "ok": True,
+        "status": "resolved",
+        "job_mode": mode,
+        "runner": runner_name,
+        "dry_run": bool(dry_run),
+    }
 
 
 def __getattr__(name: str) -> Any:

@@ -525,6 +525,23 @@ def _dry_run_validate_job_mode(mode: str, runner: Optional[Callable[[], Dict[str
             "allowed_modes": sorted(JOB_DISPATCH.keys()),
         })
         return 2
+    facade_resolution = None
+    resolver = getattr(app, "resolve_worker_job_mode", None) if app is not None else None
+    if callable(resolver):
+        facade_resolution = resolver(mode, dry_run=True)
+        if not facade_resolution.get("ok"):
+            _json_print("[worker] dry_run", {
+                "ok": False,
+                "status": str(facade_resolution.get("status") or "job_mode_resolution_failed"),
+                "reason": str(facade_resolution.get("reason") or facade_resolution.get("status") or "job_mode_resolution_failed"),
+                "job_mode": mode,
+                "runner_resolved": False,
+                "facade_import_ok": facade_resolution.get("status") != "app_import_failed",
+                "lock_key_computable": bool(lock_key),
+                "allowed_modes": sorted(JOB_DISPATCH.keys()),
+            })
+            return 2
+
     _json_print("[worker] dry_run", {
         "ok": True,
         "status": "dry_run_validated",
@@ -532,6 +549,7 @@ def _dry_run_validate_job_mode(mode: str, runner: Optional[Callable[[], Dict[str
         "job_mode": mode,
         "runner_resolved": True,
         "facade_import_ok": app is not None,
+        "facade_resolution": facade_resolution,
         "lock_key_computable": bool(lock_key),
         "lock_key": lock_key,
         "writes": False,
