@@ -47,6 +47,7 @@ import config as app_config
 import app_service
 import notification_core
 import monitoring_core
+import monitoring_service
 import portfolio_service
 from runtime_core import (
     _env_bool as runtime_env_bool,
@@ -14362,6 +14363,29 @@ def hard_gate_monitoring_row(row: Dict[str, Any], portfolio_row: Optional[Dict[s
     return monitoring_core.hard_gate_monitoring_row(row, portfolio_row=portfolio_row, history=history)
 
 
+def normalize_monitoring_status(value: Any) -> str:
+    return monitoring_service.normalize_monitoring_status(value)
+
+
+def classify_monitoring_row(row: Dict[str, Any], portfolio_row: Optional[Dict[str, Any]] = None, history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    return monitoring_service.classify_monitoring_row(row, portfolio_row=portfolio_row, history=history)
+
+
+def plan_monitoring_archive_transitions(
+    monitoring_rows: List[Dict[str, Any]],
+    portfolio_rows: Optional[List[Dict[str, Any]]] = None,
+    history_by_token: Optional[Dict[str, Any]] = None,
+    *,
+    auto_archive_enabled: bool = True,
+) -> Dict[str, Any]:
+    return monitoring_service.plan_monitoring_archive_transitions(
+        monitoring_rows,
+        portfolio_rows,
+        history_by_token,
+        auto_archive_enabled=auto_archive_enabled,
+    )
+
+
 def build_token_identity(row: Dict[str, Any]) -> Dict[str, str]:
     return monitoring_core.build_token_identity(row)
 
@@ -14383,7 +14407,7 @@ def should_surface_in_priority(row: Dict[str, Any], portfolio_row: Optional[Dict
 
 
 def build_priority_watchlist_rows(monitoring_rows: List[Dict[str, Any]], portfolio_rows: Optional[List[Dict[str, Any]]] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    return monitoring_core.build_priority_watchlist_rows(monitoring_rows, portfolio_rows)
+    return monitoring_service.build_priority_watchlist_rows(monitoring_rows, portfolio_rows)
 
 
 def resolve_monitoring_portfolio_state(monitoring_row: Dict[str, Any], portfolio_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -14995,8 +15019,25 @@ def page_monitoring(auto_cfg: Dict[str, Any], context: Optional[Dict[str, Any]] 
         [c.get("row", {}) for c in cards_all],
         portfolio_rows,
     )
+    archive_plan = plan_monitoring_archive_transitions(
+        [c.get("row", {}) for c in cards_all],
+        portfolio_rows,
+        auto_archive_enabled=True,
+    )
+    archive_diag_raw = archive_plan.get("diagnostics") if isinstance(archive_plan, dict) else {}
+    monitoring_archive_diagnostics = {
+        "rows_seen": int(archive_plan.get("rows_seen", 0) or 0) if isinstance(archive_plan, dict) else 0,
+        "active": int((archive_diag_raw or {}).get("active", 0) or 0),
+        "watch_early": int((archive_diag_raw or {}).get("watch_early", 0) or 0),
+        "no_entry": int((archive_diag_raw or {}).get("no_entry", 0) or 0),
+        "archived": int((archive_diag_raw or {}).get("archived", 0) or 0),
+        "hard_gated": int((archive_diag_raw or {}).get("hard_gated", 0) or 0),
+        "portfolio_conflict": int((archive_diag_raw or {}).get("portfolio_conflict", 0) or 0),
+        "archive_candidates": int((archive_diag_raw or {}).get("archive_candidates", 0) or 0),
+    }
     context["priority_watchlist_rows"] = priority_watchlist_rows
     context["priority_watchlist_debug"] = priority_watchlist_debug
+    context["monitoring_archive_diagnostics"] = monitoring_archive_diagnostics
     # Temporary compatibility aliases for older page/debug snippets; the
     # canonical render boundary is context["priority_watchlist_rows"].
     context["priority_rows"] = priority_watchlist_rows
@@ -16977,6 +17018,16 @@ def build_ui_context(
         "runtime_state": dict(runtime_state or {}),
         "priority_watchlist_rows": [],
         "priority_watchlist_debug": monitoring_core.empty_priority_watchlist_debug(0),
+        "monitoring_archive_diagnostics": {
+            "rows_seen": 0,
+            "active": 0,
+            "watch_early": 0,
+            "no_entry": 0,
+            "archived": 0,
+            "hard_gated": 0,
+            "portfolio_conflict": 0,
+            "archive_candidates": 0,
+        },
         "portfolio_action_diagnostics": {
             "rows_seen": 0,
             "material_count": 0,

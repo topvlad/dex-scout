@@ -23,6 +23,20 @@ def render_monitoring_page(context: Dict[str, Any]) -> None:
                 canonical_rows = context.get(legacy_key)
                 break
     context["priority_watchlist_rows"] = list(canonical_rows or [])
+    diagnostics = context.get("monitoring_archive_diagnostics")
+    if not isinstance(diagnostics, dict):
+        debug = context.get("priority_watchlist_debug") if isinstance(context.get("priority_watchlist_debug"), dict) else {}
+        diagnostics = debug.get("monitoring_archive_diagnostics") if isinstance(debug.get("monitoring_archive_diagnostics"), dict) else {}
+    context["monitoring_archive_diagnostics"] = {
+        "rows_seen": int((diagnostics or {}).get("rows_seen", 0) or 0),
+        "active": int((diagnostics or {}).get("active", 0) or 0),
+        "watch_early": int((diagnostics or {}).get("watch_early", 0) or 0),
+        "no_entry": int((diagnostics or {}).get("no_entry", 0) or 0),
+        "archived": int((diagnostics or {}).get("archived", 0) or 0),
+        "hard_gated": int((diagnostics or {}).get("hard_gated", 0) or 0),
+        "portfolio_conflict": int((diagnostics or {}).get("portfolio_conflict", 0) or 0),
+        "archive_candidates": int((diagnostics or {}).get("archive_candidates", 0) or 0),
+    }
 
     actions = context.get("actions") or {}
     renderer = actions.get("render_monitoring")
