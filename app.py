@@ -44,6 +44,7 @@ import requests
 import streamlit as st
 import pandas as pd
 import config as app_config
+import app_service
 import notification_core
 import monitoring_core
 from runtime_core import (
@@ -1346,7 +1347,7 @@ def _remember_storage_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def storage_diagnostics_snapshot() -> Dict[str, Any]:
-    return dict(_LAST_STORAGE_RESULT or {
+    default_result = {
         "ok": False,
         "write_ok": False,
         "verify_status": "skipped",
@@ -1355,7 +1356,8 @@ def storage_diagnostics_snapshot() -> Dict[str, Any]:
         "verify_mode": STORAGE_VERIFY_MODE,
         "backend": _active_storage_source_label(),
         "verification_bypasses_cache": False,
-    })
+    }
+    return app_service.build_storage_summary(_LAST_STORAGE_RESULT or default_result, {"storage_backend": _active_storage_source_label()})
 
 
 def load_csv(path: str, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -8217,18 +8219,7 @@ def save_notification_event_journal(journal: Dict[str, Any]) -> bool:
 
 def notification_event_journal_counts(journal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     j = journal if isinstance(journal, dict) else load_notification_event_journal()
-    summary = summarize_notification_event_journal(j)
-    return {
-        "sent": int(summary.get("sent_count", 0) or 0),
-        "skipped_duplicate": int(summary.get("skipped_count", 0) or 0),
-        "failed": int(summary.get("failed_count", 0) or 0),
-        "pending": int(summary.get("pending_count", 0) or 0),
-        "journal_size": int(summary.get("journal_size", 0) or 0),
-        "last_sent_ts": str(summary.get("last_sent_ts") or ""),
-        "last_failed_ts": str(summary.get("last_failed_ts") or ""),
-        "last_failed_reason": str(summary.get("last_failed_reason") or ""),
-        "trimmed": int(summary.get("trimmed_count", 0) or 0),
-    }
+    return app_service.build_notification_summary(j)
 
 
 def _notification_event_base(
@@ -16842,6 +16833,30 @@ def build_active_monitoring_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, A
     )[:150]
     return active_rows
 
+
+
+def build_runtime_summary(context: Dict[str, Any]) -> Dict[str, Any]:
+    return app_service.build_runtime_summary(context)
+
+
+def build_storage_summary(storage_result: Dict[str, Any], runtime_state: Dict[str, Any]) -> Dict[str, Any]:
+    return app_service.build_storage_summary(storage_result, runtime_state)
+
+
+def build_notification_summary(journal: Dict[str, Any]) -> Dict[str, Any]:
+    return app_service.build_notification_summary(journal)
+
+
+def build_monitoring_summary(monitoring_rows: List[Dict[str, Any]], portfolio_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return app_service.build_monitoring_summary(monitoring_rows, portfolio_rows)
+
+
+def build_live_pulse_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return app_service.build_live_pulse_summary(payload)
+
+
+def build_operator_status(context: Dict[str, Any]) -> Dict[str, Any]:
+    return app_service.build_operator_status(context)
 
 
 def build_ui_context(
