@@ -30,6 +30,7 @@ def test_core_modules_role_succeeds_without_importing_app(monkeypatch):
     assert "app" not in sys.modules
     assert "streamlit_imported_by_core_modules" not in result.get("errors", [])
     assert "app_service" in result.get("modules", [])
+    assert "portfolio_service" in result.get("modules", [])
 
 
 def test_worker_role_reports_app_import_failed_on_forced_facade_failure(monkeypatch):
@@ -137,3 +138,12 @@ def test_runtime_matrix_json_file_schema(tmp_path):
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["ok"] is True
     assert data["roles"]["ui_streamlit"]["errors"] == []
+
+
+def test_runtime_matrix_includes_portfolio_service_smokes():
+    result = matrix._core_modules_role()
+
+    assert result["ok"] is True
+    assert "portfolio_service" in result.get("modules", [])
+    assert not any("portfolio_material_classifier_smoke_failed" in err for err in result.get("errors", []))
+    assert not any("portfolio_conflict_resolver_smoke_failed" in err for err in result.get("errors", []))

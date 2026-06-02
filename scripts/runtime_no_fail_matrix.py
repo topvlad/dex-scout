@@ -29,6 +29,7 @@ CORE_MODULES = (
     "storage_repository",
     "notification_core",
     "monitoring_core",
+    "portfolio_service",
     "app_service",
 )
 REQUIRED_JOB_MODES = (
@@ -315,6 +316,18 @@ def _core_modules_role() -> Dict[str, Any]:
                 errors.append("app_imported_by_core_modules")
             if "streamlit" in sys.modules:
                 errors.append("streamlit_imported_by_core_modules")
+            portfolio_service = sys.modules.get("portfolio_service")
+            if portfolio_service is None:
+                errors.append("portfolio_service_not_imported")
+            else:
+                if getattr(portfolio_service, "is_material_portfolio_action")({"final_action": "REDUCE", "current_price": ""}) is not True:
+                    errors.append("portfolio_material_classifier_smoke_failed")
+                conflict = getattr(portfolio_service, "resolve_portfolio_monitoring_conflict")(
+                    {"final_action": "REDUCE", "current_price": ""},
+                    {"entry_status": "WATCH"},
+                )
+                if conflict.get("source") != "portfolio" or conflict.get("display_action") != "REDUCE" or not conflict.get("material_portfolio_action"):
+                    errors.append(f"portfolio_conflict_resolver_smoke_failed:{conflict}")
         finally:
             for name in snapshot_names:
                 sys.modules.pop(name, None)
