@@ -13,7 +13,7 @@
   <section class="card"><h2>Architecture</h2>
     <div class="grid">
       <div><h3>Runtime roles</h3><ul>
-        <li><b>UI / Streamlit</b>: <code>app.py</code> shell with <code>ui/pages_*.py</code> render modules.</li>
+        <li><b>UI / Streamlit</b>: <code>app.py</code> compatibility shell with <code>ui/pages_*.py</code> render modules; app.py is now compatibility shell, not business owner.</li>
         <li><b>Worker</b>: <code>worker.py</code> delegates through <code>app_runtime_facade.py</code>.</li>
         <li><b>Webhook</b>: <code>tg_webhook.py</code> delegates through <code>app_runtime_facade.py</code>.</li>
         <li><b>Dash/read-only sidecar</b>: may inspect state but must not mutate runtime state.</li>
@@ -57,13 +57,14 @@
       <tr><td>#288 Priority watchlist materialization hotfix</td><td class="good">Completed</td><td>WATCH/EARLY rows remain visible when eligible.</td></tr>
       <tr><td>#289 Portfolio service extraction</td><td class="good">Completed</td><td><code>portfolio_service.py</code> extraction.</td></tr>
       <tr><td>#290 Monitoring/archive service extraction</td><td class="good">Completed</td><td><code>monitoring_service.py</code> owns import-safe monitoring/archive planning.</td></tr>
-      <tr><td>#291 Scanner / Live Pulse service boundary</td><td class="warn">Current</td><td><code>scanner_service.py</code> owns scanner/live-pulse service boundary and payload diagnostics.</td></tr>
+      <tr><td>#291 Scanner / Live Pulse service boundary</td><td class="good">Completed</td><td><code>scanner_service.py</code> owns scanner/live-pulse service boundary and payload diagnostics.</td></tr>
+      <tr><td>#292 app.py compatibility wrapper audit + stale glue cleanup</td><td class="warn">Current</td><td><code>app.py</code> remains a compatibility shell while <code>tests/fixtures/app_compat_manifest.json</code>, wrapper signature tests, and <code>app_compat</code> runtime matrix checks protect facade/webhook/worker contracts.</td></tr>
     </table>
   </section>
 
   <section class="card"><h2>Playbook</h2>
     <ul>
-      <li>Runtime matrix roles: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, and <code>core_modules</code>.</li>
+      <li>Runtime matrix roles: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, <code>app_compat</code>, and <code>core_modules</code>.</li>
       <li>Use no secrets in guide examples, logs, matrix output, screenshots, or PR notes.</li>
       <li>Before merging service extraction PRs, run <code>python scripts/runtime_no_fail_matrix.py --json runtime-no-fail-summary.json</code> and <code>pytest -q</code>.</li>
       <li>For scanner changes, verify <code>scanner_service.py</code> imports without <code>streamlit</code> or <code>app.py</code> and performs no source fetch, storage write, or Telegram send at import time.</li>
@@ -74,17 +75,17 @@
 
   <section class="card"><h2>Gaps / next planned</h2>
     <ul>
-      <li><b>#292 — scanner source adapter cleanup / ingest diagnostics</b>: make source calls explicit adapters with clearer per-source counters.</li>
-      <li>Alternative #292 scope if source cleanup is deferred: final <code>app.py</code> compatibility wrapper audit.</li>
-      <li>Residual <code>app.py</code> glue remains by design until wrappers and runtime signatures are fully audited.</li>
+      <li><b>#293 — scanner source adapter cleanup / ingest diagnostics</b>: make source calls explicit adapters with clearer per-source counters.</li>
+      <li><code>app.py</code> compatibility wrappers should stay thin and delegate to service modules where ownership has moved.</li>
+      <li>Residual <code>app.py</code> glue remains only where runtime adapters or external imports still require the public name.</li>
     </ul>
   </section>
 
   <section class="card"><h2>Risk Matrix</h2>
     <table><tr><th>Risk</th><th>Mitigation</th></tr>
       <tr><td class="risk">Scanner/live-pulse materialization can silently empty without diagnostics.</td><td>Canonical payload counters, <code>last_empty_reason</code>, and <code>blocked_reasons</code> in <code>scanner_service.py</code>.</td></tr>
-      <tr><td class="risk"><code>app.py</code> still has compatibility wrappers and residual glue.</td><td>Keep wrappers stable; move pure logic into service modules incrementally.</td></tr>
-      <tr><td class="risk">Facade/app function signature drift can still happen.</td><td><code>runtime_matrix</code> facade-forwarding checks and wrapper signature tests.</td></tr>
+      <tr><td class="risk">Stale wrappers or duplicate helpers can reappear after extraction.</td><td><code>scripts/audit_app_compat.py</code> fails duplicate top-level defs and reports service-owned stale markers.</td></tr>
+      <tr><td class="risk"><code>app_runtime_facade.py</code> ↔ <code>app.py</code> function signature drift can still happen.</td><td><code>runtime_matrix</code> <code>app_compat</code> role, facade-forwarding checks, manifest callability tests, and wrapper signature tests protect those contracts.</td></tr>
       <tr><td class="risk">New service modules may miss import/no-side-effect coverage.</td><td>Every new service module must be added to <code>scripts/runtime_no_fail_matrix.py</code>.</td></tr>
       <tr><td class="risk">UI could accidentally run scanner or write storage during render.</td><td>UI pages read canonical context keys only; scanner runs remain runtime-job actions.</td></tr>
       <tr><td class="risk">Priority watchlist can regress to empty when active WATCH/EARLY rows exist.</td><td>Regression tests cover WATCH/EARLY Priority materialization and hard-gate exclusions.</td></tr>
