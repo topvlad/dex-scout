@@ -36,6 +36,7 @@ CORE_MODULES = (
     "portfolio_service",
     "app_service",
     "scanner_service",
+    "scanner_sources",
 )
 REQUIRED_JOB_MODES = (
     "scan_cycle",
@@ -625,6 +626,34 @@ def _core_modules_role() -> Dict[str, Any]:
                 )
                 if filtered.get("diagnostics", {}).get("final_count") != 1 or filtered.get("diagnostics", {}).get("hard_gated") < 1:
                     errors.append(f"scanner_service_filter_smoke_failed:{filtered}")
+
+
+
+            scanner_sources = sys.modules.get("scanner_sources")
+            if scanner_sources is None:
+                errors.append("scanner_sources_not_imported")
+            else:
+                if sys.modules.get("streamlit") is not None:
+                    errors.append("scanner_sources_imported_streamlit")
+                if sys.modules.get("app") is not None:
+                    errors.append("scanner_sources_imported_app")
+                source_result = scanner_sources.make_source_result(source="test", ok=True, status="success", raw_candidates=[{"chainId": "solana", "baseToken": {"address": "A"}}])
+                if source_result.get("raw_count") != 1 or len(source_result.get("raw_candidates") or []) != 1:
+                    errors.append(f"scanner_sources_make_result_failed:{source_result}")
+                disabled = scanner_sources.fetch_birdeye_trending_source(enabled=False)
+                if disabled.get("ok") is not True or disabled.get("status") != "disabled":
+                    errors.append(f"scanner_sources_disabled_birdeye_failed:{disabled}")
+                success = lambda: scanner_sources.make_source_result(source="one", ok=True, status="success", raw_candidates=[{"chainId": "solana", "baseToken": {"address": "A"}}])
+                failed = lambda: scanner_sources.make_source_result(source="bad", ok=False, status="failed", error="boom")
+                empty = lambda: scanner_sources.make_source_result(source="empty", ok=True, status="empty")
+                if scanner_sources.collect_scanner_sources(source_fns=[success]).get("status") != "success":
+                    errors.append("scanner_sources_collect_success_failed")
+                if scanner_sources.collect_scanner_sources(source_fns=[failed, success]).get("status") != "partial":
+                    errors.append("scanner_sources_collect_partial_failed")
+                if scanner_sources.collect_scanner_sources(source_fns=[empty, empty]).get("status") != "empty":
+                    errors.append("scanner_sources_collect_empty_failed")
+                if scanner_sources.collect_scanner_sources(source_fns=[failed, failed]).get("status") != "failed":
+                    errors.append("scanner_sources_collect_failed_failed")
 
             portfolio_service = sys.modules.get("portfolio_service")
             if portfolio_service is None:

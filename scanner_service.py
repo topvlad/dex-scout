@@ -80,8 +80,23 @@ def _add_rejection(rejected: List[Dict[str, Any]], blocked: Dict[str, int], row:
         rejected.append(_compact_candidate(row, reason))
 
 
-def _empty_reason(status: str, raw_seen: int, normalized: int, final_count: int, blocked_reasons: Dict[str, int], error: str = "") -> str:
+def _empty_reason(status: str, raw_seen: int, normalized: int, final_count: int, blocked_reasons: Dict[str, int], error: str = "", source_state: dict | None = None) -> str:
     status = str(status or "success").strip().lower()
+    state = source_state if isinstance(source_state, dict) else {}
+    if final_count <= 0 and raw_seen <= 0 and state:
+        diag = state.get("diagnostics") if isinstance(state.get("diagnostics"), dict) else {}
+        total = int(diag.get("sources_total", 0) or 0)
+        failed = int(diag.get("sources_failed", 0) or 0)
+        empty = int(diag.get("sources_empty", 0) or 0)
+        disabled = int(diag.get("sources_disabled", 0) or 0)
+        if total > 0 and disabled == total:
+            return "sources_disabled"
+        if total > 0 and failed == total:
+            return "source_api_failed"
+        if total > 0 and failed > 0 and (empty > 0 or disabled > 0):
+            return "source_api_empty_with_failures"
+        if total > 0 and (empty + disabled) == total:
+            return "source_api_empty"
     if status == "failed" or error:
         error_text = str(error or "").lower()
         return "scanner_failed" if "scanner" in error_text else "worker_failed"
@@ -107,9 +122,9 @@ def _empty_reason(status: str, raw_seen: int, normalized: int, final_count: int,
     return "unknown_empty"
 
 
-def determine_live_pulse_empty_reason(status: str, raw_seen: int, normalized: int, final_count: int, blocked_reasons: Dict[str, int], error: str = "") -> str:
+def determine_live_pulse_empty_reason(status: str, raw_seen: int, normalized: int, final_count: int, blocked_reasons: Dict[str, int], error: str = "", source_state: dict | None = None) -> str:
     """Return the canonical non-empty reason for an empty/failed Live Pulse payload."""
-    return _empty_reason(status, raw_seen, normalized, final_count, blocked_reasons, error=error)
+    return _empty_reason(status, raw_seen, normalized, final_count, blocked_reasons, error=error, source_state=source_state)
 
 
 def build_live_pulse_payload(
@@ -124,6 +139,7 @@ def build_live_pulse_payload(
     refill_attempts: int = 0,
     error: str = "",
     now_ts: str | None = None,
+    source_state: dict | None = None,
 ) -> dict:
     raw = _copy_dicts(raw_candidates)
     normalized = _copy_dicts(normalized_candidates if normalized_candidates is not None else raw_candidates)
@@ -139,7 +155,7 @@ def build_live_pulse_payload(
         payload_status = "failed" if error else "empty"
     if len(final) <= 0 and payload_status == "success":
         payload_status = "empty"
-    reason = _empty_reason(payload_status, len(raw), len(normalized), len(final), blocked_reasons, error=error)
+    reason = _empty_reason(payload_status, len(raw), len(normalized), len(final), blocked_reasons, error=error, source_state=source_state)
     return {
         "ts_utc": _now(now_ts),
         "source": str(source or "unknown") if str(source or "").strip() in {"scan_cycle", "manual", "test", "unknown"} else "unknown",
@@ -154,7 +170,7 @@ def build_live_pulse_payload(
         "blocked_reasons": blocked_reasons,
         "final_candidates": [_compact_candidate(row) if not ("row" in row or "best" in row) else dict(row) for row in final],
         "rejected_candidates": rejected,
-        "debug": {"error": str(error or "")},
+        "debug": {"error": str(error or ""), "source_results": _source_results_summary(source_state), "source_diagnostics": _source_diagnostics(source_state)},
     }
 
 
@@ -294,6 +310,54 @@ def plan_live_pulse_refill(*, current_count: int, target_min: int, target_max: i
     return {"should_refill": reason == "below_target", "remaining_slots": max(0, target_max - current), "attempts_allowed": allowed, "target_min": target_min, "target_max": target_max, "reason": reason}
 
 
+
+def _source_diagnostics(source_state: dict | None) -> dict:
+    if not isinstance(source_state, dict):
+        return {}
+    diag = source_state.get("diagnostics") if isinstance(source_state.get("diagnostics"), dict) else {}
+    out = dict(diag)
+    if source_state.get("status"):
+        out["status"] = str(source_state.get("status") or "")
+    return out
+
+
+def _source_results_summary(source_state: dict | None) -> list[dict]:
+    if not isinstance(source_state, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for result in list(source_state.get("source_results") or []):
+        if not isinstance(result, dict):
+            continue
+        out.append({
+            "source": str(result.get("source") or "unknown"),
+            "ok": bool(result.get("ok")),
+            "status": str(result.get("status") or ""),
+            "raw_count": int(result.get("raw_count", len(result.get("raw_candidates") or [])) or 0),
+            "seeds_used": list(result.get("seeds_used") or [])[:10],
+            "error": str(result.get("error") or "")[:240],
+            "http_status": result.get("http_status"),
+            "duration_ms": result.get("duration_ms"),
+        })
+    return out
+
+
+def _normalize_source_fetch_result(fetched: Any) -> tuple[list[dict], list[str], dict]:
+    if isinstance(fetched, dict):
+        raw = _copy_dicts(fetched.get("raw_candidates") or fetched.get("candidates") or [])
+        sources_tried = list(fetched.get("sources_tried") or [])
+        if "source_results" in fetched or "diagnostics" in fetched:
+            source_state = {
+                "status": str(fetched.get("status") or ""),
+                "sources_tried": list(sources_tried),
+                "source_results": list(fetched.get("source_results") or []),
+                "diagnostics": dict(fetched.get("diagnostics") or {}),
+            }
+            if not sources_tried:
+                sources_tried = list(source_state.get("sources_tried") or [])
+            return raw, sources_tried, source_state
+        return raw, sources_tried, {}
+    return _copy_dicts(fetched), [], {}
+
 def run_scanner_service_cycle(
     *,
     fetch_sources_fn,
@@ -309,29 +373,26 @@ def run_scanner_service_cycle(
     cfg = dict(config or {})
     sources_tried: List[str] = []
     raw: List[Dict[str, Any]] = []
+    source_state: Dict[str, Any] = {}
     try:
         fetched = fetch_sources_fn(config=deepcopy(cfg))
-        if isinstance(fetched, dict):
-            raw = _copy_dicts(fetched.get("raw_candidates") or fetched.get("candidates") or [])
-            sources_tried = list(fetched.get("sources_tried") or [])
-        else:
-            raw = _copy_dicts(fetched)
+        raw, sources_tried, source_state = _normalize_source_fetch_result(fetched)
     except Exception as exc:
-        return _failed_cycle(save_payload_fn, raw, [], [], [], sources_tried, f"{type(exc).__name__}:{exc}", now_ts)
+        return _failed_cycle(save_payload_fn, raw, [], [], [], sources_tried, f"{type(exc).__name__}:{exc}", now_ts, source_state)
     try:
         norm = normalize_fn(raw_candidates=_copy_dicts(raw))
         normalized = _copy_dicts(norm.get("normalized_candidates") if isinstance(norm, dict) else norm)
         norm_rejected = _copy_dicts(norm.get("rejected_candidates") if isinstance(norm, dict) else [])
     except Exception as exc:
-        return _failed_cycle(save_payload_fn, raw, [], [], [], sources_tried, f"{type(exc).__name__}:{exc}", now_ts)
+        return _failed_cycle(save_payload_fn, raw, [], [], [], sources_tried, f"{type(exc).__name__}:{exc}", now_ts, source_state)
     try:
         filt = filter_fn(candidates=_copy_dicts(normalized), monitoring_rows=_copy_dicts(monitoring_rows), portfolio_rows=_copy_dicts(portfolio_rows), archive_rows=_copy_dicts(archive_rows))
         final = _copy_dicts(filt.get("final_candidates") if isinstance(filt, dict) else filt)
         rejected = norm_rejected + _copy_dicts(filt.get("rejected_candidates") if isinstance(filt, dict) else [])
     except Exception as exc:
-        return _failed_cycle(save_payload_fn, raw, normalized, [], norm_rejected, sources_tried, f"{type(exc).__name__}:{exc}", now_ts)
+        return _failed_cycle(save_payload_fn, raw, normalized, [], norm_rejected, sources_tried, f"{type(exc).__name__}:{exc}", now_ts, source_state)
     status = "success" if final else "empty"
-    payload = build_live_pulse_payload(raw_candidates=raw, normalized_candidates=normalized, final_candidates=final, rejected_candidates=rejected, status=status, source=str(cfg.get("source") or "scan_cycle"), sources_tried=sources_tried, refill_attempts=int(cfg.get("refill_attempts") or 0), now_ts=now_ts)
+    payload = build_live_pulse_payload(raw_candidates=raw, normalized_candidates=normalized, final_candidates=final, rejected_candidates=rejected, status=status, source=str(cfg.get("source") or "scan_cycle"), sources_tried=sources_tried, refill_attempts=int(cfg.get("refill_attempts") or 0), now_ts=now_ts, source_state=source_state)
     try:
         save_payload_fn(payload)
     except Exception as exc:
@@ -342,8 +403,8 @@ def run_scanner_service_cycle(
     return {"ok": True, "status": status, "payload": payload, "raw_seen": len(raw), "final_count": len(final), "last_empty_reason": payload.get("last_empty_reason", ""), "sources_tried": sources_tried, "error": ""}
 
 
-def _failed_cycle(save_payload_fn, raw, normalized, final, rejected, sources_tried, error, now_ts):
-    payload = build_live_pulse_payload(raw_candidates=raw, normalized_candidates=normalized, final_candidates=final, rejected_candidates=rejected, status="failed", sources_tried=sources_tried, error=error, now_ts=now_ts)
+def _failed_cycle(save_payload_fn, raw, normalized, final, rejected, sources_tried, error, now_ts, source_state=None):
+    payload = build_live_pulse_payload(raw_candidates=raw, normalized_candidates=normalized, final_candidates=final, rejected_candidates=rejected, status="failed", sources_tried=sources_tried, error=error, now_ts=now_ts, source_state=source_state)
     ok = False
     save_error = ""
     try:

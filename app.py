@@ -50,6 +50,7 @@ import monitoring_core
 import monitoring_service
 import portfolio_service
 import scanner_service
+import scanner_sources
 from runtime_core import (
     _env_bool as runtime_env_bool,
     _env_float as runtime_env_float,
@@ -171,6 +172,7 @@ if MON_HISTORY_SUPABASE_MODE not in {"off", "local_only", "blob_fallback"}:
     MON_HISTORY_SUPABASE_MODE = "local_only"
 
 SCAN_CACHE: Dict[str, Dict[str, Any]] = {}
+LAST_SCANNER_SOURCE_AGGREGATION: Dict[str, Any] = {}
 CACHE_TTL = 300
 PULSE_SPARKLINE_LOG_DEBOUNCE_SEC = 300
 PULSE_SPARKLINE_LOG_LAST_TS: Dict[str, float] = {}
@@ -11411,6 +11413,7 @@ def is_signal_worthy(row: Dict[str, Any]) -> bool:
     return True
 
 def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any], seeds_raw: str, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> List[Dict[str, Any]]:
+    global LAST_SCANNER_SOURCE_AGGREGATION
     chain = normalize_chain_name(chain or "solana")
     cache_key = safe_json({
         "chain": chain,
@@ -11423,6 +11426,8 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     cached = SCAN_CACHE.get(cache_key)
     now_ts = time.time()
     if cached and (now_ts - float(cached.get("ts", 0.0))) < CACHE_TTL:
+        if isinstance(cached.get("source_aggregation"), dict):
+            LAST_SCANNER_SOURCE_AGGREGATION = dict(cached.get("source_aggregation") or {})
         return list(cached.get("pairs", []))
 
     seeds = [x.strip() for x in (seeds_raw or "").split(",") if x.strip()]
@@ -11435,12 +11440,20 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
     all_pairs: List[Dict[str, Any]] = []
 
     search_terms = list(dict.fromkeys(sampled + DEX_SEARCH_TERMS[:20]))
-    for q in search_terms:
-        try:
-            all_pairs.extend(fetch_dexscreener_search(q, MAX_DEX_SEARCH_PER_TERM))
-            time.sleep(0.05)
-        except Exception as e:
-            debug_log(f"dex_search_fail q={q} err={type(e).__name__}:{e}")
+
+    def _fetch_dex_search_with_legacy_pause(query: str, timeout: int = 12) -> List[Dict[str, Any]]:
+        rows = fetch_dexscreener_search(query, MAX_DEX_SEARCH_PER_TERM)
+        time.sleep(0.05)
+        return rows
+
+    dex_source_result = scanner_sources.fetch_dexscreener_search_source(
+        seeds=search_terms,
+        fetch_pairs_by_query_fn=_fetch_dex_search_with_legacy_pause,
+        max_items=max(len(search_terms) * MAX_DEX_SEARCH_PER_TERM, MAX_DEX_SEARCH_PER_TERM),
+    )
+    all_pairs.extend(dex_source_result.get("raw_candidates") or [])
+    for seed, err in dict((dex_source_result.get("meta") or {}).get("errors_by_seed") or {}).items():
+        debug_log(f"dex_search_fail q={seed} err={err}")
 
     try:
         all_pairs.extend(fetch_dexscreener_trending(chain, limit=60))
@@ -11453,11 +11466,14 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         except Exception:
             pass
 
-    if use_birdeye_trending and chain == "solana":
-        try:
-            all_pairs.extend(fetch_birdeye_pairs(limit=int(birdeye_limit)))
-        except Exception as e:
-            debug_log(f"birdeye_fail {type(e).__name__}:{e}")
+    birdeye_source_result = scanner_sources.fetch_birdeye_trending_source(
+        enabled=bool(use_birdeye_trending and chain == "solana"),
+        fetch_fn=fetch_birdeye_pairs,
+        limit=int(birdeye_limit),
+    )
+    all_pairs.extend(birdeye_source_result.get("raw_candidates") or [])
+    if not birdeye_source_result.get("ok"):
+        debug_log(f"birdeye_fail {birdeye_source_result.get('error')}")
 
     try:
         unified_tokens = fetch_tokens_unified(chain=chain, limit=80)
@@ -11553,7 +11569,17 @@ def scout_collect_candidates(chain: str, window_name: str, preset: Dict[str, Any
         out.append(row)
 
     out = dedupe_tokens_by_address(out)
-    SCAN_CACHE[cache_key] = {"ts": now_ts, "pairs": out}
+    source_aggregation = scanner_sources.collect_scanner_sources(
+        source_fns=[
+            lambda: dex_source_result,
+            lambda: birdeye_source_result,
+        ],
+        max_total=max(int(max_items or 0), LIVE_PULSE_RAW_MAX),
+    )
+    source_aggregation["raw_candidates"] = [dict(r) for r in out[: max(int(max_items or 0), LIVE_PULSE_RAW_MAX)] if isinstance(r, dict)]
+    source_aggregation.setdefault("diagnostics", {})["raw_deduped"] = len(source_aggregation["raw_candidates"])
+    LAST_SCANNER_SOURCE_AGGREGATION = source_aggregation
+    SCAN_CACHE[cache_key] = {"ts": now_ts, "pairs": out, "source_aggregation": source_aggregation}
     return out
 
 def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, int]:
@@ -11561,6 +11587,14 @@ def ingest_window_to_monitoring(chain: str, window_name: str, preset_key: str, s
     preset = PRESETS.get(window_name, PRESETS.get("Wide Net (explore)", {}))
     counts = {"added": 0, "updated_active": 0, "skipped_active": 0, "skipped_archived": 0, "skipped_noise": 0, "skipped_major_like": 0, "skipped_symbol_duplicate": 0, "skipped_quote_like": 0, "skipped_wrong_chain": 0, "skipped_major": 0, "skipped_suppressed": 0, "errors": 0, "seen": 0}
     pairs = scout_collect_candidates(chain=chain, window_name=window_name, preset=preset, seeds_raw=seeds_raw, use_birdeye_trending=use_birdeye_trending, birdeye_limit=birdeye_limit)
+    source_aggregation = dict(LAST_SCANNER_SOURCE_AGGREGATION or {})
+    source_diag = source_aggregation.get("diagnostics") if isinstance(source_aggregation.get("diagnostics"), dict) else {}
+    counts["source_status"] = str(source_aggregation.get("status") or "")
+    counts["sources_tried"] = list(source_aggregation.get("sources_tried") or [])
+    counts["source_results"] = list(source_aggregation.get("source_results") or [])
+    counts["source_diagnostics"] = dict(source_diag or {})
+    counts["raw_total"] = int(source_diag.get("raw_total", len(pairs)) or 0)
+    counts["raw_deduped"] = int(source_diag.get("raw_deduped", len(pairs)) or 0)
     counts["raw_seen"] = len(pairs)
     counts["raw_candidates"] = [dict(r) for r in pairs[:LIVE_PULSE_RAW_MAX] if isinstance(r, dict)]
     debug_log(f"ingest_pairs_raw={len(pairs)}")
@@ -14324,6 +14358,12 @@ def build_live_pulse_candidates_payload(
     if final_count <= 0 and payload_status == "success":
         payload_status = "empty"
     error = str(scan_result.get("error") or "") if isinstance(scan_result, dict) else ""
+    source_state = {
+        "status": str(scan_stats.get("source_status") or ""),
+        "sources_tried": list(scan_stats.get("sources_tried") or stats.get("sources_tried") or []),
+        "source_results": list(scan_stats.get("source_results") or []),
+        "diagnostics": dict(scan_stats.get("source_diagnostics") or {}),
+    }
     canonical_payload = scanner_service.build_live_pulse_payload(
         raw_candidates=raw_candidates if raw_candidates else ([{}] * raw_seen),
         normalized_candidates=normalized_candidates if normalized_candidates else ([{}] * normalized),
@@ -14331,10 +14371,11 @@ def build_live_pulse_candidates_payload(
         rejected_candidates=rejected_candidates,
         status=payload_status,
         source="scan_cycle",
-        sources_tried=list(stats.get("sources_tried") or []),
+        sources_tried=list(source_state.get("sources_tried") or []),
         refill_attempts=int(parse_float(stats.get("refill_attempts", 0), 0)),
         error=error,
         now_ts=now_utc_str(),
+        source_state=source_state,
     )
     # Preserve app.py's legacy blocked-reason names/counters while letting the
     # import-safe service own canonical payload shape and empty-reason mapping.
@@ -14350,6 +14391,8 @@ def build_live_pulse_candidates_payload(
         "normalized_candidates_count": len(normalized_candidates),
         "target_min": int(min_target),
         "target_max": int(max_target),
+        "source_results": scanner_service._source_results_summary(source_state),
+        "source_diagnostics": scanner_service._source_diagnostics(source_state),
     }
     canonical_payload["last_scan_ts"] = canonical_payload["ts_utc"]
     canonical_payload["duplicate_filtered"] = int(parse_float(stats.get("duplicate_filtered", stats.get("filtered_out", 0)), 0))
@@ -14359,6 +14402,7 @@ def build_live_pulse_candidates_payload(
         "normalized_candidates": normalized,
         "rejected_candidates": blocked_reasons,
         "final_candidates": final_count,
+        "source_status": str(source_state.get("status") or ""),
     }
     return canonical_payload
 
@@ -17063,6 +17107,9 @@ def build_ui_context(
         now_ts="",
     )
     live_pulse_debug = live_pulse_payload.get("debug", {}) if isinstance(live_pulse_payload, dict) else {}
+    source_diag = (live_pulse_debug or {}).get("source_diagnostics") if isinstance((live_pulse_debug or {}).get("source_diagnostics"), dict) else {}
+    source_results = (live_pulse_debug or {}).get("source_results") if isinstance((live_pulse_debug or {}).get("source_results"), list) else []
+    source_errors = [str(r.get("error") or "") for r in source_results if isinstance(r, dict) and str(r.get("error") or "").strip()][:3]
     scanner_diagnostics = {
         "last_scan_status": str(live_pulse_payload.get("status") or "empty"),
         "last_empty_reason": str(live_pulse_payload.get("last_empty_reason") or "scan_not_run"),
@@ -17074,6 +17121,14 @@ def build_ui_context(
         "sources_tried": list(live_pulse_payload.get("sources_tried") or []),
         "blocked_reasons": dict(live_pulse_payload.get("blocked_reasons") or {}),
         "last_error": str((live_pulse_debug or {}).get("error") or ""),
+        "source_status": str((source_diag or {}).get("status") or (live_pulse_payload.get("status") or "empty")),
+        "sources_success": int(parse_float((source_diag or {}).get("sources_success", 0), 0)),
+        "sources_failed": int(parse_float((source_diag or {}).get("sources_failed", 0), 0)),
+        "sources_empty": int(parse_float((source_diag or {}).get("sources_empty", 0), 0)),
+        "sources_disabled": int(parse_float((source_diag or {}).get("sources_disabled", 0), 0)),
+        "raw_total": int(parse_float((source_diag or {}).get("raw_total", live_pulse_payload.get("raw_seen", 0)), 0)),
+        "raw_deduped": int(parse_float((source_diag or {}).get("raw_deduped", live_pulse_payload.get("raw_seen", 0)), 0)),
+        "source_errors": source_errors,
     }
     return {
         "version": VERSION,
