@@ -985,12 +985,6 @@ def local_fallback_path(path: str) -> str:
     ensure_storage()
     return path
 
-def storage_read_text(key: str) -> Optional[str]:
-    return sb_get_storage(key)
-
-def storage_write_text(key: str, content: str) -> bool:
-    return sb_put_storage(key, content)
-
 def storage_delete_key(key: str) -> bool:
     if USE_D1:
         return d1_delete_storage(key)
@@ -2201,11 +2195,6 @@ def _token_pairs_chain_state(chain: str) -> Dict[str, Any]:
     if last_429_ts > 0 and (now_mono - last_429_ts) > TOKEN_PAIRS_429_PRESSURE_COOLDOWN_SEC:
         state["recent_429"] = max(0, int(state.get("recent_429", 0) or 0) - 1)
     return state
-
-
-def _token_pairs_is_pressure_active(chain: str) -> bool:
-    state = _token_pairs_chain_state(chain)
-    return time.monotonic() < float(state.get("pressure_until_ts", 0.0) or 0.0)
 
 
 def reset_pair_fetch_run_state() -> None:
@@ -10605,6 +10594,8 @@ def analyze_position_for_tg(position: Dict[str, Any], monitoring_row: Optional[D
     }
 
 
+# Compatibility wrapper: external runtime still imports this from app.py.
+# Implementation lives in portfolio_service.py.
 def is_material_portfolio_action(row: Any, analysis: Optional[Dict[str, Any]] = None) -> bool:
     if analysis is None:
         return portfolio_service.is_material_portfolio_action(row)
@@ -10804,12 +10795,17 @@ def _compact_notification_diagnostics(stats: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def run_auto_notifications(
-    scan_state: Dict[str, Any],
-    monitoring_rows: List[Dict[str, Any]],
-    portfolio_rows: List[Dict[str, Any]],
+    scan_state: Optional[Dict[str, Any]] = None,
+    monitoring_rows: Optional[List[Dict[str, Any]]] = None,
+    portfolio_rows: Optional[List[Dict[str, Any]]] = None,
     cycle_context: Optional[Dict[str, Any]] = None,
     trigger_model: str = "ui_scan_sync",
 ) -> Dict[str, Any]:
+    # Compatibility wrapper: external runtime still imports this from app.py.
+    # Notification event semantics remain owned by notification_core.py.
+    scan_state = scan_state if isinstance(scan_state, dict) else (scanner_state_load() or {})
+    monitoring_rows = monitoring_rows if isinstance(monitoring_rows, list) else build_active_monitoring_rows(load_monitoring())
+    portfolio_rows = portfolio_rows if isinstance(portfolio_rows, list) else [r for r in load_portfolio() if is_active_portfolio_row(r)]
     now_ts = time.time()
     cycle_context = cycle_context if isinstance(cycle_context, dict) else {}
     trigger_model = str(trigger_model or "unknown").strip().lower() or "unknown"
@@ -12364,10 +12360,16 @@ def build_priority_scan_queue(
 
 
 def run_priority_scanner_cycle(
-    monitoring_rows: List[Dict[str, Any]],
-    portfolio_rows: List[Dict[str, Any]],
+    monitoring_rows: Optional[List[Dict[str, Any]]] = None,
+    portfolio_rows: Optional[List[Dict[str, Any]]] = None,
     max_scans: int = 3,
 ) -> Dict[str, Any]:
+    # Compatibility wrapper: external runtime still imports this from app.py.
+    # Implementation remains app-owned until scanner source adapters are split.
+    if monitoring_rows is None:
+        monitoring_rows = load_monitoring()
+    if portfolio_rows is None:
+        portfolio_rows = [r for r in load_portfolio() if str(r.get("active", "1")).strip() == "1"]
     now_ts = time.time()
     now_dt = datetime.utcfromtimestamp(now_ts)
     state = scanner_state_load() or {}
@@ -12466,7 +12468,10 @@ def current_scan_slot(now_ts: Optional[float] = None) -> Tuple[str, str, str, in
     window_name, preset_key, chain = SCAN_ROTATION[step % len(SCAN_ROTATION)]
     return window_name, preset_key, chain, step
 
-def maybe_run_rotating_scanner(seeds_raw: str, max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
+def maybe_run_rotating_scanner(seeds_raw: str = "", max_items: int = 100, use_birdeye_trending: bool = True, birdeye_limit: int = 50) -> Dict[str, Any]:
+    # Compatibility wrapper: external runtime still imports this from app.py.
+    # Implementation remains app-owned until scanner source adapters are split.
+    seeds_raw = str(seeds_raw or DEFAULT_SEEDS)
     reset_pair_fetch_run_state()
     state = scanner_state_load() or {}
     if not isinstance(state, dict):
@@ -14361,14 +14366,20 @@ def build_live_pulse_candidates_payload(
 MATERIAL_PORTFOLIO_ACTIONS = notification_core.MATERIAL_PORTFOLIO_ACTIONS
 
 
+# Compatibility wrapper: external runtime still imports this from app.py.
+# Implementation lives in portfolio_service.py.
 def normalize_portfolio_action(value: Any) -> str:
     return portfolio_service.normalize_portfolio_action(value)
 
 
+# Compatibility wrapper: external runtime still imports this from app.py.
+# Implementation lives in portfolio_service.py.
 def normalize_material_portfolio_action(value: Any) -> str:
     return portfolio_service.normalize_portfolio_action(value)
 
 
+# Compatibility wrapper: external runtime still imports this from app.py.
+# Implementation lives in portfolio_service.py.
 def classify_portfolio_row(row: Dict[str, Any], market_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return portfolio_service.classify_portfolio_row(row, market_snapshot=market_snapshot)
 
@@ -14389,10 +14400,14 @@ def hard_gate_monitoring_row(row: Dict[str, Any], portfolio_row: Optional[Dict[s
     return monitoring_core.hard_gate_monitoring_row(row, portfolio_row=portfolio_row, history=history)
 
 
+# Compatibility wrapper: external runtime still imports this from app.py.
+# Implementation lives in monitoring_service.py.
 def normalize_monitoring_status(value: Any) -> str:
     return monitoring_service.normalize_monitoring_status(value)
 
 
+# Compatibility wrapper: external runtime still imports this from app.py.
+# Implementation lives in monitoring_service.py.
 def classify_monitoring_row(row: Dict[str, Any], portfolio_row: Optional[Dict[str, Any]] = None, history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     return monitoring_service.classify_monitoring_row(row, portfolio_row=portfolio_row, history=history)
 
@@ -16995,6 +17010,8 @@ def build_storage_summary(storage_result: Dict[str, Any], runtime_state: Dict[st
     return app_service.build_storage_summary(storage_result, runtime_state)
 
 
+# Compatibility wrapper: external runtime still imports this from app.py.
+# Implementation lives in app_service.py.
 def build_notification_summary(journal: Dict[str, Any]) -> Dict[str, Any]:
     return app_service.build_notification_summary(journal)
 
