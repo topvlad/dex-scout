@@ -320,6 +320,14 @@ def _ui_streamlit_role() -> Dict[str, Any]:
         missing = [name for name in required if not callable(getattr(app, name, None))]
         if missing:
             return _role("missing_router", ok=False, errors=[f"missing:{','.join(missing)}"])
+        import app_service
+        fixture_diag = app_service.build_operator_diagnostics({
+            "scanner_diagnostics": {"source_status": "source_api_empty", "last_empty_reason": "source_api_empty", "final_count": 0},
+            "priority_watchlist_debug": {"final_priority_rows": 0, "eligible_watch_early_rows": 1, "excluded": {"no_entry": 1}},
+        })
+        failed_diag = app_service.build_operator_diagnostics({"scanner_diagnostics": {"source_status": "source_api_failed"}})
+        if fixture_diag.get("status") != "warning" or failed_diag.get("status") != "degraded":
+            return _role("operator_diagnostics_status_failed", ok=False, errors=[f"unexpected_operator_status:{fixture_diag.get('status')}:{failed_diag.get('status')}"])
         for page in ("Monitoring", "Archive", "Portfolio", "Scout", "Runtime"):
             ctx = app.build_ui_context(selected_page=page, actions={
                 "render_scout": lambda *a, **k: None,

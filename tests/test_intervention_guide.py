@@ -35,3 +35,10 @@ def test_guide_contains_current_modules_and_runtime_terms():
     ]
     for phrase in required:
         assert phrase in text
+
+
+def test_guide_tracks_ui_operator_observability_current_and_next_plan():
+    text = GUIDE.read_text(encoding="utf-8")
+    assert "#296 UI runtime diagnostics polish / operator observability" in text
+    assert "#297 — runbook/admin controls for safe manual recovery" in text
+    assert "runtime_matrix</code>/<code>app_compat</code>/<code>golden_fixtures" in text

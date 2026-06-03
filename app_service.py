@@ -166,6 +166,218 @@ def build_live_pulse_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+_SECRET_KEY_PARTS = ("secret", "token", "password", "passwd", "api_key", "apikey", "private_key", "webhook", "bearer", "authorization")
+
+
+def _is_secret_key(key: Any) -> bool:
+    text = str(key or "").lower()
+    return any(part in text for part in _SECRET_KEY_PARTS)
+
+
+def _public(value: Any, *, depth: int = 0) -> Any:
+    """Return a bounded, secret-redacted copy of operator-facing diagnostics."""
+    if depth > 3:
+        return "…"
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if _is_secret_key(key):
+                continue
+            out[str(key)] = _public(item, depth=depth + 1)
+        return out
+    if isinstance(value, list):
+        return [_public(item, depth=depth + 1) for item in value[:10]]
+    if isinstance(value, tuple):
+        return [_public(item, depth=depth + 1) for item in list(value)[:10]]
+    if isinstance(value, str):
+        text = value.strip()
+        if "Traceback (most recent call last)" in text:
+            return "traceback redacted"
+        return text[:500]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:200]
+
+
+def _first_dict(ctx: Dict[str, Any], *keys: str) -> Dict[str, Any]:
+    for key in keys:
+        value = ctx.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _bounded_dict_list(value: Any, limit: int) -> List[Dict[str, Any]]:
+    rows = _as_rows(value)[: max(0, int(limit))]
+    return [_public(row) for row in rows if isinstance(_public(row), dict)]
+
+
+def _status_value(*values: Any, default: str = "unknown") -> str:
+    for value in values:
+        text = _str(value).lower()
+        if text:
+            return text
+    return default
+
+
+def _is_good_status(value: Any) -> bool:
+    return _status_value(value) in {"ok", "success", "pass", "passed", "green", "verified", "skipped"}
+
+
+def _is_bad_status(value: Any) -> bool:
+    return _status_value(value) in {"failed", "fail", "error", "missing", "degraded", "mismatch"}
+
+
+def _runtime_diagnostics(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    runtime_state = _first_dict(ctx, "runtime_state", "runtime")
+    matrix = _first_dict(ctx, "runtime_matrix", "runtime_matrix_summary") or _as_dict(runtime_state.get("runtime_matrix"))
+    app_compat = _first_dict(ctx, "app_compat", "app_compat_audit") or _as_dict(runtime_state.get("app_compat"))
+    golden = _first_dict(ctx, "golden_fixtures", "golden_fixtures_summary") or _as_dict(runtime_state.get("golden_fixtures"))
+    roles = _as_dict(_as_dict(matrix.get("roles")).get("golden_fixtures"))
+    jobs = _first_dict(ctx, "last_jobs") or _as_dict(runtime_state.get("last_jobs")) or _as_dict(runtime_state.get("modes"))
+    stale_jobs = ctx.get("stale_jobs", runtime_state.get("stale_jobs", []))
+    if not isinstance(stale_jobs, list):
+        stale_jobs = []
+    blocked_cycles = ctx.get("blocked_cycles", runtime_state.get("blocked_cycles", []))
+    if not isinstance(blocked_cycles, list):
+        blocked_cycles = []
+    return {
+        "matrix_status": _status_value(matrix.get("status"), "ok" if matrix.get("ok") is True else "failed" if matrix.get("ok") is False else ""),
+        "app_compat_status": _status_value(app_compat.get("status"), "ok" if app_compat.get("ok") is True else "failed" if app_compat.get("ok") is False else ""),
+        "golden_fixtures_status": _status_value(golden.get("status"), roles.get("status"), "ok" if golden.get("ok") is True or roles.get("ok") is True else "failed" if golden.get("ok") is False or roles.get("ok") is False else ""),
+        "last_jobs": _public(jobs),
+        "stale_jobs": [_public(item) for item in stale_jobs[:5]],
+        "blocked_cycles": [_public(item) for item in blocked_cycles[:5]],
+    }
+
+
+def _scanner_diagnostics(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    scanner = _as_dict(ctx.get("scanner_diagnostics"))
+    payload = _as_dict(ctx.get("live_pulse_payload") or ctx.get("live_pulse"))
+    debug = _as_dict(ctx.get("live_pulse_debug") or payload.get("debug"))
+    source_diag = _as_dict(debug.get("source_diagnostics") or scanner.get("source_diagnostics"))
+    source_results = debug.get("source_results") if isinstance(debug.get("source_results"), list) else scanner.get("source_results", [])
+    if not isinstance(source_results, list):
+        source_results = []
+    errors = scanner.get("source_errors")
+    if not isinstance(errors, list):
+        errors = [r.get("error") for r in source_results if isinstance(r, dict) and _str(r.get("error"))]
+    tried = scanner.get("sources_tried", payload.get("sources_tried", []))
+    if not isinstance(tried, list):
+        tried = []
+    return {
+        "source_status": _status_value(scanner.get("source_status"), source_diag.get("status"), scanner.get("last_scan_status"), payload.get("status")),
+        "last_empty_reason": _str(scanner.get("last_empty_reason") or payload.get("last_empty_reason") or debug.get("last_empty_reason")),
+        "raw_seen": _int(scanner.get("raw_seen", payload.get("raw_seen", source_diag.get("raw_total", 0)))),
+        "normalized": _int(scanner.get("normalized", payload.get("normalized", 0))),
+        "clean_candidates": _int(scanner.get("clean_candidates", payload.get("clean_candidates", 0))),
+        "final_count": _int(scanner.get("final_count", payload.get("final_count", len(payload.get("final_candidates") if isinstance(payload.get("final_candidates"), list) else [])))),
+        "sources_tried": [_str(item) for item in tried[:10] if _str(item)],
+        "sources_failed": _int(scanner.get("sources_failed", source_diag.get("sources_failed", 0))),
+        "sources_empty": _int(scanner.get("sources_empty", source_diag.get("sources_empty", 0))),
+        "sources_disabled": _int(scanner.get("sources_disabled", source_diag.get("sources_disabled", 0))),
+        "source_errors": [_str(_public(item)) for item in errors[:3] if _str(_public(item))],
+    }
+
+
+def _priority_diagnostics(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    debug = _as_dict(ctx.get("priority_watchlist_debug"))
+    rows = ctx.get("priority_watchlist_rows") if isinstance(ctx.get("priority_watchlist_rows"), list) else []
+    excluded = _as_dict(debug.get("excluded"))
+    wanted = ("no_entry", "archived", "hard_gated", "portfolio_material_conflict", "portfolio_conflict", "missing_score", "below_priority_threshold", "unknown")
+    normalized_excluded = {key: _int(excluded.get(key, 0)) for key in wanted}
+    if normalized_excluded.get("portfolio_material_conflict", 0) == 0 and normalized_excluded.get("portfolio_conflict", 0):
+        normalized_excluded["portfolio_material_conflict"] = normalized_excluded.get("portfolio_conflict", 0)
+    return {
+        "source_monitoring_rows": _int(debug.get("source_monitoring_rows", debug.get("monitoring_rows", 0))),
+        "active_monitoring_rows": _int(debug.get("active_monitoring_rows", 0)),
+        "final_priority_rows": _int(debug.get("final_priority_rows", len(rows))),
+        "eligible_watch_early_rows": _int(debug.get("eligible_watch_early_rows", 0)),
+        "top_excluded_samples": _bounded_dict_list(debug.get("top_excluded_samples"), 3),
+        "excluded": normalized_excluded,
+    }
+
+
+def _storage_diagnostics(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    storage = _as_dict(ctx.get("storage") or ctx.get("storage_result") or ctx.get("storage_summary"))
+    runtime_state = _first_dict(ctx, "runtime_state", "runtime")
+    backend = _status_value(storage.get("backend"), ctx.get("storage_backend"), runtime_state.get("storage_backend"), default="unknown")
+    if backend not in {"d1", "supabase", "local", "unknown"}:
+        backend = "unknown"
+    verify = _status_value(storage.get("verify_status"), runtime_state.get("storage_verify_status"), default="unknown")
+    return {
+        "backend": backend,
+        "last_read_ok": storage.get("last_read_ok") if isinstance(storage.get("last_read_ok"), bool) else storage.get("read_ok") if isinstance(storage.get("read_ok"), bool) else storage.get("ok") if isinstance(storage.get("ok"), bool) else None,
+        "last_write_ok": storage.get("last_write_ok") if isinstance(storage.get("last_write_ok"), bool) else storage.get("write_ok") if isinstance(storage.get("write_ok"), bool) else None,
+        "verify_status": verify if verify in {"ok", "skipped", "failed", "unknown"} else ("ok" if _is_good_status(verify) else "failed" if _is_bad_status(verify) else "unknown"),
+        "last_summary": _str(storage.get("summary") or storage.get("last_diag_summary") or runtime_state.get("last_storage_diag_summary")),
+    }
+
+
+def build_operator_diagnostics(context: Dict[str, Any]) -> Dict[str, Any]:
+    """Build read-only operator diagnostics from already-loaded UI context.
+
+    This pure helper performs no storage reads/writes, scanner runs, network calls,
+    Telegram sends, or Streamlit imports. It tolerates legacy/missing context keys
+    and returns bounded, secret-redacted diagnostics for compact UI panels.
+    """
+    ctx = _as_dict(context)
+    runtime = _runtime_diagnostics(ctx)
+    scanner = _scanner_diagnostics(ctx)
+    priority = _priority_diagnostics(ctx)
+    storage = _storage_diagnostics(ctx)
+
+    has_any = any([ctx.get("runtime_state"), ctx.get("scanner_diagnostics"), ctx.get("live_pulse_payload"), ctx.get("priority_watchlist_debug"), ctx.get("storage_result"), ctx.get("storage")])
+    degraded_reasons: List[str] = []
+    warning_reasons: List[str] = []
+
+    runtime_available = any(key in ctx for key in ("runtime_state", "runtime", "runtime_matrix", "runtime_matrix_summary", "app_compat", "app_compat_audit", "golden_fixtures", "golden_fixtures_summary"))
+    if runtime_available and (_is_bad_status(runtime.get("matrix_status")) or runtime.get("matrix_status") in {"unknown", "missing"}):
+        degraded_reasons.append("runtime_matrix unavailable")
+    if runtime_available and (_is_bad_status(runtime.get("app_compat_status")) or runtime.get("app_compat_status") in {"unknown", "missing"}):
+        degraded_reasons.append("app_compat unavailable")
+    if runtime_available and _is_bad_status(runtime.get("golden_fixtures_status")):
+        degraded_reasons.append("golden_fixtures failed")
+    if runtime.get("stale_jobs"):
+        degraded_reasons.append("critical jobs stale")
+
+    source_status = str(scanner.get("source_status") or "unknown").lower()
+    if source_status in {"source_api_failed", "failed", "error"}:
+        degraded_reasons.append("source_api_failed")
+    elif scanner.get("sources_failed", 0) and scanner.get("final_count", 0) > 0:
+        warning_reasons.append("partial source failure with candidates")
+    elif scanner.get("final_count", 0) <= 0 and scanner.get("last_empty_reason"):
+        warning_reasons.append(f"Live Pulse empty: {scanner.get('last_empty_reason')}")
+
+    if priority.get("final_priority_rows", 0) <= 0 and (sum(_as_dict(priority.get("excluded")).values()) > 0 or priority.get("eligible_watch_early_rows", 0) > 0):
+        warning_reasons.append("Priority empty with known exclusions")
+
+    if storage.get("verify_status") == "failed" or storage.get("last_read_ok") is False:
+        degraded_reasons.append("storage verification failed")
+
+    if not has_any:
+        status = "unknown"
+        summary = "Diagnostics not available yet."
+    elif degraded_reasons:
+        status = "degraded"
+        summary = "; ".join(degraded_reasons[:3])
+    elif warning_reasons:
+        status = "warning"
+        summary = "; ".join(warning_reasons[:3])
+    else:
+        status = "ok"
+        summary = "Runtime, scanner, priority, and storage diagnostics look ok."
+
+    return {
+        "status": status,
+        "summary": _public(summary),
+        "runtime": runtime,
+        "scanner": scanner,
+        "priority": priority,
+        "storage": storage,
+    }
+
 def build_operator_status(context: Dict[str, Any]) -> Dict[str, Any]:
     """Build status-card data for operators from already-loaded context."""
     ctx = _as_dict(context)
