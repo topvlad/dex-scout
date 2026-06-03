@@ -1,0 +1,50 @@
+{
+  "rows": [
+    {
+      "base_symbol": "OOO",
+      "entry_status": "EARLY",
+      "priority_score": 266.57
+    },
+    {
+      "base_symbol": "FARTCOIN",
+      "entry_status": "EARLY",
+      "priority_score": 127.04
+    },
+    {
+      "base_symbol": "PUNCH",
+      "entry_status": "WATCH",
+      "priority_score": 73.39
+    },
+    {
+      "base_symbol": "BUTTCOIN",
+      "entry_status": "WATCH",
+      "priority_score": 45.02
+    }
+  ],
+  "debug_subset": {
+    "final_priority_rows": 4,
+    "excluded": {
+      "no_entry": 2,
+      "archived": 0,
+      "hard_gated": 0,
+      "portfolio_material_conflict": 0,
+      "portfolio_linked_policy": 0,
+      "missing_score": 0,
+      "below_priority_threshold": 0,
+      "unknown": 0
+    }
+  },
+  "conflict_debug_subset": {
+    "final_priority_rows": 1,
+    "excluded": {
+      "no_entry": 0,
+      "archived": 0,
+      "hard_gated": 0,
+      "portfolio_material_conflict": 2,
+      "portfolio_linked_policy": 0,
+      "missing_score": 0,
+      "below_priority_threshold": 0,
+      "unknown": 0
+    }
+  }
+}

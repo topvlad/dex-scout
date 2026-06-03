@@ -1,0 +1,55 @@
+{
+  "diagnostics": {
+    "raw_seen": 8,
+    "normalized": 6,
+    "rejected": 2,
+    "reasons": {
+      "duplicate": 1,
+      "missing_chain": 1
+    }
+  },
+  "candidates": [
+    {
+      "chain": "solana",
+      "base_addr": "SoLmiXeDCase111111111111111111111111111111",
+      "base_symbol": "SOLMIX",
+      "score": 25,
+      "entry_status": "WATCH"
+    },
+    {
+      "chain": "bsc",
+      "base_addr": "0xabcdef0000000000000000000000000000000001",
+      "base_symbol": "BSCWIN",
+      "score": 18,
+      "entry_status": "EARLY"
+    },
+    {
+      "chain": "solana",
+      "base_addr": "NoEntrySoL11111111111111111111111111111111",
+      "base_symbol": "NOPE",
+      "score": 47,
+      "entry_status": "NO_ENTRY"
+    },
+    {
+      "chain": "bsc",
+      "base_addr": "0xdead000000000000000000000000000000000001",
+      "base_symbol": "DEADSCAM",
+      "score": 20,
+      "entry_status": "WATCH"
+    },
+    {
+      "chain": "solana",
+      "base_addr": "ArchiveSoL111111111111111111111111111111",
+      "base_symbol": "ARCH",
+      "score": 16,
+      "entry_status": "WATCH"
+    },
+    {
+      "chain": "solana",
+      "base_addr": "PortfolioSoL1111111111111111111111111111",
+      "base_symbol": "PORT",
+      "score": 19,
+      "entry_status": "WATCH"
+    }
+  ]
+}

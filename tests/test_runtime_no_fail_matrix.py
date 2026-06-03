@@ -16,7 +16,7 @@ def test_runtime_matrix_script_builds_schema_and_redacts_secret(monkeypatch):
     payload = json.dumps(summary, sort_keys=True, default=str)
 
     assert set(summary) == {"ok", "ts_utc", "commit", "roles", "secrets_redacted"}
-    assert set(summary["roles"]) == {"ui_streamlit", "worker", "webhook", "dash_readonly", "app_compat", "core_modules"}
+    assert set(summary["roles"]) == {"ui_streamlit", "worker", "webhook", "dash_readonly", "app_compat", "core_modules", "golden_fixtures"}
     assert summary["secrets_redacted"] is True
     assert "matrix-secret-token" not in payload
 
@@ -147,3 +147,12 @@ def test_runtime_matrix_includes_portfolio_service_smokes():
     assert "portfolio_service" in result.get("modules", [])
     assert not any("portfolio_material_classifier_smoke_failed" in err for err in result.get("errors", []))
     assert not any("portfolio_conflict_resolver_smoke_failed" in err for err in result.get("errors", []))
+
+
+def test_runtime_matrix_includes_golden_fixtures_role():
+    result = matrix._golden_fixtures_role()
+
+    assert result["ok"] is True
+    assert result["status"] == "ok"
+    assert result["fixtures_checked"] >= 8
+

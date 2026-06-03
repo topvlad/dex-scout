@@ -59,13 +59,14 @@
       <tr><td>#290 Monitoring/archive service extraction</td><td class="good">Completed</td><td><code>monitoring_service.py</code> owns import-safe monitoring/archive planning.</td></tr>
       <tr><td>#291 Scanner / Live Pulse service boundary</td><td class="good">Completed</td><td><code>scanner_service.py</code> owns scanner/live-pulse service boundary and payload diagnostics.</td></tr>
       <tr><td>#292 app.py compatibility wrapper audit + stale glue cleanup / #293 scanner source adapter cleanup / ingest diagnostics baseline</td><td class="good">Completed</td><td><code>app.py</code> remains a compatibility shell while <code>tests/fixtures/app_compat_manifest.json</code>, wrapper signature tests, and <code>app_compat</code> runtime matrix checks protect facade/webhook/worker contracts.</td></tr>
-      <tr><td>#294 scanner source adapters + ingest diagnostics</td><td class="warn">Current</td><td><code>scanner_sources.py</code> exposes structured source results and aggregation diagnostics without changing scanner scoring, filters, recommendations, or Live Pulse storage keys.</td></tr>
+      <tr><td>#294 scanner source adapters + ingest diagnostics</td><td class="good">Completed</td><td><code>scanner_sources.py</code> exposes structured source results and aggregation diagnostics without changing scanner scoring, filters, recommendations, or Live Pulse storage keys.</td></tr>
+      <tr><td>#295 scanner outcome parity / golden fixture regression pack</td><td class="warn">Current</td><td>Golden fixtures protect scanner/Live Pulse/Priority outcomes after extraction.</td></tr>
     </table>
   </section>
 
   <section class="card"><h2>Playbook</h2>
     <ul>
-      <li>Runtime matrix roles: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, <code>app_compat</code>, and <code>core_modules</code>.</li>
+      <li>Runtime matrix roles: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, <code>app_compat</code>, <code>core_modules</code>, and <code>golden_fixtures</code>.</li>
       <li>Use no secrets in guide examples, logs, matrix output, screenshots, or PR notes.</li>
       <li>Before merging service extraction PRs, run <code>python scripts/runtime_no_fail_matrix.py --json runtime-no-fail-summary.json</code> and <code>pytest -q</code>.</li>
       <li>For scanner changes, verify <code>scanner_sources.py</code> and <code>scanner_service.py</code> import without <code>streamlit</code> or <code>app.py</code> and perform no source fetch, storage write, or Telegram send at import time.</li>
@@ -76,7 +77,7 @@
 
   <section class="card"><h2>Gaps / next planned</h2>
     <ul>
-      <li><b>#295 — scanner outcome parity / golden fixture regression pack</b>: lock scanner outcome parity with golden fixtures before any future behavioral changes.</li>
+      <li><b>#296 — UI runtime diagnostics polish / operator observability</b>: continue surfacing scanner ingest, Live Pulse empty reasons, and runtime status in operator-friendly diagnostics.</li>
       <li><code>app.py</code> compatibility wrappers should stay thin and delegate to service modules where ownership has moved.</li>
       <li>Residual <code>app.py</code> glue remains only where runtime adapters or external imports still require the public name.</li>
     </ul>
@@ -89,7 +90,8 @@
       <tr><td class="risk"><code>app_runtime_facade.py</code> ↔ <code>app.py</code> function signature drift can still happen.</td><td><code>runtime_matrix</code> <code>app_compat</code> role, facade-forwarding checks, manifest callability tests, and wrapper signature tests protect those contracts.</td></tr>
       <tr><td class="risk">New service modules may miss import/no-side-effect coverage.</td><td>Every new service module must be added to <code>scripts/runtime_no_fail_matrix.py</code>.</td></tr>
       <tr><td class="risk">UI could accidentally run scanner or write storage during render.</td><td>UI pages read canonical context keys only; scanner runs remain runtime-job actions.</td></tr>
-      <tr><td class="risk">Priority watchlist can regress to empty when active WATCH/EARLY rows exist.</td><td>Regression tests cover WATCH/EARLY Priority materialization and hard-gate exclusions.</td></tr>
+      <tr><td class="risk">Priority watchlist can regress to empty when active WATCH/EARLY rows exist.</td><td>Regression tests cover WATCH/EARLY Priority materialization, material Portfolio conflicts, and hard-gate exclusions.</td></tr>
+      <tr><td class="risk">Scanner refactors can silently change source aggregation, Live Pulse empty reasons, duplicate/archive filtering, or Priority eligibility.</td><td>Golden fixtures protect scanner/Live Pulse/Priority outcomes after extraction and are checked by pytest plus the runtime matrix <code>golden_fixtures</code> role.</td></tr>
     </table>
   </section>
 

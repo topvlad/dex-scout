@@ -1,0 +1,19 @@
+{
+  "status": "success",
+  "ok": true,
+  "sources_tried": [
+    "dexscreener_search",
+    "empty_source"
+  ],
+  "diagnostics": {
+    "sources_total": 2,
+    "sources_success": 1,
+    "sources_empty": 1,
+    "sources_failed": 0,
+    "sources_disabled": 0,
+    "raw_total": 2,
+    "raw_deduped": 2,
+    "duplicates": 0,
+    "capped": false
+  }
+}
