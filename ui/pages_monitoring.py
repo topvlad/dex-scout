@@ -12,6 +12,61 @@ from typing import Any, Dict
 import streamlit as st
 
 
+
+EXCLUDED_KEYS = (
+    "no_entry",
+    "archived",
+    "hard_gated",
+    "portfolio_material_conflict",
+    "missing_score",
+    "below_priority_threshold",
+    "unknown",
+)
+
+
+def _operator_diagnostics(context: Dict[str, Any]) -> Dict[str, Any]:
+    diag = context.get("operator_diagnostics") if isinstance(context.get("operator_diagnostics"), dict) else None
+    if diag:
+        return diag
+    import app_service
+
+    return app_service.build_operator_diagnostics(context)
+
+
+def _render_priority_diagnostics(context: Dict[str, Any]) -> None:
+    diag = _operator_diagnostics(context)
+    priority = diag.get("priority", {}) if isinstance(diag.get("priority"), dict) else {}
+    rows = context.get("priority_watchlist_rows") if isinstance(context.get("priority_watchlist_rows"), list) else []
+    final_rows = int(priority.get("final_priority_rows", len(rows)) or 0)
+    if final_rows > 0:
+        if hasattr(st, "expander"):
+            with st.expander("Priority diagnostics", expanded=False):
+                st.json(priority)
+        return
+
+    excluded = priority.get("excluded") if isinstance(priority.get("excluded"), dict) else {}
+    counts = {key: int(excluded.get(key, 0) or 0) for key in EXCLUDED_KEYS}
+    if counts["portfolio_material_conflict"] == 0 and excluded.get("portfolio_conflict"):
+        counts["portfolio_material_conflict"] = int(excluded.get("portfolio_conflict", 0) or 0)
+
+    st.markdown("**Priority watchlist diagnostics**")
+    st.markdown(str(
+        {
+            "source_monitoring_rows": priority.get("source_monitoring_rows", 0),
+            "active_monitoring_rows": priority.get("active_monitoring_rows", 0),
+            "eligible_watch_early_rows": priority.get("eligible_watch_early_rows", 0),
+            "final_priority_rows": final_rows,
+            "excluded": counts,
+        }
+    ))
+    samples = priority.get("top_excluded_samples") if isinstance(priority.get("top_excluded_samples"), list) else []
+    if samples:
+        st.caption(f"Top excluded samples: {samples[:3]}")
+    if hasattr(st, "expander"):
+        with st.expander("Raw Priority diagnostics", expanded=False):
+            st.json(priority)
+
+
 def render_monitoring_page(context: Dict[str, Any]) -> None:
     """Render the Monitoring page using the explicit UI context."""
     if not isinstance(context, dict):
@@ -42,6 +97,7 @@ def render_monitoring_page(context: Dict[str, Any]) -> None:
     renderer = actions.get("render_monitoring")
     if not callable(renderer):
         st.error("Monitoring renderer is unavailable.")
+        _render_priority_diagnostics(context)
         return
 
     try:
@@ -57,3 +113,4 @@ def render_monitoring_page(context: Dict[str, Any]) -> None:
         renderer(context.get("auto_cfg") or {}, context=context)
     else:
         renderer(context.get("auto_cfg") or {})
+    _render_priority_diagnostics(context)

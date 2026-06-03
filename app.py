@@ -17130,7 +17130,27 @@ def build_ui_context(
         "raw_deduped": int(parse_float((source_diag or {}).get("raw_deduped", live_pulse_payload.get("raw_seen", 0)), 0)),
         "source_errors": source_errors,
     }
-    return {
+    priority_rows = runtime_snapshot.get("priority_watchlist_rows") if isinstance(runtime_snapshot.get("priority_watchlist_rows"), list) else []
+    priority_debug = runtime_snapshot.get("priority_watchlist_debug") if isinstance(runtime_snapshot.get("priority_watchlist_debug"), dict) else monitoring_core.empty_priority_watchlist_debug(0)
+    archive_diag = runtime_snapshot.get("monitoring_archive_diagnostics") if isinstance(runtime_snapshot.get("monitoring_archive_diagnostics"), dict) else {
+        "rows_seen": 0,
+        "active": 0,
+        "watch_early": 0,
+        "no_entry": 0,
+        "archived": 0,
+        "hard_gated": 0,
+        "portfolio_conflict": 0,
+        "archive_candidates": 0,
+    }
+    portfolio_diag = runtime_snapshot.get("portfolio_action_diagnostics") if isinstance(runtime_snapshot.get("portfolio_action_diagnostics"), dict) else {
+        "rows_seen": 0,
+        "material_count": 0,
+        "missing_price_material": 0,
+        "non_material": 0,
+        "blocked_no_urgent_heartbeat": False,
+        "blocked_reason": "",
+    }
+    context = {
         "version": VERSION,
         "storage_backend": STORAGE_BACKEND,
         "selected_page": selected_page,
@@ -17140,28 +17160,17 @@ def build_ui_context(
         "live_pulse_payload": live_pulse_payload,
         "live_pulse_debug": live_pulse_debug,
         "scanner_diagnostics": scanner_diagnostics,
-        "priority_watchlist_rows": [],
-        "priority_watchlist_debug": monitoring_core.empty_priority_watchlist_debug(0),
-        "monitoring_archive_diagnostics": {
-            "rows_seen": 0,
-            "active": 0,
-            "watch_early": 0,
-            "no_entry": 0,
-            "archived": 0,
-            "hard_gated": 0,
-            "portfolio_conflict": 0,
-            "archive_candidates": 0,
-        },
-        "portfolio_action_diagnostics": {
-            "rows_seen": 0,
-            "material_count": 0,
-            "missing_price_material": 0,
-            "non_material": 0,
-            "blocked_no_urgent_heartbeat": False,
-            "blocked_reason": "",
-        },
+        "priority_watchlist_rows": priority_rows,
+        "priority_watchlist_debug": priority_debug,
+        "monitoring_archive_diagnostics": archive_diag,
+        "portfolio_action_diagnostics": portfolio_diag,
         "actions": ui_actions,
     }
+    context["operator_diagnostics"] = app_service.build_operator_diagnostics(context)
+    # Temporary legacy aliases for page/render tests and older UI snippets.
+    context.setdefault("priority_candidates", context["priority_watchlist_rows"])
+    context.setdefault("priority_rows", context["priority_watchlist_rows"])
+    return context
 
 
 def render_selected_page(context: Dict[str, Any]) -> None:
