@@ -45,6 +45,7 @@ import streamlit as st
 import pandas as pd
 import config as app_config
 import app_service
+import admin_controls
 import notification_core
 import monitoring_core
 import monitoring_service
@@ -17072,6 +17073,64 @@ def build_operator_status(context: Dict[str, Any]) -> Dict[str, Any]:
     return app_service.build_operator_status(context)
 
 
+def build_admin_recovery_plan(context: Dict[str, Any]) -> Dict[str, Any]:
+    return admin_controls.build_admin_recovery_plan(context)
+
+
+def validate_admin_action(
+    action_id: str,
+    context: Dict[str, Any],
+    *,
+    confirmation: str = "",
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    return admin_controls.validate_admin_action(action_id, context, confirmation=confirmation, dry_run=dry_run)
+
+
+def _clear_stale_lock_adapter(**kwargs: Any) -> Dict[str, Any]:
+    stale_lock = kwargs.get("stale_lock") if isinstance(kwargs.get("stale_lock"), dict) else {}
+    lock_key = str(stale_lock.get("lock_key") or "").strip()
+    owner = str(stale_lock.get("owner") or "").strip()
+    if not lock_key or not owner:
+        return {"ok": False, "status": "blocked", "reason": "lock_key_and_owner_required"}
+    return release_lock(lock_key=lock_key, owner=owner)
+
+
+def _write_runtime_note_adapter(**kwargs: Any) -> Dict[str, Any]:
+    context = kwargs.get("context") if isinstance(kwargs.get("context"), dict) else {}
+    note = str(context.get("runtime_note") or context.get("admin_note") or "manual recovery note").strip()[:240]
+    runtime, status = update_runtime_state(
+        updates={"last_admin_note": note, "last_admin_note_ts": now_utc_str()},
+        state_key="worker_runtime",
+    )
+    return {"ok": bool(status.get("ok")), "status": status, "runtime_note": runtime.get("last_admin_note")}
+
+
+def _trigger_admin_task_adapter(**kwargs: Any) -> Dict[str, Any]:
+    return {"ok": False, "status": "blocked", "reason": "existing_admin_task_adapter_not_configured"}
+
+
+def execute_admin_action(
+    action_id: str,
+    context: Dict[str, Any],
+    *,
+    confirmation: str = "",
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    adapters = {
+        "clear_stale_lock_fn": _clear_stale_lock_adapter,
+        "write_runtime_note_fn": _write_runtime_note_adapter,
+        "trigger_admin_task_fn": _trigger_admin_task_adapter,
+    }
+    return admin_controls.execute_admin_action(
+        action_id,
+        context,
+        confirmation=confirmation,
+        dry_run=dry_run,
+        adapters=adapters,
+    )
+
+
 def build_ui_context(
     *,
     selected_page: str = "Monitoring",
@@ -17093,6 +17152,9 @@ def build_ui_context(
         "render_portfolio": page_portfolio,
         "render_runtime": render_debug_panel,
         "render_debug_panel": render_debug_panel,
+        "build_admin_recovery_plan": build_admin_recovery_plan,
+        "validate_admin_action": validate_admin_action,
+        "execute_admin_action": execute_admin_action,
     }
     if actions:
         ui_actions.update(actions)
