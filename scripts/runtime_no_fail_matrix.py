@@ -32,6 +32,7 @@ CORE_MODULES = (
     "monitoring_service",
     "portfolio_service",
     "app_service",
+    "scanner_service",
 )
 REQUIRED_JOB_MODES = (
     "scan_cycle",
@@ -346,6 +347,43 @@ def _core_modules_role() -> Dict[str, Any]:
                 )
                 if not conflict.get("portfolio_conflict") or conflict.get("priority_eligible"):
                     errors.append(f"monitoring_service_portfolio_conflict_smoke_failed:{conflict}")
+
+            scanner_service = sys.modules.get("scanner_service")
+            if scanner_service is None:
+                errors.append("scanner_service_not_imported")
+            else:
+                if sys.modules.get("streamlit") is not None:
+                    errors.append("scanner_service_imported_streamlit")
+                if sys.modules.get("app") is not None:
+                    errors.append("scanner_service_imported_app")
+                payload = scanner_service.build_live_pulse_payload(
+                    raw_candidates=[{"chain": "solana", "base_addr": "a"}, {"chain": "solana", "base_addr": "b"}, {"chain": "solana", "base_addr": "c"}],
+                    normalized_candidates=[{"chain": "solana", "base_addr": "a"}, {"chain": "solana", "base_addr": "b"}],
+                    final_candidates=[{"chain": "solana", "base_addr": "a", "score": 1}],
+                    status="success",
+                    source="test",
+                    now_ts="matrix",
+                )
+                if payload.get("raw_seen") != 3 or payload.get("normalized") != 2 or payload.get("final_count") != 1:
+                    errors.append(f"scanner_service_payload_counters_failed:{payload}")
+                failed_payload = scanner_service.build_live_pulse_payload(raw_candidates=[], normalized_candidates=[], final_candidates=[], status="failed", source="test", error="scanner boom", now_ts="matrix")
+                if failed_payload.get("last_empty_reason") not in {"worker_failed", "scanner_failed"}:
+                    errors.append(f"scanner_service_failed_reason_failed:{failed_payload}")
+                refill = scanner_service.plan_live_pulse_refill(current_count=1, target_min=3, target_max=5, max_attempts=2, sources_tried=[])
+                if not refill.get("should_refill") or refill.get("reason") != "below_target":
+                    errors.append(f"scanner_service_refill_smoke_failed:{refill}")
+                filtered = scanner_service.filter_live_pulse_candidates(
+                    [
+                        {"chain": "solana", "base_addr": "watch", "base_symbol": "WATCH", "entry_status": "WATCH", "score": "10"},
+                        {"chain": "solana", "base_addr": "no", "base_symbol": "NO", "entry_status": "NO_ENTRY", "score": "10"},
+                        {"chain": "solana", "base_addr": "hard", "base_symbol": "HARD", "entry_status": "WATCH", "score": "10", "risk_flags": "toxic"},
+                    ],
+                    hard_gate_fn=lambda row: {"blocked": str(row.get("entry_status")) == "NO_ENTRY"},
+                    max_candidates=5,
+                )
+                if filtered.get("diagnostics", {}).get("final_count") != 1 or filtered.get("diagnostics", {}).get("hard_gated") < 1:
+                    errors.append(f"scanner_service_filter_smoke_failed:{filtered}")
+
             portfolio_service = sys.modules.get("portfolio_service")
             if portfolio_service is None:
                 errors.append("portfolio_service_not_imported")

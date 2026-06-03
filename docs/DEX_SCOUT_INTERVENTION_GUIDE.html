@@ -1,134 +1,97 @@
 <!doctype html>
-<html lang="uk">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>DEX Scout Master Intervention Guide</title>
   <style>
-    :root { --bg:#07111f; --panel:#0d1b2e; --panel2:#10243d; --text:#e6edf7; --muted:#9db0c7; --accent:#66e3ff; --good:#46d28a; --warn:#ffd166; --bad:#ff6b6b; --line:#27415f; }
-    * { box-sizing:border-box; }
-    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; color:var(--text); background:radial-gradient(circle at top left,#17375f 0,#07111f 42%,#050914 100%); }
-    header { padding:34px 28px 20px; border-bottom:1px solid var(--line); background:rgba(5,9,20,.72); position:sticky; top:0; z-index:2; backdrop-filter: blur(10px); }
-    h1 { margin:0 0 8px; font-size:34px; letter-spacing:-.03em; }
-    h2 { margin:0 0 16px; font-size:24px; }
-    h3 { margin:18px 0 8px; color:var(--accent); }
-    p, li { color:var(--muted); line-height:1.55; }
-    nav { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
-    nav a { color:var(--text); text-decoration:none; border:1px solid var(--line); border-radius:999px; padding:8px 12px; background:rgba(16,36,61,.7); }
-    main { max-width:1180px; margin:0 auto; padding:28px; }
-    section { margin:0 0 28px; padding:24px; border:1px solid var(--line); border-radius:22px; background:linear-gradient(180deg,rgba(13,27,46,.95),rgba(8,17,31,.95)); box-shadow:0 20px 60px rgba(0,0,0,.28); }
-    .banner { border-color:rgba(102,227,255,.55); background:linear-gradient(135deg,rgba(102,227,255,.14),rgba(70,210,138,.08)); }
-    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }
-    .card { padding:16px; border:1px solid var(--line); border-radius:16px; background:rgba(16,36,61,.72); }
-    .good { color:var(--good); } .warn { color:var(--warn); } .bad { color:var(--bad); }
-    table { width:100%; border-collapse:collapse; overflow:hidden; border-radius:14px; }
-    th, td { text-align:left; padding:11px 12px; border-bottom:1px solid var(--line); vertical-align:top; color:var(--muted); }
-    th { color:#cfe7ff; background:rgba(102,227,255,.08); }
-    code, pre { color:#d7f7ff; background:#07111f; border:1px solid var(--line); border-radius:10px; padding:2px 6px; }
-    pre { padding:14px; overflow:auto; line-height:1.5; }
-    .flow { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-line; color:#d7f7ff; }
-    .last { font-size:13px; color:var(--muted); border-left:3px solid var(--accent); padding-left:12px; }
-  </style>
+    body{font-family:Inter,Arial,sans-serif;margin:0;background:#0f172a;color:#e5e7eb;line-height:1.5}.wrap{max-width:1120px;margin:auto;padding:32px}.card{background:#111827;border:1px solid #334155;border-radius:16px;padding:22px;margin:18px 0;box-shadow:0 12px 30px #0004}h1,h2{color:#f8fafc}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}.pill{display:inline-block;border-radius:999px;padding:4px 10px;background:#1d4ed8;color:white;font-size:12px}.good{color:#86efac}.warn{color:#fde68a}.risk{color:#fca5a5}code{background:#020617;border:1px solid #334155;border-radius:6px;padding:1px 5px}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #334155;text-align:left;padding:8px}ul{margin-top:8px}</style>
 </head>
-<body>
-  <header>
-    <h1>DEX Scout Master Intervention Guide</h1>
-    <p>червень 2026 / current post-refactor runtime map</p>
-    <nav>
-      <a href="#architecture">Architecture</a><a href="#health">Current health</a><a href="#phases">Completed phases</a><a href="#risks">Current risks</a><a href="#roadmap">Roadmap</a><a href="#checks">Regression checklist</a>
-    </nav>
-  </header>
-  <main>
-    <section id="health" class="banner">
-      <h2>Current health</h2>
-      <div class="grid">
-        <div class="card"><b class="good">Runtime split is active</b><p><code>runtime_core.py</code>, <code>storage_core.py</code>, <code>storage_repository.py</code>, <code>notification_core.py</code>, <code>monitoring_core.py</code>, <code>app_service.py</code>, <code>portfolio_service.py</code>, <code>monitoring_service.py</code>, and <code>app_runtime_facade.py</code> now carry extracted responsibilities.</p></div>
-        <div class="card"><b class="warn">Legacy shell remains</b><p><code>app.py</code> is still the Streamlit entrypoint, compatibility wrapper home, UI router, and remaining business-glue layer.</p></div>
-        <div class="card"><b>Persistence reality</b><p>Cloudflare D1 via the D1 Worker / <code>app_storage</code> path is the current primary persistence architecture. Local CSV fallback remains where code supports it. Supabase is legacy/fallback only where still present in code.</p></div>
-        <div class="card"><b>No secrets</b><p>This guide intentionally documents component names and workflows only; no secrets, private URLs, tokens, or environment values are embedded.</p></div>
-      </div>
-      <p class="last">Current PR marker: #290 Monitoring/archive service extraction.</p>
-    </section>
+<body><div class="wrap">
+  <h1>DEX Scout Master Intervention Guide</h1>
+  <p><span class="pill">Current persistence: D1</span> <span class="pill">Runtime guard: runtime_matrix</span> <span class="pill">Live Pulse key: live_pulse_candidates.json</span></p>
 
-    <section id="architecture">
-      <h2>Architecture</h2>
-      <div class="grid">
-        <div class="card"><h3>SHARED — Ingest / Normalize</h3><ul><li><code>dex.py</code></li><li><code>config.py</code></li><li><code>runtime_core.py</code> helpers where shared normalization/parsing is relevant</li></ul></div>
-        <div class="card"><h3>SHARED — Score / Filter</h3><ul><li><code>scoring.py</code></li><li><code>config.py</code></li><li>Do not change scoring or recommendation semantics during UI-shell work.</li></ul></div>
-        <div class="card"><h3>CORE LEGACY SHELL</h3><ul><li><code>app.py</code></li><li>Streamlit entrypoint</li><li>Compatibility wrappers</li><li>UI router</li><li>Remaining business glue</li></ul></div>
-        <div class="card"><h3>EXTRACTED CORE / SERVICE LAYER</h3><ul><li><code>runtime_core.py</code></li><li><code>storage_core.py</code></li><li><code>storage_repository.py</code></li><li><code>notification_core.py</code></li><li><code>monitoring_core.py</code></li><li><code>app_service.py</code></li><li><code>portfolio_service.py</code></li><li><code>monitoring_service.py</code></li><li><code>app_runtime_facade.py</code></li></ul></div>
-        <div class="card"><h3>UI</h3><ul><li><code>app.py</code> entrypoint</li><li><code>ui/pages_*.py</code> page render adapters</li><li>Dash dashboard, if present, is a read-only sidecar rather than a write path.</li></ul></div>
-        <div class="card"><h3>WORKER</h3><ul><li><code>worker.py</code></li><li><code>app_runtime_facade.py</code></li><li>Lazy <code>app.py</code> import only for remaining business functions.</li></ul></div>
-        <div class="card"><h3>WEBHOOK</h3><ul><li><code>tg_webhook.py</code></li><li><code>app_runtime_facade.py</code></li><li>Explicit <code>app_import_failed</code> state for import failures.</li></ul></div>
-        <div class="card"><h3>PERSISTENCE</h3><ul><li>Cloudflare D1 / D1 Worker / <code>app_storage</code></li><li>Local CSV fallback if still supported by runtime code</li><li>Supabase only as legacy/fallback if code still supports it</li></ul></div>
-        <div class="card"><h3>ALERT / NOTIFICATION</h3><ul><li><code>notification_core.py</code></li><li><code>notification_event_journal</code></li><li>Telegram send remains in <code>app.py</code> for now.</li></ul></div>
-        <div class="card"><h3>MONITORING / PORTFOLIO STATE</h3><ul><li><code>monitoring_core.py</code></li><li><code>monitoring_service.py</code></li><li><code>portfolio_service.py</code></li><li><code>app.py</code> storage wrappers</li><li>UI display via <code>ui/pages_*.py</code></li></ul></div>
-      </div>
-      <pre class="flow">Streamlit operator → app.py → ui/pages_*.py → explicit context actions
-Worker → worker.py → app_runtime_facade.py → lazy app.py compatibility functions
-Telegram webhook → tg_webhook.py → app_runtime_facade.py → lazy app.py compatibility functions
-Persistence → storage_repository.py / storage_core.py → D1 Worker app_storage path, with supported fallbacks</pre>
-    </section>
+  <section class="card"><h2>Architecture</h2>
+    <div class="grid">
+      <div><h3>Runtime roles</h3><ul>
+        <li><b>UI / Streamlit</b>: <code>app.py</code> shell with <code>ui/pages_*.py</code> render modules.</li>
+        <li><b>Worker</b>: <code>worker.py</code> delegates through <code>app_runtime_facade.py</code>.</li>
+        <li><b>Webhook</b>: <code>tg_webhook.py</code> delegates through <code>app_runtime_facade.py</code>.</li>
+        <li><b>Dash/read-only sidecar</b>: may inspect state but must not mutate runtime state.</li>
+      </ul></div>
+      <div><h3>Persistence</h3><ul>
+        <li><b>Primary</b>: Cloudflare <code>D1</code> through D1 Worker and <code>app_storage</code> / repository helpers.</li>
+        <li><b>Fallback</b>: local CSV/text fallback remains supported where code paths allow it.</li>
+        <li><b>Legacy</b>: Supabase references are legacy/fallback only, not the current primary persistence path.</li>
+      </ul></div>
+      <div><h3>Extracted service/core layer</h3><ul>
+        <li><code>runtime_core.py</code>, <code>storage_core.py</code>, <code>storage_repository.py</code></li>
+        <li><code>notification_core.py</code>, <code>monitoring_core.py</code>, <code>monitoring_service.py</code></li>
+        <li><code>portfolio_service.py</code>, <code>app_service.py</code>, <code>scanner_service.py</code></li>
+      </ul></div>
+    </div>
+  </section>
 
-    <section id="phases">
-      <h2>Completed phases</h2>
-      <table><thead><tr><th>Phase</th><th>Status</th><th>Meaning</th></tr></thead><tbody>
-        <tr><td>#270/#272 audit safety cleanup</td><td class="good">Completed</td><td>Audit safety fixes are not active TODO items.</td></tr>
-        <tr><td>#273 runtime import/env/storage truth</td><td class="good">Completed</td><td>Worker-mode import and environment/storage truth checks are part of baseline health.</td></tr>
-        <tr><td>#274 Live Pulse + hard quarantine</td><td class="good">Completed</td><td>Live Pulse and quarantine behavior is established and should not be changed by UI refactors.</td></tr>
-        <tr><td>#275 runtime/storage core extraction</td><td class="good">Completed</td><td>Shared runtime and storage helpers moved out of the app shell.</td></tr>
-        <tr><td>#276 worker/webhook facade split + guide</td><td class="good">Completed</td><td>Worker and webhook use the lazy facade and structured import state.</td></tr>
-        <tr><td>#277 exactly-once notification journal</td><td class="good">Completed</td><td>Notification journal semantics protect duplicate sends.</td></tr>
-        <tr><td>#278 runtime smoke workflow</td><td class="good">Completed</td><td>Runtime smoke workflow covers preflight/read-only safety checks.</td></tr>
-        <tr><td>#279 notification core</td><td class="good">Completed</td><td>Notification filtering/journal helper logic is extracted.</td></tr>
-        <tr><td>#280 monitoring/portfolio core</td><td class="good">Completed</td><td>Monitoring and portfolio state helpers are import-safe.</td></tr>
-        <tr><td>#281 storage repository boundary</td><td class="good">Completed</td><td>Storage repository boundary exists, though app.py may still hold wrappers.</td></tr>
-        <tr><td>#282 UI page shell split + guide refresh</td><td class="warn">Current</td><td>Streamlit page rendering begins moving behind <code>ui/</code> render functions while preserving behavior.</td></tr>
-      </tbody></table>
-    </section>
+  <section class="card"><h2>Data Flow</h2>
+    <ol>
+      <li>Runtime jobs resolve through <code>app_runtime_facade.py</code> so <code>scan_cycle</code>, <code>monitor_cycle</code>, and notification jobs keep stable signatures.</li>
+      <li>Scanner source fetch remains adapter-owned by runtime/app code; <code>scanner_service.py</code> owns deterministic normalization, filtering diagnostics, refill planning, cycle orchestration, and Live Pulse payload materialization.</li>
+      <li>Live Pulse writes preserve <code>live_pulse_candidates.json</code>. Empty or failed scans should still write counters and <code>last_empty_reason</code> when possible.</li>
+      <li>Monitoring Priority rows continue to use <code>monitoring_core.py</code> and <code>monitoring_service.py</code>; Live Pulse candidates must not override Priority watchlist materialization.</li>
+    </ol>
+  </section>
 
-    <section id="risks">
-      <h2>Current risks</h2>
-      <ul>
-        <li><code>app.py</code> still contains too much business glue.</li>
-        <li>UI split can accidentally introduce render-time writes.</li>
-        <li>UI modules may grow hidden storage dependencies.</li>
-        <li>Facade wrappers may drift from <code>app.py</code> functions.</li>
-        <li><code>storage_repository.py</code> exists, but <code>app.py</code> may still hold too many wrappers.</li>
-      </ul>
-    </section>
+  <section class="card"><h2>Completed phases</h2>
+    <table><tr><th>Phase</th><th>Status</th><th>Notes</th></tr>
+      <tr><td>#270/#272 audit safety cleanup</td><td class="good">Completed</td><td>Baseline safety cleanup.</td></tr>
+      <tr><td>#273 runtime import/env/storage truth</td><td class="good">Completed</td><td>Runtime import and storage truth pass.</td></tr>
+      <tr><td>#274 Live Pulse + hard quarantine</td><td class="good">Completed</td><td>Live Pulse and hard quarantine guardrails established.</td></tr>
+      <tr><td>#275 runtime/storage core extraction</td><td class="good">Completed</td><td><code>runtime_core.py</code> and storage core split.</td></tr>
+      <tr><td>#276 worker/webhook facade split</td><td class="good">Completed</td><td><code>worker.py</code> and <code>tg_webhook.py</code> facade delegation.</td></tr>
+      <tr><td>#277 exactly-once notification journal</td><td class="good">Completed</td><td>Notification journal semantics extracted without changing templates.</td></tr>
+      <tr><td>#278 runtime smoke workflow / notification journal</td><td class="good">Completed</td><td>Runtime smoke guardrails introduced.</td></tr>
+      <tr><td>#282/#283 UI page shell + guide</td><td class="good">Completed</td><td><code>ui/pages_*.py</code> shell extraction.</td></tr>
+      <tr><td>#284 runtime no-fail matrix</td><td class="good">Completed</td><td><code>runtime_matrix</code> import/no-side-effect preflight.</td></tr>
+      <tr><td>#285 facade job_mode kwarg hotfix</td><td class="good">Completed</td><td>Runtime no-fail matrix + service facade guardrails: runtime facade <code>job_mode</code> kwarg collision fixed; facade forwarding collision guard remains covered.</td></tr>
+      <tr><td>#286 runtime matrix guardrails</td><td class="good">Completed</td><td>service facade / business glue reduction continued; matrix expanded for service modules.</td></tr>
+      <tr><td>#287 app service facade</td><td class="good">Completed</td><td><code>app_service.py</code> boundary.</td></tr>
+      <tr><td>#288 Priority watchlist materialization hotfix</td><td class="good">Completed</td><td>WATCH/EARLY rows remain visible when eligible.</td></tr>
+      <tr><td>#289 Portfolio service extraction</td><td class="good">Completed</td><td><code>portfolio_service.py</code> extraction.</td></tr>
+      <tr><td>#290 Monitoring/archive service extraction</td><td class="good">Completed</td><td><code>monitoring_service.py</code> owns import-safe monitoring/archive planning.</td></tr>
+      <tr><td>#291 Scanner / Live Pulse service boundary</td><td class="warn">Current</td><td><code>scanner_service.py</code> owns scanner/live-pulse service boundary and payload diagnostics.</td></tr>
+    </table>
+  </section>
 
-    <section id="roadmap">
-      <h2>Roadmap</h2>
-      <table><thead><tr><th>PR</th><th>Target</th><th>Guardrail</th></tr></thead><tbody>
-        <tr><td>#282</td><td>UI page shell split + guide refresh</td><td>No scanner/recommendation, Telegram template, D1 schema, storage-key, worker-order, or callback-behavior changes.</td></tr>
-        <tr><td>#283</td><td>Completed: Streamlit UI page rendering split + guide refresh</td><td>Keep UI adapters import-safe and render-only unless an explicit action callable is invoked.</td></tr>
-        <tr><td>#284</td><td>Completed: runtime facade <code>job_mode</code> kwarg collision fixed</td><td>Facade internals use reserved names so public worker heartbeat kwargs continue to reach <code>app.py</code>.</td></tr>
-        <tr><td>#285</td><td>Completed: Runtime no-fail matrix + service facade guardrails</td><td>Checks UI, worker, webhook, Dash readonly, and core module roles independently with explicit degraded states.</td></tr>
-        <tr><td>#286</td><td>Completed: <code>app.py</code> service facade / business glue reduction</td><td><code>app_service.py</code> is the import-safe service facade for pure runtime, storage, notification, monitoring, Live Pulse, and operator summaries while preserving the current D1 persistence path.</td></tr>
-        <tr><td>#287</td><td>Completed: runtime no-fail and service-layer guardrails follow-up</td><td>Keep role checks explicit and preserve D1 persistence, Telegram event-key, storage-key, and worker-order behavior.</td></tr>
-        <tr><td>#288</td><td>Completed: Priority watchlist materialization hotfix</td><td>Priority watchlist materialization remains a read/selection consistency fix, not a scoring or scanner-source change.</td></tr>
-        <tr><td>#289</td><td>Completed: Portfolio service extraction + action consistency</td><td><code>portfolio_service.py</code> owns import-safe Portfolio action normalization, row classification, notification-candidate diagnostics, and Portfolio/Monitoring material-action conflict resolution.</td></tr>
-        <tr><td>#290</td><td>Current: Monitoring/archive service extraction</td><td><code>monitoring_service.py</code> owns import-safe Monitoring status normalization, row classification, archive-transition planning, Priority diagnostics, and Portfolio conflict exclusion while keeping writes in <code>app.py</code>.</td></tr>
-        <tr><td>#291</td><td>Next: scanner/live-pulse service boundary</td><td>Proceed only after runtime_matrix and monitor_cycle are green; do not move scanner source logic, scoring weights, Telegram templates, D1 schema, storage keys, or runtime job order.</td></tr>
-      </tbody></table>
-    </section>
+  <section class="card"><h2>Playbook</h2>
+    <ul>
+      <li>Runtime matrix roles: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, and <code>core_modules</code>.</li>
+      <li>Use no secrets in guide examples, logs, matrix output, screenshots, or PR notes.</li>
+      <li>Before merging service extraction PRs, run <code>python scripts/runtime_no_fail_matrix.py --json runtime-no-fail-summary.json</code> and <code>pytest -q</code>.</li>
+      <li>For scanner changes, verify <code>scanner_service.py</code> imports without <code>streamlit</code> or <code>app.py</code> and performs no source fetch, storage write, or Telegram send at import time.</li>
+      <li>After merge, run runtime smoke modes in order: <code>runtime_matrix</code>, <code>read_only</code>, <code>monitor_cycle</code>, <code>notify_cycle</code>, then <code>scan_cycle</code>.</li>
+      <li>In Streamlit, check Scout Live Pulse, Monitoring Priority watchlist, and Runtime/debug diagnostics for visible counters and empty reasons.</li>
+    </ul>
+  </section>
 
-    <section id="checks">
-      <h2>Regression checklist</h2>
-      <ul>
-        <li><code>python -m py_compile monitoring_service.py portfolio_service.py app.py worker.py tg_webhook.py app_runtime_facade.py runtime_core.py storage_core.py storage_repository.py notification_core.py monitoring_core.py app_service.py</code></li>
-        <li><code>pytest -q</code></li>
-        <li><code>DEX_SCOUT_WORKER_MODE=1 python -c "import app; print('ok')"</code></li>
-        <li><code>python -c "import ui.pages_monitoring; print('ok')"</code></li>
-        <li>Runtime Smoke workflow: <code>runtime_matrix</code></li>
-        <li>Runtime Smoke workflow: <code>read_only</code></li>
-        <li>Runtime no-fail matrix checklist: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, <code>core_modules</code>.</li>
-        <li>Streamlit UI opens.</li>
-        <li>No write during normal render.</li>
-        <li><code>/_import_status</code> returns no secrets.</li>
-      </ul>
-    </section>
-  </main>
-</body>
-</html>
+  <section class="card"><h2>Gaps / next planned</h2>
+    <ul>
+      <li><b>#292 — scanner source adapter cleanup / ingest diagnostics</b>: make source calls explicit adapters with clearer per-source counters.</li>
+      <li>Alternative #292 scope if source cleanup is deferred: final <code>app.py</code> compatibility wrapper audit.</li>
+      <li>Residual <code>app.py</code> glue remains by design until wrappers and runtime signatures are fully audited.</li>
+    </ul>
+  </section>
+
+  <section class="card"><h2>Risk Matrix</h2>
+    <table><tr><th>Risk</th><th>Mitigation</th></tr>
+      <tr><td class="risk">Scanner/live-pulse materialization can silently empty without diagnostics.</td><td>Canonical payload counters, <code>last_empty_reason</code>, and <code>blocked_reasons</code> in <code>scanner_service.py</code>.</td></tr>
+      <tr><td class="risk"><code>app.py</code> still has compatibility wrappers and residual glue.</td><td>Keep wrappers stable; move pure logic into service modules incrementally.</td></tr>
+      <tr><td class="risk">Facade/app function signature drift can still happen.</td><td><code>runtime_matrix</code> facade-forwarding checks and wrapper signature tests.</td></tr>
+      <tr><td class="risk">New service modules may miss import/no-side-effect coverage.</td><td>Every new service module must be added to <code>scripts/runtime_no_fail_matrix.py</code>.</td></tr>
+      <tr><td class="risk">UI could accidentally run scanner or write storage during render.</td><td>UI pages read canonical context keys only; scanner runs remain runtime-job actions.</td></tr>
+      <tr><td class="risk">Priority watchlist can regress to empty when active WATCH/EARLY rows exist.</td><td>Regression tests cover WATCH/EARLY Priority materialization and hard-gate exclusions.</td></tr>
+    </table>
+  </section>
+
+  <section class="card"><h2>Historical/fixed stale review items</h2>
+    <p>Older external-review phrases such as Supabase-centric architecture, missing tests, webhook import failures, app-at-startup runtime risks, negative scoring, or worker lock-key incidents must not be treated as current TODOs unless a new reproduction is attached.</p>
+  </section>
+</div></body></html>

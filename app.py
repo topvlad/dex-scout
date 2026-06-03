@@ -49,6 +49,7 @@ import notification_core
 import monitoring_core
 import monitoring_service
 import portfolio_service
+import scanner_service
 from runtime_core import (
     _env_bool as runtime_env_bool,
     _env_float as runtime_env_float,
@@ -14025,9 +14026,31 @@ def live_pulse_storage_read() -> Dict[str, Any]:
         }
     try:
         data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+        defaults = scanner_service.build_live_pulse_payload(
+            raw_candidates=[],
+            normalized_candidates=[],
+            final_candidates=[],
+            rejected_candidates=[],
+            status=str(data.get("status") or "empty"),
+            source=str(data.get("source") or "scan_cycle"),
+            now_ts=str(data.get("ts_utc") or ""),
+        )
+        defaults.update(data)
+        if not defaults.get("last_empty_reason") and int(parse_float(defaults.get("final_count", 0), 0)) <= 0:
+            defaults["last_empty_reason"] = "scan_not_run"
+        return defaults
     except Exception:
-        return {"status": "failed", "last_empty_reason": "worker_failed", "debug": {"decode_error": True}}
+        return scanner_service.build_live_pulse_payload(
+            raw_candidates=[],
+            normalized_candidates=[],
+            final_candidates=[],
+            rejected_candidates=[],
+            status="failed",
+            source="scan_cycle",
+            error="decode_error",
+        )
 
 
 def live_pulse_storage_write(payload: Dict[str, Any]) -> bool:
@@ -14296,40 +14319,43 @@ def build_live_pulse_candidates_payload(
     if final_count <= 0 and payload_status == "success":
         payload_status = "empty"
     error = str(scan_result.get("error") or "") if isinstance(scan_result, dict) else ""
-    last_empty_reason = _live_pulse_empty_reason(payload_status, raw_seen, final_count, blocked_reasons, error=error)
-    return {
-        "ts_utc": now_utc_str(),
-        "source": "scan_cycle",
-        "status": payload_status,
-        "raw_seen": raw_seen,
-        "normalized": normalized,
-        "clean_candidates": clean_candidates,
-        "final_count": final_count,
-        "refill_attempts": int(parse_float(stats.get("refill_attempts", 0), 0)),
-        "last_empty_reason": last_empty_reason,
-        "sources_tried": list(stats.get("sources_tried") or []),
-        "blocked_reasons": blocked_reasons,
-        "final_candidates": cards,
-        "rejected_candidates": rejected_candidates[:100],
-        "debug": {
-            "scan_stats": scan_stats,
-            "error": error,
-            "raw_candidates_count": len(raw_candidates),
-            "normalized_candidates_count": len(normalized_candidates),
-            "target_min": int(min_target),
-            "target_max": int(max_target),
-        },
-        # backward-compatible aliases used by older UI/tests
-        "last_scan_ts": now_utc_str(),
-        "duplicate_filtered": int(parse_float(stats.get("duplicate_filtered", stats.get("filtered_out", 0)), 0)),
-        "scam_filtered": int(parse_float(stats.get("scam_blocked", stats.get("last_pulse_scam_blocked", 0)), 0)),
-        "scan_debug": {
-            "raw_candidates": raw_seen,
-            "normalized_candidates": normalized,
-            "rejected_candidates": blocked_reasons,
-            "final_candidates": final_count,
-        },
+    canonical_payload = scanner_service.build_live_pulse_payload(
+        raw_candidates=raw_candidates if raw_candidates else ([{}] * raw_seen),
+        normalized_candidates=normalized_candidates if normalized_candidates else ([{}] * normalized),
+        final_candidates=cards,
+        rejected_candidates=rejected_candidates,
+        status=payload_status,
+        source="scan_cycle",
+        sources_tried=list(stats.get("sources_tried") or []),
+        refill_attempts=int(parse_float(stats.get("refill_attempts", 0), 0)),
+        error=error,
+        now_ts=now_utc_str(),
+    )
+    # Preserve app.py's legacy blocked-reason names/counters while letting the
+    # import-safe service own canonical payload shape and empty-reason mapping.
+    canonical_payload["raw_seen"] = raw_seen
+    canonical_payload["normalized"] = normalized
+    canonical_payload["clean_candidates"] = clean_candidates
+    canonical_payload["blocked_reasons"] = blocked_reasons
+    canonical_payload["last_empty_reason"] = scanner_service.determine_live_pulse_empty_reason(payload_status, raw_seen, normalized, final_count, blocked_reasons, error=error)
+    canonical_payload["debug"] = {
+        "scan_stats": scan_stats,
+        "error": error,
+        "raw_candidates_count": len(raw_candidates),
+        "normalized_candidates_count": len(normalized_candidates),
+        "target_min": int(min_target),
+        "target_max": int(max_target),
     }
+    canonical_payload["last_scan_ts"] = canonical_payload["ts_utc"]
+    canonical_payload["duplicate_filtered"] = int(parse_float(stats.get("duplicate_filtered", stats.get("filtered_out", 0)), 0))
+    canonical_payload["scam_filtered"] = int(parse_float(stats.get("scam_blocked", stats.get("last_pulse_scam_blocked", 0)), 0))
+    canonical_payload["scan_debug"] = {
+        "raw_candidates": raw_seen,
+        "normalized_candidates": normalized,
+        "rejected_candidates": blocked_reasons,
+        "final_candidates": final_count,
+    }
+    return canonical_payload
 
 
 MATERIAL_PORTFOLIO_ACTIONS = notification_core.MATERIAL_PORTFOLIO_ACTIONS
@@ -17009,13 +17035,39 @@ def build_ui_context(
     }
     if actions:
         ui_actions.update(actions)
+    runtime_snapshot = dict(runtime_state or {})
+    live_pulse_payload = runtime_snapshot.get("live_pulse_payload") if isinstance(runtime_snapshot.get("live_pulse_payload"), dict) else scanner_service.build_live_pulse_payload(
+        raw_candidates=[],
+        normalized_candidates=[],
+        final_candidates=[],
+        rejected_candidates=[],
+        status="empty",
+        source="unknown",
+        now_ts="",
+    )
+    live_pulse_debug = live_pulse_payload.get("debug", {}) if isinstance(live_pulse_payload, dict) else {}
+    scanner_diagnostics = {
+        "last_scan_status": str(live_pulse_payload.get("status") or "empty"),
+        "last_empty_reason": str(live_pulse_payload.get("last_empty_reason") or "scan_not_run"),
+        "raw_seen": int(parse_float(live_pulse_payload.get("raw_seen", 0), 0)),
+        "normalized": int(parse_float(live_pulse_payload.get("normalized", 0), 0)),
+        "clean_candidates": int(parse_float(live_pulse_payload.get("clean_candidates", 0), 0)),
+        "final_count": int(parse_float(live_pulse_payload.get("final_count", 0), 0)),
+        "refill_attempts": int(parse_float(live_pulse_payload.get("refill_attempts", 0), 0)),
+        "sources_tried": list(live_pulse_payload.get("sources_tried") or []),
+        "blocked_reasons": dict(live_pulse_payload.get("blocked_reasons") or {}),
+        "last_error": str((live_pulse_debug or {}).get("error") or ""),
+    }
     return {
         "version": VERSION,
         "storage_backend": STORAGE_BACKEND,
         "selected_page": selected_page,
         "auto_cfg": dict(auto_cfg or {}),
         "scout_cfg": dict(scout_cfg or {}),
-        "runtime_state": dict(runtime_state or {}),
+        "runtime_state": runtime_snapshot,
+        "live_pulse_payload": live_pulse_payload,
+        "live_pulse_debug": live_pulse_debug,
+        "scanner_diagnostics": scanner_diagnostics,
         "priority_watchlist_rows": [],
         "priority_watchlist_debug": monitoring_core.empty_priority_watchlist_debug(0),
         "monitoring_archive_diagnostics": {
