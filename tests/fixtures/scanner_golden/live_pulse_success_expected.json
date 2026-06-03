@@ -1,0 +1,92 @@
+{
+  "source": "test",
+  "status": "success",
+  "raw_seen": 8,
+  "normalized": 6,
+  "clean_candidates": 2,
+  "final_count": 2,
+  "refill_attempts": 0,
+  "last_empty_reason": "",
+  "sources_tried": [
+    "dexscreener_search"
+  ],
+  "blocked_reasons": {
+    "duplicate": 1,
+    "missing_chain": 1,
+    "hard_gated": 1,
+    "scam_or_toxic": 1,
+    "archived": 1,
+    "portfolio_active": 1
+  },
+  "final_candidates": [
+    {
+      "chain": "solana",
+      "base_addr": "SoLmiXeDCase111111111111111111111111111111",
+      "base_symbol": "SOLMIX",
+      "score": 25,
+      "entry_status": "WATCH"
+    },
+    {
+      "chain": "bsc",
+      "base_addr": "0xabcdef0000000000000000000000000000000001",
+      "base_symbol": "BSCWIN",
+      "score": 18,
+      "entry_status": "EARLY"
+    }
+  ],
+  "rejected_candidates": [
+    {
+      "chain": "bsc",
+      "base_addr": "0xabcdef0000000000000000000000000000000001",
+      "base_symbol": "BSCWIN",
+      "score": 17,
+      "entry_status": "EARLY",
+      "reason": "duplicate"
+    },
+    {
+      "chain": "",
+      "base_addr": "MissingChain111",
+      "base_symbol": "MISS",
+      "score": 8,
+      "entry_status": "WATCH",
+      "reason": "missing_chain"
+    },
+    {
+      "chain": "solana",
+      "base_addr": "NoEntrySoL11111111111111111111111111111111",
+      "base_symbol": "NOPE",
+      "score": 47,
+      "entry_status": "NO_ENTRY",
+      "reason": "hard_gated"
+    },
+    {
+      "chain": "bsc",
+      "base_addr": "0xdead000000000000000000000000000000000001",
+      "base_symbol": "DEADSCAM",
+      "score": 20,
+      "entry_status": "WATCH",
+      "reason": "scam_or_toxic"
+    },
+    {
+      "chain": "solana",
+      "base_addr": "ArchiveSoL111111111111111111111111111111",
+      "base_symbol": "ARCH",
+      "score": 16,
+      "entry_status": "WATCH",
+      "reason": "archived"
+    },
+    {
+      "chain": "solana",
+      "base_addr": "PortfolioSoL1111111111111111111111111111",
+      "base_symbol": "PORT",
+      "score": 19,
+      "entry_status": "WATCH",
+      "reason": "portfolio_active"
+    }
+  ],
+  "debug": {
+    "error": "",
+    "source_results": [],
+    "source_diagnostics": {}
+  }
+}

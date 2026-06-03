@@ -1,0 +1,62 @@
+[
+  {
+    "chainId": "solana",
+    "pairAddress": "SoPairAlpha111",
+    "baseToken": {"address": "SoLmiXeDCase111111111111111111111111111111", "symbol": "SOLMIX"},
+    "score": 25,
+    "entry_status": "WATCH",
+    "liq_usd": 25000,
+    "vol24_usd": 150000
+  },
+  {
+    "chainId": "bsc",
+    "pairAddress": "0xPairAlpha00000000000000000000000000000001",
+    "baseToken": {"address": "0xABCDEF0000000000000000000000000000000001", "symbol": "BSCWIN"},
+    "score": 18,
+    "entry_status": "EARLY",
+    "liq_usd": 22000,
+    "vol24_usd": 120000
+  },
+  {
+    "chainId": "bsc",
+    "pairAddress": "0xPairAlpha00000000000000000000000000000002",
+    "baseToken": {"address": "0xabcdef0000000000000000000000000000000001", "symbol": "BSCWIN"},
+    "score": 17,
+    "entry_status": "EARLY"
+  },
+  {
+    "chainId": "solana",
+    "pairAddress": "SoPairNoEntry111",
+    "baseToken": {"address": "NoEntrySoL11111111111111111111111111111111", "symbol": "NOPE"},
+    "score": 47,
+    "entry_status": "NO_ENTRY"
+  },
+  {
+    "chainId": "bsc",
+    "pairAddress": "0xPairDead0000000000000000000000000000000001",
+    "baseToken": {"address": "0xdead000000000000000000000000000000000001", "symbol": "DEADSCAM"},
+    "score": 20,
+    "entry_status": "WATCH",
+    "risk_flags": "toxic scam dead"
+  },
+  {
+    "chainId": "solana",
+    "pairAddress": "SoPairArchive111",
+    "baseToken": {"address": "ArchiveSoL111111111111111111111111111111", "symbol": "ARCH"},
+    "score": 16,
+    "entry_status": "WATCH"
+  },
+  {
+    "chainId": "solana",
+    "pairAddress": "SoPairPortfolio111",
+    "baseToken": {"address": "PortfolioSoL1111111111111111111111111111", "symbol": "PORT"},
+    "score": 19,
+    "entry_status": "WATCH"
+  },
+  {
+    "pairAddress": "MissingChainPair",
+    "baseToken": {"address": "MissingChain111", "symbol": "MISS"},
+    "score": 8,
+    "entry_status": "WATCH"
+  }
+]

@@ -1,0 +1,27 @@
+{
+  "source_api_empty": {
+    "status": "empty",
+    "final_count": 0,
+    "last_empty_reason": "source_api_empty"
+  },
+  "source_api_failed": {
+    "status": "empty",
+    "final_count": 0,
+    "last_empty_reason": "source_api_failed"
+  },
+  "scanner_returned_no_candidates": {
+    "status": "empty",
+    "final_count": 0,
+    "last_empty_reason": "scanner_returned_no_candidates"
+  },
+  "all_filtered_archive_or_duplicate": {
+    "status": "empty",
+    "final_count": 0,
+    "last_empty_reason": "all_filtered_archive_or_duplicate"
+  },
+  "all_filtered_hard_gate": {
+    "status": "empty",
+    "final_count": 0,
+    "last_empty_reason": "all_filtered_hard_gate"
+  }
+}

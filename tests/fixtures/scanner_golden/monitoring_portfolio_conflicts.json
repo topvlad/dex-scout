@@ -1,0 +1,14 @@
+{
+  "monitoring_rows": [
+    {"chain": "solana", "base_addr": "PortfolioSoL1111111111111111111111111111", "base_symbol": "PORT", "entry_status": "WATCH", "priority_score": 19},
+    {"chain": "solana", "base_addr": "ReduceWatch111111111111111111111111111111", "base_symbol": "REDWATCH", "entry_status": "WATCH", "priority_score": 88},
+    {"chain": "bsc", "base_addr": "0xtakeprofit000000000000000000000000000001", "base_symbol": "TPEARLY", "entry_status": "EARLY", "priority_score": 77},
+    {"chain": "solana", "base_addr": "HoldWatch11111111111111111111111111111111", "base_symbol": "HOLDWATCH", "entry_status": "WATCH", "priority_score": 66}
+  ],
+  "portfolio_rows": [
+    {"chain": "solana", "base_token_address": "PortfolioSoL1111111111111111111111111111", "base_symbol": "PORT", "final_action": "HOLD", "current_price": "0.10"},
+    {"chain": "solana", "base_token_address": "ReduceWatch111111111111111111111111111111", "base_symbol": "REDWATCH", "final_action": "REDUCE", "current_price": "0.20"},
+    {"chain": "bsc", "base_token_address": "0xTAKEPROFIT000000000000000000000000000001", "base_symbol": "TPEARLY", "final_action": "TAKE PROFIT", "current_price": "0.30"},
+    {"chain": "solana", "base_token_address": "HoldWatch11111111111111111111111111111111", "base_symbol": "HOLDWATCH", "final_action": "HOLD", "current_price": "0.40"}
+  ]
+}

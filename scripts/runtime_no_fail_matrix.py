@@ -24,8 +24,8 @@ from types import ModuleType
 from typing import Any, Callable, Dict, Iterable, List
 from unittest.mock import patch
 
-REQUIRED_ROLES = ("ui_streamlit", "worker", "webhook", "app_compat", "core_modules")
-ROLE_ORDER = (*REQUIRED_ROLES[:3], "dash_readonly", REQUIRED_ROLES[3], REQUIRED_ROLES[4])
+REQUIRED_ROLES = ("ui_streamlit", "worker", "webhook", "app_compat", "core_modules", "golden_fixtures")
+ROLE_ORDER = (*REQUIRED_ROLES[:3], "dash_readonly", REQUIRED_ROLES[3], REQUIRED_ROLES[4], REQUIRED_ROLES[5])
 CORE_MODULES = (
     "runtime_core",
     "storage_core",
@@ -676,6 +676,70 @@ def _core_modules_role() -> Dict[str, Any]:
     return _capture_role(run)
 
 
+def _golden_fixtures_role() -> Dict[str, Any]:
+    """Cheap golden-fixture smoke with no network, storage write, send, or scan."""
+    def run() -> Dict[str, Any]:
+        errors: List[str] = []
+        fixture_dir = REPO_ROOT / "tests" / "fixtures" / "scanner_golden"
+        fixture_paths = sorted(fixture_dir.glob("*.json")) if fixture_dir.exists() else []
+        if not fixture_dir.exists():
+            errors.append("fixtures_dir_missing")
+        fixtures: Dict[str, Any] = {}
+        for path in fixture_paths:
+            try:
+                fixtures[path.name] = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                errors.append(f"fixture_invalid_json:{path.name}:{type(exc).__name__}")
+        try:
+            import scanner_service
+            import scanner_sources
+            import monitoring_service
+
+            raw = fixtures.get("raw_dex_pairs_mixed.json") or []
+            conflicts = fixtures.get("monitoring_portfolio_conflicts.json") or {}
+            norm = scanner_service.normalize_scanner_candidates(raw)
+            filtered = scanner_service.filter_live_pulse_candidates(
+                norm.get("normalized_candidates", []),
+                portfolio_rows=(conflicts.get("portfolio_rows") or [])[:1],
+                archive_rows=[{"chain": "solana", "base_addr": "ArchiveSoL111111111111111111111111111111"}],
+                hard_gate_fn=lambda row: {"blocked": False},
+                max_candidates=5,
+            )
+            payload = scanner_service.build_live_pulse_payload(
+                raw_candidates=raw,
+                normalized_candidates=norm.get("normalized_candidates", []),
+                final_candidates=filtered.get("final_candidates", []),
+                rejected_candidates=(norm.get("rejected_candidates", []) + filtered.get("rejected_candidates", [])),
+                status="success",
+                source="test",
+                now_ts="matrix",
+            )
+            if payload.get("final_count", 0) <= 0 or payload.get("raw_seen") != len(raw):
+                errors.append(f"scanner_fixture_payload_failed:{payload}")
+
+            aggregate = scanner_sources.collect_scanner_sources(
+                source_fns=[lambda: scanner_sources.make_source_result(source="fixture", ok=True, status="success", raw_candidates=raw[:2])],
+                max_total=5,
+            )
+            if aggregate.get("status") != "success" or aggregate.get("diagnostics", {}).get("raw_deduped", 0) <= 0:
+                errors.append(f"source_fixture_aggregate_failed:{aggregate}")
+
+            priority_fixture = fixtures.get("priority_watchlist_expected.json") or {}
+            priority_rows, debug = monitoring_service.build_priority_watchlist_rows([
+                {"chain": "solana", "base_addr": "OOO111111111111111111111111111111111111", "base_symbol": "OOO", "entry_status": "EARLY", "priority_score": 266.57},
+                {"chain": "solana", "base_addr": "8X5VQB1111111111111111111111111111O2WN", "base_symbol": "8X5VQB...O2WN", "entry_status": "NO_ENTRY", "priority_score": 47},
+            ], [])
+            if not priority_rows or int(debug.get("final_priority_rows", 0) or 0) <= 0:
+                errors.append(f"priority_fixture_failed:{debug}")
+            expected_final = int((priority_fixture.get("debug_subset") or {}).get("final_priority_rows", 0) or 0)
+            if expected_final <= 0:
+                errors.append("priority_fixture_expected_missing")
+        except Exception as exc:
+            errors.append(f"golden_fixture_exception:{type(exc).__name__}:{_sanitize(exc)}")
+        return _role("ok" if not errors else "golden_fixtures_failed", ok=not errors, errors=errors, fixtures_checked=len(fixture_paths))
+    return _capture_role(run)
+
+
 def _capture_role(func: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
     try:
         result = func()
@@ -709,6 +773,7 @@ def build_matrix() -> Dict[str, Any]:
             "dash_readonly": _dash_readonly_role(),
             "app_compat": _app_compat_role(),
             "core_modules": _core_modules_role(),
+            "golden_fixtures": _golden_fixtures_role(),
         }
     finally:
         for key, previous in previous_env.items():

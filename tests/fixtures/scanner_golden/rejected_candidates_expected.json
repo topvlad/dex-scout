@@ -1,0 +1,28 @@
+{
+  "diagnostics": {
+    "raw_seen": 8,
+    "rejected": 2,
+    "reasons": {
+      "duplicate": 1,
+      "missing_chain": 1
+    }
+  },
+  "rejected": [
+    {
+      "chain": "bsc",
+      "base_addr": "0xabcdef0000000000000000000000000000000001",
+      "base_symbol": "BSCWIN",
+      "score": 17,
+      "entry_status": "EARLY",
+      "reason": "duplicate"
+    },
+    {
+      "chain": "",
+      "base_addr": "MissingChain111",
+      "base_symbol": "MISS",
+      "score": 8,
+      "entry_status": "WATCH",
+      "reason": "missing_chain"
+    }
+  ]
+}
