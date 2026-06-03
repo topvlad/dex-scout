@@ -1,0 +1,50 @@
+{
+  "worker_runners": [
+    "maybe_run_rotating_scanner",
+    "run_priority_scanner_cycle",
+    "run_auto_notifications",
+    "trigger_digest_notification",
+    "evaluate_outcome_journals",
+    "run_storage_maintenance_cycle"
+  ],
+  "runtime_state_locks_heartbeats": [
+    "get_worker_runtime_state",
+    "update_worker_runtime_state",
+    "acquire_lock",
+    "release_lock",
+    "update_job_heartbeat"
+  ],
+  "storage_compatibility": [
+    "load_csv",
+    "save_csv",
+    "load_json",
+    "save_json",
+    "sb_get_storage",
+    "sb_put_storage",
+    "storage_key_for_path"
+  ],
+  "ui_context_diagnostics": [
+    "build_ui_context",
+    "render_selected_page",
+    "live_pulse_storage_read",
+    "live_pulse_storage_write",
+    "build_live_pulse_candidates_payload"
+  ],
+  "telegram_notifications": [
+    "run_auto_notifications",
+    "send_telegram",
+    "load_notification_event_journal",
+    "save_notification_event_journal",
+    "trim_notification_event_journal",
+    "summarize_notification_event_journal",
+    "notification_event_journal_counts"
+  ],
+  "service_delegate_wrappers": [
+    "normalize_portfolio_action",
+    "is_material_portfolio_action",
+    "classify_portfolio_row",
+    "normalize_monitoring_status",
+    "classify_monitoring_row",
+    "build_notification_summary"
+  ]
+}

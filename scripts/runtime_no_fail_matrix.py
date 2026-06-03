@@ -10,6 +10,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib
+import importlib.util
+import types
+from urllib.parse import parse_qs, urlsplit
 import inspect
 import json
 import os
@@ -21,8 +24,8 @@ from types import ModuleType
 from typing import Any, Callable, Dict, Iterable, List
 from unittest.mock import patch
 
-REQUIRED_ROLES = ("ui_streamlit", "worker", "webhook", "core_modules")
-ROLE_ORDER = (*REQUIRED_ROLES[:3], "dash_readonly", REQUIRED_ROLES[3])
+REQUIRED_ROLES = ("ui_streamlit", "worker", "webhook", "app_compat", "core_modules")
+ROLE_ORDER = (*REQUIRED_ROLES[:3], "dash_readonly", REQUIRED_ROLES[3], REQUIRED_ROLES[4])
 CORE_MODULES = (
     "runtime_core",
     "storage_core",
@@ -45,8 +48,159 @@ REQUIRED_JOB_MODES = (
 SECRET_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CHAT_ID", "D1_PROXY_URL", "SUPABASE_URL")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+APP_COMPAT_MANIFEST_PATH = REPO_ROOT / "tests" / "fixtures" / "app_compat_manifest.json"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def _install_requests_stub() -> None:
+    """Install a no-network requests stub when requests is unavailable."""
+    if "requests" in sys.modules:
+        return
+    if importlib.util.find_spec("requests") is not None:
+        return
+
+    class _Response:
+        status_code = 200
+        text = ""
+        content = b""
+        headers: Dict[str, Any] = {}
+
+        def __init__(self, json_data: Any = None, status_code: int = 200, text: str = "") -> None:
+            self._json_data = {} if json_data is None else json_data
+            self.status_code = int(status_code)
+            self.text = str(text or "")
+            self.content = self.text.encode()
+            self.headers = {}
+
+        def json(self) -> Any:
+            return self._json_data
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+    def _request(*args: Any, **kwargs: Any) -> _Response:
+        return _Response()
+
+    class _Session:
+        def request(self, *args: Any, **kwargs: Any) -> _Response:
+            return _request(*args, **kwargs)
+        def get(self, *args: Any, **kwargs: Any) -> _Response:
+            return _request(*args, **kwargs)
+        def post(self, *args: Any, **kwargs: Any) -> _Response:
+            return _request(*args, **kwargs)
+
+    stub = ModuleType("requests")
+    stub.get = _request  # type: ignore[attr-defined]
+    stub.post = _request  # type: ignore[attr-defined]
+    stub.put = _request  # type: ignore[attr-defined]
+    stub.patch = _request  # type: ignore[attr-defined]
+    stub.delete = _request  # type: ignore[attr-defined]
+    stub.request = _request  # type: ignore[attr-defined]
+    stub.Session = _Session  # type: ignore[attr-defined]
+    stub.Response = _Response  # type: ignore[attr-defined]
+    stub.exceptions = types.SimpleNamespace(RequestException=Exception, Timeout=TimeoutError)  # type: ignore[attr-defined]
+    sys.modules["requests"] = stub
+
+
+def _install_pandas_stub() -> None:
+    if "pandas" in sys.modules:
+        return
+    if importlib.util.find_spec("pandas") is not None:
+        return
+
+    class _DataFrame(list):
+        def __init__(self, data: Any = None, *args: Any, **kwargs: Any) -> None:
+            super().__init__(data if isinstance(data, list) else [])
+        def copy(self) -> "_DataFrame":
+            return _DataFrame(list(self))
+
+    stub = ModuleType("pandas")
+    stub.DataFrame = _DataFrame  # type: ignore[attr-defined]
+    stub.to_datetime = lambda value, **kwargs: value  # type: ignore[attr-defined]
+    stub.to_numeric = lambda value, **kwargs: value  # type: ignore[attr-defined]
+    sys.modules["pandas"] = stub
+
+
+def _install_fastapi_stub() -> None:
+    if "fastapi" in sys.modules:
+        return
+    if importlib.util.find_spec("fastapi") is not None:
+        return
+
+    class HTTPException(Exception):
+        def __init__(self, status_code: int = 500, detail: Any = None) -> None:
+            self.status_code = status_code
+            self.detail = detail
+            super().__init__(detail)
+
+    class Response:
+        def __init__(self, content: Any = b"", status_code: int = 200, media_type: str | None = None) -> None:
+            self.content = content
+            self.status_code = int(status_code)
+            self.media_type = media_type
+
+    class Request:
+        def __init__(self, json_payload: Any = None) -> None:
+            self._json_payload = json_payload or {}
+        async def json(self) -> Any:
+            return self._json_payload
+
+    class FastAPI:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.routes: Dict[tuple[str, str], Callable[..., Any]] = {}
+        def _decorator(self, method: str, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+                self.routes[(method.upper(), path)] = func
+                return func
+            return decorate
+        def get(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            return self._decorator("GET", path)
+        def post(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            return self._decorator("POST", path)
+        def head(self, path: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+            return self._decorator("HEAD", path)
+
+    class _ClientResponse:
+        def __init__(self, payload: Any = None, status_code: int = 200) -> None:
+            self._payload = payload
+            self.status_code = int(status_code)
+        def json(self) -> Any:
+            return self._payload
+
+    class TestClient:
+        def __init__(self, app: Any) -> None:
+            self.app = app
+        def get(self, url: str) -> _ClientResponse:
+            return self._request("GET", url)
+        def post(self, url: str, json: Any = None) -> _ClientResponse:
+            return self._request("POST", url, json_payload=json)
+        def _request(self, method: str, url: str, json_payload: Any = None) -> _ClientResponse:
+            parsed = urlsplit(url)
+            func = self.app.routes[(method.upper(), parsed.path)]
+            kwargs = {key: value[-1] for key, value in parse_qs(parsed.query).items()}
+            signature = inspect.signature(func)
+            if "req" in signature.parameters:
+                kwargs["req"] = Request(json_payload)
+            result = func(**kwargs)
+            if inspect.isawaitable(result):
+                import asyncio
+                result = asyncio.run(result)
+            if isinstance(result, Response):
+                return _ClientResponse(result.content, result.status_code)
+            return _ClientResponse(result, 200)
+
+    fastapi_stub = ModuleType("fastapi")
+    fastapi_stub.FastAPI = FastAPI  # type: ignore[attr-defined]
+    fastapi_stub.HTTPException = HTTPException  # type: ignore[attr-defined]
+    fastapi_stub.Request = Request  # type: ignore[attr-defined]
+    fastapi_stub.Response = Response  # type: ignore[attr-defined]
+    testclient_stub = ModuleType("fastapi.testclient")
+    testclient_stub.TestClient = TestClient  # type: ignore[attr-defined]
+    fastapi_stub.testclient = testclient_stub  # type: ignore[attr-defined]
+    sys.modules["fastapi"] = fastapi_stub
+    sys.modules["fastapi.testclient"] = testclient_stub
 
 
 class _StreamlitContext:
@@ -157,6 +311,8 @@ def _check_no_writes(func: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
 def _ui_streamlit_role() -> Dict[str, Any]:
     def run() -> Dict[str, Any]:
         os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
+        _install_requests_stub()
+        _install_pandas_stub()
         _install_streamlit_stub()
         app = importlib.import_module("app")
         required = ["build_ui_context", "render_selected_page"]
@@ -227,9 +383,92 @@ def _verify_facade_forwarding(facade: ModuleType) -> Dict[str, Any]:
     return {"ok": not errors, "errors": errors, "heartbeat": captured, "missing_function": missing}
 
 
+
+def _load_app_compat_manifest() -> Dict[str, List[str]]:
+    data = json.loads(APP_COMPAT_MANIFEST_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("app compat manifest must be a JSON object")
+    return {str(category): [str(name) for name in names] for category, names in data.items() if isinstance(names, list)}
+
+
+def _manifest_function_names(manifest: Dict[str, List[str]]) -> List[str]:
+    names: List[str] = []
+    for values in manifest.values():
+        names.extend(values)
+    return sorted(set(names))
+
+
+def _app_compat_role() -> Dict[str, Any]:
+    def run() -> Dict[str, Any]:
+        os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
+        _install_requests_stub()
+        _install_pandas_stub()
+        _install_streamlit_stub()
+        manifest = _load_app_compat_manifest()
+        required_wrappers = _manifest_function_names(manifest)
+        app = importlib.import_module("app")
+        facade = importlib.import_module("app_runtime_facade")
+        errors: List[str] = []
+
+        for name in required_wrappers:
+            if not callable(getattr(app, name, None)):
+                errors.append(f"missing_or_not_callable:{name}")
+
+        runner_map = getattr(facade, "WORKER_JOB_MODE_RUNNERS", {})
+        resolver = getattr(facade, "resolve_worker_job_mode", None)
+        for mode, runner_name in sorted(dict(runner_map).items()):
+            if not callable(getattr(app, str(runner_name), None)):
+                errors.append(f"runner_missing:{mode}:{runner_name}")
+            if callable(resolver):
+                resolved = resolver(str(mode), dry_run=True)
+                if not resolved.get("ok"):
+                    errors.append(f"runner_resolution_failed:{mode}:{resolved.get('status')}")
+            else:
+                errors.append("missing_facade_resolver")
+                break
+
+        from scripts import audit_app_compat
+        audit = audit_app_compat.audit_app_path(REPO_ROOT / "app.py")
+        duplicates = list(audit.get("duplicates") or [])
+        if duplicates:
+            errors.append(f"duplicate_top_level_defs:{duplicates}")
+
+        # Verify service modules still import independently of app.py/Streamlit.
+        snapshot_names = ("app", "streamlit", *CORE_MODULES)
+        snapshot = {name: sys.modules.get(name) for name in snapshot_names}
+        try:
+            sys.modules.pop("app", None)
+            sys.modules.pop("streamlit", None)
+            for name in CORE_MODULES:
+                sys.modules.pop(name, None)
+                importlib.import_module(name)
+            if sys.modules.get("app") is not None:
+                errors.append("service_modules_imported_app")
+            if sys.modules.get("streamlit") is not None:
+                errors.append("service_modules_imported_streamlit")
+        finally:
+            for name in snapshot_names:
+                sys.modules.pop(name, None)
+                if snapshot.get(name) is not None:
+                    sys.modules[name] = snapshot[name]  # type: ignore[assignment]
+
+        return _role(
+            "ok" if not errors else "app_compat_failed",
+            ok=not errors,
+            errors=errors,
+            checked_wrappers=len(required_wrappers),
+            duplicates=duplicates,
+            stale_markers=list(audit.get("stale_markers") or []),
+        )
+    return _capture_role(run)
+
+
 def _worker_role() -> Dict[str, Any]:
     def run() -> Dict[str, Any]:
         os.environ["DEX_SCOUT_WORKER_MODE"] = "1"
+        _install_requests_stub()
+        _install_pandas_stub()
+        _install_streamlit_stub()
         facade = importlib.import_module("app_runtime_facade")
         import_state = facade.load_app_runtime(force_reload=True)
         if not import_state.get("ok"):
@@ -260,6 +499,8 @@ def _worker_role() -> Dict[str, Any]:
 
 def _webhook_role() -> Dict[str, Any]:
     def run() -> Dict[str, Any]:
+        _install_requests_stub()
+        _install_fastapi_stub()
         tg = importlib.import_module("tg_webhook")
         errors: List[str] = []
         status_payload: Dict[str, Any] = {}
@@ -293,6 +534,7 @@ def _dash_readonly_role() -> Dict[str, Any]:
     if not Path("dash_app.py").exists():
         return _role("skipped_absent")
     def run() -> Dict[str, Any]:
+        _install_pandas_stub()
         module = importlib.import_module("dash_app")
         return _role("ok", module=getattr(module, "__name__", "dash_app"))
     return _capture_role(lambda: _check_no_writes(run))
@@ -436,6 +678,7 @@ def build_matrix() -> Dict[str, Any]:
             "worker": _worker_role(),
             "webhook": _webhook_role(),
             "dash_readonly": _dash_readonly_role(),
+            "app_compat": _app_compat_role(),
             "core_modules": _core_modules_role(),
         }
     finally:
