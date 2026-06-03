@@ -24,8 +24,8 @@ from types import ModuleType
 from typing import Any, Callable, Dict, Iterable, List
 from unittest.mock import patch
 
-REQUIRED_ROLES = ("ui_streamlit", "worker", "webhook", "app_compat", "core_modules", "golden_fixtures")
-ROLE_ORDER = (*REQUIRED_ROLES[:3], "dash_readonly", REQUIRED_ROLES[3], REQUIRED_ROLES[4], REQUIRED_ROLES[5])
+REQUIRED_ROLES = ("ui_streamlit", "worker", "webhook", "app_compat", "core_modules", "golden_fixtures", "admin_controls")
+ROLE_ORDER = (*REQUIRED_ROLES[:3], "dash_readonly", REQUIRED_ROLES[3], REQUIRED_ROLES[4], REQUIRED_ROLES[5], REQUIRED_ROLES[6])
 CORE_MODULES = (
     "runtime_core",
     "storage_core",
@@ -748,6 +748,44 @@ def _golden_fixtures_role() -> Dict[str, Any]:
     return _capture_role(run)
 
 
+def _admin_controls_role() -> Dict[str, Any]:
+    """Import-safe manual recovery smoke with dry-run only checks."""
+    def run() -> Dict[str, Any]:
+        errors: List[str] = []
+        snapshot = {name: sys.modules.get(name) for name in ("admin_controls", "app", "streamlit")}
+        try:
+            sys.modules.pop("admin_controls", None)
+            sys.modules.pop("app", None)
+            sys.modules.pop("streamlit", None)
+            admin_controls = importlib.import_module("admin_controls")
+            if sys.modules.get("app") is not None:
+                errors.append("admin_controls_imported_app")
+            if sys.modules.get("streamlit") is not None:
+                errors.append("admin_controls_imported_streamlit")
+            ctx = {
+                "operator_diagnostics": {"status": "ok", "runtime": {"matrix_status": "ok", "read_only_status": "ok", "monitor_cycle_status": "ok"}},
+                "read_only_status": "ok",
+                "locks": [{"lock_key": "scanner_lock_1", "owner": "worker-a", "expires_epoch": 1}],
+            }
+            plan = admin_controls.build_admin_recovery_plan(ctx)
+            registry = admin_controls.get_admin_action_registry()
+            if not isinstance(plan, dict) or plan.get("recommended_order", [])[:2] != ["runtime_matrix", "read_only"]:
+                errors.append(f"bad_plan:{plan}")
+            clear = admin_controls.validate_admin_action("clear_stale_lock", ctx, confirmation="CLEAR STALE LOCK", dry_run=True)
+            if not clear.get("enabled") or not clear.get("dry_run"):
+                errors.append(f"clear_dry_run_validation_failed:{clear}")
+            for action_id, descriptor in registry.items():
+                if descriptor.get("type") == "runbook" and not admin_controls.validate_admin_action(action_id, ctx).get("enabled"):
+                    errors.append(f"runbook_disabled:{action_id}")
+            return _role("ok" if not errors else "admin_controls_failed", ok=not errors, errors=errors, actions_checked=len(registry))
+        finally:
+            for name, module in snapshot.items():
+                sys.modules.pop(name, None)
+                if module is not None:
+                    sys.modules[name] = module  # type: ignore[assignment]
+    return _capture_role(lambda: _check_no_writes(run))
+
+
 def _capture_role(func: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
     try:
         result = func()
@@ -782,6 +820,7 @@ def build_matrix() -> Dict[str, Any]:
             "app_compat": _app_compat_role(),
             "core_modules": _core_modules_role(),
             "golden_fixtures": _golden_fixtures_role(),
+            "admin_controls": _admin_controls_role(),
         }
     finally:
         for key, previous in previous_env.items():

@@ -242,6 +242,16 @@ def _runtime_diagnostics(ctx: Dict[str, Any]) -> Dict[str, Any]:
     blocked_cycles = ctx.get("blocked_cycles", runtime_state.get("blocked_cycles", []))
     if not isinstance(blocked_cycles, list):
         blocked_cycles = []
+    locks = ctx.get("locks", runtime_state.get("locks", runtime_state.get("stale_locks", [])))
+    if isinstance(locks, dict):
+        locks = [locks]
+    if not isinstance(locks, list):
+        locks = []
+    job_heartbeats = ctx.get("job_heartbeats", runtime_state.get("job_heartbeats", []))
+    if isinstance(job_heartbeats, dict):
+        job_heartbeats = [{"job": key, **value} if isinstance(value, dict) else {"job": key, "value": value} for key, value in job_heartbeats.items()]
+    if not isinstance(job_heartbeats, list):
+        job_heartbeats = []
     return {
         "matrix_status": _status_value(matrix.get("status"), "ok" if matrix.get("ok") is True else "failed" if matrix.get("ok") is False else ""),
         "app_compat_status": _status_value(app_compat.get("status"), "ok" if app_compat.get("ok") is True else "failed" if app_compat.get("ok") is False else ""),
@@ -249,6 +259,11 @@ def _runtime_diagnostics(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "last_jobs": _public(jobs),
         "stale_jobs": [_public(item) for item in stale_jobs[:5]],
         "blocked_cycles": [_public(item) for item in blocked_cycles[:5]],
+        "locks": [_public(item) for item in locks[:5]],
+        "job_heartbeats": [_public(item) for item in job_heartbeats[:5]],
+        "last_block_reason": _public(runtime_state.get("last_block_reason") or runtime_state.get("blocked_cycle_reason")),
+        "last_duplicate_run_reason": _public(runtime_state.get("last_duplicate_run_reason") or runtime_state.get("duplicate_run_reason")),
+        "stale_lock_reason": _public(runtime_state.get("stale_lock_reason") or runtime_state.get("last_lock_code")),
     }
 
 

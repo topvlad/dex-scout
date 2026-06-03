@@ -61,17 +61,19 @@
       <tr><td>#292 app.py compatibility wrapper audit + stale glue cleanup / #293 scanner source adapter cleanup / ingest diagnostics baseline</td><td class="good">Completed</td><td><code>app.py</code> remains a compatibility shell while <code>tests/fixtures/app_compat_manifest.json</code>, wrapper signature tests, and <code>app_compat</code> runtime matrix checks protect facade/webhook/worker contracts.</td></tr>
       <tr><td>#294 scanner source adapters + ingest diagnostics</td><td class="good">Completed</td><td><code>scanner_sources.py</code> exposes structured source results and aggregation diagnostics without changing scanner scoring, filters, recommendations, or Live Pulse storage keys.</td></tr>
       <tr><td>#295 scanner outcome parity / golden fixture regression pack</td><td class="good">Completed</td><td>Golden fixtures protect scanner/Live Pulse/Priority outcomes after extraction.</td></tr>
-      <tr><td>#296 UI runtime diagnostics polish / operator observability</td><td class="warn">Current</td><td>Runtime, Scout/Live Pulse, and Monitoring/Priority pages surface compact read-only diagnostics for operators.</td></tr>
+      <tr><td>#296 UI runtime diagnostics polish / operator observability</td><td class="good">Completed</td><td>Runtime, Scout/Live Pulse, and Monitoring/Priority pages surface compact read-only diagnostics for operators.</td></tr>
+      <tr><td>#297 safe manual recovery / admin controls</td><td class="warn">Current</td><td><b>#297 — runbook/admin controls for safe manual recovery</b>: Runtime page exposes guarded manual recovery runbooks, stale-lock visibility, and confirmation-gated admin actions without automatic recovery.</td></tr>
     </table>
   </section>
 
   <section class="card"><h2>Playbook</h2>
     <ul>
-      <li>Runtime matrix roles: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, <code>app_compat</code>, <code>core_modules</code>, and <code>golden_fixtures</code>.</li>
+      <li>Runtime matrix roles: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, <code>app_compat</code>, <code>core_modules</code>, <code>golden_fixtures</code>, and <code>admin_controls</code>.</li>
       <li>Use no secrets in guide examples, logs, matrix output, screenshots, or PR notes.</li>
       <li>Before merging service extraction PRs, run <code>python scripts/runtime_no_fail_matrix.py --json runtime-no-fail-summary.json</code> and <code>pytest -q</code>.</li>
       <li>For scanner changes, verify <code>scanner_sources.py</code> and <code>scanner_service.py</code> import without <code>streamlit</code> or <code>app.py</code> and perform no source fetch, storage write, or Telegram send at import time.</li>
-      <li>After merge, run runtime smoke modes in order: <code>runtime_matrix</code>, <code>read_only</code>, <code>monitor_cycle</code>, <code>notify_cycle</code>, then <code>scan_cycle</code>.</li>
+      <li>Manual recovery runbook order: <code>runtime_matrix</code>, <code>read_only</code>, <code>maintenance_cycle</code>, <code>monitor_cycle</code>, <code>notify_cycle</code>, then <code>scan_cycle</code> last.</li>
+      <li>Manual recovery is never automatic: mutating actions require explicit operator click plus confirmation; <code>scan_cycle</code> should only run after smoke/read-only/monitor/notify checks are green.</li>
       <li>Operator checklist: open the Runtime page, verify <code>runtime_matrix</code>/<code>app_compat</code>/<code>golden_fixtures</code>, check the Live Pulse empty/source reason before rerunning scan, and run <code>monitor_cycle</code>/<code>notify_cycle</code> before <code>scan_cycle</code> after an unstable deploy.</li>
       <li>In Streamlit, check Scout Live Pulse, Monitoring Priority watchlist, and Runtime/debug diagnostics for visible counters and empty reasons.</li>
     </ul>
@@ -79,7 +81,7 @@
 
   <section class="card"><h2>Gaps / next planned</h2>
     <ul>
-      <li><b>#297 — runbook/admin controls for safe manual recovery</b>: add safe manual recovery controls that preserve D1 persistence, runtime job order, and no-render-side-effect rules.</li>
+      <li><b>#298 — notification/runtime delivery audit and operator acknowledgment trail</b>: add auditable operator acknowledgment around runtime notification delivery without changing Telegram templates or event keys.</li>
       <li><code>app.py</code> compatibility wrappers should stay thin and delegate to service modules where ownership has moved.</li>
       <li>Residual <code>app.py</code> glue remains only where runtime adapters or external imports still require the public name.</li>
     </ul>
@@ -91,7 +93,7 @@
       <tr><td class="risk">Stale wrappers or duplicate helpers can reappear after extraction.</td><td><code>scripts/audit_app_compat.py</code> fails duplicate top-level defs and reports service-owned stale markers.</td></tr>
       <tr><td class="risk"><code>app_runtime_facade.py</code> ↔ <code>app.py</code> function signature drift can still happen.</td><td><code>runtime_matrix</code> <code>app_compat</code> role, facade-forwarding checks, manifest callability tests, and wrapper signature tests protect those contracts.</td></tr>
       <tr><td class="risk">New service modules may miss import/no-side-effect coverage.</td><td>Every new service module must be added to <code>scripts/runtime_no_fail_matrix.py</code>.</td></tr>
-      <tr><td class="risk">UI could accidentally run scanner or write storage during render.</td><td>UI pages read canonical context keys only; scanner runs remain runtime-job actions.</td></tr>
+      <tr><td class="risk">UI could accidentally run scanner or write storage during render.</td><td>UI pages read canonical context keys only; scanner runs remain runtime-job actions; manual recovery controls default to dry-run and never mutate during render.</td></tr>
       <tr><td class="risk">Priority watchlist can regress to empty when active WATCH/EARLY rows exist.</td><td>Regression tests cover WATCH/EARLY Priority materialization, material Portfolio conflicts, and hard-gate exclusions.</td></tr>
       <tr><td class="risk">Scanner refactors can silently change source aggregation, Live Pulse empty reasons, duplicate/archive filtering, or Priority eligibility.</td><td>Golden fixtures protect scanner/Live Pulse/Priority outcomes after extraction and are checked by pytest plus the runtime matrix <code>golden_fixtures</code> role.</td></tr>
     </table>

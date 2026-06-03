@@ -6,6 +6,8 @@ from typing import Any, Dict
 
 import streamlit as st
 
+import admin_controls
+
 
 
 JOB_MODES = ("scan_cycle", "monitor_cycle", "notify_cycle", "digest_cycle", "outcome_cycle", "maintenance_cycle")
@@ -78,12 +80,77 @@ def _render_runtime_diagnostics(context: Dict[str, Any]) -> None:
             st.json(diag)
 
 
+
+def _render_manual_recovery(context: Dict[str, Any]) -> None:
+    """Render guarded manual recovery controls without mutating on render."""
+    st.markdown("**Manual recovery**")
+    plan_builder = (context.get("actions") or {}).get("build_admin_recovery_plan")
+    if callable(plan_builder):
+        plan = plan_builder(context)
+    else:
+        plan = admin_controls.build_admin_recovery_plan(context)
+    st.caption(f"Recovery plan status: {_fmt(plan.get('status'))}")
+
+    order = plan.get("recommended_order") if isinstance(plan.get("recommended_order"), list) else []
+    if order:
+        st.markdown("Recommended order: " + " → ".join(str(item) for item in order))
+
+    steps = plan.get("manual_workflow_steps") if isinstance(plan.get("manual_workflow_steps"), list) else []
+    if steps:
+        st.markdown("Runbook steps:")
+        for step in steps:
+            st.caption(f"• {_fmt(step)}")
+            if hasattr(st, "code"):
+                st.code(str(step))
+
+    warnings = plan.get("warnings") if isinstance(plan.get("warnings"), list) else []
+    for warning in warnings[:4]:
+        if hasattr(st, "warning"):
+            st.warning(_fmt(warning))
+        else:
+            st.caption(f"Warning: {_fmt(warning)}")
+
+    validator = (context.get("actions") or {}).get("validate_admin_action")
+    executor = (context.get("actions") or {}).get("execute_admin_action")
+    validate_fn = validator if callable(validator) else admin_controls.validate_admin_action
+    execute_fn = executor if callable(executor) else None
+
+    stale_validation = validate_fn("clear_stale_lock", context, confirmation="", dry_run=True)
+    if stale_validation.get("reason") != "stale_lock_not_available_or_not_auditable" or stale_validation.get("enabled"):
+        st.markdown("**Guarded stale lock control**")
+        st.caption(f"Dry-run preview: {_fmt(stale_validation.get('reason'))}; confirmation required: {_fmt(stale_validation.get('confirmation_phrase'))}")
+        confirmation = st.text_input("Confirm stale lock action", value="", key="admin_clear_stale_lock_confirmation")
+        dry_run = st.checkbox("Dry-run only", value=True, key="admin_clear_stale_lock_dry_run")
+        if st.button("Preview clear stale lock", key="admin_clear_stale_lock_preview"):
+            result = admin_controls.execute_admin_action("clear_stale_lock", context, confirmation=confirmation, dry_run=True, adapters={})
+            st.caption(f"Preview result: {_fmt(result.get('status'))} — {_fmt(result.get('reason'))}")
+            if hasattr(st, "expander"):
+                with st.expander("Raw preview", expanded=False):
+                    st.json(result)
+        if st.button("Execute clear stale lock", key="admin_clear_stale_lock_execute"):
+            if execute_fn is None:
+                result = admin_controls.execute_admin_action("clear_stale_lock", context, confirmation=confirmation, dry_run=dry_run, adapters={})
+            else:
+                result = execute_fn("clear_stale_lock", context, confirmation=confirmation, dry_run=dry_run)
+            st.caption(f"Action result: {_fmt(result.get('status'))} — {_fmt(result.get('reason'))}")
+            if hasattr(st, "expander"):
+                with st.expander("Raw action result", expanded=False):
+                    st.json(result)
+    else:
+        st.caption("Stale lock control: not available or no auditable stale lock detected.")
+
+    if hasattr(st, "expander"):
+        with st.expander("Raw manual recovery plan", expanded=False):
+            st.json(plan)
+
+
 def render_runtime_page(context: Dict[str, Any]) -> None:
     """Render runtime diagnostics from explicit context/action callables."""
     if not isinstance(context, dict):
         context = {}
     st.title("Runtime")
     _render_runtime_diagnostics(context)
+    _render_manual_recovery(context)
     actions = context.get("actions") or {}
     renderer = actions.get("render_runtime") or actions.get("render_debug_panel")
     if callable(renderer):
