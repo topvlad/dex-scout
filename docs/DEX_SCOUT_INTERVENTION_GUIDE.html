@@ -62,13 +62,14 @@
       <tr><td>#294 scanner source adapters + ingest diagnostics</td><td class="good">Completed</td><td><code>scanner_sources.py</code> exposes structured source results and aggregation diagnostics without changing scanner scoring, filters, recommendations, or Live Pulse storage keys.</td></tr>
       <tr><td>#295 scanner outcome parity / golden fixture regression pack</td><td class="good">Completed</td><td>Golden fixtures protect scanner/Live Pulse/Priority outcomes after extraction.</td></tr>
       <tr><td>#296 UI runtime diagnostics polish / operator observability</td><td class="good">Completed</td><td>Runtime, Scout/Live Pulse, and Monitoring/Priority pages surface compact read-only diagnostics for operators.</td></tr>
-      <tr><td>#297 safe manual recovery / admin controls</td><td class="warn">Current</td><td><b>#297 — runbook/admin controls for safe manual recovery</b>: Runtime page exposes guarded manual recovery runbooks, stale-lock visibility, and confirmation-gated admin actions without automatic recovery.</td></tr>
+      <tr><td>#297 safe manual recovery / admin controls</td><td class="good">Completed</td><td><b>#297 — runbook/admin controls for safe manual recovery</b>: Runtime page exposes guarded manual recovery runbooks, stale-lock visibility, and confirmation-gated admin actions without automatic recovery.</td></tr>
+      <tr><td>#298 external audit reconciliation + active safety regression guards</td><td class="warn">Current</td><td><b>#298 — External audit reconciliation + active safety regression guards</b>: stale third-party review findings are reconciled against current contracts, guarded by pytest and the runtime matrix.</td></tr>
     </table>
   </section>
 
   <section class="card"><h2>Playbook</h2>
     <ul>
-      <li>Runtime matrix roles: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, <code>app_compat</code>, <code>core_modules</code>, <code>golden_fixtures</code>, and <code>admin_controls</code>.</li>
+      <li>Runtime matrix roles: <code>ui_streamlit</code>, <code>worker</code>, <code>webhook</code>, <code>dash_readonly</code>, <code>app_compat</code>, <code>core_modules</code>, <code>golden_fixtures</code>, <code>admin_controls</code>, and <code>external_audit_claims</code>.</li>
       <li>Use no secrets in guide examples, logs, matrix output, screenshots, or PR notes.</li>
       <li>Before merging service extraction PRs, run <code>python scripts/runtime_no_fail_matrix.py --json runtime-no-fail-summary.json</code> and <code>pytest -q</code>.</li>
       <li>For scanner changes, verify <code>scanner_sources.py</code> and <code>scanner_service.py</code> import without <code>streamlit</code> or <code>app.py</code> and perform no source fetch, storage write, or Telegram send at import time.</li>
@@ -81,10 +82,23 @@
 
   <section class="card"><h2>Gaps / next planned</h2>
     <ul>
-      <li><b>#298 — notification/runtime delivery audit and operator acknowledgment trail</b>: add auditable operator acknowledgment around runtime notification delivery without changing Telegram templates or event keys.</li>
+      <li><b>#299 — core signal pipeline ownership audit / active scoring owner extraction</b>: document and, if needed, extract ownership for the active scoring/signal pipeline without changing scoring weights, scanner thresholds, Telegram templates, D1 storage, or runtime job order.</li>
       <li><code>app.py</code> compatibility wrappers should stay thin and delegate to service modules where ownership has moved.</li>
       <li>Residual <code>app.py</code> glue remains only where runtime adapters or external imports still require the public name.</li>
     </ul>
+  </section>
+
+  <section class="card"><h2>External audit reconciliation</h2>
+    <p>A third-party review was useful as a checklist, but several findings were stale against current main. Treat external-review items as hypotheses until current source, tests, and runtime matrix evidence verify them.</p>
+    <ul>
+      <li>Verified current contract: active scoring has a non-negative final score guard; legacy <code>scoring.py</code> remains reference-only and is also floored.</li>
+      <li>Verified current contract: worker job dispatch initializes <code>lock_key</code> before lock acquisition and guards final release.</li>
+      <li>Verified current contract: webhook degraded import state is explicit through <code>/_import_status</code>, non-ok health payloads or HEAD 500, and callback <code>app_import_failed</code> responses.</li>
+      <li>Verified current contract: summary key validation uses constant-time comparison.</li>
+      <li>Verified current contract: Telegram row matching is centralized through one helper that covers canonical address aliases.</li>
+      <li>Verified current contract: pytest installs a Streamlit stub so app imports do not require the real Streamlit runtime in worker tests.</li>
+    </ul>
+    <p><b>Remaining risk:</b> active scoring ownership must stay documented, stale audit findings must not become new TODOs without reproduction, and <code>app.py</code> compatibility wrappers can drift from service/facade contracts.</p>
   </section>
 
   <section class="card"><h2>Risk Matrix</h2>
