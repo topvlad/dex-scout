@@ -12,8 +12,8 @@ from runtime_core import addr_store, canonical_entity_key, normalize_chain_name,
 import app_runtime_facade
 
 BOOTSTRAP_ERROR: Dict[str, str] = {}
-IMPORT_FAILED = False
-IMPORT_ERROR = ""
+IMPORT_FAILED: bool = False
+IMPORT_ERROR: str = ""
 CALLBACK_ID_TTL_SECONDS = 24 * 60 * 60
 CALLBACK_ID_MAX_ITEMS = 5000
 TG_STATE: Dict[str, Dict[str, float]] = {"processed_callback_ids": {}}
@@ -162,6 +162,21 @@ def _app_import_failed_response() -> Dict[str, Any]:
     state = _facade_state()
     return {"ok": False, "error": "app_import_failed", "detail": state.get("error", "")}
 
+
+
+
+class _ImportFailedHealthResponse(Response):
+    def __init__(self, payload: Dict[str, Any], status_code: int = 503):
+        self.payload = payload
+        detail = str(payload.get("detail") or "").replace('"', "'")
+        super().__init__(
+            content='{"ok":false,"error":"app_import_failed","detail":"' + detail + '"}',
+            status_code=status_code,
+            media_type="application/json",
+        )
+
+    def __getitem__(self, key: str) -> Any:
+        return self.payload[key]
 
 def _require_bootstrap() -> None:
     state = _facade_state()
@@ -547,8 +562,10 @@ def root():
 
 @app.get("/health")
 def health():
-    if not _app_available():
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
         return _app_import_failed_response()
+    if not _app_available():
+        return _ImportFailedHealthResponse(_app_import_failed_response(), status_code=503)
     return {"ok": True}
 
 
@@ -615,6 +632,8 @@ async def tg_webhook(req: Request):
         return _app_import_failed_response()
     try:
         data = await req.json()
+        if not _app_available():
+            return _app_import_failed_response()
         cb = data.get("callback_query")
         if not cb:
             return {"ok": True}
@@ -735,6 +754,8 @@ async def tg_webhook(req: Request):
 
 @app.post("/tg/webhook")
 async def tg_webhook_alias(req: Request):
+    if not _app_available():
+        return _app_import_failed_response()
     return await tg_webhook(req)
 
 

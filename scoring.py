@@ -41,10 +41,13 @@ def passes_safe_filters(row: dict) -> bool:
     pc_m5 = _safe_float(row.get("pc_m5"), None)
     pc_h1 = _safe_float(row.get("pc_h1"), None)
     vol_m5 = _safe_float(vol_raw, 0.0 if vol_raw is None else None)
-    buys = _safe_int(row.get("buys_m5"), None)
-    sells = _safe_int(row.get("sells_m5"), None)
+    try:
+        buys = int(row.get("buys_m5") or 0)
+        sells = int(row.get("sells_m5") or 0)
+    except (TypeError, ValueError):
+        return False
 
-    if None in (liq, txns_m5, pc_m5, vol_m5, buys, sells):
+    if None in (liq, txns_m5, pc_m5, vol_m5):
         return False
 
     ratio = buys / max(1, sells)
@@ -81,5 +84,4 @@ def score_row(row: dict) -> float:
     if liq < MIN_LIQ_USD:
         score -= SCORE_LIQ_BELOW_MIN_PENALTY
 
-    score = max(SCORE_MIN_VALUE, score)
-    return float(score)
+    return float(max(SCORE_MIN_VALUE, score))

@@ -559,8 +559,11 @@ def _dry_run_validate_job_mode(mode: str, runner: Optional[Callable[[], Dict[str
     return 0
 
 def run_job_mode(job_mode: str) -> int:
-    assert app is not None
+    global app
+    if app is None:
+        app = _load_app()
     mode = str(job_mode or "").strip().lower()
+    lock_key: Optional[str]
     lock_key = None
     owner = f"{socket.gethostname()}:{os.getpid()}"
     try:
@@ -658,10 +661,6 @@ def run_job_mode(job_mode: str) -> int:
         )
         print(f"[worker] duplicate_guard mode={mode} age_sec={int(age_sec)}", flush=True)
         return 3
-
-    # FIX #1: initialise lock_key to None before any branching so the
-    # finally block never hits NameError on early returns.
-    lock_key: Optional[str] = None
 
     lock_key = f"job_mode:{mode}"
 
