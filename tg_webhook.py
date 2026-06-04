@@ -163,6 +163,21 @@ def _app_import_failed_response() -> Dict[str, Any]:
     return {"ok": False, "error": "app_import_failed", "detail": state.get("error", "")}
 
 
+
+
+class _ImportFailedHealthResponse(Response):
+    def __init__(self, payload: Dict[str, Any], status_code: int = 503):
+        self.payload = payload
+        detail = str(payload.get("detail") or "").replace('"', "'")
+        super().__init__(
+            content='{"ok":false,"error":"app_import_failed","detail":"' + detail + '"}',
+            status_code=status_code,
+            media_type="application/json",
+        )
+
+    def __getitem__(self, key: str) -> Any:
+        return self.payload[key]
+
 def _require_bootstrap() -> None:
     state = _facade_state()
     if not state.get("ok"):
@@ -547,13 +562,10 @@ def root():
 
 @app.get("/health")
 def health():
+    if IMPORT_FAILED or BOOTSTRAP_ERROR:
+        return _app_import_failed_response()
     if not _app_available():
-        detail = str(_facade_state().get("error") or "").replace('"', "'")
-        return Response(
-            content='{"ok":false,"error":"app_import_failed","detail":"' + detail + '"}',
-            status_code=503,
-            media_type="application/json",
-        )
+        return _ImportFailedHealthResponse(_app_import_failed_response(), status_code=503)
     return {"ok": True}
 
 

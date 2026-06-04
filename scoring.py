@@ -10,7 +10,7 @@ from config import (
     MIN_LIQ_USD, MIN_TXNS_M5, MAX_ABS_PRICECHANGE_M5, MAX_PRICECHANGE_H1, MIN_VOLUME_M5,
     MIN_BUY_SELL_RATIO,
     W_TXNS_IMBALANCE, W_VOLUME_M5, W_LIQ, W_PCHG_M5_PENALTY,
-    SCORE_VOL_SCALE, SCORE_LIQ_SCALE, SCORE_LIQ_BELOW_MIN_PENALTY,
+    SCORE_VOL_SCALE, SCORE_LIQ_SCALE, SCORE_LIQ_BELOW_MIN_PENALTY, SCORE_MIN_VALUE,
 )
 
 
@@ -84,4 +84,4 @@ def score_row(row: dict) -> float:
     if liq < MIN_LIQ_USD:
         score -= SCORE_LIQ_BELOW_MIN_PENALTY
 
-    return float(max(score, 0.0))
+    return float(max(SCORE_MIN_VALUE, score))

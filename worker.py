@@ -563,7 +563,8 @@ def run_job_mode(job_mode: str) -> int:
     if app is None:
         app = _load_app()
     mode = str(job_mode or "").strip().lower()
-    lock_key: Optional[str] = None
+    lock_key: Optional[str]
+    lock_key = None
     owner = f"{socket.gethostname()}:{os.getpid()}"
     try:
         validate_job_dispatch(JOB_DISPATCH)
