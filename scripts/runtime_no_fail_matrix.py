@@ -24,8 +24,8 @@ from types import ModuleType
 from typing import Any, Callable, Dict, Iterable, List
 from unittest.mock import patch
 
-REQUIRED_ROLES = ("ui_streamlit", "worker", "webhook", "app_compat", "core_modules", "golden_fixtures", "admin_controls")
-ROLE_ORDER = (*REQUIRED_ROLES[:3], "dash_readonly", REQUIRED_ROLES[3], REQUIRED_ROLES[4], REQUIRED_ROLES[5], REQUIRED_ROLES[6])
+REQUIRED_ROLES = ("ui_streamlit", "worker", "webhook", "app_compat", "core_modules", "golden_fixtures", "admin_controls", "external_audit_claims")
+ROLE_ORDER = (*REQUIRED_ROLES[:3], "dash_readonly", REQUIRED_ROLES[3], REQUIRED_ROLES[4], REQUIRED_ROLES[5], REQUIRED_ROLES[6], REQUIRED_ROLES[7])
 CORE_MODULES = (
     "runtime_core",
     "storage_core",
@@ -802,6 +802,34 @@ def _commit() -> str:
         return ""
 
 
+
+def _external_audit_claims_role() -> Dict[str, Any]:
+    """Check stale external-review claims without network, writes, sends, or scans."""
+    try:
+        from scripts import audit_external_review_claims
+        report = audit_external_review_claims.audit_claims()
+        claims = report.get("claims") if isinstance(report, dict) else {}
+        active_claims = [
+            key for key, value in (claims or {}).items()
+            if isinstance(value, dict) and value.get("status") == "true"
+        ]
+        errors = [f"active_external_audit_claim:{key}" for key in active_claims]
+        return _role(
+            "ok" if not errors else "external_audit_claims_failed",
+            ok=not errors,
+            errors=errors,
+            claims_checked=len(claims or {}),
+            active_claims=active_claims,
+        )
+    except Exception as exc:
+        return _role(
+            "external_audit_claims_exception",
+            ok=False,
+            errors=[f"external_audit_claims_exception:{type(exc).__name__}:{_sanitize(exc)}"],
+            claims_checked=0,
+            active_claims=[],
+        )
+
 def build_matrix() -> Dict[str, Any]:
     env_overrides = {
         "JOB_DRY_RUN": "true",
@@ -821,6 +849,7 @@ def build_matrix() -> Dict[str, Any]:
             "core_modules": _core_modules_role(),
             "golden_fixtures": _golden_fixtures_role(),
             "admin_controls": _admin_controls_role(),
+            "external_audit_claims": _external_audit_claims_role(),
         }
     finally:
         for key, previous in previous_env.items():

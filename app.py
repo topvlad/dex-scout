@@ -3849,7 +3849,11 @@ def score_pair(p: Optional[Dict[str, Any]]) -> float:
     if toxic:
         s -= 200
 
-    return round(s, 2)
+    # Active scanner/recommendation scoring is allowed to apply the existing
+    # penalties above, but the public score contract is non-negative.  Keep the
+    # weights untouched and floor only the final value so stale external-review
+    # findings about negative active scores cannot re-enter unnoticed.
+    return max(0.0, round(s, 2))
 
 
 def detect_snipers(pair: Optional[Dict[str, Any]]) -> bool:

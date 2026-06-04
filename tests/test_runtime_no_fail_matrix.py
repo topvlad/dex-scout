@@ -16,7 +16,7 @@ def test_runtime_matrix_script_builds_schema_and_redacts_secret(monkeypatch):
     payload = json.dumps(summary, sort_keys=True, default=str)
 
     assert set(summary) == {"ok", "ts_utc", "commit", "roles", "secrets_redacted"}
-    assert set(summary["roles"]) == {"ui_streamlit", "worker", "webhook", "dash_readonly", "app_compat", "core_modules", "golden_fixtures", "admin_controls"}
+    assert set(summary["roles"]) == {"ui_streamlit", "worker", "webhook", "dash_readonly", "app_compat", "core_modules", "golden_fixtures", "admin_controls", "external_audit_claims"}
     assert summary["secrets_redacted"] is True
     assert "matrix-secret-token" not in payload
 
